@@ -1,0 +1,123 @@
+{
+  "scope": "issue_reporting_and_validation",
+  "title": "Issue Reporting & Validation",
+  "diagram_type": "use_case",
+  "actors": [
+    "Evolver Agent",
+    "GitHub Hub",
+    "External Hub / Judge",
+    "System (automated)"
+  ],
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Report Recurring Failure",
+      "actor": "Evolver Agent",
+      "trigger": "maybeReportIssue(opts) called with failure signals",
+      "preconditions": [
+        "EVOLVER_AUTO_ISSUE env var is not 'false'/'0'",
+        "GITHUB_TOKEN / GH_TOKEN / GITHUB_PAT available",
+        "signals include 'failure_loop_detected' OR ('recurring_error' AND 'high_failure_ratio')",
+        "consecutive_failure_streak >= minStreak (default 5)",
+        "cooldown period (default 24h) has elapsed or error key not yet seen"
+      ],
+      "steps": [
+        "getConfig() — read env vars for repo, cooldown, minStreak",
+        "shouldReport(signals, config) — validate trigger conditions + cooldown dedup via readState()",
+        "computeErrorKey(signals) — SHA-256 hash of relevant signal subset",
+        "extractErrorSignature(signals) — human-readable error description",
+        "buildIssueBody(opts) — compose markdown body with env fingerprint, failure signals, recent events table, session log excerpt (all sanitized via redactString)",
+        "findExistingIssue(repo, title, token) — GET GitHub Search API to detect duplicate open issues",
+        "createGithubIssue(repo, title, body, token) — POST to GitHub Issues API (15s timeout)",
+        "writeState(state) — persist lastReportedAt, recentIssueKeys, issue URL/number"
+      ],
+      "outcomes": [
+        "New GitHub issue created (#N) in target repo",
+        "Duplicate detected — state updated, issue skipped",
+        "No token — silently skipped",
+        "API failure — non-fatal logged, no state written"
+      ]
+    },
+    {
+      "id": "UC2",
+      "name": "Build Validation Report",
+      "actor": "Evolver Agent",
+      "trigger": "buildValidationReport({ geneId, commands, results, envFp, startedAt, finishedAt })",
+      "steps": [
+        "captureEnvFingerprint() — gather node version, platform, arch, container flag, evolver version",
+        "Map commands + results into normalized { command, ok, stdout, stderr } entries (truncated at 4000 chars each)",
+        "Compute overall_ok (all results pass)",
+        "computeAssetId(report) — content hash for dedup/integrity",
+        "Return ValidationReport object with schema_version, id, gene_id, env_fingerprint, commands[], overall_ok, duration_ms, created_at, asset_id"
+      ],
+      "outcomes": [
+        "Returns structured ValidationReport object (type='ValidationReport')"
+      ]
+    },
+    {
+      "id": "UC3",
+      "name": "Validate Report Integrity",
+      "actor": "External Hub / Judge",
+      "trigger": "isValidValidationReport(obj) called on received report",
+      "steps": [
+        "Check obj.type === 'ValidationReport'",
+        "Check obj.id is a non-empty string",
+        "Check obj.commands is an Array",
+        "Check obj.overall_ok is boolean"
+      ],
+      "outcomes": [
+        "Returns true — report is well-formed and consumable",
+        "Returns false — report rejected"
+      ]
+    },
+    {
+      "id": "UC4",
+      "name": "Analyze Past Failures (Self-Correction)",
+      "actor": "System (automated)",
+      "trigger": "analyzeFailures() called (meta-learning step)",
+      "steps": [
+        "Locate MEMORY.md in cwd",
+        "Parse failure rows via regex: /F\\d+/ Fix entries with summary + detail",
+        "Return top 3 failures for prompt injection context"
+      ],
+      "outcomes": [
+        "{ status: 'success', count: N, failures: [...] } — up to 3 structured failure entries",
+        "{ status: 'skipped', reason: 'no_memory' } — MEMORY.md absent"
+      ]
+    }
+  ],
+  "include_extends": [
+    "UC1 <<include>> UC2 (issue body uses env fingerprint, same source as ValidationReport)",
+    "UC1 <<include>> UC4 (failure analysis informs signal detection upstream)",
+    "UC2 <<include>> UC3 (consumers validate report before processing)",
+    "UC1 <<extend>> 'Find Existing Issue' (dedup check extends the base report flow)"
+  ],
+  "key_dependencies": [
+    "issueReporter.js → envFingerprint.captureEnvFingerprint()",
+    "issueReporter.js → sanitize.redactString() — PII/secret removal",
+    "issueReporter.js → a2aProtocol.getNodeId() — device identity",
+    "issueReporter.js → paths.getEvolutionDir() — state file location",
+    "validationReport.js → contentHash.computeAssetId(), contentHash.SCHEMA_VERSION",
+    "validationReport.js → envFingerprint.captureEnvFingerprint(), envFingerprintKey()",
+    "analyzer.js → MEMORY.md (filesystem read)"
+  ],
+  "data_objects": [
+    "IssueReporterState: { lastReportedAt, recentIssueKeys[], lastIssueUrl, lastIssueNumber, lastSkippedAt }",
+    "ValidationReport: { type, schema_version, id, gene_id, env_fingerprint, env_fingerprint_key, commands[], overall_ok, duration_ms, created_at, asset_id }",
+    "FailureAnalysis: { status, count, failures[{ summary, detail }] }",
+    "IssueBody: markdown string — env section, failure summary, error signature, recent events table, session log excerpt"
+  ],
+  "env_config": [
+    "EVOLVER_AUTO_ISSUE — enable/disable (default: true)",
+    "EVOLVER_ISSUE_REPO — target GitHub repo (default: autogame-17/capability-evolver)",
+    "EVOLVER_ISSUE_COOLDOWN_MS — dedup window (default: 86400000ms)",
+    "EVOLVER_ISSUE_MIN_STREAK — minimum failure streak (default: 5)",
+    "GITHUB_TOKEN / GH_TOKEN / GITHUB_PAT — authentication"
+  ],
+  "important_notes": "issueReporter uses SHA-256 error keys for dedup, 24h cooldown, and sanitizes all user-facing content before posting. ValidationReport is schema-versioned and content-hashed (asset_id) for interoperability with external Hubs/Judges. analyzer.js is a standalone meta-learning module, runnable directly (require.main check), reads MEMORY.md to surface top-3 prior failures for prompt context.",
+  "source_files_analyzed": [
+    "src/gep/issueReporter.js",
+    "src/gep/validationReport.js",
+    "src/gep/analyzer.js"
+  ]
+}

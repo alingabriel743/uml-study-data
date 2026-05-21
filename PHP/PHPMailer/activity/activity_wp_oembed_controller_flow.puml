@@ -1,0 +1,187 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam note {
+    BackgroundColor #D1ECF1
+    BorderColor #0C5460
+    FontColor #0C5460
+}
+
+title WordPress oEmbed Controller Flow\n<size:11>(WP_oEmbed_Controller — REST API Route Registration & Request Handling)</size>
+
+|#E9ECEF|WordPress Bootstrap|
+start
+:WordPress REST API initialises;
+:Instantiate WP_oEmbed_Controller;
+
+note right
+  Class is **final** — cannot be subclassed.
+  Introduced in WordPress 4.4.0.
+end note
+
+:Call register_routes();
+
+|#D4EDDA|oEmbed Controller|
+:Apply filter **'oembed_default_width'**\n→ $maxwidth (default: 600);
+
+fork
+  :Register REST route\n**GET oembed/1.0/embed**\n• callback: get_item()\n• permission: __return_true (public)\n• args: url (required, URI),\n  format (default: json),\n  maxwidth (default: $maxwidth);
+  note right
+    Fully **public** endpoint —
+    no authentication required.
+  end note
+fork again
+  :Register REST route\n**GET oembed/1.0/proxy**\n• callback: get_proxy_item()\n• permission: get_proxy_item_permissions_check()\n• args: url (required, URI),\n  format (json|xml), maxwidth,\n  maxheight, discover (boolean);
+  note right
+    Requires **edit_posts** capability
+    (Editor role or higher).
+  end note
+end fork
+
+|#FEFEFE|REST Client|
+:Client sends HTTP GET request;
+
+if (Route matched?) then (GET /embed)
+
+  |oEmbed Controller|
+  :get_item(WP_REST_Request $request);
+  :url_to_postid($request['url'])\n→ $post_id;
+  :Apply filter **'oembed_request_post_id'**\n($post_id, $url) → $post_id (override);
+  :get_oembed_response_data\n($post_id, $request['maxwidth'])\n→ $data;
+
+  if ($data is falsy?) then (yes)
+    |#F8D7DA|Error Handling|
+    :Return **WP_Error**\n'oembed_invalid_url' (HTTP 404);
+    stop
+  else (no)
+    |oEmbed Controller|
+    :Return oEmbed **$data** array\nto REST client;
+    stop
+  endif
+
+else (GET /proxy)
+
+  |#FFF3CD|Authorization|
+  :get_proxy_item_permissions_check();
+  :Check **current_user_can('edit_posts')**;
+
+  if (User has edit_posts capability?) then (no)
+    |#F8D7DA|Error Handling|
+    :Return **WP_Error** 'rest_forbidden'\nHTTP 401 / 403 via\nrest_authorization_required_code();
+    stop
+  else (yes)
+
+    |oEmbed Controller|
+    :get_proxy_item(WP_REST_Request $request);
+    :Get all request params → $args;
+    :Unset **$args['_wpnonce']**\n(strip security token before\ncache key generation);
+
+    note right
+      Nonce stripped to ensure
+      **cache-key stability** across
+      nonce rotations.
+    end note
+
+    :Compute **$cache_key**\n= 'oembed_' . md5(serialize($args));
+
+    |#D4EDDA|Transient Cache|
+    :get_transient($cache_key) → $data;
+
+    if ($data not empty?) then (cache hit)
+      :Return cached **$data**\n(early return);
+      stop
+    else (cache miss)
+
+      |oEmbed Controller|
+      :Extract $url = $request['url'];
+      :Unset $args['url'];
+      :Remap maxwidth → width\n(if set in $args);
+      :Remap maxheight → height\n(if set in $args);
+
+      note right
+        **maxwidth/maxheight** are remapped
+        to **width/height** for
+        WP_oEmbed::get_data() compatibility.
+      end note
+
+      |#D4EDDA|Local oEmbed Resolver|
+      :get_oembed_response_data_for_url\n($url, $args) → $data\n(local site short-circuit);
+
+      if ($data truthy?) then (local match)
+        |oEmbed Controller|
+        :Return local **$data**\n(early return, no caching needed);
+        stop
+      else (not local)
+
+        |#CCE5FF|External oEmbed Fetch|
+        :_wp_oembed_get_object()\n→ WP_oEmbed singleton;
+        :WP_oEmbed::get_data($url, $args)\n→ $data (external provider fetch);
+
+        if ($data === false?) then (fetch failed)
+
+          |oEmbed Controller|
+          :WP_Embed::get_embed_handler_html\n($args, $url) → $html\n(classic embed handler fallback);
+
+          if ($html truthy?) then (handler matched)
+            :Collect enqueued script srcs\nfrom **$wp_scripts->queue**\n→ $enqueued_scripts;
+            :Return **(object)**\n{ provider_name: 'Embed Handler',\n  html: $html,\n  scripts: $enqueued_scripts };
+            stop
+          else (no handler)
+            |#F8D7DA|Error Handling|
+            :Return **WP_Error**\n'oembed_invalid_url' (HTTP 404);
+            stop
+          endif
+
+        else (fetch succeeded)
+
+          |oEmbed Controller|
+          :Apply filter **'oembed_result'** via\nWP_oEmbed::data2html($data, $url)\n→ $data->html (rendered HTML);
+          :Apply filter **'rest_oembed_ttl'**\n→ $ttl (default: DAY_IN_SECONDS);
+
+          note right
+            TTL is **filterable** via
+            'rest_oembed_ttl' hook.
+            Default = 86400 seconds (1 day).
+          end note
+
+          |#D4EDDA|Transient Cache|
+          :set_transient($cache_key, $data, $ttl)\n(cache response for future requests);
+
+          |oEmbed Controller|
+          :Return oEmbed **$data** object\nto REST client;
+          stop
+        endif
+      endif
+    endif
+  endif
+endif
+
+@enduml

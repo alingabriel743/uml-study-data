@@ -1,0 +1,242 @@
+@startuml class_tracing_processors_providers
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #F9A825
+}
+
+title Tracing – Processors & Providers
+
+' ─────────────────────────────────────────
+' PROCESSOR INTERFACE (abstract base types)
+' ─────────────────────────────────────────
+package "processor_interface" {
+
+    abstract class TracingProcessor {
+        +{abstract} on_trace_start(trace: Trace) : None
+        +{abstract} on_trace_end(trace: Trace) : None
+        +{abstract} on_span_start(span: Span[Any]) : None
+        +{abstract} on_span_end(span: Span[Any]) : None
+        +{abstract} shutdown() : None
+        +{abstract} force_flush() : None
+    }
+    note right of TracingProcessor
+        All methods must be
+        thread-safe and non-blocking
+    end note
+
+    abstract class TracingExporter {
+        +{abstract} export(items: list[Trace | Span[Any]]) : None
+    }
+}
+
+' ─────────────────────────────────────────
+' PROCESSORS (concrete implementations)
+' ─────────────────────────────────────────
+package "processors" {
+
+    class BatchTraceProcessor {
+        -_exporter: TracingExporter
+        -_queue: Queue[Trace | Span[Any]]
+        -_max_queue_size: int = 8192
+        -_max_batch_size: int = 128
+        -_schedule_delay: float = 5.0
+        -_export_trigger_size: int
+        -_worker_thread: Thread | None
+        -_shutdown_event: Event
+        --
+        +__init__(exporter, max_queue_size, max_batch_size, schedule_delay, export_trigger_ratio)
+        +on_trace_start(trace) : None
+        +on_span_end(span) : None
+        +shutdown(timeout) : None
+        +force_flush() : None
+        -_ensure_thread_started() : None
+        -_run() : None
+        -_export_batches(force) : None
+    }
+    note right of BatchTraceProcessor
+        Lazy daemon thread started on
+        first enqueue. Exports when
+        queue >= trigger_size OR
+        schedule_delay elapsed.
+        Final flush registered via atexit.
+    end note
+
+    class ConsoleSpanExporter {
+        +export(items: list[Trace | Span[Any]]) : None
+    }
+    note bottom of ConsoleSpanExporter
+        Prints traces/spans to stdout
+    end note
+
+    class BackendSpanExporter {
+        -_api_key: str | None
+        -_organization: str | None
+        -_project: str | None
+        +endpoint: str
+        +max_retries: int = 3
+        +base_delay: float = 1.0
+        +max_delay: float = 30.0
+        -_client: httpx.Client
+        -{static} _OPENAI_TRACING_MAX_FIELD_BYTES: int = 100_000
+        --
+        +set_api_key(api_key: str) : None
+        +api_key : str
+        +organization : str
+        +project : str
+        +export(items: list[Trace | Span[Any]]) : None
+        +close() : None
+        -_sanitize_for_openai_tracing_api(payload_item) : dict
+        -_truncate_span_field_value(value) : Any
+    }
+    note right of BackendSpanExporter
+        POST https://api.openai.com/v1/traces/ingest
+        Groups by tracing_api_key.
+        Sanitizes input/output to max 100KB.
+        Exponential backoff with 10% jitter.
+        Falls back to OPENAI_API_KEY env var.
+    end note
+
+    class "<<module>> processors" as ProcessorsSingletons {
+        +default_exporter() : BackendSpanExporter
+        +default_processor() : BatchTraceProcessor
+        ~_global_exporter: BackendSpanExporter | None
+        ~_global_processor: BatchTraceProcessor | None
+        ~_global_lock: Lock
+    }
+    note bottom of ProcessorsSingletons
+        Thread-safe lazy singletons —
+        not initialised at import time
+        (safe for fork-based workers)
+    end note
+}
+
+' ─────────────────────────────────────────
+' PROVIDER (orchestration layer)
+' ─────────────────────────────────────────
+package "provider" {
+
+    abstract class TraceProvider {
+        +{abstract} register_processor(processor: TracingProcessor) : None
+        +{abstract} set_processors(processors: list[TracingProcessor]) : None
+        +{abstract} get_current_trace() : Trace | None
+        +{abstract} get_current_span() : Span[Any] | None
+        +{abstract} set_disabled(disabled: bool) : None
+        +{abstract} gen_trace_id() : str
+        +{abstract} gen_span_id() : str
+        +{abstract} gen_group_id() : str
+        +{abstract} create_trace(name, trace_id, group_id, metadata, disabled, tracing) : Trace
+        +{abstract} create_span(span_data, span_id, parent, disabled) : Span[TSpanData]
+        +force_flush() : None
+        +shutdown() : None
+    }
+
+    class SynchronousMultiTracingProcessor {
+        -_processors: tuple[TracingProcessor, ...]
+        -_lock: Lock
+        --
+        +add_tracing_processor(processor: TracingProcessor) : None
+        +set_processors(processors: list[TracingProcessor]) : None
+        +on_trace_start(trace) : None
+        +on_trace_end(trace) : None
+        +on_span_start(span) : None
+        +on_span_end(span) : None
+        +shutdown() : None
+        +force_flush() : None
+    }
+    note right of SynchronousMultiTracingProcessor
+        Fan-out to all registered processors.
+        Immutable tuple for safe concurrent
+        iteration. Per-processor errors are
+        logged, not re-raised.
+    end note
+
+    class DefaultTraceProvider {
+        -_multi_processor: SynchronousMultiTracingProcessor
+        -_env_disabled: bool | None
+        -_manual_disabled: bool | None
+        -_disabled: bool
+        --
+        +register_processor(processor) : None
+        +set_processors(processors) : None
+        +get_current_trace() : Trace | None
+        +get_current_span() : Span | None
+        +set_disabled(disabled: bool) : None
+        +gen_trace_id() : str
+        +gen_span_id() : str
+        +gen_group_id() : str
+        +create_trace(...) : Trace
+        +create_span(...) : Span
+        +force_flush() : None
+        +shutdown() : None
+        -_refresh_disabled_flag() : None
+    }
+    note right of DefaultTraceProvider
+        Returns NoOpTrace / NoOpSpan when
+        disabled or no active Scope trace.
+        Reads OPENAI_AGENTS_DISABLE_TRACING
+        env var for env-level disable.
+        Scope uses contextvars for concurrency.
+    end note
+}
+
+' ─────────────────────────────────────────
+' SETUP (global singleton bootstrapping)
+' ─────────────────────────────────────────
+package "setup" {
+
+    class "<<module>> setup" as SetupModule {
+        ~GLOBAL_TRACE_PROVIDER: TraceProvider | None
+        --
+        +get_trace_provider() : TraceProvider
+        +set_trace_provider(provider: TraceProvider) : None
+        -_shutdown_global_trace_provider() : None
+    }
+    note bottom of SetupModule
+        get_trace_provider() lazily creates
+        DefaultTraceProvider + registers
+        default_processor(). atexit hook
+        calls shutdown() on process exit.
+    end note
+}
+
+' ─────────────────────────────────────────
+' INHERITANCE RELATIONSHIPS
+' ─────────────────────────────────────────
+BatchTraceProcessor               --|> TracingProcessor
+SynchronousMultiTracingProcessor  --|> TracingProcessor
+ConsoleSpanExporter               --|> TracingExporter
+BackendSpanExporter               --|> TracingExporter
+DefaultTraceProvider              --|> TraceProvider
+
+' ─────────────────────────────────────────
+' COMPOSITION / AGGREGATION
+' ─────────────────────────────────────────
+BatchTraceProcessor               *--> TracingExporter              : uses (1)
+DefaultTraceProvider              *--> SynchronousMultiTracingProcessor : owns (1)
+SynchronousMultiTracingProcessor  o--> TracingProcessor             : fan-out (0..*)
+
+' ─────────────────────────────────────────
+' MODULE-LEVEL FACTORY DEPENDENCIES
+' ─────────────────────────────────────────
+ProcessorsSingletons ..> BackendSpanExporter   : creates (default_exporter)
+ProcessorsSingletons ..> BatchTraceProcessor   : creates (default_processor)
+SetupModule          ..> DefaultTraceProvider  : creates (lazy)
+SetupModule          ..> ProcessorsSingletons  : uses (registers default_processor)
+
+@enduml

@@ -1,0 +1,224 @@
+@startuml activity_mcp_server_reconnect_and_cleanup
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+skinparam note {
+    BackgroundColor #D1ECF1
+    BorderColor #0C5460
+    FontColor #212529
+}
+
+title MCP Server Reconnect and Cleanup
+
+|Caller|
+start
+:Call manager.reconnect(failed_only=True|False);
+
+|MCPServerManager|
+if (failed_only == True?) then (yes)
+    :Collect servers_to_retry\n= _unique_servers(failed_servers);
+    note right
+        Only retry servers tracked
+        in failed_servers list
+    end note
+else (no — full restart)
+    :await cleanup_all()\n[Teardown all servers in reverse order];
+    note right
+        Ensures proper teardown
+        before a full reconnect attempt
+    end note
+    :servers_to_retry = list(_all_servers);
+    :Reset failed_servers list\nand errors dict;
+endif
+
+:servers_to_connect =\n_servers_to_connect(servers_to_retry);
+note right
+    Skips already-connected servers —
+    connect_all() is idempotent
+end note
+
+if (connect_in_parallel?) then (yes — parallel mode)
+    :await _connect_all_parallel(servers_to_connect);
+    fork
+        |MCPServerManager|
+        :Create asyncio.Task per server\n_attempt_connect(server, raise_on_error=False);
+        :Retrieve _ServerWorker via _get_worker(server)\n[Creates worker if not exists];
+        |_ServerWorker|
+        :Execute 'connect' command\nfrom asyncio.Queue;
+        |MCPServer|
+        :server.connect() with timeout\n(default: 10s);
+        |MCPServerManager|
+        :_connected_servers.add(server)\nRemove from failed tracking;
+    fork again
+        |MCPServerManager|
+        :Create asyncio.Task per server\n_attempt_connect(server, raise_on_error=False);
+        |_ServerWorker|
+        :Execute 'connect' command\nfrom asyncio.Queue;
+        |MCPServer|
+        :server.connect() with timeout\n(default: 10s);
+        |MCPServerManager|
+        :_connected_servers.add(server)\nRemove from failed tracking;
+    end fork
+    |MCPServerManager|
+    :await asyncio.gather(*tasks,\nreturn_exceptions=True);
+    if (CancelledError found AND NOT suppress_cancelled_error?) then (yes)
+        :Re-raise first CancelledError;
+        stop
+    else (no)
+    endif
+    if (BaseException (non-Cancelled) found?) then (yes)
+        :Re-raise first BaseException;
+        stop
+    else (no)
+    endif
+    if (strict=True AND failed_servers present?) then (yes)
+        :Raise first stored connection error\n(skip CancelledErrors if suppressing);
+        stop
+    else (no)
+    endif
+else (no — sequential mode)
+    :For each server in servers_to_connect:;
+    repeat
+        :await _attempt_connect(server);
+        |MCPServer|
+        :await _run_with_timeout(\n  server.connect,\n  connect_timeout_seconds);
+        note right
+            Python 3.13+: asyncio.timeout()
+            Python 3.10-: loop.call_later() + task.cancel()
+            Default timeout: 10.0s
+        end note
+        |MCPServerManager|
+        if (Connect succeeded?) then (yes)
+            :_connected_servers.add(server);
+            if (server was previously failed?) then (yes)
+                :_remove_failed_server(server);
+                :Pop server from errors dict;
+            endif
+        else (no)
+            if (CancelledError?) then (yes)
+                if (suppress_cancelled_error?) then (yes)
+                    :Log and record failure;
+                    :_record_failure(server, exc, 'connect');
+                else (no)
+                    :_record_failure(server, exc, 'connect');
+                    :Re-raise CancelledError;
+                    stop
+                endif
+            elseif (Exception?) then (yes)
+                :_record_failure(server, exc, 'connect');
+                if (strict=True / raise_on_error?) then (yes)
+                    :Re-raise exception;
+                    note right
+                        Triggers error recovery:
+                        _cleanup_servers(connected + failed)
+                        Restore previous _active_servers
+                    end note
+                    stop
+                endif
+            else (BaseException)
+                :_record_failure(server, exc, 'connect');
+                :Always re-raise BaseException;
+                stop
+            endif
+        endif
+    repeat while (more servers to connect?) is (yes)
+    ->no;
+endif
+
+|MCPServerManager|
+:_refresh_active_servers();
+if (drop_failed_servers == True?) then (yes)
+    :_active_servers = [s for s in _all_servers\n  if s NOT in _failed_server_set];
+    note right
+        Excludes failed servers from the
+        active pool exposed to agents
+    end note
+else (no)
+    :_active_servers = list(_all_servers);
+    note right
+        All servers included, including
+        failed ones (caller handles errors)
+    end note
+endif
+
+|Caller|
+:Return _active_servers list\n(copy of internal list);
+
+stop
+
+' =============================================
+' Detached flow: cleanup_all() / cleanup_server
+' =============================================
+
+|MCPServerManager|
+partition "cleanup_all() / __aexit__" {
+    :for server in reversed(_all_servers);
+    repeat
+        :await _cleanup_server(server);
+        if (connect_in_parallel AND server in _workers?) then (yes — parallel worker exists)
+            :Retrieve worker from _workers dict;
+            if (worker.is_done?) then (yes — task already finished)
+                :Pop worker from _workers;
+                :_connected_servers.discard(server);
+                note right: Skip redundant cleanup call
+            else (no — worker still running)
+                |_ServerWorker|
+                :Send 'cleanup' command\nto asyncio.Queue;
+                |MCPServer|
+                :Execute server.cleanup()\nwith timeout;
+                |MCPServerManager|
+                :FINALLY: Pop worker from _workers;
+                :_connected_servers.discard(server);
+            endif
+        else (no — sequential mode)
+            |MCPServer|
+            :await _run_with_timeout(\n  server.cleanup,\n  cleanup_timeout_seconds);
+            note right
+                Default cleanup timeout: 10.0s
+            end note
+            |MCPServerManager|
+            :FINALLY: _connected_servers.discard(server);
+        endif
+        if (CancelledError raised?) then (yes)
+            if (suppress_cancelled_error?) then (yes)
+                :Log warning + record in errors;
+            else (no)
+                :Re-raise CancelledError;
+            endif
+        elseif (Exception raised?) then (yes)
+            :Log exception;
+            :Record in errors dict;
+        endif
+    repeat while (more servers to clean?) is (yes)
+    ->no;
+    note right: Cleanup complete — all servers torn down
+}
+
+@enduml

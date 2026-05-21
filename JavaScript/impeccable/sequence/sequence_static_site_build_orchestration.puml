@@ -1,0 +1,194 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceParticipant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequenceArrowColor #495057
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceGroupBorderColor #6C757D
+skinparam sequenceGroupBackgroundColor #E9ECEF
+skinparam noteBorderColor #6C757D
+skinparam noteBackgroundColor #FFF9E6
+
+title Static Site Build Orchestration
+
+participant "build()" as build
+participant "generateSubPages\n(build-sub-pages.js)" as subpages
+participant "Bun.build\n(buildStaticSite)" as bunbuild
+participant "FileSystem\n(fs / copyDirSync)" as fs
+participant "readSourceFiles /\nreadPatterns\n(lib/utils.js)" as utils
+participant "createTransformer\n(lib/transformers)" as transformer
+participant "assembleUniversal" as universal
+participant "createAllZips\n(lib/zip.js)" as zip
+participant "generateApiData" as apidata
+participant "copyDistToBuild" as copydist
+participant "generateCFConfig" as cfconfig
+participant "generateCounts" as counts
+participant "Validators" as validators
+
+== Phase 1: Sub-Page & Static Site Generation ==
+
+[-> build: build()
+activate build
+
+build -> subpages: generateSubPages(ROOT_DIR)
+activate subpages
+note right: Generates skills, antipatterns,\ntutorials HTML sub-pages
+subpages --> build: { files: subPageFiles }
+deactivate subpages
+
+build -> bunbuild: buildStaticSite(subPageFiles)
+activate bunbuild
+note right: Bun.build({ entrypoints:\n  [index.html, cheatsheet.html,\n   privacy.html, ...subPageFiles],\n  outdir: 'build/', minify: true })
+bunbuild --> build: BuildResult
+note right: Flattens build/public/* → build/*\n(CF Pages dedup guard)
+deactivate bunbuild
+
+build -> fs: copy static assets\n(og-image.jpg, robots.txt,\nsitemap.xml, favicon.svg, apple-touch-icon.png)\npublic/ → build/
+activate fs
+fs --> build: done
+build -> fs: copyDirSync(public/antipattern-examples\n→ build/antipattern-examples)
+build -> fs: copyFileSync(src/detect-antipatterns-browser.js\n→ build/js/detect-antipatterns-browser.js)
+fs --> build: done
+deactivate fs
+
+== Phase 2: Read Source Data ==
+
+build -> utils: readSourceFiles(ROOT_DIR)
+activate utils
+utils --> build: { skills[] }
+deactivate utils
+
+build -> utils: readPatterns(ROOT_DIR)
+activate utils
+utils --> build: { patterns[], antipatterns[] }
+deactivate utils
+
+build -> fs: readFileSync('.claude-plugin/plugin.json')
+activate fs
+fs --> build: skillsVersion
+deactivate fs
+
+== Phase 3: Provider Transformation ==
+
+loop for each PROVIDER in PROVIDERS
+    build -> transformer: createTransformer(config)
+    activate transformer
+    transformer --> build: transform fn
+    deactivate transformer
+
+    build -> transformer: transform(skills, DIST_DIR,\n{ skillsVersion }) [unprefixed]
+    activate transformer
+    transformer --> build: dist/{provider}/{configDir}/
+    deactivate transformer
+
+    build -> transformer: transform(skills, DIST_DIR,\n{ prefix: 'i-', outputSuffix: '-prefixed',\n  skillsVersion }) [prefixed]
+    activate transformer
+    transformer --> build: dist/{provider}/{configDir}-prefixed/
+    deactivate transformer
+end
+
+== Phase 4: Universal Assembly & Zipping ==
+
+build -> universal: assembleUniversal(DIST_DIR)
+activate universal
+note right: Merges all provider configDirs\n→ dist/universal/, writes README.txt
+universal --> build: done
+deactivate universal
+
+build -> universal: assembleUniversal(DIST_DIR, '-prefixed')
+activate universal
+note right: → dist/universal-prefixed/
+universal --> build: done
+deactivate universal
+
+build -> zip: createAllZips(DIST_DIR)
+activate zip
+note right: ZIP bundles for individual\nproviders + universal
+zip --> build: done
+deactivate zip
+
+== Phase 5: API Data & Deployment Assets ==
+
+build -> apidata: generateApiData(buildDir, skills, patterns)
+activate apidata
+note right: Writes build/_data/api/\n  {skills,commands,patterns}.json\n  command-source/{id}.json per skill
+apidata --> build: done
+deactivate apidata
+
+build -> copydist: copyDistToBuild(DIST_DIR, buildDir)
+activate copydist
+note right: Copies dist/ → build/_data/dist/\n(for CF Pages Functions)
+copydist --> build: done
+deactivate copydist
+
+build -> cfconfig: generateCFConfig(buildDir)
+activate cfconfig
+note right: Writes:\n  build/_headers (security + cache)\n  build/_redirects (API rewrites + /gallery)\n  build/_routes.json (CF Functions)
+cfconfig --> build: done
+deactivate cfconfig
+
+== Phase 6: Local Harness Sync ==
+
+loop for each PROVIDER in PROVIDERS
+    build -> fs: copyDirSync(dist/{provider}/{configDir}/skills\n→ {ROOT}/{configDir}/skills)
+    activate fs
+    fs --> build: done
+    build -> fs: rmSync(deprecated local skill stubs)
+    fs --> build: done
+    deactivate fs
+end
+
+== Phase 7: Counts & Validation ==
+
+build -> counts: generateCounts(ROOT_DIR, skills, buildDir)
+activate counts
+note right: Counts active commands +\ndetection rules from detect-antipatterns.mjs\nWrites public/js/generated/counts.js\nValidates stale refs in HTML/MD/JSON
+counts --> build: countErrors
+deactivate counts
+
+build -> validators: validateAntipatternRules(ROOT_DIR)
+activate validators
+note right: Cross-validates ANTIPATTERNS rules\nagainst SKILL.md DON'T sections
+validators --> build: validationErrors
+deactivate validators
+
+build -> validators: validateSiteHeader(ROOT_DIR)
+activate validators
+note right: Checks index.html, cheatsheet.html,\nprivacy.html for <!-- site-header v1 -->
+validators --> build: headerErrors
+deactivate validators
+
+build -> validators: validateNoEmDashes(ROOT_DIR)
+activate validators
+note right: Scans content/site, public HTML,\nscripts for em dash characters
+validators --> build: emDashErrors
+deactivate validators
+
+alt countErrors | validationErrors | headerErrors | emDashErrors > 0
+    build -> build: process.exit(1)
+    note right: Build fails — errors reported
+else all validations pass
+    [<-- build: Build complete
+end
+
+deactivate build
+
+@enduml

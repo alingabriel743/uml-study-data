@@ -1,0 +1,327 @@
+@startuml class_run_internal_tool_execution
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #F9A825
+    FontColor #212529
+}
+
+title Run Internal – Tool Execution\n<size:11>(Tool Planning, Execution, Approval Flow, Guardrail Application & Batch Executor)</size>
+
+' ─────────────────────────────────────────────
+'  EXTERNAL / SHARED TYPES
+' ─────────────────────────────────────────────
+package "shared types" <<Rectangle>> {
+    class Agent <<external>> {
+    }
+
+    class RunContextWrapper <<external>> {
+        +get_approval_status(tool_name, call_id): bool|None
+        +approve_tool(tool_name, call_id): None
+        +reject_tool(tool_name, call_id): None
+    }
+
+    class RunConfig <<external>> {
+    }
+
+    class RunHooks <<external>> {
+        +on_tool_start(...)
+        +on_tool_end(...)
+    }
+
+    class ToolRunFunction <<external>> {
+    }
+
+    class ToolRunComputerAction <<external>> {
+    }
+
+    class ToolRunCustom <<external>> {
+    }
+
+    class ToolRunShellCall <<external>> {
+    }
+
+    class ToolRunApplyPatchCall <<external>> {
+    }
+
+    class ToolRunLocalShellCall <<external>> {
+    }
+
+    class ToolRunMCPApprovalRequest <<external>> {
+    }
+
+    class FunctionToolResult <<external>> {
+    }
+
+    class ToolInputGuardrailResult <<external>> {
+    }
+
+    class ToolOutputGuardrailResult <<external>> {
+    }
+
+    class RunItem <<external>> {
+    }
+
+    class ProcessedResponse <<external>> {
+        +tools_used: list[str]
+        +new_items: list[RunItem]
+    }
+}
+
+' ─────────────────────────────────────────────
+'  APPROVALS
+' ─────────────────────────────────────────────
+package "approvals" <<Rectangle>> {
+    class ToolApprovalItem {
+        ' Pending-approval placeholder returned in place
+        ' of ToolCallOutputItem when approval is needed.
+        ' Interrupts the run loop until resolved.
+    }
+
+    note bottom of ToolApprovalItem
+        Approval flow:
+        1. function_needs_approval() checks if approval required
+        2. resolve_approval_status() queries RunContextWrapper
+           - None  → ToolApprovalItem returned (run interrupted)
+           - True  → tool executes normally
+           - False → rejection ToolCallOutputItem returned
+        3. on_approval callback may call approve_tool()/reject_tool()
+        4. MCP approvals: on_approval_request callback or manual HITL
+    end note
+}
+
+' ─────────────────────────────────────────────
+'  TOOL PLANNING
+' ─────────────────────────────────────────────
+package "tool_planning" <<Rectangle>> {
+
+    class ToolExecutionPlan <<dataclass>> {
+        +function_runs: list[ToolRunFunction]
+        +computer_actions: list[ToolRunComputerAction]
+        +custom_tool_calls: list[ToolRunCustom]
+        +shell_calls: list[ToolRunShellCall]
+        +apply_patch_calls: list[ToolRunApplyPatchCall]
+        +local_shell_calls: list[ToolRunLocalShellCall]
+        +pending_interruptions: list[ToolApprovalItem]
+        +approved_mcp_responses: list[RunItem]
+        +mcp_requests_with_callback: list[ToolRunMCPApprovalRequest]
+        +has_interruptions: bool  {property}
+    }
+
+    note right of ToolExecutionPlan
+        Built by:
+        • _build_plan_for_fresh_turn()  — first model response
+        • _build_plan_for_resume_turn() — after approval resume
+        Both call _collect_mcp_approval_plan()
+        which partitions MCP approval requests.
+        Dispatched by _execute_tool_plan() via asyncio.gather
+        (parallel across tool-type categories).
+    end note
+}
+
+' ─────────────────────────────────────────────
+'  TOOL EXECUTION (batch)
+' ─────────────────────────────────────────────
+package "tool_execution" <<Rectangle>> {
+
+    class _FunctionToolBatchExecutor {
+        -execution_agent: Agent
+        -public_agent: Agent
+        -tool_runs: list[ToolRunFunction]
+        -hooks: RunHooks
+        -context_wrapper: RunContextWrapper
+        -config: RunConfig
+        -isolate_parallel_failures: bool
+        -tool_input_guardrail_results: list[ToolInputGuardrailResult]
+        -tool_output_guardrail_results: list[ToolOutputGuardrailResult]
+        -task_states: dict[Task, _FunctionToolTaskState]
+        -results_by_tool_run: dict[int, Any]
+        -pending_tasks: set[Task]
+        -propagating_failure: BaseException | None
+        -available_function_tools: list[FunctionTool]
+        +execute(): tuple[list[FunctionToolResult], list[ToolInputGuardrailResult], list[ToolOutputGuardrailResult]]
+        -_create_tool_task(tool_run, order): None
+        -_drain_pending_tasks(): None
+        -_raise_failure_after_draining_siblings(failure): None
+        -_partition_pending_tasks(): tuple[set[Task], set[Task]]
+        -_run_single_tool(task_state, func_tool, tool_call): Any
+        -_maybe_execute_tool_approval(func_tool, tool_call, ...): Any|None
+        -_execute_single_tool_body(...): Any
+        -_invoke_tool_and_run_post_invoke(...): Any
+        -_build_function_tool_results(): list[FunctionToolResult]
+        -_consume_nested_tool_run_result(tool_run): tuple
+        -_get_nested_tool_interruptions(nested_run_result): list[ToolApprovalItem]
+    }
+
+    note right of _FunctionToolBatchExecutor
+        Batch execution lifecycle:
+        1. execute() → resolve_enabled_function_tools()
+           → create asyncio.Task per ToolRunFunction
+        2. _drain_pending_tasks() → asyncio.wait(FIRST_COMPLETED) loop
+        3. On failure → cancel siblings, drain cancelled tasks,
+           merge failures, raise
+        4. _run_single_tool(): approval check → input guardrails
+           → on_tool_start hook → invoke tool
+           → output guardrails → on_tool_end hook
+        5. _build_function_tool_results() assembles FunctionToolResult
+           (includes nested agent run result + interruptions)
+
+        isolate_parallel_failures=True when >1 tool runs concurrently
+    end note
+
+    class _FunctionToolTaskState <<dataclass>> {
+        +tool_run: ToolRunFunction
+        +order: int
+        +invoke_task: asyncio.Task | None
+        +in_post_invoke_phase: bool
+    }
+
+    class _FunctionToolFailure <<dataclass, frozen>> {
+        +error: BaseException
+        +order: int
+        +source: Literal['direct','cancelled_teardown','post_invoke']
+    }
+}
+
+' ─────────────────────────────────────────────
+'  TOOL ACTIONS
+' ─────────────────────────────────────────────
+package "tool_actions" <<Rectangle>> {
+
+    class ComputerAction {
+        +TRACE_TOOL_NAME: str = "computer"
+        +execute(agent, action, hooks, context_wrapper, config, acknowledged_safety_checks): RunItem  {classmethod}
+        -_execute_action_and_capture(computer, tool_call): str  {classmethod}
+        -_iter_actions(tool_call): list  {staticmethod}
+        -_get_trace_input_payload(tool_call): Any  {classmethod}
+        -_filter_supported_kwargs(method_name, method, kwargs): dict  {classmethod}
+        -_normalize_modifier_keys(keys): list|None  {staticmethod}
+    }
+
+    class ShellAction {
+        +execute(agent, call, hooks, context_wrapper, config): RunItem  {classmethod}
+    }
+
+    class LocalShellAction {
+        +execute(agent, call, hooks, context_wrapper, config): RunItem  {classmethod}
+    }
+
+    class CustomToolAction {
+        +execute(agent, call, hooks, context_wrapper, config): RunItem  {classmethod}
+        -_normalize_output(output): str  {staticmethod}
+        -_tool_output_item(agent, call_id, output): ToolCallOutputItem  {staticmethod}
+    }
+
+    class ApplyPatchAction {
+        +execute(agent, call, hooks, context_wrapper, config): RunItem  {classmethod}
+    }
+
+    note bottom of ShellAction
+        ShellAction, CustomToolAction, ApplyPatchAction all call:
+        • evaluate_needs_approval_setting()
+        • resolve_approval_status()
+        • resolve_approval_rejection_message()
+        All Action.execute() use with_tool_function_span() for tracing.
+    end note
+}
+
+' ─────────────────────────────────────────────
+'  TOOL USE TRACKER
+' ─────────────────────────────────────────────
+package "tool_use_tracker" <<Rectangle>> {
+
+    class AgentToolUseTracker {
+        +agent_map: dict[str, set[str]]
+        +agent_to_tools: list[tuple[Agent, list[str]]]
+        +record_used_tools(agent, tools: list[ToolRunFunction]): None
+        +record_processed_response(agent, processed_response: ProcessedResponse): None
+        +add_tool_use(agent, tool_names: list[str]): None
+        +has_used_tools(agent): bool
+        +as_serializable(): dict[str, list[str]]
+        +from_serializable(data): AgentToolUseTracker  {classmethod}
+    }
+
+    note right of AgentToolUseTracker
+        Used by maybe_reset_tool_choice() to decide
+        whether to reset ModelSettings.tool_choice.
+        serialize_tool_use_tracker() / hydrate_tool_use_tracker()
+        persist tracker state across run resume.
+        record_processed_response() consumes
+        ProcessedResponse.tools_used and .new_items.
+    end note
+}
+
+' ─────────────────────────────────────────────
+'  RELATIONSHIPS
+' ─────────────────────────────────────────────
+
+' ToolExecutionPlan aggregates all tool run types
+ToolExecutionPlan "1" *-- "0..*" ToolRunFunction        : function_runs
+ToolExecutionPlan "1" *-- "0..*" ToolRunComputerAction  : computer_actions
+ToolExecutionPlan "1" *-- "0..*" ToolRunCustom          : custom_tool_calls
+ToolExecutionPlan "1" *-- "0..*" ToolRunShellCall       : shell_calls
+ToolExecutionPlan "1" *-- "0..*" ToolRunApplyPatchCall  : apply_patch_calls
+ToolExecutionPlan "1" *-- "0..*" ToolRunLocalShellCall  : local_shell_calls
+ToolExecutionPlan "1" *-- "0..*" ToolApprovalItem       : pending_interruptions
+ToolExecutionPlan "1" *-- "0..*" ToolRunMCPApprovalRequest : mcp_requests_with_callback
+
+' Batch executor internal composition
+_FunctionToolBatchExecutor "1" *-- "0..*" _FunctionToolTaskState : task_states
+_FunctionToolTaskState --> ToolRunFunction                        : wraps
+
+' Batch executor dependencies
+_FunctionToolBatchExecutor --> Agent           : execution_agent / public_agent
+_FunctionToolBatchExecutor --> RunContextWrapper : context_wrapper
+_FunctionToolBatchExecutor --> RunConfig       : config
+_FunctionToolBatchExecutor --> RunHooks        : hooks
+
+' Batch executor produces results
+_FunctionToolBatchExecutor ..> FunctionToolResult        : <<produces>>
+_FunctionToolBatchExecutor ..> ToolInputGuardrailResult  : <<produces>>
+_FunctionToolBatchExecutor ..> ToolOutputGuardrailResult : <<produces>>
+_FunctionToolBatchExecutor ..> _FunctionToolFailure      : <<raises on error>>
+
+' Approval check
+_FunctionToolBatchExecutor ..> ToolApprovalItem  : <<evaluates / may return>>
+_FunctionToolBatchExecutor ..> RunContextWrapper : approval status query
+
+' Action classes produce RunItem; may return ToolApprovalItem
+ComputerAction    ..> RunItem          : <<produces>>
+ShellAction       ..> RunItem          : <<produces>>
+LocalShellAction  ..> RunItem          : <<produces>>
+CustomToolAction  ..> RunItem          : <<produces>>
+ApplyPatchAction  ..> RunItem          : <<produces>>
+ShellAction       ..> ToolApprovalItem : <<may interrupt with>>
+CustomToolAction  ..> ToolApprovalItem : <<may interrupt with>>
+ApplyPatchAction  ..> ToolApprovalItem : <<may interrupt with>>
+ComputerAction    ..> ToolApprovalItem : <<may interrupt with>>
+
+' Action classes use RunContextWrapper for approval
+ComputerAction   ..> RunContextWrapper : approval check
+ShellAction      ..> RunContextWrapper : approval check
+CustomToolAction ..> RunContextWrapper : approval check
+ApplyPatchAction ..> RunContextWrapper : approval check
+
+' Tracker uses Agent and ProcessedResponse
+AgentToolUseTracker --> Agent             : tracks per-agent tool use
+AgentToolUseTracker ..> ProcessedResponse : <<consumes tools_used>>
+
+' ToolExecutionPlan dispatches to _FunctionToolBatchExecutor
+ToolExecutionPlan ..> _FunctionToolBatchExecutor : <<dispatches function_runs via execute_function_tool_calls()>>
+
+@enduml

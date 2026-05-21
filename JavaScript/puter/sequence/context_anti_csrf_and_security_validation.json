@@ -1,0 +1,131 @@
+{
+  "scope": "Anti-CSRF and Request Security Validation Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "GUI_AntiCSRFService",
+    "Browser/Client",
+    "eggspress_router",
+    "auth2_middleware (configurable_auth)",
+    "anticsrf_middleware",
+    "Backend_AntiCSRFService",
+    "AuthService",
+    "helpers (validate_signature_auth / sign_file)",
+    "CircularQueue",
+    "APIError"
+  ],
+
+  "interaction_flow": [
+    "=== FLOW 1: CSRF Token Acquisition (GUI → Backend) ===",
+    "Browser/Client → GUI_AntiCSRFService: token()",
+    "GUI_AntiCSRFService → Backend: GET /get-anticsrf-token  [Authorization: Bearer <auth_token>]",
+    "Backend: eggspress routes request through auth2_middleware (auth2: true)",
+    "auth2_middleware → AuthService: authenticate_from_token(token)",
+    "AuthService → auth2_middleware: returns Actor (sets req.user, req.actor)",
+    "auth2_middleware → route_handler: next()",
+    "route_handler → route_handler: check subdomain !== 'api' (OR experimental_no_subdomain)",
+    "route_handler: if subdomain is 'api' → res.status(404).send('Hey, stop that!') [ABORT]",
+    "route_handler: if !req.user → res.status(403) [ABORT]",
+    "route_handler → Backend_AntiCSRFService: create_token(req.user.uuid)",
+    "Backend_AntiCSRFService: if no queue → new CircularQueue(10); map_session_to_tokens[uuid] = queue",
+    "Backend_AntiCSRFService → crypto: randomBytes(32).toString('hex') → token",
+    "Backend_AntiCSRFService → CircularQueue: push(token)",
+    "Backend_AntiCSRFService → route_handler: return token",
+    "route_handler → GUI_AntiCSRFService: res.send({ token })",
+    "GUI_AntiCSRFService → Browser/Client: return anti_csrf token",
+
+    "=== FLOW 2: CSRF Token Validation on Protected Endpoint ===",
+    "Browser/Client → eggspress_router: POST /secure-endpoint  { anti_csrf: <token>, ...body }",
+    "eggspress_router: run middleware chain (auth2 → anticsrf → handler)",
+    "auth2_middleware → AuthService: authenticate_from_token(token) → Actor",
+    "auth2_middleware: sets req.user, req.actor → next()",
+    "anticsrf_middleware: check req.body.anti_csrf present",
+    "anticsrf_middleware: if missing → APIError.create('anti-csrf-incorrect').write(res) [ABORT]",
+    "anticsrf_middleware → Backend_AntiCSRFService: consume_token(req.user.uuid, req.body.anti_csrf)",
+    "Backend_AntiCSRFService → CircularQueue: maybe_consume(token) → boolean",
+    "Backend_AntiCSRFService → anticsrf_middleware: return has (true/false)",
+    "anticsrf_middleware: if !has → APIError.create('anti-csrf-incorrect').write(res) [ABORT]",
+    "anticsrf_middleware: if valid → next() → route handler executes",
+
+    "=== FLOW 3: Signature-Based Auth (validate_signature_auth) ===",
+    "Caller → helpers.validate_signature_auth(url, action, options?)",
+    "validate_signature_auth: parse URL searchParams → uid, expires, signature",
+    "validate_signature_auth: throw if uid missing | action missing | expires missing | signature missing",
+    "validate_signature_auth: if options.uid provided && uid !== options.uid → throw 'uid does not match'",
+    "validate_signature_auth: check expires < Date.now()/1000 → if expired throw 'Signature expired'",
+    "validate_signature_auth: compute expected_write = sha256(`${uid}/write/${secret}/${expires}`)",
+    "validate_signature_auth: if signature === expected_write → return true (write allows all actions)",
+    "validate_signature_auth: else compute expected_action = sha256(`${uid}/${action}/${secret}/${expires}`)",
+    "validate_signature_auth: if signature === expected_action → return true",
+    "validate_signature_auth: else throw 'Authentication failed'",
+
+    "=== FLOW 3b: Signature Generation (sign_file) ===",
+    "Caller → helpers.sign_file(fsentry, action)",
+    "sign_file: uid = fsentry.uuid ?? fsentry.uid ?? fsentry._id",
+    "sign_file: expires = Math.ceil(Date.now()/1000) + 9999999999999 (very large TTL)",
+    "sign_file: signature = sha256(`${uid}/${action}/${secret}/${expires}`)",
+    "sign_file → Caller: return { uid, expires, signature, url, read_url, write_url, metadata_url, ... }",
+
+    "=== FLOW 4: Auth2 Token Extraction & Delegation ===",
+    "Request → configurable_auth: check req.actor already set (PreAuthService short-circuit) → next()",
+    "configurable_auth: extract token from [body.auth_token | Authorization header | cookie | query.auth_token | socket.handshake]",
+    "configurable_auth: if no token && optional → next(); else APIError 'token_missing'",
+    "configurable_auth → AuthService: authenticate_from_token(token) → Actor",
+    "configurable_auth: on LegacyTokenError + path=='/whoami' → svc_auth.check_session(token, {req, from_upgrade:true})",
+    "configurable_auth: set context actor/user, req.actor, req.user, req.token → next()",
+
+    "=== FLOW 5: body_parser_error_handler ===",
+    "Express → body_parser_error_handler(err, req, res, next)",
+    "body_parser_error_handler: if err instanceof SyntaxError && err.status===400 && 'body' in err → res.status(400).send(err)",
+    "body_parser_error_handler: else → next()"
+  ],
+
+  "key_relationships": [
+    "Backend_AntiCSRFService extends BaseService",
+    "Backend_AntiCSRFService uses CircularQueue (capacity=10) per user session for token storage",
+    "GUI_AntiCSRFService extends Service (frontend)",
+    "auth2 = configurable_auth({ optional: false }) — thin wrapper",
+    "eggspress chains middleware: [subdomain?] → [abuse?] → [json parsers] → [auth|auth2?] → [files?] → [mw?] → handler",
+    "anticsrf_middleware depends_on Backend_AntiCSRFService (via req.services.get('anti-csrf'))",
+    "anticsrf_middleware depends_on auth2_middleware (needs req.user.uuid already set)",
+    "configurable_auth depends_on AuthService (authenticate_from_token / check_session)",
+    "validate_signature_auth depends_on config.url_signature_secret and sha256 (js-sha256)",
+    "sign_file produces signatures consumed by validate_signature_auth",
+    "CoreModule registers anticsrf middleware as 'puter.middlewares.anticsrf'",
+    "CoreModule registers auth2 middleware as 'puter.middlewares.auth'"
+  ],
+
+  "method_signatures": {
+    "GUI_AntiCSRFService.token": "async token(): Promise<string>  — GET /get-anticsrf-token with Bearer token",
+    "Backend_AntiCSRFService.create_token": "create_token(session: string): string",
+    "Backend_AntiCSRFService.consume_token": "consume_token(session: string, token: string): boolean",
+    "Backend_AntiCSRFService.generate_token_": "generate_token_(): string  — crypto.randomBytes(32).toString('hex')",
+    "anticsrf": "anticsrf(options) => async (req, res, next)  — validates req.body.anti_csrf",
+    "configurable_auth": "configurable_auth(options) => async (req, res, next)  — options: { optional, allow_cached_user, no_options_auth }",
+    "validate_signature_auth": "validate_signature_auth(url: string, action: string, options?: { uid? }): boolean | throws",
+    "sign_file": "async sign_file(fsentry, action): { uid, expires, signature, url, read_url, write_url, metadata_url, ... }",
+    "body_parser_error_handler": "body_parser_error_handler(err, req, res, next): void  — catches SyntaxError 400"
+  },
+
+  "important_notes": [
+    "CSRF tokens are scoped per user.uuid (not per session), stored in a CircularQueue of 10; oldest token is evicted when capacity exceeded",
+    "consume_token is one-time use: token is removed from CircularQueue (maybe_consume), preventing replay",
+    "The /get-anticsrf-token endpoint is explicitly blocked on the 'api.' subdomain (more relaxed CORS) to prevent cross-origin token harvest",
+    "validate_signature_auth: 'write' signature grants ALL actions (super-permission); action-specific signature only grants that action",
+    "Signature secret is config.url_signature_secret; algorithm is sha256",
+    "sign_file uses a very large TTL (~317 years), so signatures are effectively permanent unless secret changes",
+    "auth2 middleware skips if req.actor is already set (PreAuthService pre-populates it)",
+    "LegacyTokenError on /whoami triggers session upgrade: check_session + new cookie + new token",
+    "body_parser_error_handler is an Express error-handling middleware (4 args) catching malformed JSON bodies",
+    "eggspress is a router factory — anticsrf must be placed in 'mw' array AFTER auth2 since it requires req.user"
+  ],
+
+  "source_files_analyzed": [
+    "src/backend/src/services/auth/AntiCSRFService.js",
+    "src/gui/src/services/AntiCSRFService.js",
+    "src/backend/src/middleware/anticsrf.js",
+    "src/backend/src/middleware/auth2.js",
+    "src/backend/src/middleware/configurable_auth.js",
+    "src/backend/src/modules/web/lib/eggspress.js",
+    "src/backend/src/helpers.js (validate_signature_auth @ L2131, sign_file @ L1431, body_parser_error_handler @ L1349)"
+  ]
+}

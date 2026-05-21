@@ -1,0 +1,127 @@
+{
+  "scope": "filesystem_node_read_and_stat",
+  "title": "Filesystem Node Read and Stat Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Caller (API/Service)",
+    "FSService (svc_fs)",
+    "FSNodeContext",
+    "PuterFSProvider",
+    "FSEntryController",
+    "ResourceService (svc_resource)",
+    "Database (db)"
+  ],
+
+  "interaction_flow": [
+    "=== Node Construction ===",
+    "Caller → FSService: node(selector)  // NodeUIDSelector | NodePathSelector | NodeChildSelector | NodeRawEntrySelector",
+    "FSService → FSNodeContext: new FSNodeContext({ services, selector, provider, fs })",
+    "FSNodeContext → ECMAP: get_fsNodeContext_from_selector(selector)  // dedup check",
+    "FSNodeContext → selector: setPropertiesKnownBySelector(this)  // pre-populate uid/path from selector",
+
+    "=== get_optimal_selector ===",
+    "FSNodeContext → FSNodeContext: get_optimal_selector()  // called whenever .selector is accessed",
+    "FSNodeContext → FSNodeContext: iterates SELECTOR_PRIORITY_ORDER: [NodeRawEntrySelector, RootNodeSelector, NodeInternalIDSelector, NodeUIDSelector, NodeChildSelector, NodePathSelector]",
+    "FSNodeContext → FSNodeContext: returns first matching selector type found in selectors_[]",
+
+    "=== fetchEntry (stat) ===",
+    "Caller → FSNodeContext: fetchEntry(fetch_entry_options)  // or via exists(), get(key), etc.",
+    "FSNodeContext → FSNodeContext: guard: if fetching !== null, await this.fetching (concurrency dedup)",
+    "FSNodeContext → FSNodeContext: skip if found===true && !force && thumbnail already satisfied",
+    "FSNodeContext → PuterFSProvider: stat({ selector: get_optimal_selector(), options, node: this, controls })",
+
+    "=== PuterFSProvider.stat — resource/entry race ===",
+    "PuterFSProvider → ResourceService: waitForResource(selector)  // resolves when uid not pending-create",
+    "PuterFSProvider → FSEntryController: waitForEntry(node, callback)  // resolves when op queued for uid",
+    "note: first of the two to resolve wins; the other is detached",
+
+    "=== PuterFSProvider.stat — fetch from controller ===",
+    "alt resource is pending (svc_resource.getResourceInfo(uid) truthy)",
+    "  PuterFSProvider → FSEntryController: get(maybe_uid, options)  // scans currentState+deferredState queues then DB",
+    "  FSEntryController → Database: findByUID via find() if needed",
+    "else",
+    "  PuterFSProvider → FSEntryController: find(selector, options)",
+    "end",
+
+    "=== FSEntryController.find — selector dispatch ===",
+    "FSEntryController → FSEntryController: if RootNodeSelector → return selector.entry",
+    "FSEntryController → Database: if NodePathSelector → findByPath(path)  // tries direct path lookup first, then iterative segment walk",
+    "FSEntryController → Database: if NodeUIDSelector → findByUID(uuid)  // SELECT defaultProperties FROM fsentries WHERE uuid=?",
+    "FSEntryController → Database: if NodeInternalIDSelector → findByID(id)  // SELECT ... WHERE id=?",
+    "FSEntryController → FSEntryController: if NodeChildSelector → find(selector.parent) recursively, then findNameInParent(parentUuid, name), then find(new NodeInternalIDSelector(id))",
+
+    "=== Back in stat — post-fetch ===",
+    "PuterFSProvider → FSNodeContext (via controls): provide_selector(new NodeInternalIDSelector('mysql', entry.id))  // cache internal ID for future calls",
+    "PuterFSProvider → FSNodeContext: return entry object (or null if not found)",
+
+    "=== FSNodeContext.fetchEntry — finalize ===",
+    "FSNodeContext → FSNodeContext: if entry null → found=false, entry=false",
+    "FSNodeContext → FSNodeContext: if entry found → found=true; update uid, mysql_id, path, name from entry; Object.assign(this.entry, entry)",
+    "FSNodeContext → FSNodeContext: this.fetching.resolve()  // unblock concurrent callers",
+
+    "=== Stat checks (root / public / appdata) ===",
+    "Caller → FSNodeContext: isRoot  // synchronous: this.path === '/'",
+    "Caller → FSNodeContext: isUserDirectory()  // fetchEntry(); return !this.entry.parent_uid",
+    "Caller → FSNodeContext: isPublic()  // getPathComponents() → components[1]==='Public' AND NOT isUserDirectory()",
+    "Caller → FSNodeContext: isAppDataDirectory()  // getPathComponents() → components[1]==='AppData'",
+    "FSNodeContext → FSNodeContext: getPathComponents()  // splits this.path or NodePathSelector.value by '/'",
+
+    "=== readdirstat_uuid (optimized readdir) ===",
+    "Caller → PuterFSProvider: readdirstat_uuid({ uuid, options })  // requires READDIR_UUID_MODE capability",
+    "PuterFSProvider → FSEntryController: get_descendants_full(uuid, options)",
+    "FSEntryController → Database: SELECT defaultProperties [+thumbnail] FROM fsentries AS f LEFT JOIN subdomains AS s ON f.id=s.root_dir_id WHERE parent_uid=? ORDER BY f.id",
+    "FSEntryController → FSEntryController: collapse rows by id (handle subdomain join dupes), collect subdomains[]",
+    "FSEntryController → PuterFSProvider: return raw_entry[]",
+    "PuterFSProvider → FSService: for each raw_entry: svc_fs.node(new NodeRawEntrySelector(raw_entry, { found_thumbnail }))",
+    "PuterFSProvider → FSNodeContext (each): node.found = true  // mark as already resolved",
+    "PuterFSProvider → Caller: return Promise<FSNodeContext[]>",
+
+    "=== readdir (standard, returns UUIDs only) ===",
+    "Caller → PuterFSProvider: readdir({ node })",
+    "PuterFSProvider → FSNodeContext: node.get('uid')  // may trigger fetchEntry if not cached",
+    "PuterFSProvider → FSEntryController: fast_get_direct_descendants(uuid)",
+    "FSEntryController → Database: SELECT uuid FROM fsentries WHERE parent_uid=?  // or IS NULL for root",
+    "FSEntryController → PuterFSProvider: return uuid[]",
+    "PuterFSProvider → Caller: return uuid[]  // caller must call svc_fs.node() for each to get FSNodeContext"
+  ],
+
+  "key_relationships": [
+    "FSNodeContext depends_on PuterFSProvider (via this.provider.stat / get_recursive_size / directory_has_name)",
+    "PuterFSProvider depends_on FSEntryController (composition: this.fsEntryController)",
+    "PuterFSProvider depends_on ResourceService (svc_resource.waitForResource / getResourceInfo)",
+    "FSEntryController depends_on Database (db.read / db.tryHardRead / db.batch_write)",
+    "FSNodeContext uses ECMAP (EntityContextMap) for selector deduplication across the request context",
+    "FSNodeContext uses selector hierarchy: NodeRawEntrySelector > RootNodeSelector > NodeInternalIDSelector > NodeUIDSelector > NodeChildSelector > NodePathSelector"
+  ],
+
+  "selector_types": {
+    "NodeRawEntrySelector": "Wraps a raw DB row — bypasses DB fetch entirely; stat() converts to NodeUIDSelector",
+    "RootNodeSelector": "Represents virtual root '/'; find() returns selector.entry directly",
+    "NodeInternalIDSelector": "MySQL row ID; findByID() — fastest DB lookup",
+    "NodeUIDSelector": "UUID string; findByUID() — standard lookup",
+    "NodeChildSelector": "parent_selector + child_name; resolved recursively via find(parent) then findNameInParent()",
+    "NodePathSelector": "Full path string; findByPath() — tries direct path column first, falls back to segment walk"
+  },
+
+  "fsentry_default_properties": ["id","associated_app_id","uuid","public_token","bucket","bucket_region","file_request_token","user_id","parent_uid","is_dir","is_public","is_shortcut","is_symlink","symlink_path","shortcut_to","sort_by","sort_order","immutable","name","metadata","modified","created","accessed","size","layout","path"],
+
+  "capabilities_relevant": [
+    "READDIR_UUID_MODE — enables readdirstat_uuid optimized path",
+    "READDIRSTAT_UUID — advertised by PuterFSProvider.get_capabilities()"
+  ],
+
+  "important_notes": [
+    "fetchEntry() is idempotent and concurrency-safe via this.fetching TeePromise guard",
+    "stat() races waitForResource vs waitForEntry to handle nodes pending DB insert",
+    "controls.provide_selector() feeds NodeInternalIDSelector back into FSNodeContext.selectors_ for caching",
+    "readdirstat_uuid returns Promise<FSNode[]> (full nodes); readdir returns uuid[] (shallow)",
+    "isPublic/isAppDataDirectory rely on path component position [1], so path must be resolved first",
+    "FSEntryController batches writes via enqueue_/exec_ but all reads go directly to db.read/tryHardRead"
+  ],
+
+  "source_files_analyzed": [
+    "src/backend/src/deprecated/filesystem/FSNodeContext.js",
+    "extensions/legacyFileSystem/PuterFSProvider.js",
+    "extensions/legacyFileSystem/fsentries/FSEntryController.js"
+  ]
+}

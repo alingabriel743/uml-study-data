@@ -1,0 +1,116 @@
+{
+  "scope": "binlog_table_maintenance_handling",
+  "title": "Binlog Table Maintenance Handling",
+  "diagram_type": "activity",
+  "description": "Processing DDL/table maintenance statements (OPTIMIZE, ANALYZE, REPAIR) from the binlog stream. These statements are read from the binlog but are explicitly filtered out and never stored in schema history or dispatched as change events.",
+
+  "key_participants": [
+    "BinlogStreamingChangeEventSource",
+    "BinlogDatabaseSchema",
+    "SchemaHistory (DDL filter)",
+    "DdlParser (AntlrDdlParser)",
+    "EventDispatcher",
+    "UniqueDatabase / TestHelper"
+  ],
+
+  "activity_flow": [
+    "START: MySQL/MariaDB executes ANALYZE TABLE / OPTIMIZE TABLE / REPAIR TABLE",
+    "Binlog captures statement as QUERY event",
+    "BinlogStreamingChangeEventSource: EventType.QUERY handler invokes handleQueryEvent(partition, offsetContext, event)",
+    "handleQueryEvent: extract SQL via QueryEventData.getSql().trim()",
+    "DECISION: sql == 'BEGIN'? → handleTransactionBegin(); return",
+    "DECISION: sql == 'COMMIT'? → handleTransactionCompletion(); return",
+    "DECISION: sql starts with 'XA '? → ignore, return",
+    "DECISION: !TRUNCATE_STATEMENT_PATTERN.matches(sql) AND schema.ddlFilter().test(sql)?",
+    "  → TRUE (matches ANALYZE/OPTIMIZE/REPAIR regex): log DEBUG 'DDL filtered out'; return [EARLY EXIT - no further processing]",
+    "  → FALSE: continue processing as normal DDL",
+    "DECISION: isDmlStatement(sql)? → log WARN + return",
+    "DECISION: sql == 'ROLLBACK'? → log WARN (unsupported)",
+    "schema.parseStreamingDdl(partition, sql, database, offsetContext, eventTime) → List<SchemaChangeEvent>",
+    "  Inside parseDdl(): ignoredQueryStatements check (BEGIN/END/FLUSH PRIVILEGES)",
+    "  ddlParser.parse(ddlStatements, tables()) → produces DdlChanges",
+    "  For ANALYZE/OPTIMIZE/REPAIR: parser produces NO DdlParserListener events (0 table events)",
+    "  ddlChanges.isEmpty() == true → emits SchemaChangeEvent.ofDatabase() as fallback",
+    "FOR EACH SchemaChangeEvent:",
+    "  DECISION: schema.skipSchemaChangeEvent(event)? → skip",
+    "  DECISION: event type == TRUNCATE AND tableId != null? → dispatchDataChangeEvent(TRUNCATE)",
+    "  ELSE: eventDispatcher.dispatchSchemaChangeEvent(partition, offsetContext, tableId, receiver)",
+    "END"
+  ],
+
+  "filter_logic": {
+    "filter_location": "SchemaHistory.DDL_FILTER field (regex-based)",
+    "filter_regex": "^(?:SET STATEMENT\\s+.*?FOR\\s+)?(?:ANALYZE|OPTIMIZE|REPAIR)\\s+(?:NO_WRITE_TO_BINLOG\\s+|LOCAL\\s+)?TABLE\\s+.*",
+    "filter_also_covers": ["GRANT/REVOKE", "TRUNCATE TABLE", "REPLACE INTO", "CREATE/ALTER/DROP USER/ROLE/VIEW/FUNCTION/PROCEDURE/TRIGGER"],
+    "filter_check_in_code": "BinlogStreamingChangeEventSource.handleQueryEvent() line ~771: schema.ddlFilter().test(sql)",
+    "result_when_filtered": "LOGGER.debug(\"DDL '{}' was filtered out of processing\"); return — no SchemaChangeEvent emitted, no Kafka record produced"
+  },
+
+  "parser_behavior": {
+    "test": "BinlogAntlrDdlParserTest.shouldParseTableMaintenanceStatements() @FixFor(DBZ-253)",
+    "ddl_parsed": ["CREATE TABLE db1.table1", "ANALYZE TABLE db1.table1", "OPTIMIZE TABLE db1.table1", "REPAIR TABLE db1.table1"],
+    "result": "tables.size()==1, listener.total()==1 — ANALYZE/OPTIMIZE/REPAIR produce zero DdlParserListener events",
+    "conclusion": "DDL parser silently ignores maintenance statements; they generate no schema-change listener events"
+  },
+
+  "test_class_hierarchy": [
+    "BinlogTableMaintenanceStatementsIT<C extends SourceConnector> extends AbstractBinlogConnectorIT<C> [abstract, package: io.debezium.connector.binlog]",
+    "MySqlTableMaintenanceStatementsIT extends BinlogTableMaintenanceStatementsIT<MySqlConnector> implements MySqlCommon",
+    "MariaDB TableMaintenanceStatementsIT extends BinlogTableMaintenanceStatementsIT<MariaDbConnector> implements MariaDbCommon"
+  ],
+
+  "test_setup": {
+    "database_name": "tablemaintenanceit / table_maintenance_test",
+    "schema_history_path": "file-schema-history-table-maintenance.txt",
+    "ddl_sql_file": "debezium-connector-binlog/src/test/resources/ddl/table_maintenance_test.sql",
+    "ddl_operations_in_sql": ["CREATE TABLE dbz_253_table_maintenance_test (id INT AUTO_INCREMENT PK, other INT)", "ANALYZE TABLE dbz_253_table_maintenance_test", "OPTIMIZE TABLE dbz_253_table_maintenance_test", "REPAIR TABLE dbz_253_table_maintenance_test"],
+    "beforeEach": ["stopConnector()", "DATABASE.createAndInitialize()", "initializeConnectorTestFramework()", "Files.delete(SCHEMA_HISTORY_PATH)"],
+    "afterEach": ["stopConnector()", "Files.delete(SCHEMA_HISTORY_PATH)"]
+  },
+
+  "key_test_method": {
+    "name": "shouldConsumeAllEventsFromDatabaseUsingBinlogAndNoSnapshot",
+    "jira": "DBZ-253",
+    "config": "SNAPSHOT_MODE = NEVER (binlog-only, no snapshot)",
+    "expected_event_counts": {
+      "numCreateDatabase": 1,
+      "numCreateTables": 1,
+      "numTableMaintenanceStatements": 0,
+      "total": 2
+    },
+    "assertions": [
+      "records not null",
+      "records for serverName topic == 2 (CREATE DB + CREATE TABLE only)",
+      "databaseNames contains only DATABASE.getDatabaseName()",
+      "ddlRecordsForDatabase size == 2",
+      "all records valid (serializable/deserializable)"
+    ],
+    "comment": "numTableMaintenanceStatements = 0 explicitly — ANALYZE/OPTIMIZE/REPAIR not stored in schema history"
+  },
+
+  "schema_history_filter_confirmation": {
+    "source": "BinlogSchemaHistoryIT (separate test)",
+    "test": "execute ANALYZE TABLE + OPTIMIZE TABLE after CREATE TABLE",
+    "result": "consumeRecordsByTopic(1) receives only CREATE TABLE; ddl field contains 'CREATE TABLE employees'; ANALYZE/OPTIMIZE produce no records"
+  },
+
+  "important_notes": [
+    "ANALYZE/OPTIMIZE/REPAIR are filtered at two levels: (1) DDL filter regex in SchemaHistory rejects them before parseStreamingDdl(), (2) DdlParser produces zero events even if parsed directly",
+    "Filter is applied in handleQueryEvent() via schema.ddlFilter().test(sql) — short-circuits entire processing pipeline",
+    "SnapshotMode.NEVER means connector reads only binlog — no initial snapshot; only binlog events (CREATE DB, CREATE TABLE) are captured",
+    "MariaDB supports 'SET STATEMENT ... FOR ANALYZE/OPTIMIZE/REPAIR' syntax — regex handles this variant",
+    "Fix is tracked under DBZ-253 (Jira)"
+  ],
+
+  "source_files_analyzed": [
+    "debezium-connector-binlog/src/test/java/io/debezium/connector/binlog/BinlogTableMaintenanceStatementsIT.java",
+    "debezium-connector-mysql/src/test/java/io/debezium/connector/mysql/MySqlTableMaintenanceStatementsIT.java",
+    "debezium-connector-mariadb/src/test/java/io/debezium/connector/mariadb/TableMaintenanceStatementsIT.java",
+    "debezium-connector-binlog/src/test/resources/ddl/table_maintenance_test.sql",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogStreamingChangeEventSource.java (lines 751-817)",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogDatabaseSchema.java (lines 304-396)",
+    "debezium-connector-common/src/main/java/io/debezium/relational/history/SchemaHistory.java (lines 85-114)",
+    "debezium-connector-binlog/src/test/java/io/debezium/connector/binlog/BinlogAntlrDdlParserTest.java (lines 2727-2739)",
+    "debezium-connector-binlog/src/test/java/io/debezium/connector/binlog/BinlogSchemaHistoryIT.java (lines 395-419)"
+  ]
+}

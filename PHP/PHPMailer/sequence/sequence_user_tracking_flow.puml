@@ -1,0 +1,161 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #6C757D
+    GroupBackgroundColor #F1F3F5
+    GroupBorderColor #ADB5BD
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title User Tracking and Authentication Events
+
+actor "Application" as App
+
+box "DDTrace (Core Tracing)" #E8F4FD
+    participant "DDTrace\\active_span()\nDDTrace\\root_span()" as DDTraceSpan
+    participant "DDTrace\\set_user()" as SetUser
+    participant "DDTrace\\add_distributed_tag()" as DistTag
+end box
+
+box "AppSec v2 (Application Security)" #FDF3E8
+    participant "datadog\\appsec\\v2\n::track_user_login_success()" as LoginSuccess
+    participant "datadog\\appsec\\v2\n::track_user_login_failure()" as LoginFailure
+end box
+
+participant "RootSpanData\n(meta[])" as RootSpan
+participant "Distributed Trace\nHeaders" as DistHeaders
+
+== Span Retrieval ==
+
+App -> DDTraceSpan: active_span()
+activate DDTraceSpan
+DDTraceSpan --> App: SpanData|null\n(innermost span on stack)
+deactivate DDTraceSpan
+
+App -> DDTraceSpan: root_span()
+activate DDTraceSpan
+DDTraceSpan --> App: RootSpanData|null\n(outermost span of active stack)
+deactivate DDTraceSpan
+
+== User Identity Recording ==
+
+App -> SetUser: set_user($userId, $metadata[], $propagate)
+activate SetUser
+note right of SetUser
+  **$userId** → written as usr.id tag
+  **$metadata** → written as usr.<TAG_NAME> pairs
+  **$propagate** → true = forward as distributed headers
+end note
+
+SetUser -> RootSpan: write usr.id = $userId\nwrite usr.<TAG_NAME> = $metadata[TAG_NAME]
+activate RootSpan
+RootSpan --> SetUser: tags stored in meta[]
+deactivate RootSpan
+
+alt propagate = true
+    SetUser -> DistHeaders: propagate user info\nas distributed trace headers
+    activate DistHeaders
+    DistHeaders --> SetUser: headers forwarded downstream
+    deactivate DistHeaders
+end
+
+SetUser --> App: void
+deactivate SetUser
+
+== Distributed Tag Propagation ==
+
+App -> DistTag: add_distributed_tag($key, $value)
+activate DistTag
+note right of DistTag
+  Tags BOTH the local root span
+  AND propagates to downstream services
+end note
+
+DistTag -> RootSpan: write $key = $value\nto span.meta[]
+activate RootSpan
+RootSpan --> DistTag: tag stored
+deactivate RootSpan
+
+DistTag -> DistHeaders: propagate $key=$value\ndownstream via trace headers
+activate DistHeaders
+DistHeaders --> DistTag: propagated
+deactivate DistHeaders
+
+DistTag --> App: void
+deactivate DistTag
+
+== Authentication Event Tracking (AppSec v2) ==
+
+group Login Success Flow
+    App -> LoginSuccess: track_user_login_success(\n  $login, $user, $metadata[])
+    activate LoginSuccess
+    note right of LoginSuccess
+      **$login** → login identifier
+      **$user** → string (user id) OR array with 'id' key
+      (must match set_user format)
+      **$metadata** → additional event metadata
+    end note
+
+    LoginSuccess -> RootSpan: append user metadata tags\nto root span meta[]
+    activate RootSpan
+    RootSpan --> LoginSuccess: tags stored
+    deactivate RootSpan
+
+    LoginSuccess --> App: void
+    deactivate LoginSuccess
+end
+
+group Login Failure Flow
+    App -> LoginFailure: track_user_login_failure(\n  $login, $exists, $metadata[])
+    activate LoginFailure
+    note right of LoginFailure
+      **$login** → login identifier attempted
+      **$exists** → bool: does the account exist?
+      **$metadata** → additional failure metadata
+    end note
+
+    LoginFailure -> RootSpan: append failure metadata tags\nto root span meta[]
+    activate RootSpan
+    RootSpan --> LoginFailure: tags stored
+    deactivate RootSpan
+
+    LoginFailure --> App: void
+    deactivate LoginFailure
+end
+
+note over RootSpan
+  **RootSpanData.meta[]** accumulates all user tracking tags:
+  • usr.id (from set_user / track_user_login_success)
+  • usr.<TAG_NAME> (from set_user metadata)
+  • Custom distributed tags (from add_distributed_tag)
+  • AppSec login event metadata (from appsec v2 functions)
+end note
+
+@enduml

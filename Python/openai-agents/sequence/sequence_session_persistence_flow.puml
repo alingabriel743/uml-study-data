@@ -1,0 +1,233 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    NoteBackgroundColor #FFF3CD
+    NoteBorderColor #FFC107
+}
+
+title Session Persistence Flow\nSaving turn items and run results to a session store, and restoring them on multi-turn continuation
+
+actor Caller as caller
+participant "AgentRunner\n(run.py)" as runner
+participant "agent_runner_helpers" as helpers
+participant "session_persistence" as persistence
+participant "Session\n(abstract store)" as session
+participant "RunState" as runstate
+
+== Initial Turn Setup ==
+
+caller -> runner : Runner.run(input, session=session, ...)
+activate runner
+
+runner -> helpers : validate_session_conversation_settings(\n  session, conversation_id,\n  previous_response_id,\n  auto_previous_response_id)
+activate helpers
+note right of helpers
+  **Business Rule**: Session is mutually exclusive
+  with conversation_id, previous_response_id,
+  and auto_previous_response_id.
+  Raises UserError if combined.
+end note
+helpers --> runner : (validated)
+deactivate helpers
+
+runner -> persistence : prepare_input_with_session(\n  raw_input, session,\n  session_input_callback, session_settings)
+activate persistence
+
+persistence -> session : get_items(limit?)
+activate session
+session --> persistence : history: list[TResponseInputItem]
+deactivate session
+
+persistence -> persistence : normalize + deduplicate\n(history + new_input)
+
+opt session_input_callback provided
+  persistence -> caller : session_input_callback(\n  history_copy, new_items_copy)
+  caller --> persistence : combined items
+  persistence -> persistence : classify combined →\nappended (new) vs history sets
+end
+
+persistence --> runner : (prepared_input, session_input_items_for_persistence)
+deactivate persistence
+
+runner -> persistence : save_result_to_session(\n  session, input_items_for_persistence, [], run_state)
+activate persistence
+note right of persistence
+  **User input items are persisted
+  BEFORE the model call.**
+end note
+persistence -> session : add_items(input_items)
+activate session
+session --> persistence : (saved)
+deactivate session
+persistence -> runstate : _current_turn_persisted_item_count += n
+persistence --> runner : (input turn persisted)
+deactivate persistence
+
+== Per-Turn Execution ==
+
+runner -> runner : execute_turn()
+activate runner
+note right of runner
+  Calls the model; produces
+  a SingleStepResult with
+  next_step classification.
+end note
+runner --> runner : turn_result: SingleStepResult
+deactivate runner
+
+== Path A: NextStepRunAgain (tool calls / more turns needed) ==
+
+alt [NextStepRunAgain]
+  runner -> helpers : save_turn_items_if_needed(\n  session, run_state,\n  session_persistence_enabled,\n  input_guardrail_results, items, response_id)
+  activate helpers
+  note right of helpers
+    Guards (skip if any):
+    • session_persistence not enabled
+    • input guardrail was triggered
+    • run_state._current_turn_persisted_item_count > 0
+  end note
+  helpers -> persistence : save_result_to_session(\n  session, [], new_items, run_state, response_id)
+  activate persistence
+  persistence -> persistence : already_persisted =\n  run_state._current_turn_persisted_item_count\nnew_run_items = items[already_persisted:]\n(dedup / retry protection)
+  persistence -> persistence : run_item_to_input_item(RunItem)\n→ TResponseInputItem
+  persistence -> persistence : deduplicate_input_items_preferring_latest(\n  input_list + new_items_as_input)
+  persistence -> session : add_items(items_to_save)
+  activate session
+  session --> persistence : (saved)
+  deactivate session
+  persistence -> runstate : _current_turn_persisted_item_count += saved_count
+
+  opt response_id provided AND compaction-aware session
+    alt local tool outputs present
+      persistence -> session : _defer_compaction(response_id)
+      note right : Skip compaction — tool context\nmust not be lost yet
+    else no local tool outputs
+      persistence -> session : run_compaction(\n  {response_id, force?, store?})
+      activate session
+      session --> persistence : (compacted)
+      deactivate session
+    end
+  end
+
+  persistence --> helpers : (turn items saved)
+  deactivate persistence
+  helpers --> runner : (done)
+  deactivate helpers
+
+== Path B: NextStepFinalOutput (agent finished) ==
+
+else [NextStepFinalOutput]
+  runner -> helpers : save_turn_items_if_needed(\n  session, run_state,\n  session_persistence_enabled,\n  input_guardrail_results, items, response_id)
+  activate helpers
+  helpers -> persistence : save_result_to_session(\n  session, [], final_items, run_state, response_id)
+  activate persistence
+  persistence -> persistence : dedup + convert items
+  persistence -> session : add_items(items_to_save)
+  activate session
+  session --> persistence : (saved)
+  deactivate session
+  persistence -> runstate : _current_turn_persisted_item_count += saved_count
+  persistence --> helpers : (final turn saved)
+  deactivate persistence
+  helpers --> runner : (done)
+  deactivate helpers
+
+== Path C: NextStepInterruption (human-in-the-loop) ==
+
+else [NextStepInterruption]
+  runner -> persistence : save_result_to_session(\n  session, input_items_for_save,\n  session_items_for_turn(turn_result), run_state)
+  activate persistence
+  persistence -> session : add_items(items_to_save)
+  activate session
+  session --> persistence : (saved)
+  deactivate session
+  persistence --> runner : (interruption state persisted)
+  deactivate persistence
+
+  runner -> helpers : update_run_state_for_interruption(\n  run_state, model_responses, processed_response,\n  generated_items, session_items, current_turn, next_step)
+  activate helpers
+  helpers -> runstate : update _generated_items,\n_session_items, _current_step
+  helpers --> runner : (run_state updated)
+  deactivate helpers
+
+  runner --> caller : RunResultStreaming / RunResult\n(interrupted — awaiting human input)
+end
+
+== Resume Path (multi-turn continuation) ==
+
+caller -> runner : Runner.run(run_state=saved_run_state, ...)
+note right of runner : is_resumed_state = True
+
+runner -> persistence : resumed_turn_items(turn_result)
+activate persistence
+persistence --> runner : (generated_items = pre_step_items + new_step_items,\n turn_session_items = session_items_for_turn(turn_result))
+deactivate persistence
+
+runner -> runner : session_items.extend(turn_session_items)
+
+runner -> helpers : update_run_state_after_resume(\n  run_state, turn_result, generated_items, session_items)
+activate helpers
+helpers -> runstate : _original_input = copy_input_items(turn_result.original_input)
+helpers -> runstate : _generated_items = generated_items
+helpers -> runstate : _session_items = session_items
+helpers -> runstate : _current_step = turn_result.next_step
+helpers --> runner : (run_state restored)
+deactivate helpers
+
+runner -> persistence : save_resumed_turn_items(\n  session, turn_session_items,\n  persisted_count, response_id,\n  reasoning_item_id_policy)
+activate persistence
+persistence -> persistence : save_result_to_session(\n  session, [], items, None, response_id)
+persistence -> session : add_items(resumed_items)
+activate session
+session --> persistence : (saved)
+deactivate session
+persistence --> runner : updated persisted_count
+deactivate persistence
+
+== Guardrail Trip Path ==
+
+runner -> persistence : persist_session_items_for_guardrail_trip(\n  session, server_conversation_tracker,\n  session_input_items, original_user_input, run_state)
+activate persistence
+note right of persistence
+  Skipped if server_conversation_tracker is set
+  (server-managed conversation handles its own state).
+end note
+persistence -> persistence : save_result_to_session(\n  session, input_items, [], run_state)
+persistence -> session : add_items(guardrail_input_items)
+activate session
+session --> persistence : (saved)
+deactivate session
+persistence --> runner : (guardrail items persisted)
+deactivate persistence
+
+runner --> caller : RunResult (with guardrail error)
+deactivate runner
+
+note over session
+  **Session Interface (abstract)**
+  • get_items(limit?) → list[TResponseInputItem]
+  • add_items(items)
+  • run_compaction({response_id, force?, store?})
+  • pop_item() — optional, used for rollback (rewind_session_items)
+
+  **Implementations**
+  • SQLiteSession — local file-backed store
+  • OpenAIConversationsSession — strips id/provider_data fields
+  • OpenAIResponsesCompactionAwareSession — triggers or defers compaction after add_items
+end note
+
+@enduml

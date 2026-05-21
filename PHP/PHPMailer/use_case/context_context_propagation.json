@@ -1,0 +1,283 @@
+{
+  "scope": "context_propagation",
+  "title": "Distributed Context Propagation",
+  "diagram_type": "use_case",
+  "description": "Injecting and extracting trace context across service boundaries (HTTP headers, AMQP, Kafka)",
+
+  "actors": [
+    "HTTP Client Service",
+    "HTTP Server Service",
+    "AMQP Message Producer",
+    "AMQP Message Consumer",
+    "Kafka Producer",
+    "OpenTracing Client",
+    "OpenTelemetry Client",
+    "DDTrace Tracer"
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Inject Trace Context into HTTP Headers",
+      "actor": "HTTP Client Service",
+      "description": "Serialize SpanContext into carrier map with x-datadog-trace-id, x-datadog-parent-id, x-datadog-sampling-priority, x-datadog-origin, ot-baggage-* headers",
+      "steps": [
+        "Tracer::inject(SpanContext, Format::HTTP_HEADERS, &$carrier)",
+        "Tracer routes to TextMap propagator",
+        "TextMap::inject() writes x-datadog-trace-id = traceId",
+        "TextMap::inject() writes x-datadog-parent-id = spanId",
+        "TextMap::inject() writes x-datadog-sampling-priority (if known)",
+        "TextMap::inject() writes x-datadog-origin (if set)",
+        "TextMap::inject() iterates baggage: ot-baggage-{key} = value"
+      ]
+    },
+    {
+      "id": "UC2",
+      "name": "Extract Trace Context from HTTP Headers",
+      "actor": "HTTP Server Service",
+      "description": "Deserialize incoming HTTP headers into a SpanContext to continue an existing trace",
+      "steps": [
+        "Tracer::extract(Format::HTTP_HEADERS, $carrier)",
+        "TextMap::extract() reads x-datadog-trace-id and x-datadog-parent-id",
+        "Validates traceId and spanId are numeric strings",
+        "Reads ot-baggage-* items into baggageItems",
+        "extractPrioritySampling() reads x-datadog-sampling-priority",
+        "extractOrigin() reads x-datadog-origin",
+        "Returns SpanContext(traceId, spanId, null, baggage, isDistributedTracingActivationContext=true)"
+      ]
+    },
+    {
+      "id": "UC3",
+      "name": "Create Child Span from Propagated Context",
+      "actor": "HTTP Server Service",
+      "description": "Use extracted SpanContext to start a new span that continues the distributed trace",
+      "steps": [
+        "SpanContext::createAsChild(parentContext)",
+        "If isDistributedTracingActivationContext: set_distributed_tracing_context(traceId, spanId, origin)",
+        "start_span() to push onto native span stack",
+        "New SpanContext inherits traceId, copies baggage, links parentContext",
+        "setPropagatedPrioritySampling from parent"
+      ]
+    },
+    {
+      "id": "UC4",
+      "name": "Inject Context into AMQP Message",
+      "actor": "AMQP Message Producer",
+      "description": "Embed trace headers in AMQP application_headers before publishing",
+      "steps": [
+        "AMQPIntegration prehook on publish/basic_publish",
+        "ddtrace_config_distributed_tracing_enabled() check",
+        "AMQPIntegration::injectContext(AMQPMessage)",
+        "generate_distributed_tracing_headers() -> headers array",
+        "Merge into AMQPMessage application_headers (AMQPTable)"
+      ]
+    },
+    {
+      "id": "UC5",
+      "name": "Extract Context from AMQP Message",
+      "actor": "AMQP Message Consumer",
+      "description": "Read trace headers from incoming AMQP message and link to new consumer trace",
+      "steps": [
+        "AMQPIntegration prehook on consume callback",
+        "Check hasDistributedHeaders(AMQPMessage)",
+        "start_trace_span() for new consumer trace",
+        "AMQPIntegration::extractContext(AMQPMessage)",
+        "Read application_headers for x-datadog-trace-id, x-datadog-parent-id",
+        "Create span links between producer and consumer traces"
+      ]
+    },
+    {
+      "id": "UC6",
+      "name": "Inject Context into Kafka Message",
+      "actor": "Kafka Producer",
+      "description": "Inject distributed tracing headers into Kafka ProducerTopic::producev() args",
+      "steps": [
+        "KafkaIntegration prehook on RdKafka::ProducerTopic::producev()",
+        "ddtrace_config_distributed_tracing_enabled() check",
+        "generate_distributed_tracing_headers() -> headers",
+        "KafkaIntegration::injectHeadersIntoArgs(args, headers)",
+        "hook.overrideArguments(args) to pass headers into Kafka message"
+      ]
+    },
+    {
+      "id": "UC7",
+      "name": "Get Current OTel Context",
+      "actor": "OpenTelemetry Client",
+      "description": "Retrieve active context bridged between DDTrace native spans and OpenTelemetry context API",
+      "steps": [
+        "Context::getCurrent() / Context::resolve()",
+        "API\\Span::fromContext(storage()->current()) -> check for ended parents",
+        "Context::deactivateEndedParents(ddSpan) recursively ends completed OTel spans",
+        "Context::activateParent(active_span()) walks up span stack",
+        "generate_distributed_tracing_headers(['tracecontext']) for W3C traceparent/tracestate",
+        "SDK\\Span::startSpan(ddSpan, spanContext, ...) associates DDTrace<->OTel span",
+        "ObjectKVStore::put(ddSpan, 'otel_span', otelSpan)",
+        "storage()->attach(currentContext)"
+      ]
+    },
+    {
+      "id": "UC8",
+      "name": "Propagate Baggage Items",
+      "actor": "OpenTracing Client",
+      "description": "Carry key-value baggage across service boundaries via SpanContext",
+      "steps": [
+        "SpanContext::withBaggageItem(key, value) returns new immutable SpanContext",
+        "TextMap::inject() serializes baggage as ot-baggage-{key} headers",
+        "TextMap::extract() deserializes ot-baggage-* headers back to baggageItems",
+        "Context::get(baggageContextKey) builds Baggage from DDTrace span.baggage",
+        "Context::with(baggageContextKey, baggage) stores baggage items on DDTrace span"
+      ]
+    },
+    {
+      "id": "UC9",
+      "name": "Determine Operation Name by Convention",
+      "actor": "OpenTelemetry Client",
+      "description": "Derive standardized OTel operation names from span metadata (span.kind + semantic attributes)",
+      "steps": [
+        "Convention::defaultOperationName(SpanData $span)",
+        "Read span.meta for span.kind, http.request.method, db.system, messaging.system, rpc.system, faas.trigger, graphql.operation.type",
+        "HTTP Server: 'http.server.request', HTTP Client: 'http.client.request'",
+        "DB: '{db.system}.query'",
+        "Messaging: '{messaging.system}.{messaging.operation}'",
+        "AWS: 'aws.{service}.request', RPC: '{rpc.system}.client/server.request'",
+        "FaaS: '{faas.trigger}.invoke', GraphQL: 'graphql.server.request'"
+      ]
+    },
+    {
+      "id": "UC10",
+      "name": "Normalize Trace Analytics Sampling Rate",
+      "actor": "DDTrace Tracer",
+      "description": "Set or unset the _dd1.sr.eausr analytics metric on a span's metrics map",
+      "steps": [
+        "TraceAnalyticsProcessor::normalizeAnalyticsValue(&$metrics, $value)",
+        "true -> metrics[ANALYTICS_KEY] = 1.0",
+        "false -> unset metrics[ANALYTICS_KEY]",
+        "0.0-1.0 float -> metrics[ANALYTICS_KEY] = (float)$value"
+      ]
+    }
+  ],
+
+  "key_components": [
+    {
+      "name": "Propagator",
+      "type": "interface",
+      "namespace": "DDTrace",
+      "methods": ["inject(SpanContextInterface, &$carrier): void", "extract($carrier): SpanContextInterface"],
+      "constants": ["DEFAULT_TRACE_ID_HEADER=x-datadog-trace-id", "DEFAULT_PARENT_ID_HEADER=x-datadog-parent-id", "DEFAULT_SAMPLING_PRIORITY_HEADER=x-datadog-sampling-priority", "DEFAULT_ORIGIN_HEADER=x-datadog-origin", "DEFAULT_BAGGAGE_HEADER_PREFIX=ot-baggage-"]
+    },
+    {
+      "name": "TextMap",
+      "type": "class",
+      "namespace": "DDTrace\\Propagators",
+      "implements": "Propagator",
+      "methods": ["inject(SpanContextInterface, &$carrier)", "extract($carrier): SpanContext", "extractPrioritySampling()", "extractOrigin()"],
+      "notes": "Concrete HTTP/text-map propagator; handles both TEXT_MAP and HTTP_HEADERS formats"
+    },
+    {
+      "name": "Noop",
+      "type": "class",
+      "namespace": "DDTrace\\Propagators",
+      "implements": "Propagator",
+      "notes": "No-op propagator; extract() returns NoopSpanContext"
+    },
+    {
+      "name": "SpanContext (Contract)",
+      "type": "interface",
+      "namespace": "DDTrace\\Contracts",
+      "methods": ["getTraceId()", "getSpanId()", "getParentId()", "getBaggageItem($key)", "withBaggageItem($key, $value)", "getAllBaggageItems()", "getPropagatedPrioritySampling()", "setPropagatedPrioritySampling()", "isDistributedTracingActivationContext()", "isHostRoot()"]
+    },
+    {
+      "name": "SpanContext",
+      "type": "class",
+      "namespace": "DDTrace",
+      "extends": "DDTrace\\Data\\SpanContext",
+      "implements": "DDTrace\\Contracts\\SpanContext",
+      "methods": ["createAsChild(parentContext)", "createAsRoot(baggageItems)", "isEqual(SpanContextInterface)"],
+      "notes": "Immutable; createAsChild calls set_distributed_tracing_context() + start_span() to bridge native engine"
+    },
+    {
+      "name": "Context",
+      "type": "class",
+      "namespace": "OpenTelemetry\\Context (DDTrace override)",
+      "implements": "ContextInterface",
+      "methods": ["getCurrent(): ContextInterface", "resolve($context): ContextInterface", "getRoot(): ContextInterface", "activate(): ScopeInterface", "with(key, value): self", "get(key)", "setStorage()", "storage()"],
+      "notes": "Bridges DDTrace native spans to OTel context; uses ObjectKVStore for DDSpan<->OTelSpan association"
+    },
+    {
+      "name": "Convention",
+      "type": "class",
+      "namespace": "DDTrace\\OpenTelemetry",
+      "methods": ["static defaultOperationName(SpanData $span): string"],
+      "notes": "OTel operation name derivation from span kind + semantic convention attributes"
+    },
+    {
+      "name": "TraceAnalyticsProcessor",
+      "type": "class",
+      "namespace": "DDTrace\\Processing",
+      "methods": ["static normalizeAnalyticsValue(&$metrics, $value)"],
+      "notes": "Sets _dd1.sr.eausr metric; bool true=1.0, false=unset, float 0-1 stored as-is"
+    },
+    {
+      "name": "Tracer",
+      "type": "class",
+      "namespace": "DDTrace",
+      "notes": "Holds $propagators map keyed by Format; routes inject/extract calls to TextMap by default for TEXT_MAP and HTTP_HEADERS"
+    },
+    {
+      "name": "Format",
+      "type": "class",
+      "namespace": "DDTrace",
+      "constants": ["TEXT_MAP", "HTTP_HEADERS", "BINARY"],
+      "notes": "Format identifiers used as keys in Tracer::$propagators"
+    }
+  ],
+
+  "key_relationships": [
+    "TextMap implements Propagator",
+    "Noop implements Propagator",
+    "DDTrace\\SpanContext extends DDTrace\\Data\\SpanContext implements DDTrace\\Contracts\\SpanContext",
+    "DDTrace\\OpenTracer\\SpanContext wraps DDTrace\\Contracts\\SpanContext (adapter)",
+    "DDTrace\\OpenTelemetry\\SpanContext wraps DDTrace\\SpanData (OTel bridge)",
+    "Tracer depends_on Propagator[] (injected by format key)",
+    "TextMap depends_on Tracer (for getPrioritySampling)",
+    "Context depends_on ObjectKVStore (DDSpan<->OTelSpan association)",
+    "AMQPIntegration uses Propagator constants for header names",
+    "KafkaIntegration uses generate_distributed_tracing_headers() native function"
+  ],
+
+  "propagation_formats": {
+    "datadog": ["x-datadog-trace-id", "x-datadog-parent-id", "x-datadog-sampling-priority", "x-datadog-origin"],
+    "opentracing_baggage": ["ot-baggage-{key}"],
+    "w3c_tracecontext": ["traceparent", "tracestate"],
+    "amqp": "application_headers (AMQPTable)",
+    "kafka": "message headers via RdKafka::ProducerTopic::producev() args"
+  },
+
+  "important_notes": [
+    "isDistributedTracingActivationContext=true flags incoming remote context (vs local child spans)",
+    "SpanContext is immutable; withBaggageItem() returns a new instance",
+    "Tracer defaults to TextMap for both TEXT_MAP and HTTP_HEADERS formats",
+    "Context (OTel) uses ObjectKVStore to link DDTrace SpanData to OTel SDK Span",
+    "generate_distributed_tracing_headers() is a native DDTrace PHP extension function",
+    "Convention::defaultOperationName() returns empty string as fallback to avoid using resource name",
+    "TraceAnalyticsProcessor sets _dd1.sr.eausr (Tag::ANALYTICS_KEY) metric for App Analytics",
+    "AMQPIntegration creates span links between producer and consumer traces (not parent-child)"
+  ],
+
+  "source_files_analyzed": [
+    "src/DDTrace/Propagator.php",
+    "src/DDTrace/Propagators/TextMap.php",
+    "src/DDTrace/Propagators/Noop.php",
+    "src/DDTrace/SpanContext.php",
+    "src/api/Contracts/SpanContext.php",
+    "src/DDTrace/OpenTelemetry/Context.php",
+    "src/DDTrace/OpenTelemetry/Convention.php",
+    "src/DDTrace/OpenTelemetry/SpanContext.php",
+    "src/DDTrace/OpenTracer/SpanContext.php",
+    "src/DDTrace/Processing/TraceAnalyticsProcessor.php",
+    "src/api/Format.php",
+    "src/DDTrace/Integrations/AMQP/AMQPIntegration.php",
+    "src/DDTrace/Integrations/Kafka/KafkaIntegration.php",
+    "src/DDTrace/Tracer.php (inject/extract routing)"
+  ]
+}

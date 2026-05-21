@@ -1,0 +1,211 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF3CD
+    BorderColor #856404
+}
+skinparam component {
+    BackgroundColor #D1ECF1
+    BorderColor #0C5460
+    FontColor #0C5460
+}
+
+title Sampling and Priority
+
+' ─────────────────────────────────────────────────────────────
+' DDTrace\Sampling
+' ─────────────────────────────────────────────────────────────
+package "DDTrace\\Sampling" {
+    class PrioritySampling <<value object>> {
+        +{static} USER_REJECT : int = -1
+        +{static} AUTO_REJECT : int = 0
+        +{static} AUTO_KEEP  : int = 1
+        +{static} USER_KEEP  : int = 2
+        +{static} UNKNOWN    : null
+        --
+        +{static} parse($value): int|null
+    }
+    note right of PrioritySampling
+        USER_REJECT / AUTO_REJECT → agent drops trace
+        AUTO_KEEP → agent keeps (automatic decision)
+        USER_KEEP  → agent keeps; volume cap only
+        UNKNOWN    → could not be parsed from header
+    end note
+}
+
+' ─────────────────────────────────────────────────────────────
+' DDTrace\Contracts (interfaces)
+' ─────────────────────────────────────────────────────────────
+package "DDTrace\\Contracts" {
+    interface TracerInterface <<interface>> {
+        +setPrioritySampling($prioritySampling): void
+        +getPrioritySampling(): int|null
+        +startRootSpan(...): Scope
+    }
+
+    interface SpanContextInterface <<interface>> {
+        +getPropagatedPrioritySampling(): int
+        +setPropagatedPrioritySampling($p): void
+        +getTraceId(): string
+        +getSpanId(): string
+        +getParentId(): string
+        +isDistributedTracingActivationContext(): bool
+    }
+}
+
+' ─────────────────────────────────────────────────────────────
+' DDTrace\Data (abstract implementations)
+' ─────────────────────────────────────────────────────────────
+package "DDTrace\\Data" {
+    abstract class SpanContextData <<abstract>> {
+        +$propagatedPrioritySampling : int
+        +$traceId : string
+        +$spanId : string
+        +$parentId : string
+        +$origin : string
+        +$baggageItems : array
+        +$isDistributedTracingActivationContext : bool
+        +$parentContext : SpanContextInterface
+    }
+}
+
+' ─────────────────────────────────────────────────────────────
+' DDTrace (core implementations)
+' ─────────────────────────────────────────────────────────────
+package "DDTrace" {
+    class Tracer <<final>> {
+        +setPrioritySampling($prioritySampling): void
+        +getPrioritySampling(): int|null
+        -setPrioritySamplingFromSpan(SpanInterface $span): void
+    }
+    note bottom of Tracer
+        setPrioritySampling() calls native
+        set_priority_sampling($p) and
+        set_priority_sampling($p, true) for user flag.
+        startRootSpan() triggers setPrioritySamplingFromSpan().
+    end note
+
+    class NoopTracer <<final>> {
+        +setPrioritySampling($prioritySampling): void
+        +getPrioritySampling(): null
+    }
+    note right of NoopTracer
+        No-op: always returns null,
+        ignores all priority writes.
+    end note
+
+    class SpanContext <<final>> {
+        +{static} createAsChild(SpanContextInterface $parentContext): self
+        +{static} createAsRoot(array $baggageItems = []): self
+        +getPropagatedPrioritySampling(): int
+        +setPropagatedPrioritySampling($p): void
+        +getTraceId(): string
+        +getSpanId(): string
+        +getParentId(): string
+        +getBaggageItem($key): string
+        +isDistributedTracingActivationContext(): bool
+    }
+    note right of SpanContext
+        createAsChild() calls
+        setPropagatedPrioritySampling(
+          $parentContext->getPropagatedPrioritySampling()
+        ) — key priority propagation chain.
+    end note
+
+    interface Propagator <<interface>> {
+        +{static} DEFAULT_SAMPLING_PRIORITY_HEADER = "x-datadog-sampling-priority"
+        --
+        +inject(SpanContextInterface $ctx, &$carrier): void
+        +extract($carrier): SpanContextInterface
+    }
+}
+
+' ─────────────────────────────────────────────────────────────
+' DDTrace\Propagators
+' ─────────────────────────────────────────────────────────────
+package "DDTrace\\Propagators" {
+    class TextMap <<final>> {
+        +inject(SpanContextInterface $ctx, &$carrier): void
+        +extract($carrier): SpanContextInterface|null
+        -extractPrioritySampling(SpanContextInterface, $carrier): void
+    }
+    note bottom of TextMap
+        inject: reads tracer->getPrioritySampling()
+                → writes carrier[x-datadog-sampling-priority]
+        extract: reads carrier header
+                 → PrioritySampling::parse()
+                 → spanContext->setPropagatedPrioritySampling()
+    end note
+}
+
+' ─────────────────────────────────────────────────────────────
+' C Extension (native)
+' ─────────────────────────────────────────────────────────────
+component "C Extension\n(Native Sampling Engine)" as CExtension {
+}
+note right of CExtension
+    Native functions:
+      \\DDTrace\\get_priority_sampling(): int|null
+      \\DDTrace\\set_priority_sampling(int $p, bool $userFlag = false): void
+      \\DDTrace\\root_span(): SpanData
+    Rule engine config (INI):
+      datadog.trace.sampling_rules  (JSON array)
+      datadog.trace.sampling_rules_format (glob|regex)
+    Rule fields: service, name, resource, sample_rate
+    Built-in RateLimiter: limits keep rate to max_per_second.
+    Evaluates rules against root span service/name/resource.
+end note
+
+' ─────────────────────────────────────────────────────────────
+' Benchmarks\API
+' ─────────────────────────────────────────────────────────────
+package "Benchmarks\\API" {
+    class SamplingRuleMatchingBench <<benchmark>> {
+        +benchSamplingRuleMatching(): void
+    }
+    note bottom of SamplingRuleMatchingBench
+        Benchmarks native C-extension rule matching.
+        Configures datadog.trace.sampling_rules via INI.
+        Calls \\DDTrace\\get_priority_sampling() to
+        trigger rule evaluation against root span.
+    end note
+}
+
+' ─────────────────────────────────────────────────────────────
+' Inheritance / Implementation Relationships
+' ─────────────────────────────────────────────────────────────
+Tracer              ..|>  TracerInterface       : implements
+NoopTracer          ..|>  TracerInterface       : implements
+SpanContext         --|>  SpanContextData       : extends
+SpanContextData     ..|>  SpanContextInterface  : implements
+TextMap             ..|>  Propagator            : implements
+
+' ─────────────────────────────────────────────────────────────
+' Dependency / Usage Relationships
+' ─────────────────────────────────────────────────────────────
+TextMap             ..>   TracerInterface       : uses (getPrioritySampling)
+TextMap             ..>   PrioritySampling      : uses (parse / UNKNOWN check)
+TextMap             ..>   SpanContext           : creates / populates
+
+Tracer              ..>   PrioritySampling      : reads (UNKNOWN constant)
+Tracer              ..>   SpanContext           : reads propagatedPrioritySampling
+Tracer              ..>   CExtension            : delegates\nset/get_priority_sampling
+
+SamplingRuleMatchingBench ..> CExtension        : benchmarks\nget_priority_sampling
+
+@enduml

@@ -1,0 +1,123 @@
+{
+  "scope": "async_and_queued_operations",
+  "title": "Async & Queued Operations",
+  "diagram_type": "use_case",
+  "description": "Developer dispatches agent prompts to Laravel queues for background processing, with broadcast notifications on completion.",
+
+  "actors": [
+    {
+      "name": "Developer",
+      "type": "primary",
+      "description": "Dispatches agent prompts to queues, registers then/catch callbacks, configures queue/connection"
+    },
+    {
+      "name": "Laravel Queue Worker",
+      "type": "system",
+      "description": "Picks up and executes InvokeAgent or BroadcastAgent jobs in background"
+    },
+    {
+      "name": "Agent (Contract)",
+      "type": "system",
+      "description": "Underlying AI agent invoked via prompt() or stream() inside the job"
+    },
+    {
+      "name": "Broadcast System",
+      "type": "system",
+      "description": "Receives StreamEvent via broadcastNow() during BroadcastAgent execution"
+    },
+    {
+      "name": "Test Environment",
+      "type": "secondary",
+      "description": "Uses FakePendingDispatch to prevent real queue dispatch during testing"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Dispatch Agent Prompt to Queue",
+      "actor": "Developer",
+      "description": "Developer wraps agent+prompt in QueuedAgentPrompt DTO, dispatches InvokeAgent job via QueuedAgentResponse(PendingDispatch)",
+      "key_classes": ["QueuedAgentPrompt", "QueuedAgentResponse", "InvokeAgent"],
+      "entry_point": "QueuedAgentResponse wraps PendingDispatch; developer calls ->onQueue(), ->onConnection(), ->delay() etc."
+    },
+    {
+      "id": "UC2",
+      "name": "Process Agent Invocation in Background",
+      "actor": "Laravel Queue Worker",
+      "description": "Queue worker executes InvokeAgent::handle() which calls agent->prompt(prompt, attachments, provider, model) then fires thenCallbacks",
+      "key_classes": ["InvokeAgent", "InvokesQueuedResponseCallbacks"],
+      "call_chain": "InvokeAgent::handle() → withCallbacks(fn) → agent->prompt(...) → invoke thenCallbacks[](response)"
+    },
+    {
+      "id": "UC3",
+      "name": "Stream Agent Response with Broadcast",
+      "actor": "Laravel Queue Worker",
+      "description": "Queue worker executes BroadcastAgent::handle() which streams agent response, broadcasting each StreamEvent to configured channels, then fires callbacks",
+      "key_classes": ["BroadcastAgent", "InvokesQueuedResponseCallbacks", "StreamEvent"],
+      "call_chain": "BroadcastAgent::handle() → agent->stream(...).each(StreamEvent::broadcastNow(channels)).then(capture response) → withCallbacks(fn) → thenCallbacks[](response)"
+    },
+    {
+      "id": "UC4",
+      "name": "Register Success Callback",
+      "actor": "Developer",
+      "description": "Developer calls ->then(Closure) on QueuedAgentResponse; callback is serialized (SerializableClosure) and stored on the job, fired after successful agent invocation",
+      "key_classes": ["QueuedAgentResponse", "HasQueuedResponseCallbacks", "InvokesQueuedResponseCallbacks"],
+      "call_chain": "QueuedAgentResponse::then(cb) → PendingDispatch::getJob()->then(cb) → InvokesQueuedResponseCallbacks stores SerializableClosure in thenCallbacks[]"
+    },
+    {
+      "id": "UC5",
+      "name": "Register Failure Callback",
+      "actor": "Developer",
+      "description": "Developer calls ->catch(Closure) on QueuedAgentResponse; callback stored on job, fired from InvokesQueuedResponseCallbacks::failed(Throwable) when job fails",
+      "key_classes": ["QueuedAgentResponse", "HasQueuedResponseCallbacks", "InvokesQueuedResponseCallbacks"],
+      "call_chain": "QueuedAgentResponse::catch(cb) → job->catch(cb) → catchCallbacks[] → fired by failed(Throwable)"
+    },
+    {
+      "id": "UC6",
+      "name": "Configure Queue Dispatch Options",
+      "actor": "Developer",
+      "description": "Developer fluently configures dispatch: onQueue(), onConnection(), delay(), afterCommit(), chain(), afterResponse() — all proxied through QueuedAgentResponse.__call() to PendingDispatch",
+      "key_classes": ["QueuedAgentResponse", "PendingDispatch (Laravel)"],
+      "call_chain": "QueuedAgentResponse::__call(method, args) → PendingDispatch->{method}(...args)"
+    },
+    {
+      "id": "UC7",
+      "name": "Fake Queue Dispatch for Testing",
+      "actor": "Test Environment",
+      "description": "FakePendingDispatch replaces real PendingDispatch; all queue configuration methods are no-ops, __destruct does nothing (prevents real dispatch). HasQueuedResponseCallbacks skips callback registration when FakePendingDispatch detected.",
+      "key_classes": ["FakePendingDispatch", "HasQueuedResponseCallbacks"],
+      "call_chain": "QueuedAgentResponse(FakePendingDispatch) → then()/catch() check instanceof FakePendingDispatch → skip → no real dispatch"
+    }
+  ],
+
+  "key_relationships": [
+    "QueuedAgentResponse wraps PendingDispatch (composition)",
+    "QueuedAgentResponse uses HasQueuedResponseCallbacks trait",
+    "InvokeAgent implements ShouldQueue, uses InvokesQueuedResponseCallbacks trait",
+    "BroadcastAgent implements ShouldQueue, uses InvokesQueuedResponseCallbacks trait",
+    "FakePendingDispatch extends PendingDispatch (inheritance, overrides all methods as no-ops)",
+    "HasQueuedResponseCallbacks detects FakePendingDispatch to skip callback wiring in tests",
+    "InvokesQueuedResponseCallbacks stores callbacks as SerializableClosure for queue serialization",
+    "QueuedAgentPrompt is a DTO (data carrier, no behavior) for agent+prompt+attachments+provider+model"
+  ],
+
+  "important_notes": [
+    "QueuedAgentPrompt is a plain DTO — it does NOT dispatch itself; dispatching is done externally",
+    "QueuedAgentResponse.__call() proxies ALL unknown methods to PendingDispatch for full fluent API support",
+    "BroadcastAgent uses agent->stream() not agent->prompt(); each StreamEvent is broadcast in real-time during queue processing",
+    "Callbacks are serialized with SerializableClosure (laravel/serializable-closure) to survive queue serialization",
+    "FakePendingDispatch::__destruct is a no-op, preventing Laravel's auto-dispatch on destruction",
+    "Both jobs expose displayName() returning agent class name for queue monitoring tools"
+  ],
+
+  "source_files_analyzed": [
+    "src/QueuedAgentPrompt.php",
+    "src/Jobs/InvokeAgent.php",
+    "src/Jobs/BroadcastAgent.php",
+    "src/Responses/QueuedAgentResponse.php",
+    "src/FakePendingDispatch.php",
+    "src/Jobs/Concerns/InvokesQueuedResponseCallbacks.php",
+    "src/Responses/Concerns/HasQueuedResponseCallbacks.php"
+  ]
+}

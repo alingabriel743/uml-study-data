@@ -1,0 +1,93 @@
+{
+  "scope": "dm_messaging_flow",
+  "title": "Direct Messaging (DM) Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "SenderAgent",
+    "ReceiverAgent",
+    "ProxyServer (routes.js)",
+    "DmHandler",
+    "MailboxStore"
+  ],
+  "interaction_flow": [
+    "=== SEND ===",
+    "SenderAgent → ProxyServer: POST /dm/send { recipient_node_id, content, metadata }",
+    "ProxyServer → DmHandler: dmHandler.send({ recipientNodeId, content, metadata })",
+    "DmHandler validates: recipientNodeId required, content required",
+    "DmHandler → MailboxStore: store.send({ type: 'dm', payload: { recipient_node_id, content, metadata, sent_at: ISO }, priority: 'normal' })",
+    "MailboxStore: generateUUIDv7() → creates outbound msg { id, direction:'outbound', type:'dm', status:'pending' } → appendLine(messages.jsonl)",
+    "MailboxStore → DmHandler: return { message_id, status:'pending' }",
+    "DmHandler → ProxyServer: return { message_id, status:'pending' }",
+    "ProxyServer → SenderAgent: 200 { message_id, status:'pending' }",
+
+    "=== POLL ===",
+    "ReceiverAgent → ProxyServer: POST /dm/poll { limit? }",
+    "ProxyServer → DmHandler: dmHandler.poll({ limit: body.limit })",
+    "DmHandler → MailboxStore: store.poll({ type: 'dm', limit: limit || 20 })",
+    "MailboxStore: filters _inbound where type='dm' AND status='pending', returns up to limit messages",
+    "MailboxStore → DmHandler: return messages[]",
+    "DmHandler → ProxyServer: return messages[]",
+    "ProxyServer → ReceiverAgent: 200 { messages, count }",
+
+    "=== ACK ===",
+    "ReceiverAgent → ProxyServer: POST /mailbox/ack { message_ids: [id, ...] }",
+    "ProxyServer → MailboxStore: store.ack(message_ids) [direct, no DmHandler intermediary]",
+    "MailboxStore: for each id → _appendUpdate(id, { status:'delivered' }) → _evictFromIndex(id)",
+    "MailboxStore → ProxyServer: return count (acknowledged)",
+    "ProxyServer → ReceiverAgent: 200 { acknowledged: count }",
+
+    "=== LIST ===",
+    "Agent → ProxyServer: GET /dm/list?limit=20&offset=0",
+    "ProxyServer → DmHandler: dmHandler.list({ limit, offset })",
+    "DmHandler → MailboxStore: store.list({ type: 'dm', limit: limit||20, offset: offset||0 })",
+    "MailboxStore: filters all messages where type='dm', sorts by created_at DESC, slices by offset+limit",
+    "MailboxStore → DmHandler: return messages[]",
+    "DmHandler → ProxyServer: return messages[]",
+    "ProxyServer → Agent: 200 { messages, count }"
+  ],
+  "key_relationships": [
+    "ProxyServer instantiates DmHandler: new DmHandler({ store: MailboxStore, logger })",
+    "DmHandler depends_on MailboxStore (injected via constructor)",
+    "ProxyServer routes delegate to DmHandler when dmHandler instance is present (else fall back to store directly)",
+    "DmHandler.send() → MailboxStore.send() creates outbound direction message",
+    "DmHandler.poll() → MailboxStore.poll() reads inbound direction, status=pending",
+    "DmHandler.ack() → MailboxStore.ack() marks inbound messages as 'delivered'",
+    "DmHandler.list() → MailboxStore.list() returns full history of type='dm'",
+    "ACK route (/mailbox/ack) is shared — not DM-specific; bypasses DmHandler"
+  ],
+  "method_signatures": {
+    "DmHandler": {
+      "constructor": "({ store, logger })",
+      "send": "({ recipientNodeId, content, metadata }) → { message_id, status:'pending' }",
+      "poll": "({ limit? }) → Message[]",
+      "ack": "(messageIds: string|string[]) → number (count)",
+      "list": "({ limit?, offset? }) → Message[]"
+    },
+    "MailboxStore": {
+      "send": "({ type, payload, channel, priority, refId, expiresAt }) → { message_id, status }",
+      "poll": "({ channel?, type?, limit? }) → Message[]",
+      "ack": "(messageIds: string|string[]) → number",
+      "list": "({ type, direction?, status?, limit?, offset? }) → Message[]",
+      "writeInbound": "({ id?, type, payload, channel?, priority?, ... }) → string (id)"
+    }
+  },
+  "routes": {
+    "POST /dm/send": "routes → dmHandler.send() → store.send()",
+    "POST /dm/poll": "routes → dmHandler.poll() → store.poll()",
+    "GET /dm/list": "routes → dmHandler.list() → store.list()",
+    "POST /mailbox/ack": "routes → store.ack() directly (shared with all message types)"
+  },
+  "message_model": {
+    "outbound_dm": "{ id, channel:'evomap-hub', direction:'outbound', type:'dm', status:'pending', payload:{ recipient_node_id, content, metadata, sent_at }, priority:'normal', created_at, retry_count }",
+    "inbound_dm": "{ id, direction:'inbound', type:'dm', status:'pending'→'delivered' after ack }",
+    "persistence": "JSONL append-only file (messages.jsonl) with in-memory Map index; UUIDv7 IDs"
+  },
+  "important_notes": "DmHandler is a thin facade over MailboxStore scoped to type='dm'. ProxyServer instantiates it in src/proxy/index.js and passes it as an extension to buildRoutes(). The /mailbox/ack route is shared across all message types — DmHandler.ack() exists but is not wired to a dedicated HTTP route. Fallback path in routes bypasses DmHandler and calls store methods directly if dmHandler is absent.",
+  "source_files_analyzed": [
+    "src/proxy/extensions/dmHandler.js",
+    "src/proxy/server/routes.js",
+    "src/proxy/mailbox/store.js",
+    "src/proxy/index.js",
+    "test/extensions.test.js"
+  ]
+}

@@ -1,0 +1,226 @@
+{
+  "scope": "extended_multiview_model_training",
+  "title": "Extended Multiview Model Training",
+  "diagram_type": "use_case",
+  "description": "Training the extended (video-conditioned) multiview diffusion model with latent conditioning across N camera views.",
+
+  "actors": [
+    "Trainer (Training Loop)",
+    "Dataset (Waymo Multiview)",
+    "VAE / Tokenizer",
+    "Context Parallel Group (Megatron)",
+    "Conditioner",
+    "Sampler"
+  ],
+
+  "primary_classes": [
+    {
+      "name": "MultiviewExtendDiffusionModel",
+      "inherits": "ExtendDiffusionModel",
+      "file": "training/models/extend_model_multiview.py",
+      "key_attribute": "n_views (from config)",
+      "use_cases": [
+        "Encode multi-view video to latent space",
+        "Decode latent to multi-view video",
+        "Compute training loss with multi-view CP support",
+        "Denoise noisy latent with video latent conditioning",
+        "Add condition video indicator and input mask",
+        "Generate samples from batch with condition latent",
+        "Prepare CFG x0_fn for inference"
+      ]
+    },
+    {
+      "name": "FSDPExtendDiffusionModel",
+      "inherits": "MultiviewExtendDiffusionModel",
+      "file": "training/models/extend_model_multiview.py",
+      "note": "Decorated with @diffusion_fsdp_class_decorator; no additional methods — wraps parent for FSDP distributed training"
+    },
+    {
+      "name": "VideoExtendMultiviewGeneralDIT",
+      "inherits": "MultiviewGeneralDIT",
+      "file": "training/networks/general_dit_lvg_multiview.py",
+      "use_cases": [
+        "Accept extended in_channels (+1 for condition mask)",
+        "Concatenate condition_video_input_mask to input tensor",
+        "Optionally concatenate pose condition to input",
+        "Forward pass through DiT backbone"
+      ]
+    },
+    {
+      "name": "MultiviewModelConfig",
+      "inherits": "base config",
+      "key_fields": [
+        "n_views",
+        "conditioner.video_cond_bool.condition_location (first_n | first_random_n)",
+        "conditioner.video_cond_bool.first_random_n_num_condition_t_max",
+        "conditioner.video_cond_bool.normalize_condition_latent",
+        "conditioner.video_cond_bool.add_pose_condition",
+        "conditioner.video_cond_bool.compute_loss_for_condition_region"
+      ]
+    }
+  ],
+
+  "use_cases": [
+    {
+      "name": "Encode Multi-View Video to Latent",
+      "actor": "MultiviewExtendDiffusionModel",
+      "method": "encode(state: Tensor) -> Tensor",
+      "steps": [
+        "Rearrange B C (V T) H W -> (B V) C T H W",
+        "VAE.encode(state) per-view",
+        "Rearrange (B V) -> B back",
+        "Scale by sigma_data"
+      ]
+    },
+    {
+      "name": "Decode Latent to Multi-View Video",
+      "actor": "MultiviewExtendDiffusionModel",
+      "method": "decode(latent: Tensor) -> Tensor",
+      "steps": [
+        "Rearrange B C (V T) H W -> (B V) C T H W",
+        "VAE.decode(latent / sigma_data) per-view",
+        "Rearrange (B V) -> B back"
+      ]
+    },
+    {
+      "name": "Compute Training Loss",
+      "actor": "Trainer",
+      "method": "compute_loss_with_epsilon_and_sigma(data_batch, x0_from_data_batch, x0, condition, epsilon, sigma)",
+      "steps": [
+        "Check is_image_batch: disable CP if true",
+        "If video + CP enabled: enable cp_group on net",
+        "Rearrange x0 and epsilon for multi-view CP split",
+        "split_inputs_cp(x0, epsilon) across CP group",
+        "Rearrange back and call DiffusionModel.compute_loss_with_epsilon_and_sigma",
+        "Scale kendall_loss by CP world size if loss_reduce == 'sum'"
+      ]
+    },
+    {
+      "name": "Denoise with Video Conditioning",
+      "actor": "MultiviewExtendDiffusionModel",
+      "method": "denoise(noise_x, sigma, condition: VideoExtendCondition, condition_video_augment_sigma_in_inference)",
+      "branches": [
+        {
+          "condition": "DataType.IMAGE",
+          "action": "Call DiffusionModel.denoise directly, return VideoDenoisePrediction"
+        },
+        {
+          "condition": "DataType.VIDEO",
+          "steps": [
+            "Extract gt_latent from condition",
+            "Optionally normalize_condition_latent",
+            "augment_conditional_latent_frames(condition, cfg, condition_latent, sigma)",
+            "If CP enabled: rearrange + split_inputs_cp for indicator, augment_latent, gt_latent",
+            "If not video_cond_bool: drop_out_condition_region",
+            "Compose new_noise_xt = indicator * augment_latent + (1-indicator) * noise_x",
+            "Call DiffusionModel.denoise(new_noise_xt, sigma, condition)",
+            "Replace condition region in x0 prediction with gt_latent",
+            "Return VideoDenoisePrediction(x0, eps, logvar, net_in, xt, x0_pred_replaced)"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Add Condition Video Indicator and Input Mask",
+      "actor": "MultiviewExtendDiffusionModel",
+      "method": "add_condition_video_indicator_and_video_input_mask(latent_state, condition, num_condition_t)",
+      "steps": [
+        "Create zeros tensor [1,1,T,1,1] for condition_video_indicator",
+        "Rearrange for multi-view: (B V) C T H W",
+        "Branch on condition_location: first_n (inference) sets [:num_condition_t]=1, first_random_n (training) samples random num_condition_t",
+        "Rearrange back to B C (V T) H W",
+        "Set condition.gt_latent = latent_state",
+        "Set condition.condition_video_indicator",
+        "Create condition_video_input_mask: ones_padding * indicator (cond) or zeros_padding (uncond)",
+        "broadcast_condition(condition) across TP and CP ranks"
+      ]
+    },
+    {
+      "name": "Prepare CFG x0 Function",
+      "actor": "MultiviewExtendDiffusionModel",
+      "method": "get_x0_fn_from_batch_with_condition_latent(data_batch, guidance, condition_latent, num_condition_t, ...)",
+      "steps": [
+        "conditioner.get_condition_uncondition(data_batch) -> (condition, uncondition)",
+        "Set condition.video_cond_bool = True",
+        "add_condition_video_indicator_and_video_input_mask for condition",
+        "Optionally add_condition_pose if add_pose_condition",
+        "Set uncondition.video_cond_bool = False (or True without input-frame guidance)",
+        "add_condition_video_indicator_and_video_input_mask for uncondition",
+        "broadcast_condition for both",
+        "Return x0_fn: cond_x0 + guidance * (cond_x0 - uncond_x0)"
+      ]
+    },
+    {
+      "name": "Generate Samples from Batch",
+      "actor": "Trainer / Inference",
+      "method": "generate_samples_from_batch(data_batch, guidance, seed, state_shape, num_steps, condition_latent, ...)",
+      "steps": [
+        "_normalize_video_databatch_inplace(data_batch)",
+        "_augment_image_dim_inplace(data_batch)",
+        "If image batch: delegate to super().generate_samples_from_batch",
+        "Assert condition_latent is provided",
+        "get_x0_fn_from_batch_with_condition_latent(...) -> x0_fn",
+        "Generate x_sigma_max noise with seeded generator",
+        "If CP: split x_sigma_max across CP group",
+        "sampler(x0_fn, x_sigma_max, num_steps, sigma_max) -> samples",
+        "If CP: cat_outputs_cp to reassemble samples"
+      ]
+    },
+    {
+      "name": "Forward Pass Through DiT (VideoExtendMultiviewGeneralDIT)",
+      "actor": "VideoExtendMultiviewGeneralDIT",
+      "method": "forward(x, timesteps, crossattn_emb, ..., condition_video_input_mask, condition_video_pose)",
+      "steps": [
+        "If DataType.VIDEO: assert condition_video_input_mask not None",
+        "If CP enabled: rearrange mask B C (V T) -> B C V T, split_inputs_cp on seq_dim=3, rearrange back",
+        "Compose input_list = [x, condition_video_input_mask]",
+        "If condition_video_pose provided (and trimmed to T): append to input_list",
+        "torch.cat(input_list, dim=1) — increases channel dim",
+        "Call MultiviewGeneralDIT.forward(x=concatenated, ...)"
+      ]
+    }
+  ],
+
+  "key_relationships": [
+    "MultiviewExtendDiffusionModel extends ExtendDiffusionModel",
+    "FSDPExtendDiffusionModel extends MultiviewExtendDiffusionModel (FSDP decorator applied)",
+    "VideoExtendMultiviewGeneralDIT extends MultiviewGeneralDIT",
+    "MultiviewExtendDiffusionModel contains/uses VideoExtendMultiviewGeneralDIT (as self.net)",
+    "MultiviewExtendDiffusionModel depends_on VAE (self.vae.encode / decode)",
+    "MultiviewExtendDiffusionModel depends_on Conditioner (get_condition_uncondition)",
+    "MultiviewExtendDiffusionModel depends_on Sampler (self.sampler)",
+    "MultiviewExtendDiffusionModel depends_on Megatron parallel_state (context parallel)",
+    "MultiviewModelConfig configures MultiviewExtendDiffusionModel (n_views, video_cond_bool settings)"
+  ],
+
+  "experiment_config": {
+    "experiment": "video2world_multiview_7b_example_waymo",
+    "model_class": "FSDPExtendDiffusionModel",
+    "network_class": "VideoExtendMultiviewGeneralDIT",
+    "backbone": "faditv2_7b (7B param DiT)",
+    "conditioner": "video_cond",
+    "vae": "cosmos_diffusion_tokenizer_comp8x8x8",
+    "num_views": 5,
+    "view_keys": ["pinhole_front_left", "pinhole_front", "pinhole_front_right", "pinhole_side_left", "pinhole_side_right"],
+    "num_frames": 57,
+    "video_size": [480, 848],
+    "dataset": "Waymo",
+    "optimizer": "AdamW lr~5e-5, wd=0.1",
+    "save_iter": 200
+  },
+
+  "important_notes": [
+    "Multi-view tensor layout: B C (V T) H W — views interleaved in temporal dimension",
+    "Context Parallel (CP) splits temporal dimension across GPU ranks; rearrange to (B V) C T H W first to split per-view frames",
+    "condition_location='first_n' used at inference; 'first_random_n' used at training for random conditioning",
+    "VideoExtendMultiviewGeneralDIT adds +1 input channel for the binary condition mask (and optionally +1 for pose)",
+    "FSDPExtendDiffusionModel is identical to MultiviewExtendDiffusionModel but wrapped for FSDP sharding",
+    "CFG guidance: x0 = cond_x0 + guidance * (cond_x0 - uncond_x0); dual-guidance variant also supported"
+  ],
+
+  "source_files_analyzed": [
+    "Lyra-1/cosmos_predict1/diffusion/training/models/extend_model_multiview.py",
+    "Lyra-1/cosmos_predict1/diffusion/training/networks/general_dit_lvg_multiview.py",
+    "Lyra-1/cosmos_predict1/diffusion/training/config/video2world_multiview/experiment.py"
+  ]
+}

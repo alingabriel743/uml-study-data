@@ -1,0 +1,109 @@
+{
+  "scope": "node_lifecycle_hello_and_auth",
+  "title": "Node Lifecycle — Hello & Authentication",
+  "diagram_type": "activity",
+  "source_files_analyzed": ["src/proxy/lifecycle/manager.js"],
+
+  "constants": {
+    "HELLO_TIMEOUT": "15000ms",
+    "HEARTBEAT_TIMEOUT": "10000ms",
+    "MAX_REAUTH_ATTEMPTS": 2,
+    "DEFAULT_HEARTBEAT_INTERVAL": "360000ms"
+  },
+
+  "key_classes": [
+    "LifecycleManager",
+    "AuthError"
+  ],
+
+  "constructor_dependencies": [
+    "hubUrl (env: A2A_HUB_URL)",
+    "store (mailbox/store — getState, setState, countPending, writeInboundBatch, writeInbound)",
+    "logger (defaults to console)",
+    "getTaskMeta (optional function)"
+  ],
+
+  "hello_flow": [
+    "START: hello({ rotateSecret=false })",
+    "GUARD: if !hubUrl → return { ok:false, error:'no_hub_url' }",
+    "RESOLVE nodeId: store.getState('node_id') OR generate 'node_' + 6 random bytes hex",
+    "BUILD payload: { capabilities:{} }",
+    "IF rotateSecret=true → add payload.rotate_secret=true",
+    "CALL _getEnvFingerprint() → captureEnvFingerprint() or fallback {platform, arch, node_version}",
+    "BUILD body: { protocol, protocol_version:'1.0.0', message_type:'hello', message_id, sender_id:nodeId, timestamp, payload, env_fingerprint }",
+    "CALL _buildHeaders() → Content-Type + optional Authorization Bearer + x-correlation-id (UUID)",
+    "POST ${hubUrl}/a2a/hello with body, headers, AbortSignal.timeout(15000)",
+    "AWAIT res.json() → data",
+    "CHECK data.payload.status === 'rejected' → log error, return { ok:false, error:reason }",
+    "CHECK secret in data.payload.node_secret OR data.node_secret, validate /^[a-f0-9]{64}$/i",
+    "IF valid secret → store.setState('node_secret', secret)",
+    "store.setState('node_id', nodeId)",
+    "RETURN { ok:true, nodeId, response:data }",
+    "CATCH err → log error, return { ok:false, error:err.message }"
+  ],
+
+  "reAuthenticate_flow": [
+    "START: reAuthenticate()",
+    "GUARD: if _reauthInProgress → return false immediately",
+    "SET _reauthInProgress = true",
+    "LOOP attempt 1..MAX_REAUTH_ATTEMPTS (max 2):",
+    "  LOG warn: 're-auth attempt N/2: rotating secret via hello...'",
+    "  CALL hello({ rotateSecret:true })",
+    "  IF hello failed → log error, continue next attempt",
+    "  CHECK helloResult.response.payload.node_secret",
+    "  IF no new secret → log error, continue next attempt",
+    "  CALL heartbeat({ _skipReauth:true })",
+    "  IF heartbeat ok → log success, return true",
+    "  ELSE → log warn, continue next attempt",
+    "END LOOP",
+    "LOG error: 're-auth exhausted all attempts'",
+    "RETURN false",
+    "FINALLY: _reauthInProgress = false"
+  ],
+
+  "buildHeaders_logic": [
+    "Initialize headers: { 'Content-Type': 'application/json' }",
+    "Read nodeSecret: store.getState('node_secret') OR env A2A_NODE_SECRET",
+    "IF secret exists → headers['Authorization'] = 'Bearer ' + secret",
+    "Add headers['x-correlation-id'] = crypto.randomUUID()",
+    "RETURN headers"
+  ],
+
+  "heartbeat_interaction_with_reauth": [
+    "POST /a2a/heartbeat with _buildHeaders()",
+    "IF res.status 403 or 401 AND !_skipReauth → call reAuthenticate()",
+    "IF reAuthenticate() returns true → reset consecutiveFailures, return { ok:true, recovered:true }",
+    "IF data.status === 'unknown_node' → call hello() to re-register"
+  ],
+
+  "state_fields": [
+    "_reauthInProgress: boolean guard prevents concurrent re-auth",
+    "_consecutiveFailures: incremented on heartbeat failure, reset on success",
+    "_running: controls heartbeat loop",
+    "_heartbeatTimer: setTimeout handle with exponential backoff"
+  ],
+
+  "activity_decision_points": [
+    "hubUrl present? → proceed or abort",
+    "rotateSecret flag? → include in hello payload",
+    "hello response rejected? → abort",
+    "valid 64-char hex secret returned? → store new secret",
+    "_reauthInProgress already set? → skip, return false",
+    "hello ok in reAuth loop? → verify with heartbeat",
+    "new secret returned from hub? → proceed to heartbeat check",
+    "heartbeat ok after rotate? → auth restored",
+    "max attempts exhausted? → fail"
+  ],
+
+  "key_relationships": [
+    "LifecycleManager depends_on store (read/write node_id, node_secret, last_heartbeat_at, pending counts)",
+    "LifecycleManager depends_on crypto (randomUUID, randomBytes)",
+    "LifecycleManager depends_on gep/envFingerprint (captureEnvFingerprint, lazy-loaded)",
+    "hello() called_by reAuthenticate() with rotateSecret:true",
+    "heartbeat() called_by reAuthenticate() with _skipReauth:true (verification step)",
+    "heartbeat() calls reAuthenticate() on 401/403 (unless _skipReauth)",
+    "heartbeat() calls hello() when unknown_node status received"
+  ],
+
+  "important_notes": "MAX_REAUTH_ATTEMPTS=2; _skipReauth prevents infinite recursion between heartbeat↔reAuthenticate. Secret validated with /^[a-f0-9]{64}$/i before storing. Heartbeat uses exponential backoff: min(interval * 2^consecutiveFailures, 30min). AuthError class exported but used externally (not thrown internally in this file)."
+}

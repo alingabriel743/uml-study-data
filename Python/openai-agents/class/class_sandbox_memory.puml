@@ -1,0 +1,294 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #F9A825
+    FontColor #212529
+}
+
+title Sandbox – Memory System
+
+' ─────────────────────────────────────────
+' External / shared types (outside scope)
+' ─────────────────────────────────────────
+abstract class Capability <<external>> {
+}
+
+abstract class BaseModel <<pydantic / external>> {
+}
+
+class BaseSandboxSession <<external>> {
+}
+
+' ─────────────────────────────────────────
+' Configuration dataclasses
+' ─────────────────────────────────────────
+package "sandbox.config" {
+
+    class MemoryLayoutConfig <<dataclass>> {
+        +memories_dir: str = "memories"
+        +sessions_dir: str = "sessions"
+    }
+
+    class MemoryGenerateConfig <<dataclass>> {
+        +max_raw_memories_for_consolidation: int = 256
+        +phase_one_model: str | Model = "gpt-5.4-mini"
+        +phase_one_model_settings: ModelSettings | None
+        +phase_two_model: str | Model = "gpt-5.4"
+        +phase_two_model_settings: ModelSettings | None
+        +extra_prompt: str | None
+        +__post_init__(): None
+    }
+
+    class MemoryReadConfig <<dataclass>> {
+        +live_update: bool = True
+    }
+
+}
+
+' ─────────────────────────────────────────
+' Core capability
+' ─────────────────────────────────────────
+package "sandbox.capabilities" {
+
+    class Memory <<pydantic model>> {
+        +type: Literal["memory"] = "memory"
+        +layout: MemoryLayoutConfig
+        +read: MemoryReadConfig | None
+        +generate: MemoryGenerateConfig | None
+        --
+        +clone(): Memory
+        +model_post_init(context): None
+        +required_capability_types(): set[str]
+        +async instructions(manifest: Manifest): str | None
+    }
+
+    note right of Memory
+        Requires Shell capability.
+        Also requires Filesystem when
+        live_update=True.
+        instructions() reads memory_summary.md
+        and injects it into the system prompt.
+    end note
+
+}
+
+' ─────────────────────────────────────────
+' Memory subsystem
+' ─────────────────────────────────────────
+package "sandbox.memory" {
+
+    ' ── Manager ──────────────────────────
+    class SandboxMemoryGenerationManager {
+        -_session: BaseSandboxSession
+        -_memory: Memory
+        -_generate_config: MemoryGenerateConfig
+        -_storage: SandboxMemoryStorage
+        -_queue: asyncio.Queue[str | object]
+        -_worker_task: asyncio.Task[None] | None
+        -_flush_lock: asyncio.Lock
+        -_rollout_files_by_rollout_id: dict[str, str]
+        -_pending_phase_two_rollout_ids: list[str]
+        -_stopped: bool
+        --
+        +memory: Memory  <<property>>
+        +async enqueue_result(result, *, exception,\n  input_override, rollout_id): None
+        +async enqueue_rollout_payload(payload,\n  *, rollout_id): None
+        +async flush(): None
+        -_ensure_worker(): None
+        -async _worker(): None
+        -async _process_rollout_file(file_name: str): None
+        -async _run_phase_two(): None
+        -_memory_run_config(): RunConfig
+    }
+
+    note right of SandboxMemoryGenerationManager
+        Central orchestrator.
+        Registered as pre-stop hook on session (flush).
+        Worker processes rollout files via phase-one;
+        flush() then triggers phase-two consolidation.
+        Keyed in WeakKeyDictionary by session.
+    end note
+
+    ' ── Storage ──────────────────────────
+    class SandboxMemoryStorage {
+        -_session: BaseSandboxSession
+        -_layout: MemoryLayoutConfig
+        -_layout_lock: asyncio.Lock
+        --
+        +sessions_dir: Path  <<property>>
+        +memories_dir: Path  <<property>>
+        +raw_memories_dir: Path  <<property>>
+        +rollout_summaries_dir: Path  <<property>>
+        +phase_two_selection_path: Path  <<property>>
+        --
+        +async ensure_layout(): None
+        +async ensure_text_file(path: Path): None
+        +async read_text(path: Path): str
+        +async write_text(path: Path, text: str): None
+        +async build_phase_two_input_selection(\n  *, max_raw_memories_for_consolidation: int): PhaseTwoInputSelection
+        +async rebuild_raw_memories(\n  *, selected_items: list[PhaseTwoSelectionItem]): bool
+        +async read_phase_two_selection(): list[PhaseTwoSelectionItem]
+        +async write_phase_two_selection(\n  *, selected_items: list[PhaseTwoSelectionItem]): None
+    }
+
+    ' ── Interface / LLM output schema ────
+    class RolloutExtractionArtifacts <<pydantic model>> {
+        +rollout_slug: str
+        +rollout_summary: str
+        +raw_memory: str
+    }
+
+    ' ── Selection data structures ─────────
+    class PhaseTwoSelectionItem <<frozen dataclass>> {
+        +rollout_id: str
+        +updated_at: str
+        +rollout_path: str
+        +rollout_summary_file: str
+        +terminal_state: str
+        --
+        +to_dict(): dict[str, str]
+        +{static} from_dict(payload: dict): PhaseTwoSelectionItem | None
+    }
+
+    class PhaseTwoInputSelection <<frozen dataclass>> {
+        +selected: list[PhaseTwoSelectionItem]
+        +retained_rollout_ids: set[str]
+        +removed: list[PhaseTwoSelectionItem]
+    }
+
+    ' ── Rollout metadata ─────────────────
+    class RolloutTerminalMetadata <<pydantic model>> {
+        +terminal_state: Literal["completed", "interrupted",\n  "cancelled", "failed",\n  "max_turns_exceeded", "guardrail_tripped"]
+        +exception_type: str | None
+        +exception_message: str | None
+        +has_final_output: bool = False
+    }
+
+    ' ── Phase-one module (functions) ─────
+    class PhaseOneModule <<module>> {
+        {static} async run_phase_one(*, config: MemoryGenerateConfig,\n  prompt: str, run_config: RunConfig): RolloutExtractionArtifacts
+        {static} render_phase_one_prompt(*, rollout_contents: str): str
+        {static} validate_rollout_artifacts(artifacts): bool
+        {static} normalize_rollout_slug(value: str): str
+    }
+
+    note bottom of PhaseOneModule
+        Creates SandboxAgent "sandbox-memory-phase-one".
+        Truncates rollout to 150k tokens.
+        Returns typed RolloutExtractionArtifacts.
+    end note
+
+    ' ── Phase-two module (functions) ─────
+    class PhaseTwoModule <<module>> {
+        {static} async run_phase_two(*, config: MemoryGenerateConfig,\n  memory_root: str,\n  selection: PhaseTwoInputSelection,\n  run_config: RunConfig): None
+    }
+
+    note bottom of PhaseTwoModule
+        Creates SandboxAgent "sandbox-memory-phase-two".
+        No structured output — agent edits MEMORY.md directly.
+        Uses render_memory_consolidation_prompt.
+    end note
+
+    ' ── Rollouts module (functions) ──────
+    class RolloutsModule <<module>> {
+        {static} build_rollout_payload_from_result(\n  result: RunResultBase,\n  *, exception, input_override): dict
+        {static} async write_rollout(*, session,\n  rollout_contents, rollouts_path, file_name): Path
+    }
+
+    ' ── Prompts module (functions) ────────
+    class PromptsModule <<module>> {
+        {static} render_memory_read_prompt(...): str
+        {static} render_memory_consolidation_prompt(...): str
+        {static} render_rollout_extraction_prompt(...): str
+    }
+
+    ' ── Manager factory function ──────────
+    class ManagerFactory <<module>> {
+        {static} get_or_create_memory_generation_manager(\n  *, session: BaseSandboxSession,\n  memory: Memory): SandboxMemoryGenerationManager
+    }
+
+    note right of ManagerFactory
+        Registry: WeakKeyDictionary keyed by
+        (session, layout_key=(memories_dir, sessions_dir)).
+        Enforces uniqueness of memory dir per session.
+        Managers are GC'd when sessions close.
+    end note
+
+}
+
+' ─────────────────────────────────────────
+' Rollout lifecycle note
+' ─────────────────────────────────────────
+note as LifecycleNote
+    <b>Rollout Lifecycle</b>
+    1. enqueue_result() → build_rollout_payload_from_result()
+    2. write_rollout() → sessions/<rollout_id>.jsonl
+    3. flush() (pre-stop hook): queues rollout files for worker
+    4. _worker() → _process_rollout_file():
+       render_phase_one_prompt() → run_phase_one()
+       → writes raw_memories/<id>.md + rollout_summaries/<id>_<slug>.md
+    5. _run_phase_two():
+       build_phase_two_input_selection() → rebuild_raw_memories()
+       → run_phase_two() → MEMORY.md updated
+       → write_phase_two_selection() → phase_two_selection.json
+end note
+
+' ─────────────────────────────────────────
+' Relationships
+' ─────────────────────────────────────────
+
+' Inheritance
+Memory          --|>  Capability
+RolloutExtractionArtifacts --|>  BaseModel
+RolloutTerminalMetadata    --|>  BaseModel
+
+' Composition
+Memory          *--  MemoryLayoutConfig    : layout
+Memory          *--  MemoryGenerateConfig  : generate
+Memory          o--  MemoryReadConfig      : read (optional)
+
+SandboxMemoryGenerationManager *--  SandboxMemoryStorage   : _storage
+
+PhaseTwoInputSelection  *--  PhaseTwoSelectionItem : selected / removed
+
+' Dependencies (uses / calls)
+SandboxMemoryGenerationManager  ..>  Memory               : uses
+SandboxMemoryGenerationManager  ..>  BaseSandboxSession   : _session
+SandboxMemoryGenerationManager  ..>  PhaseOneModule       : _process_rollout_file
+SandboxMemoryGenerationManager  ..>  PhaseTwoModule       : _run_phase_two
+SandboxMemoryGenerationManager  ..>  RolloutsModule       : enqueue_result
+
+SandboxMemoryStorage  ..>  BaseSandboxSession         : delegates FS ops
+SandboxMemoryStorage  ..>  MemoryLayoutConfig         : configures paths
+SandboxMemoryStorage  ..>  PhaseTwoInputSelection     : produces
+
+PhaseOneModule  ..>  RolloutExtractionArtifacts  : returns
+PhaseOneModule  ..>  MemoryGenerateConfig        : config
+PhaseOneModule  ..>  PromptsModule               : render_rollout_extraction_prompt
+
+PhaseTwoModule  ..>  PhaseTwoInputSelection      : consumes
+PhaseTwoModule  ..>  MemoryGenerateConfig        : config
+PhaseTwoModule  ..>  PromptsModule               : render_memory_consolidation_prompt
+
+RolloutsModule  ..>  RolloutTerminalMetadata     : creates
+
+ManagerFactory  ..>  SandboxMemoryGenerationManager : creates / caches
+
+Memory          ..>  PromptsModule  : render_memory_read_prompt
+
+@enduml

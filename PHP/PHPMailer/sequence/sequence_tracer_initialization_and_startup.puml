@@ -1,0 +1,249 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    GroupBackgroundColor #E9ECEF
+    GroupBorderColor #6C757D
+    GroupFontColor #212529
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #6C757D
+    DividerFontColor #212529
+    NoteBackgroundColor #FFF3CD
+    NoteBorderColor #856404
+}
+
+title Tracer Initialization and Startup Logs
+
+actor "PHP Engine" as PHP
+participant "ddtrace ext (C)" as Ext
+participant "ConfigSystem\n(INI / Env Vars)" as Config
+participant "IntegrationsRegistry" as Integrations
+participant "StartupLogger\n(startup_logging.c)" as StartupLog
+participant "GlobalTracer (PHP)" as GlobalTracer
+participant "Tracer (PHP)" as Tracer
+participant "Transport\n(Internal / Noop)" as Transport
+participant "ScopeManager" as ScopeManager
+
+== PHP Extension Load: MINIT ==
+
+PHP -> Ext : PHP_MINIT_FUNCTION(ddtrace)
+activate Ext
+
+Ext -> Ext : ddtrace_log_init()\n<i>init logging subsystem</i>
+
+Ext -> Config : ddtrace_config_minit(module_number)
+activate Config
+note right of Config
+  Loads INI settings + environment variables:
+  DD_SERVICE, DD_ENV, DD_VERSION,
+  DD_TRACE_ENABLED, DD_TRACE_CLI_ENABLED,
+  DD_AGENT_HOST, DD_TRACE_DEBUG, etc.
+  Config is memoized at MINIT.
+end note
+Config --> Ext : config loaded
+deactivate Config
+
+alt ddtrace.disable = 1
+    Ext -> PHP : return early\n<i>(no integrations, no startup logs)</i>
+else extension enabled
+    Ext -> Ext : dd_disable_if_incompatible_sapi_detected()\n<i>optional early exit for incompatible SAPIs</i>
+    Ext -> Ext : ddtrace_autoload_minit()\n<i>register PHP class autoloader</i>
+    Ext -> Ext : register DDTrace classes\n<i>(SpanData, Integration, SpanEvent, SpanLink, etc.)</i>
+
+    Ext -> Integrations : ddtrace_integrations_minit()
+    activate Integrations
+    note right of Integrations
+      Builds name-to-integration hash map.
+      Installs method hooks via zai_hook
+      for all supported integrations.
+    end note
+    Integrations --> Ext : integrations registered
+    deactivate Integrations
+
+    Ext -> Ext : ddtrace_serializer_startup()
+    Ext -> Ext : ddtrace_sidecar_minit()
+    Ext -> Ext : ddtrace_live_debugger_minit()
+end
+
+deactivate Ext
+
+== First HTTP Request: RINIT ==
+
+PHP -> Ext : PHP_RINIT_FUNCTION(ddtrace)\n<i>[first request]</i>
+activate Ext
+
+Ext -> Ext : dd_initialize_request()\n<i>init per-request state:\nspan stacks, priority sampling,\ndistributed trace IDs</i>
+
+Ext -> Ext : pthread_once → dd_rinit_once()\n<i>runs exactly ONCE per PHP process</i>
+activate Ext
+
+note over Ext
+  pthread_once gate ensures startup logs
+  and writer init happen only once per process.
+end note
+
+Ext -> StartupLog : ddtrace_startup_logging_first_rinit()
+activate StartupLog
+
+StartupLog -> StartupLog : ddtrace_startup_diagnostics(ht, quick=true)
+note right of StartupLog
+  Performs:
+  • Agent connectivity check (cURL POST
+    with X-Datadog-Diagnostic-Check header)
+  • sources_path reachability check
+  • open_basedir restriction check
+  • excluded modules check
+end note
+
+StartupLog -> Config : _dd_get_startup_config(ht)
+activate Config
+note right of Config
+  Reads all config fields including:
+  date, version, lang=php, lang_version,
+  env (DD_ENV), service (DD_SERVICE),
+  dd_version (DD_VERSION), enabled,
+  agent_url, debug, sample_rate,
+  distributed_tracing_enabled, sapi,
+  sidecar_trace_sender, telemetry_enabled,
+  dynamic_instrumentation_enabled, architecture…
+  (First RINIT busts MINIT memoized cache to
+  pick up SAPI-level env vars.)
+end note
+Config --> StartupLog : config hash table
+deactivate Config
+
+StartupLog -> StartupLog : _dd_print_values_to_log(ht)\n<i>emits "DATADOG TRACER DIAGNOSTICS - key: value"\nlines to PHP error log</i>
+StartupLog -> StartupLog : _dd_serialize_json(ht, buf)\n<i>JSON-encode config + diagnostics</i>
+StartupLog -> StartupLog : LOG "DATADOG TRACER CONFIGURATION - {JSON}"\n<i>written to PHP error log</i>
+
+StartupLog --> Ext : startup logging complete
+deactivate StartupLog
+
+alt DD_TRACE_SIDECAR_TRACE_SENDER = false
+    Ext -> Ext : ddtrace_coms_init_and_start_writer()\n<i>start background trace-sender thread</i>
+else sidecar enabled
+    note over Ext : Skip writer thread — use sidecar process instead
+end
+
+deactivate Ext
+
+Ext -> Ext : ddtrace_read_distributed_tracing_ids()\n<i>extract W3C / Datadog headers from SAPI</i>
+
+alt DD_TRACE_GENERATE_ROOT_SPAN = true
+    Ext -> Ext : ddtrace_push_root_span()\n<i>auto-create root span for this request</i>
+end
+
+deactivate Ext
+
+== PHP Tracer Singleton Bootstrap ==
+
+[-> GlobalTracer : GlobalTracer::get()\n<i>lazy singleton access</i>
+activate GlobalTracer
+
+alt ddtrace extension is loaded
+    GlobalTracer -> Tracer : new Tracer()
+    activate Tracer
+
+    Tracer -> Config : dd_trace_env_config('DD_VERSION') → $serviceVersion
+    activate Config
+    Config --> Tracer : version string
+    deactivate Config
+
+    Tracer -> Config : dd_trace_env_config('DD_ENV') → $environment
+    activate Config
+    Config --> Tracer : environment string
+    deactivate Config
+
+    alt tracing enabled
+        Tracer -> Transport : new Internal()\n<i>default HTTP transport to agent</i>
+        activate Transport
+        Transport --> Tracer : transport instance
+        deactivate Transport
+    else tracing disabled
+        Tracer -> Transport : new NoopTransport()
+        activate Transport
+        Transport --> Tracer : noop transport
+        deactivate Transport
+    end
+
+    Tracer -> Tracer : new TextMap($this)\n<i>create TEXT_MAP + HTTP_HEADERS propagators</i>
+
+    Tracer -> Ext : current_context()\n<i>read distributed tracing parent from C layer</i>
+    activate Ext
+    Ext --> Tracer : rootContext (SpanContext with parent IDs if present)
+    deactivate Ext
+
+    Tracer -> ScopeManager : new ScopeManager($rootContext)\n<i>init active span scope stack</i>
+    activate ScopeManager
+    ScopeManager --> Tracer : scope manager ready
+    deactivate ScopeManager
+
+    Tracer --> GlobalTracer : Tracer instance
+    deactivate Tracer
+
+else ddtrace not loaded
+    GlobalTracer -> GlobalTracer : return NoopTracer\n<i>fully disabled tracer</i>
+end
+
+GlobalTracer --> [: tracer ready
+deactivate GlobalTracer
+
+== Integration Enablement Check ==
+
+[-> Integrations : Integration::shouldLoad($name)
+activate Integrations
+
+Integrations -> Ext : extension_loaded('ddtrace')
+activate Ext
+Ext --> Integrations : true / false
+deactivate Ext
+
+alt extension loaded
+    Integrations -> Config : ddtrace_config_integration_enabled($name)
+    activate Config
+    Config --> Integrations : bool (enabled / disabled)
+    deactivate Config
+
+    Integrations -> Config : handleInternalSpanServiceName()\n→ ddtrace_config_app_name($fallbackName)\nor dd_trace_env_config('DD_TRACE_REMOVE_INTEGRATION_SERVICE_NAMES_ENABLED')
+    activate Config
+    Config --> Integrations : service name string
+    deactivate Config
+end
+
+Integrations --> [: shouldLoad result
+deactivate Integrations
+
+note over PHP, ScopeManager
+  <b>Key behaviours</b>
+  • Startup logs emitted once per PHP process (pthread_once gate in dd_rinit_once).
+  • Log format: "DATADOG TRACER CONFIGURATION - {JSON}" → PHP error log.
+  • Agent diagnostic check uses cURL POST with X-Datadog-Diagnostic-Check header.
+  • DDTrace\\startup_logs() calls ddtrace_startup_logging_json() for on-demand retrieval.
+  • ddtrace_config_trace_enabled() checks both ddtrace.disable INI and DD_TRACE_ENABLED env.
+  • GlobalTracer::get() lazy-creates new Tracer() only when ddtrace extension is loaded.
+end note
+
+@enduml

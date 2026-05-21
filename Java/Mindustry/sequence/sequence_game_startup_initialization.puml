@@ -1,0 +1,232 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    GroupBackgroundColor #DEE2E6
+    GroupBorderColor #6C757D
+}
+skinparam NoteBackgroundColor #FFF9C4
+skinparam NoteBorderColor #F9A825
+
+title Game Startup and Initialization Flow
+
+actor "Platform / OS" as OS
+participant "DesktopLauncher" as DL
+participant "SdlApplication" as SDL
+participant "ClientLauncher" as CL
+participant "AssetManager" as AM
+participant "Vars" as VARS
+participant "ContentLoader" as CONTENT
+participant "Mods" as MODS
+participant "UI" as UI
+participant "Modules\n(Logic/Control/Renderer\nNetServer/NetClient)" as MODULES
+
+== Phase 1: Pre-SDL Bootstrap ==
+
+OS -> DL : main(args)
+activate DL
+
+DL -> DL : Version.init()
+DL -> DL : Vars.loadLogger()
+DL -> DL : Vars.loadFileLogger(logFile)
+DL -> DL : check32Bit()\ncheckJavaVersion()
+
+note right of DL
+  Platform sanity checks
+  (Steam init also here if applicable)
+end note
+
+DL -> SDL : new SdlApplication(\n  new DesktopLauncher(args), SdlConfig)
+activate SDL
+
+== Phase 2: Setup — Queue Asset Loads ==
+
+SDL -> CL : init()  [ApplicationCore lifecycle]
+activate CL
+
+CL -> CL : setup()
+activate CL
+
+CL -> VARS : checkLaunch()
+note right of VARS : Writes launchid.dat crash sentinel
+
+CL -> CL : Events.fire(ClientCreateEvent)
+CL -> CL : UI.loadColors()
+CL -> CL : new SpriteBatch()\nnew FileTree()\nnew Net(platform.getNet())
+
+CL -> MODS : new Mods()\nnew Schematics()
+activate MODS
+
+CL -> CL : Fonts.loadSystemCursors()\nFonts.loadDefaultFont()
+
+CL -> AM : load(new Vars())  [queues Vars as Loadable]
+activate AM
+note right of AM : Vars will be loaded\nasynchronously
+
+CL -> AM : load(atlas 'sprites.aatls')
+note right of AM : Async texture atlas load
+
+CL -> AM : loadRun('maps', ...) → maps.loadPreviews()
+CL -> AM : Musics.load() / Sounds.load()
+
+CL -> AM : loadRun('contentcreate', Content.class,\n  asyncFn, syncFn)
+note right of AM
+  async: content.createBaseContent()
+  sync:  mods.loadScripts() +
+         content.createModContent()
+end note
+
+CL -> MODULES : add(logic=new Logic())
+activate MODULES
+CL -> MODULES : add(control=new Control())
+CL -> MODULES : add(renderer=new Renderer())
+
+CL -> UI : add(ui=new UI())
+activate UI
+note right of UI : UI constructor calls\nFonts.loadFonts()
+
+CL -> MODULES : add(netServer=new NetServer())\nadd(netClient=new NetClient())
+
+CL -> AM : loadRun('contentinit', ContentLoader.class,\n  asyncFn, syncFn)
+note right of AM
+  async: content.init()
+         → ContentInitEvent
+  sync:  content.load()
+         → Floor.load() (texture regions)
+end note
+
+CL -> AM : loadRun('baseparts', ...) → bases.load()
+
+deactivate CL  ' setup()
+
+== Phase 3: Per-Frame Async Loading ==
+
+loop Each frame until assets complete
+    SDL -> CL : update()
+    activate CL
+    CL -> CL : loader.draw()  [shows loading screen]
+    CL -> AM : update(50ms slice)
+    activate AM
+
+    group Vars async load (inside AssetManager worker)
+        AM -> VARS : loadAsync()
+        activate VARS
+        VARS -> VARS : loadSettings()
+        VARS -> VARS : init()
+        activate VARS
+        VARS -> VARS : Groups.init()
+        VARS -> VARS : Version.init() / CacheLayer.init()
+        VARS -> CONTENT : content = new ContentLoader()
+        activate CONTENT
+        VARS -> VARS : new World, GameState,\nWaves, Maps, WaveSpawner,\nPathfinder, FogControl, ...
+        VARS -> VARS : becontrol.init()
+        VARS -> MODS : mods.load()  [scans mod directory]
+        VARS -> VARS : maps.load()  [scans map directory]
+        deactivate VARS
+        deactivate VARS
+    end
+
+    group contentcreate async phase
+        AM -> CONTENT : createBaseContent()
+        activate CONTENT
+        CONTENT -> CONTENT : UnitCommand.loadAll\nTeamEntries.load\nItems.load / Liquids.load\nBullets.load / UnitTypes.load\nBlocks.load / Planets.load\nSerpuloTechTree.load\nErekirTechTree.load
+        CONTENT -> CONTENT : loadColors()\n[block_colors.png → Block.mapColor]
+        deactivate CONTENT
+        AM -> MODS : loadScripts()  [sync]
+        AM -> CONTENT : createModContent()  [sync]\n→ mods.loadContent()
+    end
+
+    group contentinit async+sync phases
+        AM -> CONTENT : init()  [async]
+        activate CONTENT
+        CONTENT -> CONTENT : initialize(Content::init)\ninitialize(Content::postInit)
+        CONTENT -> CONTENT : logicVars.init()
+        CONTENT -> CONTENT : Events.fire(ContentInitEvent)
+        note right of CONTENT : Vars.emptyTile created here
+        deactivate CONTENT
+        AM -> CONTENT : load()  [sync]
+        activate CONTENT
+        CONTENT -> CONTENT : initialize(Content::loadIcon)
+        CONTENT -> CONTENT : initialize(Content::load)\n→ Floor.load() [texture regions]
+        deactivate CONTENT
+    end
+
+    AM --> CL : update() returns true\n(all assets loaded)
+    deactivate AM
+    deactivate CL
+end
+
+== Phase 4: Post-Load Module Initialization ==
+
+SDL -> CL : update()
+activate CL
+
+CL -> CL : loader.dispose()
+CL -> CL : SoundPriority.init()
+
+loop For each ApplicationModule
+    CL -> MODULES : listener.init()
+    activate MODULES
+    note right of MODULES
+      Logic.init()
+      Control.init()
+      Renderer.init()
+      NetServer.init()
+      NetClient.init()
+    end note
+    deactivate MODULES
+end
+
+CL -> UI : init()
+activate UI
+UI -> UI : Create fragments:\n  MenuFragment, HudFragment,\n  ChatFragment, ...
+UI -> UI : Create dialogs:\n  JoinDialog, HostDialog,\n  PausedDialog, PlanetDialog, ...
+UI -> UI : Core.scene=new Scene()\nTex.load() / Icon.load()\nStyles.load() / Fonts.loadContentIcons()
+deactivate UI
+
+CL -> MODS : eachClass(Mod::init)
+
+CL -> CL : finished = true
+CL -> CL : Events.fire(ClientLoadEvent)
+CL -> CL : clientLoaded = true
+
+CL -> VARS : finishLaunch()  [via app.post x4]
+VARS -> VARS : delete launchid.dat
+note right of VARS : Crash sentinel removed —\ngame successfully started
+
+deactivate CL
+deactivate CL  ' init()
+
+deactivate CONTENT
+deactivate MODS
+deactivate UI
+deactivate MODULES
+deactivate AM
+deactivate SDL
+deactivate DL
+
+@enduml

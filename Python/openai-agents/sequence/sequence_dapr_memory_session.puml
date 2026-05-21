@@ -1,0 +1,293 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #DEE2E6
+    NoteBackgroundColor #FFF3CD
+    NoteBorderColor #FFC107
+}
+
+title Dapr Memory Session\nStoring and retrieving agent conversation state via Dapr state store\nwith ETag-based optimistic concurrency conflict handling
+
+actor "Runner (Caller)" as Runner
+
+participant "DaprSession" as DaprSession
+participant "asyncio.Lock" as Lock
+participant "resolve_session_limit\n/ SessionSettings" as SessionSettings
+participant "DaprClient\n(gRPC sidecar)" as DaprClient
+database "DaprStateStore\n(backing store)" as DaprStore
+
+note over DaprSession
+  State keys:
+  • <b>{session_id}:messages</b> — JSON array of serialized items
+  • <b>{session_id}:metadata</b> — timestamps dict
+  Concurrency: ETag + Concurrency.first_write
+  Retries: up to MAX_WRITE_ATTEMPTS = 5
+  Backoff: 0.05s × 2^(attempt−1), capped at 1.0s + 10% jitter
+end note
+
+== Instantiation ==
+
+Runner -> DaprSession : from_address(session_id, state_store_name,\ndapr_address='localhost:50001')
+activate DaprSession
+DaprSession -> DaprClient : create DaprClient(address)\n[_owns_client = True]
+activate DaprClient
+DaprClient --> DaprSession : client instance
+deactivate DaprClient
+DaprSession --> Runner : DaprSession instance
+deactivate DaprSession
+
+== get_items(limit=None) — Load Conversation History ==
+
+Runner -> DaprSession : get_items(limit=None)
+activate DaprSession
+
+DaprSession -> SessionSettings : resolve_session_limit(limit, session_settings)
+activate SessionSettings
+SessionSettings --> DaprSession : session_limit (int | None)
+deactivate SessionSettings
+
+DaprSession -> Lock : acquire()
+activate Lock
+
+DaprSession -> DaprSession : _get_read_metadata()\n→ {'consistency': self._consistency}
+
+DaprSession -> DaprClient : get_state(store_name,\nkey="{session_id}:messages",\nstate_metadata)
+activate DaprClient
+DaprClient -> DaprStore : gRPC GetState
+activate DaprStore
+DaprStore --> DaprClient : StateResponse(data, etag)
+deactivate DaprStore
+DaprClient --> DaprSession : StateResponse(data, etag)
+deactivate DaprClient
+
+DaprSession -> DaprSession : _decode_messages(response.data)\n→ list of serialized items
+
+alt session_limit is not None
+    DaprSession -> DaprSession : apply slice: messages[-session_limit:]
+end
+
+DaprSession -> DaprSession : for each msg → _deserialize_item(msg)\n→ list[TResponseInputItem]
+
+DaprSession -> Lock : release()
+deactivate Lock
+
+DaprSession --> Runner : list[TResponseInputItem]
+deactivate DaprSession
+
+== add_items(items) — Persist New Conversation Items ==
+
+Runner -> DaprSession : add_items(items: list[TResponseInputItem])
+activate DaprSession
+
+alt items is empty
+    DaprSession --> Runner : return (early exit)
+end
+
+DaprSession -> DaprSession : for each item → _serialize_item(item)\n→ json.dumps(item) → serialized_items: list[str]
+
+DaprSession -> Lock : acquire()
+activate Lock
+
+note over DaprSession
+  <b>Retry loop</b>: attempt 1 .. MAX_WRITE_ATTEMPTS (5)
+  Read-modify-write with ETag-based optimistic concurrency
+end note
+
+loop attempt = 1 to 5 (until success or max retries)
+
+    DaprSession -> DaprClient : get_state(store_name,\nkey="{session_id}:messages",\nstate_metadata=_get_read_metadata())
+    activate DaprClient
+    DaprClient -> DaprStore : gRPC GetState
+    activate DaprStore
+    DaprStore --> DaprClient : StateResponse(data, etag)
+    deactivate DaprStore
+    DaprClient --> DaprSession : StateResponse(data, etag)
+    deactivate DaprClient
+
+    DaprSession -> DaprSession : _decode_messages(response.data)\n→ existing_messages
+    DaprSession -> DaprSession : updated_messages =\nexisting_messages + serialized_items
+    DaprSession -> DaprSession : messages_json = json.dumps(updated_messages)
+    DaprSession -> DaprSession : _get_state_options(Concurrency.first_write)\n→ StateOptions
+    DaprSession -> DaprSession : _get_metadata()\n→ {'ttlInSeconds': str(ttl)} (if ttl set)
+
+    DaprSession -> DaprClient : save_state(store_name,\nkey="{session_id}:messages",\nvalue=messages_json,\netag=etag,\noptions=StateOptions(first_write))
+    activate DaprClient
+    DaprClient -> DaprStore : gRPC SaveState (with ETag)
+    activate DaprStore
+
+    alt ETag matches — write succeeds
+        DaprStore --> DaprClient : OK
+        DaprClient --> DaprSession : success
+        deactivate DaprStore
+        deactivate DaprClient
+        note right of DaprSession : Break retry loop
+    else ETag conflict (ABORTED / FAILED_PRECONDITION)
+        DaprStore --> DaprClient : ABORTED / FAILED_PRECONDITION
+        deactivate DaprStore
+        DaprClient --> DaprSession : exception (gRPC error)
+        deactivate DaprClient
+
+        DaprSession -> DaprSession : _handle_concurrency_conflict(error, attempt)
+        DaprSession -> DaprSession : _is_concurrency_conflict(error)\nchecks gRPC code name in\n{ABORTED, FAILED_PRECONDITION}\nor message markers
+
+        alt attempt >= MAX_WRITE_ATTEMPTS (5)
+            DaprSession -> Lock : release()
+            DaprSession --> Runner : raise exception
+        else attempt < 5 — should retry
+            DaprSession -> DaprSession : _calculate_retry_delay(attempt)\nbase = 0.05 × 2^(attempt−1), cap 1.0s\n+ uniform jitter [0, 10% of base]
+            DaprSession -> DaprSession : asyncio.sleep(delay)
+            note right of DaprSession : Continue to next attempt
+        end
+    end
+
+end
+
+DaprSession -> DaprSession : build metadata dict\n{session_id, created_at, updated_at}
+
+DaprSession -> DaprClient : save_state(store_name,\nkey="{session_id}:metadata",\nvalue=json(metadata),\noptions=_get_state_options())
+activate DaprClient
+DaprClient -> DaprStore : gRPC SaveState\n(metadata — no ETag check)
+activate DaprStore
+DaprStore --> DaprClient : OK
+deactivate DaprStore
+DaprClient --> DaprSession : success
+deactivate DaprClient
+
+DaprSession -> Lock : release()
+deactivate Lock
+
+DaprSession --> Runner : return None
+deactivate DaprSession
+
+== pop_item() — Remove Last Conversation Item ==
+
+Runner -> DaprSession : pop_item()
+activate DaprSession
+
+DaprSession -> Lock : acquire()
+activate Lock
+
+loop attempt = 1 to 5 (until success or max retries)
+
+    DaprSession -> DaprClient : get_state(store_name,\nkey="{session_id}:messages",\nstate_metadata)
+    activate DaprClient
+    DaprClient -> DaprStore : gRPC GetState
+    activate DaprStore
+    DaprStore --> DaprClient : StateResponse(data, etag)
+    deactivate DaprStore
+    DaprClient --> DaprSession : StateResponse(data, etag)
+    deactivate DaprClient
+
+    DaprSession -> DaprSession : _decode_messages(response.data) → messages
+
+    alt messages is empty
+        DaprSession -> Lock : release()
+        deactivate Lock
+        DaprSession --> Runner : return None
+    end
+
+    DaprSession -> DaprSession : last_item = messages.pop()\n(removes last element)
+    DaprSession -> DaprSession : messages_json =\njson.dumps(remaining messages)
+
+    DaprSession -> DaprClient : save_state(key="{session_id}:messages",\nvalue=messages_json,\netag=etag,\noptions=first_write)
+    activate DaprClient
+    DaprClient -> DaprStore : gRPC SaveState (with ETag)
+    activate DaprStore
+
+    alt ETag matches
+        DaprStore --> DaprClient : OK
+        DaprClient --> DaprSession : success
+        deactivate DaprStore
+        deactivate DaprClient
+        note right of DaprSession : Break retry loop
+    else ETag conflict
+        DaprStore --> DaprClient : ABORTED / FAILED_PRECONDITION
+        deactivate DaprStore
+        DaprClient --> DaprSession : exception
+        deactivate DaprClient
+        DaprSession -> DaprSession : _handle_concurrency_conflict(error, attempt)\n→ retry or raise
+    end
+
+end
+
+DaprSession -> DaprSession : if last_item is str →\n_deserialize_item(last_item)\n→ TResponseInputItem
+
+DaprSession -> Lock : release()
+deactivate Lock
+
+DaprSession --> Runner : TResponseInputItem | None
+deactivate DaprSession
+
+== clear_session() — Delete All Session State ==
+
+Runner -> DaprSession : clear_session()
+activate DaprSession
+
+DaprSession -> Lock : acquire()
+activate Lock
+
+DaprSession -> DaprClient : delete_state(store_name,\nkey="{session_id}:messages",\noptions=_get_state_options())
+activate DaprClient
+DaprClient -> DaprStore : gRPC DeleteState (messages)
+activate DaprStore
+DaprStore --> DaprClient : OK
+deactivate DaprStore
+DaprClient --> DaprSession : success
+deactivate DaprClient
+
+DaprSession -> DaprClient : delete_state(store_name,\nkey="{session_id}:metadata",\noptions=_get_state_options())
+activate DaprClient
+DaprClient -> DaprStore : gRPC DeleteState (metadata)
+activate DaprStore
+DaprStore --> DaprClient : OK
+deactivate DaprStore
+DaprClient --> DaprSession : success
+deactivate DaprClient
+
+DaprSession -> Lock : release()
+deactivate Lock
+
+DaprSession --> Runner : return None
+deactivate DaprSession
+
+== Lifecycle: close() ==
+
+Runner -> DaprSession : close() / __aexit__()
+activate DaprSession
+alt _owns_client is True\n(created via from_address())
+    DaprSession -> DaprClient : close()
+    activate DaprClient
+    DaprClient --> DaprSession : closed
+    deactivate DaprClient
+else injected client (external ownership)
+    DaprSession -> DaprSession : skip close (client not owned)
+end
+DaprSession --> Runner : done
+deactivate DaprSession
+
+@enduml

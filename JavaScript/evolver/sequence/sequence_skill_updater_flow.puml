@@ -1,0 +1,168 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #F1F3F5
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #DEE2E6
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #6C757D
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #C8B400
+}
+
+title Skill Update Poll and Apply Flow
+
+participant "Hub\n(Remote)" as Hub #D8EAF8
+participant "SyncEngine" as SE
+participant "EvoMapProxy" as EMP
+participant "SkillUpdater" as SU
+participant "MailboxStore" as MS
+participant "FileSystem\n(fs / path)" as FS
+participant "Logger" as LOG
+
+== Inbound Poll Loop ==
+
+loop SyncEngine inbound tick
+    SE -> Hub : fetch inbound messages
+    activate SE
+    Hub --> SE : result { received: N }
+    deactivate SE
+
+    alt result.received > 0
+        SE -> EMP : onInboundReceived() [callback]
+        activate EMP
+
+        note right of EMP
+          EvoMapProxy registered this callback
+          in the SyncEngine constructor
+        end note
+
+        EMP -> SU : pollAndApply()
+        activate SU
+
+        == Poll Mailbox for Skill Updates ==
+
+        SU -> MS : poll({ type: 'skill_update' })
+        activate MS
+        MS --> SU : updates: Message[]
+        deactivate MS
+
+        loop for each msg in updates
+            SU -> SU : processSkillUpdate(msg)
+            activate SU
+
+            == Guard Checks ==
+
+            alt !this.skillPath
+                SU -> LOG : warn('[skill-updater] skillPath not set')
+                SU --> SU : return false
+            else !payload.content && !payload.skill_content
+                SU -> LOG : warn('[skill-updater] no content in message')
+                SU --> SU : return false
+            else valid message
+                == Prepare Directory ==
+
+                SU -> FS : path.dirname(skillPath)
+                activate FS
+                FS --> SU : dir
+                SU -> FS : fs.existsSync(dir)
+                FS --> SU : exists: boolean
+                deactivate FS
+
+                opt directory does not exist
+                    SU -> FS : fs.mkdirSync(dir, { recursive: true })
+                end
+
+                == Backup Existing Skill File ==
+
+                SU -> FS : fs.existsSync(skillPath)
+                activate FS
+                FS --> SU : fileExists: boolean
+                deactivate FS
+
+                opt skill file already exists
+                    SU -> FS : fs.copyFileSync(skillPath, skillPath + '.bak')
+                end
+
+                == Write New Skill Content ==
+
+                SU -> FS : fs.writeFileSync(skillPath, content, 'utf8')
+                activate FS
+
+                alt write succeeds
+                    FS --> SU : (void)
+                    deactivate FS
+
+                    == Persist State ==
+
+                    SU -> MS : setState('last_skill_update', ISOTimestamp)
+                    SU -> MS : setState('skill_version', payload.version || 'unknown')
+
+                    SU -> LOG : log('[skill-updater] Updated skill.md\n(version: <version>)')
+
+                    SU --> SU : return true
+
+                    == Acknowledge Message ==
+
+                    SU -> MS : ack(msg.id)
+                    note right of MS
+                      Message only acked on success.
+                      Failed writes leave msg in
+                      queue for retry next cycle.
+                    end note
+
+                else write error
+                    SU -> LOG : error('[skill-updater] Failed to write\nskill file', err)
+                    SU --> SU : return false
+                    note right of SU
+                      No ack — message stays in
+                      queue and will be retried
+                      on the next inbound cycle
+                    end note
+                end
+            end
+
+            deactivate SU
+        end
+
+        SU --> EMP : applied (count of successful updates)
+        deactivate SU
+
+        EMP --> SE : (callback returns)
+        deactivate EMP
+
+    else result.received == 0
+        note over SE : No inbound messages — skip callback
+    end
+
+    alt onInboundReceived callback throws
+        SE -> LOG : warn('[sync-engine] onInboundReceived error — swallowed')
+        note right of SE : Non-fatal; poll loop continues
+    end
+end
+
+@enduml

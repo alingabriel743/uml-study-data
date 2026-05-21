@@ -1,0 +1,95 @@
+{
+  "scope": "healthcheck_and_export_registration",
+  "title": "Healthcheck and Export Registrant Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Client",
+    "Express Router (healthcheck.js)",
+    "ServerHealthService",
+    "KVCache (Redis)",
+    "ServiceManager",
+    "ExportRegistrantService",
+    "Service (concepts.Service / TService trait)",
+    "FeatureBase / AdvancedBase"
+  ],
+
+  "flow_A_healthcheck": [
+    "Client → Router: GET /healthcheck",
+    "Router: check req.app.get('isDraining') → if true, return 503 {ok:false, failed:['draining']}",
+    "Router: isHostedDomainRequest(req) → if true, call next() (skip health response)",
+    "Router → send_health_status(req, res, {fail_with_http_error: false})",
+    "send_health_status → get_status(req) → req.services.get('server-health') → svc_serverHealth.get_status()",
+    "ServerHealthService.get_status(): if isDraining_ → return {ok:false, failed:['draining']}",
+    "ServerHealthService.get_status() → kv.get(ServerHealthRedisCacheKeys.status) [cache check, 5s TTL]",
+    "cache hit → JSON.parse(cached) → return status",
+    "cache miss → #getStatusFailures() → this.failures_.map(v=>v.name) + #getStaleHealthRunnerFailure()",
+    "#getStaleHealthRunnerFailure(): compare now vs last_check_cycle_completed_at_ against stale threshold (3×5s=15s)",
+    "ServerHealthService: build status = {ok: failures.length===0, failed?: [...failures]}",
+    "ServerHealthService → kv.set(cacheKey, JSON.stringify(status), {EX:5})",
+    "send_health_status: httpStatus = (fail_with_http_error && !status.ok) ? 500 : 200",
+    "Router → Client: res.status(httpStatus).json(status)"
+  ],
+
+  "flow_B_export_registrant_startup": [
+    "Caller → ServiceManager.register('export-registrant', ExportRegistrantService, options)",
+    "ServiceManager.register: await setTimeout(0) [yield to event loop]",
+    "ServiceManager: factory.create({parameters, context}) → Service.create() → new ExportRegistrantService()",
+    "Service.create(): ins.as(TService).construct(parameters) [calls _construct if present]",
+    "ServiceManager: push entry {name, instance, status:'registering'} to services_l_ / services_m_",
+    "ServiceManager → maybe_init_(name)",
+    "maybe_init_: entry.instance.as(TService).get_depends() → reads constructor.DEPENDS ?? [] (ExportRegistrantService has none declared)",
+    "maybe_init_: get_waiting_for_(depends) → [] (no deps)",
+    "maybe_init_ → init_service_(name)",
+    "init_service_: entry.status = 'initializing'",
+    "init_service_: service_impl = entry.instance.as(TService); await service_impl.init()",
+    "TService.init() → calls Service._init() → ExportRegistrantService._init()",
+    "ExportRegistrantService._init(): console.log(Spinner) [force Spinner import; prevents tree-shaking]",
+    "init_service_: entry.status = 'running'; entry.statusStartTS = new Date()",
+    "init_service_: check waiting_[name] → notify any dependent services via maybe_init_",
+    "init_service_: iterate init_listeners_ and call each listener [unblocks aget() callers]"
+  ],
+
+  "flow_C_periodic_health_checks": [
+    "ServerHealthService._init(): #initDefaultChecks() + #initServiceCheck()",
+    "#initDefaultChecks: add_check('database-liveness', fn) if database service present",
+    "on 'ready.webserver' event → #registerWebChecks(): add_check('web-server-listening'), optionally add_check('socketio-initialized')",
+    "#initServiceCheck: asyncSafeSetInterval every 5s",
+    "each interval: for each {name, fn} in checks_: Promise.race([fn(), timeout(4s)])",
+    "on check failure: svc_alarm.create('health-check-failure', ...) if not already failing; run on_fail_ handlers",
+    "after all checks: update this.failures_, this.stats_"
+  ],
+
+  "key_relationships": [
+    "FeatureBase → AdvancedBase (extends, adds TraitsFeature/.as() method)",
+    "AdvancedBase → Service (putility concepts.Service, implements TService trait)",
+    "Service (putility) → Service (gui definitions.js, adds .services binding in init())",
+    "Service (gui definitions.js) → ExportRegistrantService (extends, overrides _init)",
+    "AdvancedBase → ServiceManager (extends, uses TService trait to call init/get_depends on service instances)",
+    "BaseService → ServerHealthService (backend, extends, adds health check loop)",
+    "ServiceManager depends_on TService trait (symbol) to orchestrate init lifecycle",
+    "ServerHealthService depends_on KVCache (kv singleton) for caching get_status() responses",
+    "healthcheck.js depends_on req.services (ServiceLocator) to get 'server-health' service"
+  ],
+
+  "important_notes": [
+    "TService is a Symbol-keyed trait; .as(TService) is resolved via AdvancedBase's TraitsFeature",
+    "TService.get_depends() reads constructor.DEPENDS (static) merged with instance get_depends() override",
+    "ServiceManager uses 'pending' status + waiting_ map to handle dependency ordering at startup",
+    "ExportRegistrantService._init() sole purpose: force import of Spinner (bundle optimizer side-effect guard)",
+    "healthcheck router skips health check for hosted-domain requests (static/app hosting domains) and calls next()",
+    "get_status() cache TTL=5s; stale health loop threshold=15s (3×CHECK_INTERVAL_MS); draining check bypasses cache",
+    "send_health_status can return HTTP 500 only when query param ?return-http-error is set or fail_with_http_error=true",
+    "ServerHealthService.__on_ready.webserver hook registers web/socketio checks after web server starts"
+  ],
+
+  "source_files_analyzed": [
+    "src/backend/src/routers/healthcheck.js",
+    "src/gui/src/services/ExportRegistrantService.js",
+    "src/putility/src/system/ServiceManager.js",
+    "src/backend/src/modules/core/ServerHealthService/ServerHealthService.js",
+    "src/gui/src/definitions.js",
+    "src/putility/src/concepts/Service.js (via Grep)",
+    "src/putility/src/AdvancedBase.js (via Grep)",
+    "src/putility/src/bases/FeatureBase.js (via Grep)"
+  ]
+}

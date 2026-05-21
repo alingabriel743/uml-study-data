@@ -1,0 +1,134 @@
+{
+  "scope": "ddl_schema_change_handling",
+  "title": "DDL Schema Change Handling",
+  "diagram_type": "use_case",
+  "description": "System processes MySQL DDL events (CREATE/ALTER/DROP VIEW) to update in-memory schema metadata via ANTLR-based parser listeners",
+
+  "actors": [
+    "MySqlAntlrDdlParser (primary system actor — drives all parsing)",
+    "MySqlDdlParserPerf (JMH benchmark actor — triggers parser.parse())",
+    "DdlParserListener (event subscriber — receives TableCreatedEvent / TableAlteredEvent / TableDroppedEvent)"
+  ],
+
+  "system_boundary": "MySqlAntlrDdlParserListener (orchestrator, delegates to specialised sub-listeners)",
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Create View",
+      "trigger": "MySqlParser fires enterCreateView / exitCreateView",
+      "actor": "MySqlAntlrDdlParser",
+      "handler": "CreateViewParserListener",
+      "steps": [
+        "enterCreateView: check skipViews(); call databaseTables().editOrCreateTable(tableId)",
+        "If uidList present: add named Column stubs to TableEditor",
+        "Add ViewSelectedColumnsParserListener to shared listeners list",
+        "exitCreateView: tableEditor.addColumns(selectColumnsListener.getSelectedColumns())",
+        "Set default charset if missing via parser.charsetForTable(tableId)",
+        "databaseTables().overwriteTable(tableEditor.create())",
+        "Remove ViewSelectedColumnsParserListener from listeners",
+        "Signal: parser.signalCreateView(tableId, ctx) → fires TableCreatedEvent(isView=true)"
+      ]
+    },
+    {
+      "id": "UC2",
+      "name": "Alter View",
+      "trigger": "MySqlParser fires enterAlterView / exitAlterView",
+      "actor": "MySqlAntlrDdlParser",
+      "handler": "AlterViewParserListener",
+      "steps": [
+        "enterAlterView: check skipViews(); call databaseTables().editTable(tableId)",
+        "Throw ParsingException if view does not exist",
+        "Remove all existing columns from TableEditor",
+        "If uidList present: add new Column stubs",
+        "Add ViewSelectedColumnsParserListener to listeners",
+        "exitAlterView: tableEditor.addColumns(selectColumnsListener.getSelectedColumns())",
+        "Set default charset if missing via parser.currentDatabaseCharset()",
+        "databaseTables().overwriteTable(tableEditor.create())",
+        "Remove ViewSelectedColumnsParserListener from listeners",
+        "Signal: parser.signalAlterView(tableId, null, ctx) → fires TableAlteredEvent(isView=true)"
+      ]
+    },
+    {
+      "id": "UC3",
+      "name": "Drop View",
+      "trigger": "MySqlParser fires enterDropView",
+      "actor": "MySqlAntlrDdlParser",
+      "handler": "DropViewParserListener",
+      "steps": [
+        "enterDropView: check skipViews()",
+        "For each fullId in ctx: parse TableId",
+        "databaseTables().removeTable(tableId)",
+        "Signal: parser.signalDropView(tableId, ctx) → fires TableDroppedEvent(isView=true)"
+      ]
+    },
+    {
+      "id": "UC4",
+      "name": "Resolve View Column Definitions",
+      "trigger": "Registered by Create/AlterViewParserListener during enterCreate/AlterView",
+      "actor": "CreateViewParserListener / AlterViewParserListener",
+      "handler": "ViewSelectedColumnsParserListener",
+      "steps": [
+        "exitAtomTableItem: resolve source table by tableId or alias → populate tableByAlias map",
+        "exitSubqueryTableItem: handle subselect alias → add virtual table to tableByAlias",
+        "exitQuerySpecification / exitQuerySpecificationNointo: invoke parseSelectElements()",
+        "parseSelectElements: SELECT * → copy all columns from all aliased tables",
+        "parseSelectElements: SELECT col → match column by name/alias from tableByAlias",
+        "Return List<Column> via getSelectedColumns() to parent listener"
+      ]
+    },
+    {
+      "id": "UC5",
+      "name": "Benchmark DDL Parsing Performance",
+      "trigger": "JMH @Benchmark invocation",
+      "actor": "MySqlDdlParserPerf",
+      "handler": "MySqlAntlrDdlParser",
+      "steps": [
+        "ParserState.doSetup(): instantiate MySqlAntlrDdlParser + Tables; build CREATE TABLE DDL with parameterised columnCount",
+        "antlr(): antlrParser.parse(ddl, tables) — measured in AverageTime / MICROSECONDS",
+        "Parameterised column counts: 1, 2, 5, 10, 20, 50"
+      ]
+    }
+  ],
+
+  "key_relationships": [
+    "MySqlAntlrDdlParserListener aggregates all sub-listeners in a CopyOnWriteArrayList<ParseTreeListener>",
+    "MySqlAntlrDdlParserListener extends MySqlParserBaseListener implements AntlrDdlParserListener",
+    "CreateViewParserListener extends MySqlParserBaseListener; depends_on MySqlAntlrDdlParser, ViewSelectedColumnsParserListener",
+    "AlterViewParserListener extends MySqlParserBaseListener; depends_on MySqlAntlrDdlParser, ViewSelectedColumnsParserListener",
+    "DropViewParserListener extends MySqlParserBaseListener; depends_on MySqlAntlrDdlParser",
+    "ViewSelectedColumnsParserListener extends MySqlParserBaseListener; depends_on TableEditor, MySqlAntlrDdlParser",
+    "ViewSelectedColumnsParserListener is dynamically added/removed from listeners list per CREATE/ALTER VIEW parse",
+    "MySqlAntlrDdlParser owns databaseTables() (Tables registry) and emits DdlParserListener events",
+    "DdlParserListener interface: EventType enum includes CREATE_TABLE/ALTER_TABLE/DROP_TABLE (views flagged via isView=true on TableEvent)",
+    "MySqlDdlParserPerf depends_on MySqlAntlrDdlParser via AbstractDdlParser reference"
+  ],
+
+  "include_extends": [
+    "UC1 <<include>> UC4 (CreateView includes ResolveViewColumnDefinitions)",
+    "UC2 <<include>> UC4 (AlterView includes ResolveViewColumnDefinitions)",
+    "UC1 <<extend>> signal TableCreatedEvent to DdlParserListener",
+    "UC2 <<extend>> signal TableAlteredEvent to DdlParserListener",
+    "UC3 <<extend>> signal TableDroppedEvent to DdlParserListener"
+  ],
+
+  "important_notes": [
+    "skipViews() guard: all three view listeners short-circuit if parser is configured to skip views",
+    "ViewSelectedColumnsParserListener is dynamically scoped — added on enter, removed on exit",
+    "AlterView throws ParsingException if target view does not exist in databaseTables()",
+    "DropView supports multi-view syntax: iterates ctx.fullId() list",
+    "DdlParserListener.EventType does NOT have a CREATE_VIEW/ALTER_VIEW/DROP_VIEW variant; views reuse TABLE event types with isView=true flag",
+    "MySqlAntlrDdlParserListener skips BEGIN...END routine bodies via skipNodes flag",
+    "MySqlDdlParserPerf is a JMH microbenchmark, not production code; exercises CREATE TABLE (not views)"
+  ],
+
+  "source_files_analyzed": [
+    "debezium-connector-mysql/src/main/java/io/debezium/connector/mysql/antlr/listener/CreateViewParserListener.java",
+    "debezium-connector-mysql/src/main/java/io/debezium/connector/mysql/antlr/listener/AlterViewParserListener.java",
+    "debezium-connector-mysql/src/main/java/io/debezium/connector/mysql/antlr/listener/DropViewParserListener.java",
+    "debezium-connector-mysql/src/main/java/io/debezium/connector/mysql/antlr/listener/ViewSelectedColumnsParserListener.java",
+    "debezium-connector-mysql/src/main/java/io/debezium/connector/mysql/antlr/listener/MySqlAntlrDdlParserListener.java",
+    "debezium-connector-common/src/main/java/io/debezium/relational/ddl/DdlParserListener.java",
+    "debezium-microbenchmark/src/main/java/io/debezium/performance/connector/mysql/parser/MySqlDdlParserPerf.java"
+  ]
+}

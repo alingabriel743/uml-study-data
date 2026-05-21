@@ -1,0 +1,136 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam ArrowColor #495057
+skinparam NoteBackgroundColor #E7F3FF
+skinparam NoteBorderColor #6EA8FE
+
+title Agent Middleware Pipeline
+
+|Caller / Promptable Trait|
+start
+:Agent::prompt(string $prompt) called;
+:withModelFailover(callback, provider, model);
+:Ai::textProviderFor(agent) → resolve Provider;
+
+|Provider / GeneratesText Trait|
+:Provider::prompt(AgentPrompt);
+:Generate invocationId = Str::uuid7();
+:Create Illuminate Pipeline\n send(AgentPrompt);
+
+note right
+  pipeline()->send(AgentPrompt)
+  ->through(gatherMiddlewareFor(agent))
+  ->then(terminal callback)
+end note
+
+:gatherMiddlewareFor(agent);
+
+|Middleware Assembly|
+fork
+  if (Ai::hasFakeGatewayFor(agent::class)?) then (yes)
+    :Prepend fake-recording closure\n[Ai::recordPrompt($prompt)];
+  else (no)
+  endif
+fork again
+  if (Agent uses RemembersConversations\nAND hasConversationParticipant()?) then (yes)
+    :Append RememberConversation middleware;
+  else (no)
+  endif
+fork again
+  if (Agent implements HasMiddleware?) then (yes)
+    :Append agent->middleware() array;
+  else (no)
+  endif
+end fork
+
+note right
+  Stack order:
+  1. fake-recording? (prepend)
+  2. RememberConversation? (append)
+  3. Custom agent middleware (append)
+end note
+
+|Middleware Execution|
+:Pipeline invokes each middleware\nhandle(AgentPrompt $prompt, Closure $next);
+
+repeat
+  :Execute next middleware in chain;
+  if (Middleware short-circuits?\n(skips $next($prompt))) then (yes)
+    :Return new AgentResponse(...)\ndirectly from middleware;
+    note right
+      processedPrompt = null
+      Bypasses terminal callback
+      and AI gateway entirely
+    end note
+    |Provider / GeneratesText Trait|
+    :Pipeline returns\nshort-circuit AgentResponse;
+    note right
+      AgentPrompted event still
+      fires with originalPrompt
+    end note
+  else (no — passthrough)
+    :middleware calls $next($prompt)\nand returns result;
+  endif
+repeat while (More middleware?) is (yes)
+-> no;
+
+|Provider / GeneratesText Trait|
+:Pipeline terminal callback reached;
+:processedPrompt = received AgentPrompt;
+:dispatch PromptingAgent event;
+:Collect messages:\nagent->messages() + new UserMessage(prompt, attachments);
+:listenForToolInvocations(invocationId, agent);
+
+|AI Gateway|
+if (Agent implements HasStructuredOutput?) then (yes)
+  :Get schema = agent->schema();
+  :textGateway()->generateText(\n  provider, model, instructions,\n  messages, tools, schema, options, timeout\n);
+  :Return StructuredAgentResponse;
+else (no)
+  :textGateway()->generateText(\n  provider, model, instructions,\n  messages, tools, null, options, timeout\n);
+  :Return AgentResponse\n(messages, toolCalls, toolResults, steps);
+endif
+
+|Provider / GeneratesText Trait|
+:dispatch AgentPrompted(\n  invocationId,\n  processedPrompt ?? originalPrompt,\n  response\n);
+
+note right
+  AgentPrompted ALWAYS fires —
+  even after a short-circuit path.
+  Uses originalPrompt if processedPrompt is null.
+end note
+
+|Caller / Promptable Trait|
+:Return AgentResponse to caller;
+stop
+
+@enduml

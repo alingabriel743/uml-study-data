@@ -1,0 +1,202 @@
+{
+  "scope": "world_generation",
+  "title": "World & Map Generation",
+  "diagram_type": "activity",
+  "key_participants": [
+    "World", "Maps", "TileGen", "WorldParams", "ColorMapper",
+    "GenerateFilter", "FilterContext", "GenerateInput",
+    "MapIO", "SaveIO", "PlanetGenerator", "Tiles"
+  ],
+
+  "main_entry_points": [
+    "World.loadMap(Map, Rules)",
+    "World.loadSector(Sector, WorldParams)",
+    "World.loadGenerator(int width, int height, Cons<Tiles> generator)"
+  ],
+
+  "activity_flows": {
+    "loadMap_flow": [
+      "START: World.loadMap(Map map, Rules checkRules)",
+      "DECISION: customMapLoaders.containsKey(map)?",
+      "  YES → run customMapLoaders.get(map).run() → END",
+      "  NO  → create FilterContext(map)",
+      "       → SaveIO.load(map.file, filterContext)",
+      "           → FilterContext.end() is called",
+      "               → applyFilters(): iterate map.filters() Seq<GenerateFilter>",
+      "                   → for each filter: filter.randomize() [seed = random]",
+      "                   → input.begin(width, height, tileProvider)",
+      "                   → filter.apply(tiles, input)",
+      "                       DECISION: filter.isBuffered()?",
+      "                         YES → read all tiles into long[] buffer, then write back",
+      "                         NO  → per-tile: in.set(tile) → filter.apply(in) → tile.setFloor/setBlock/setOverlay",
+      "               → super.end() → World.endMapLoad()",
+      "       → state.map = map",
+      "DECISION: headless?",
+      "  NO → validate cores/pvp/attack rules → set invalidMap flag",
+      "  YES → check active teams have cores → throw MapException if none",
+      "DECISION: invalidMap?",
+      "  YES → Core.app.post(() → state.set(State.menu))",
+      "END"
+    ],
+
+    "loadSector_flow": [
+      "START: World.loadSector(Sector sector, WorldParams params)",
+      "→ setSectorRules(sector, params.saveInfo)",
+      "    → state.map = new Map(sector name tags)",
+      "    → state.rules.sector = sector",
+      "    → sector.planet.generator.addWeather(sector, rules)",
+      "    → iterate tiles: collect resources (items/liquids/walls) into content set",
+      "    → sector.planet.applyRules(rules)",
+      "    → sector.info.resources = content.toSeq()",
+      "    → [if saveInfo] sector.saveInfo()",
+      "→ size = sector.getSize()",
+      "→ loadGenerator(size, size, tiles → {",
+      "    DECISION: sector.preset != null?",
+      "      YES → sector.preset.generator.generate(tiles, params)",
+      "           → sector.preset.rules.get(state.rules)",
+      "      NO  → DECISION: sector.planet.generator != null?",
+      "              YES → sector.planet.generator.generate(tiles, sector, params)",
+      "              NO  → throw RuntimeException (no generator defined)",
+      "    → state.rules.sector = sector",
+      "  })",
+      "DECISION: params.saveInfo && rules.waves?",
+      "  YES → sector.info.waves = state.rules.waves",
+      "DECISION: sector.preset == null && planet.generator != null?",
+      "  YES → sector.planet.generator.postGenerate(tiles)",
+      "→ setSectorRules(sector, params.saveInfo) [reset/re-apply rules]",
+      "DECISION: defaultTeam.core() != null?",
+      "  YES → sector.info.spawnPosition = core.pos()",
+      "END"
+    ],
+
+    "loadGenerator_helper": [
+      "START: World.loadGenerator(width, height, Cons<Tiles> generator)",
+      "→ beginMapLoad()",
+      "    → generating = true",
+      "    → Events.fire(WorldLoadBeginEvent)",
+      "→ resize(width, height)",
+      "    → clearBuildings() [remove all existing builds]",
+      "    → tiles = new Tiles(width, height) [if size changed]",
+      "→ generator.get(tiles)  [execute the generation lambda]",
+      "→ endMapLoad()",
+      "    → Events.fire(WorldLoadEndEvent)",
+      "    → for each tile: remove LegacyBlocks; tile.build.updateProximity()",
+      "    → addDarkness(tiles)  [compute shadow/darkness data per tile]",
+      "    → Groups.resize(bounds)",
+      "    → generating = false",
+      "    → Events.fire(WorldLoadEvent)",
+      "END"
+    ],
+
+    "maps_load_flow": [
+      "START: Maps.load()",
+      "→ load default maps: for each name in defaultMapNames → loadMap(internalFile, custom=false)",
+      "→ walk customMapDirectory: for each .msav file → loadMap(file, custom=true)",
+      "→ platform.getWorkshopContent: for each file → loadMap(file, custom=false); map.workshop=true",
+      "→ mods.listFiles('maps'): for each file → loadMap(file, custom=false); map.mod=mod",
+      "Each loadMap → MapIO.createMap(file, custom) → maps.add(map); maps.sort()",
+      "END"
+    ],
+
+    "saveMap_flow": [
+      "START: Maps.saveMap(ObjectMap<String,String> baseTags)",
+      "→ resolve file: find existing map by name or findFile(name)",
+      "→ dispose old texture if replacing",
+      "→ MapIO.writeMap(file, map)  [serialise world tiles to file]",
+      "→ [if !headless]",
+      "    → iterate all tiles: count CoreBlocks (teams), spawn overlays",
+      "    → MapIO.generatePreview(world.tiles) → returns Pixmap",
+      "        → ColorMapper.get(color) for each pixel → maps RGBA → Block",
+      "    → new Texture(pix)",
+      "    → async: map.previewFile().writePng(pix); writeCache(map)",
+      "        writeCache → write spawns count + team IDs",
+      "→ maps.add(map); maps.sort()",
+      "END"
+    ],
+
+    "addDarkness_flow": [
+      "START: World.addDarkness(Tiles tiles)",
+      "→ init dark[] byte array; mark darkened tiles with darkRadius",
+      "→ iterate darkRadius times (flood-fill erosion):",
+      "    → for each tile: check d4 neighbors; if neighbor < current, reduce value",
+      "    → System.arraycopy writeBuffer → dark",
+      "→ write final dark values back to tile.data",
+      "→ mark fully-surrounded tiles as darkRadius+1 (fully dark)",
+      "END"
+    ]
+  },
+
+  "key_classes": {
+    "World": {
+      "fields": ["Tiles tiles", "boolean generating", "boolean invalidMap", "ObjectMap<Map,Runnable> customMapLoaders"],
+      "key_methods": ["loadMap", "loadSector", "loadGenerator", "beginMapLoad", "endMapLoad", "resize", "addDarkness", "filterContext", "makeSectorContext"]
+    },
+    "World.FilterContext": {
+      "extends": "World.Context",
+      "fields": ["Map map"],
+      "key_methods": ["end() → applyFilters() + super.end()", "applyFilters() → iterates GenerateFilter list"]
+    },
+    "World.Context": {
+      "implements": "WorldContext",
+      "key_methods": ["tile(index)", "resize(w,h)", "create(x,y,floorID,overlayID,wallID)", "begin()", "end()"]
+    },
+    "Maps": {
+      "fields": ["Seq<Map> maps", "ShuffleMode shuffleMode", "ObjectSet<Map> previewList"],
+      "key_methods": ["load()", "reload()", "saveMap()", "importMap()", "loadPreviews()", "readFilters()", "addDefaultOres()", "getNextMap()"],
+      "filter_types": ["NoiseFilter","ScatterFilter","TerrainFilter","DistortFilter","RiverNoiseFilter","OreFilter","OreMedianFilter","MedianFilter","BlendFilter","MirrorFilter","ClearFilter","CoreSpawnFilter","EnemySpawnFilter","SpawnPathFilter","LogicFilter"]
+    },
+    "TileGen": {
+      "fields": ["Block floor (default: Blocks.stone)", "Block block (default: Blocks.air)", "Block overlay (default: Blocks.air)"],
+      "key_methods": ["reset()"]
+    },
+    "WorldParams": {
+      "fields": ["int seedOffset", "boolean saveInfo (default true)", "int corePositionOverride"]
+    },
+    "ColorMapper": {
+      "fields": ["IntMap<Block> color2block (static)"],
+      "key_methods": ["load() — populate RGBA→Block map from content.blocks()", "get(int color) → Block"]
+    },
+    "GenerateFilter": {
+      "abstract": true,
+      "fields": ["int seed"],
+      "key_methods": ["apply(Tiles, GenerateInput)", "apply(GenerateInput) [per-tile override]", "randomize()", "isBuffered()", "isPost()", "options()"],
+      "inner_class_GenerateInput": ["int x,y,width,height", "Block floor,block,overlay", "long packedData", "set(Tile)", "begin(width,height,TileProvider)"]
+    }
+  },
+
+  "key_relationships": [
+    "World owns FilterContext (inner class extends Context)",
+    "FilterContext depends_on GenerateFilter (iterates map.filters())",
+    "FilterContext depends_on GenerateInput (per-filter state)",
+    "World depends_on Maps (uses Map objects)",
+    "World depends_on SaveIO (file loading)",
+    "World depends_on MapIO (map I/O, preview generation)",
+    "Maps depends_on MapIO (createMap, generatePreview, writeMap)",
+    "MapIO depends_on ColorMapper (pixel→Block mapping in generatePreview)",
+    "World.loadSector depends_on PlanetGenerator (generate, postGenerate, addWeather)",
+    "World.loadSector depends_on WorldParams (seed, saveInfo, corePositionOverride)",
+    "GenerateFilter uses TileGen-style data via GenerateInput (floor/block/overlay)"
+  ],
+
+  "important_notes": [
+    "Two distinct generation paths: loadMap (file-based, filter post-pass) vs loadSector (procedural generator, no filter post-pass)",
+    "FilterContext.end() runs all GenerateFilters BEFORE calling endMapLoad()",
+    "GenerateFilter.isBuffered() controls whether a read/write buffer is used (needed for non-1:1 spatial transforms like MedianFilter)",
+    "loadGenerator() is the core helper wrapping beginMapLoad/resize/generator/endMapLoad",
+    "TileGen is a lightweight mutable struct used by generators to stage floor/block/overlay before committing to a Tile",
+    "ColorMapper.load() must be called after content is loaded; maps RGBA pixel colors to Block types for preview generation",
+    "endMapLoad fires 3 events: WorldLoadEndEvent (before cleanup), then WorldLoadEvent (after), with updateProximity+addDarkness+Groups.resize in between",
+    "WorldParams.saveInfo=false is used for editor-only generation (no sector data saved)",
+    "Maps.allFilterTypes lists all 15 available filter constructors, used by editor UI",
+    "ShuffleMode enum implements MapProvider for server map rotation logic"
+  ],
+
+  "source_files_analyzed": [
+    "core/src/mindustry/core/World.java",
+    "core/src/mindustry/maps/Maps.java",
+    "core/src/mindustry/world/TileGen.java",
+    "core/src/mindustry/world/WorldParams.java",
+    "core/src/mindustry/world/ColorMapper.java",
+    "core/src/mindustry/maps/filters/GenerateFilter.java"
+  ]
+}

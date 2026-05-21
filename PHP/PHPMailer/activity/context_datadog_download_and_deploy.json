@@ -1,0 +1,104 @@
+{
+  "scope": "datadog_download_and_deploy",
+  "title": "Datadog Extension Download & Deployment",
+  "diagram_type": "activity",
+  "source_files_analyzed": ["datadog-setup.php"],
+
+  "entry_point": "install($options)",
+
+  "activity_flow": [
+    "START: install($options) called",
+    "STEP: get_architecture() — detect host arch (x86_64, aarch64, x86); on Linux: runs `uname -m`; on Windows: reads PROCESSOR_ARCHITECTURE env",
+    "STEP: is_alpine() — reads /etc/os-release; checks for 'alpine' string; returns false on Windows or unreadable file",
+    "DECISION: is_alpine()?",
+    "  YES → platform = '{arch}-linux-musl'",
+    "  NO  → platform = '{arch}-linux-gnu' (or '{arch}-windows' on Windows)",
+    "STEP: check_library_prerequisite_or_exit('libcurl')",
+    "STEP: check_library_prerequisite_or_exit('libgcc_s')",
+    "DECISION: is_alpine()?",
+    "  Alpine → find libs via `find /usr/local/lib /usr/lib -name '*{lib}*.so*'`",
+    "  GNU/Linux → find libs via `ldconfig -p | grep {lib}`",
+    "DECISION: OPT_ENABLE_PROFILING && !is_alpine()?",
+    "  YES → check_library_prerequisite_or_exit('libdl.so', 'libpthread', 'librt')",
+    "STEP: require_binaries_or_exit($options) — resolve PHP binary paths",
+    "LOOP: foreach selectedBinary",
+    "  STEP: check_php_ext_prerequisite_or_exit($binary, 'json')",
+    "  STEP: ini_values($binary) — extract PHP properties (version, scan dir, extension dir, thread safety, debug flag)",
+    "  DECISION: INI_SCANDIR missing && INI_MAIN missing?",
+    "    Windows → default to dirname($binary)/php.ini",
+    "    Linux   → print_error_and_exit()",
+    "  STEP: build extensionSuffix ('-debug', '-zts', or combination)",
+    "  STEP: accumulate downloadVersions keyed by '{PHP_API}{extensionSuffix}'",
+    "END LOOP",
+    "DECISION: count(downloadVersions) == 1?",
+    "  YES → tar_gz_suffix = '-{PHP_API}{extensionSuffix}' (version-specific archive)",
+    "  NO  → tar_gz_suffix = '' (full/universal archive)",
+    "STEP: prepare tmp dir: sys_get_temp_dir()/dd-install",
+    "STEP: register_shutdown_function to clean up tmpDir",
+    "DECISION: OPT_FILE option provided?",
+    "  YES → use provided file path directly (skip download)",
+    "  NO  → enter download loop",
+    "DOWNLOAD LOOP:",
+    "  STEP: build URL = RELEASE_URL_PREFIX + 'dd-library-php-{RELEASE_VERSION}-{platform}{tar_gz_suffix}.tar.gz'",
+    "  STEP: call download($url, $tmpDirTarGz, retry=$tar_gz_suffix != '')",
+    "  DECISION: download() returned true?",
+    "    YES → break loop",
+    "    NO  → tar_gz_suffix = '' (fallback to full archive) and retry",
+    "EXTRACT:",
+    "DECISION: OS / available tool?",
+    "  Linux/Mac with tar → `tar -xf {archive} -C {tmpDir}`",
+    "  Windows with tar → same command",
+    "  Windows without tar, with 7z → `7z x ... | 7z x -ttar`",
+    "  Neither → die with error",
+    "STEP: install extracted files to PHP extension dir",
+    "END"
+  ],
+
+  "download_function_detail": {
+    "signature": "download(string $url, string $destination, bool $retry = false): bool|void",
+    "strategy_waterfall": [
+      "1. ext-curl available → curl_init, CURLOPT_PROGRESSFUNCTION=on_download_progress, curl_exec(); on 404 + retry=true → return false",
+      "2. curl CLI available (non-Windows) → system('curl -f -L --output {dest} {url}')",
+      "3. allow_url_fopen=1 && ext-openssl → file_get_contents(); handles Location header redirect; increases memory_limit to 2G",
+      "4. Windows → PowerShell Invoke-WebRequest via proc_open",
+      "5. All failed + retry=false → exit(1) with prerequisite message"
+    ],
+    "retry_semantics": "When retry=true, returns false on failure (404 or error) instead of exit; allows caller to fall back to full archive"
+  },
+
+  "on_download_progress_detail": {
+    "signature": "on_download_progress($curlHandle, $download_size, $downloaded): int",
+    "behavior": "CURLOPT_PROGRESSFUNCTION callback; uses global $progress_counter; prints a dot every 5% progress (max 20 dots); returns 0 always; skips if download_size==0 or ratio==1"
+  },
+
+  "get_architecture_detail": {
+    "linux": "execute_or_exit('uname -m') → e.g. 'x86_64', 'aarch64'",
+    "windows_32bit": "returns 'x86' (unsupported, installer will fail)",
+    "windows_64bit": "reads PROCESSOR_ARCHITECTURE env (AMD64 → 'x86_64'); fallback 'x86_64'"
+  },
+
+  "is_alpine_detail": {
+    "windows": "always false",
+    "linux": "reads /etc/os-release; stripos for 'alpine'; returns false if file unreadable"
+  },
+
+  "filter_ssi_ini_paths_detail": {
+    "signature": "filter_ssi_ini_paths(array $iniFilePaths): array",
+    "behavior": "Filters out any INI path containing 'datadog-apm-library-php' (SSI-managed paths); called by find_all_ini_files() after scanning scan directory and main ini"
+  },
+
+  "key_constants": {
+    "RELEASE_URL_PREFIX": "https://github.com/DataDog/dd-trace-php/releases/download/{RELEASE_VERSION}/ (overridable via DD_TEST_INSTALLER_REPO env)",
+    "RELEASE_VERSION": "@release_version@ (substituted at build time)",
+    "archive_naming": "dd-library-php-{RELEASE_VERSION}-{arch}-linux-{musl|gnu}[-{PHP_API}[-debug][-zts]].tar.gz"
+  },
+
+  "branching_logic": [
+    "Alpine vs GNU: affects platform string ('musl' vs 'gnu'), library search method (find vs ldconfig), skips profiling lib checks on Alpine",
+    "Windows vs Linux: affects architecture detection, library checks (skipped on Windows), download method order",
+    "Version-specific archive: if all selected PHP binaries share the same API version, downloads a smaller version-specific tarball; retries with full archive on 404",
+    "OPT_FILE bypass: skips entire download pipeline when --file is passed (internal/testing use)"
+  ],
+
+  "important_notes": "Platform string format: '{arch}-linux-musl' (Alpine) or '{arch}-linux-gnu' (non-Alpine) or '{arch}-windows'. Archive name embeds version, platform, and optionally PHP API version + debug/ZTS suffixes. Download has 4-level fallback chain. Progress tracking only available via ext-curl path."
+}

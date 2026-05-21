@@ -1,0 +1,111 @@
+{
+  "scope": "async_process_execution",
+  "title": "Async Process Execution & Job Queue",
+  "diagram_type": "activity",
+  "key_participants": ["Loop", "ProcessExecutor", "React\\Promise\\Promise", "Symfony\\Process"],
+
+  "state_machine": {
+    "statuses": {
+      "STATUS_QUEUED": 1,
+      "STATUS_STARTED": 2,
+      "STATUS_COMPLETED": 3,
+      "STATUS_FAILED": 4,
+      "STATUS_ABORTED": 5
+    },
+    "transitions": [
+      "QUEUED → STARTED (via startJob when runningJobs < maxJobs)",
+      "STARTED → COMPLETED (process successful, resolve called)",
+      "STARTED → FAILED (process failed or exception thrown)",
+      "QUEUED → ABORTED (canceler called on queued job)",
+      "STARTED → ABORTED (canceler called: sends SIGINT + stop(1))"
+    ]
+  },
+
+  "activity_flow": [
+    "START: Caller creates Loop(httpDownloader, processExecutor)",
+    "Loop.__construct → processExecutor.enableAsync() [sets allowAsync=true]",
+    "Caller invokes processExecutor.executeAsync(command, cwd)",
+    "  [GUARD] allowAsync === false → throw LogicException (abort)",
+    "  Create job: {id=idGen++, status=QUEUED, command, cwd}",
+    "  Create React\\Promise with resolver (captures resolve/reject into job) and canceler (sends SIGINT, stops process)",
+    "  Attach .then() handlers: on-resolve → mark COMPLETED/FAILED → markJobDone(); on-reject → mark FAILED → markJobDone()",
+    "  Append job to $jobs[id]",
+    "  [DECISION] runningJobs < maxJobs?",
+    "    YES → call startJob(id)",
+    "    NO  → job stays QUEUED, return promise",
+    "--- startJob(id) ---",
+    "  [GUARD] job.status !== QUEUED → return (no-op)",
+    "  Set job.status = STARTED; runningJobs++",
+    "  Log async command (if IOInterface debug)",
+    "  Create Symfony\\Process from command+cwd (fromShellCommandline or new Process)",
+    "  [DECISION] Process construction threw? → call job.reject(e), return",
+    "  Store process in job['process']",
+    "  Call process.start() (non-blocking)",
+    "  [DECISION] process.start() threw? → call job.reject(e), return",
+    "=== EVENT LOOP (Loop::wait or ProcessExecutor::wait) ===",
+    "Loop.wait(promises[], progress?)",
+    "  React\\Promise\\all(promises) — aggregates all into one promise",
+    "  Register waitIndex → currentPromises[waitIndex] = promises",
+    "  [OPTIONAL] Init ProgressBar with total active jobs",
+    "  BEGIN LOOP:",
+    "    activeJobs = httpDownloader.countActiveJobs() + processExecutor.countActiveJobs()",
+    "    [OPTIONAL] Update ProgressBar every 0.1s",
+    "    [DECISION] activeJobs === 0 → BREAK loop",
+    "    (implicit busy-wait, no sleep in Loop.wait)",
+    "  END LOOP",
+    "  [OPTIONAL] ProgressBar.finish()",
+    "  unset currentPromises[waitIndex]",
+    "  [DECISION] uncaught exception? → throw it",
+    "--- ProcessExecutor.countActiveJobs(index?) [the 'tick' function] ---",
+    "  FOR EACH job in $jobs:",
+    "    IF status === STARTED AND process.isRunning() === false:",
+    "      call job['resolve'](process) → triggers .then() → marks COMPLETED/FAILED → markJobDone() [runningJobs--]",
+    "    IF status === STARTED: process.checkTimeout()",
+    "    IF runningJobs < maxJobs AND status === QUEUED: startJob(job.id)",
+    "  IF index provided: return jobs[index].status < COMPLETED ? 1 : 0",
+    "  ELSE: count jobs with status < COMPLETED; unset completed jobs from $jobs; return count",
+    "--- ProcessExecutor.wait(index?) [standalone wait] ---",
+    "  LOOP: if countActiveJobs(index) === 0 → return; else usleep(1000)",
+    "--- abortJobs (Loop) ---",
+    "  FOR EACH promise in currentPromises: promise.cancel()",
+    "  Canceler: if QUEUED → ABORTED; if STARTED → ABORTED + SIGINT + stop(1) + throw RuntimeException",
+    "END"
+  ],
+
+  "key_methods": [
+    "ProcessExecutor::enableAsync(): void — sets allowAsync=true; must be called before executeAsync",
+    "ProcessExecutor::executeAsync(command, cwd?): PromiseInterface<Process> — queues job, starts if capacity allows",
+    "ProcessExecutor::startJob(int $id): void — transitions QUEUED→STARTED, creates & starts Symfony\\Process",
+    "ProcessExecutor::countActiveJobs(?int $index): int — tick: resolves finished jobs, starts queued jobs, returns active count",
+    "ProcessExecutor::markJobDone(): void — decrements runningJobs",
+    "ProcessExecutor::wait(?int $index): void — busy-waits via usleep(1000) until countActiveJobs==0",
+    "ProcessExecutor::setMaxJobs(int): void — override limit",
+    "ProcessExecutor::resetMaxJobs(): void — reads COMPOSER_MAX_PARALLEL_PROCESSES env (1-50), default 10",
+    "Loop::__construct(HttpDownloader, ?ProcessExecutor) — enables async on both",
+    "Loop::wait(PromiseInterface[], ?ProgressBar): void — master event loop draining all active jobs",
+    "Loop::abortJobs(): void — cancels all tracked promises"
+  ],
+
+  "concurrency_rules": [
+    "maxJobs default=10, configurable via COMPOSER_MAX_PARALLEL_PROCESSES env (clamped 1-50)",
+    "runningJobs counter incremented in startJob, decremented in markJobDone",
+    "New jobs are auto-started in executeAsync IF capacity exists at enqueue time",
+    "Capacity re-checked on every countActiveJobs() tick for queued jobs",
+    "Promise canceler sends SIGINT + stop(1) to started processes"
+  ],
+
+  "dependencies": [
+    "ProcessExecutor depends_on Symfony\\Component\\Process\\Process (process lifecycle)",
+    "ProcessExecutor depends_on React\\Promise\\Promise (async resolution)",
+    "Loop depends_on ProcessExecutor (delegates tick via countActiveJobs)",
+    "Loop depends_on HttpDownloader (parallel HTTP + process jobs in same loop)",
+    "Loop depends_on React\\Promise\\all (aggregate promise resolution)"
+  ],
+
+  "important_notes": "executeAsync() throws LogicException if enableAsync() was never called — caller MUST use the ProcessExecutor bound to a Loop instance. The event loop has NO sleep in Loop::wait (pure busy-wait), but ProcessExecutor::wait uses usleep(1000). countActiveJobs() is the single 'tick' method that both resolves finished processes AND starts queued ones — it must be called repeatedly. Completed/failed jobs are GC'd (unset) from $jobs[] inside countActiveJobs() only when no specific index is queried.",
+
+  "source_files_analyzed": [
+    "src/Composer/Util/ProcessExecutor.php",
+    "src/Composer/Util/Loop.php"
+  ]
+}

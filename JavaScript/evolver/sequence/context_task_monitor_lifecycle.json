@@ -1,0 +1,108 @@
+{
+  "scope": "task_monitor_lifecycle",
+  "title": "Task Monitor Subscription and Metrics",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Worker/Client (HTTP)",
+    "RouteHandler (routes.js:buildRoutes)",
+    "TaskMonitor (task/monitor.js)",
+    "MailboxStore",
+    "LifecycleManager"
+  ],
+  "interaction_flow": [
+    "--- Initialization ---",
+    "ProxyServer → TaskMonitor: new TaskMonitor({ store, logger })",
+    "TaskMonitor → MailboxStore: getState('task_monitor_stats')",
+    "MailboxStore → TaskMonitor: raw JSON string | null",
+    "TaskMonitor → TaskMonitor: _restoreStats() — hydrates _stats from persisted state",
+
+    "--- Subscribe ---",
+    "Worker → RouteHandler: POST /task/subscribe { capability_filter: [...] }",
+    "RouteHandler → TaskMonitor: subscribe(filters)",
+    "TaskMonitor → MailboxStore: setState('task_subscription', JSON{enabled:true, filters, subscribed_at})",
+    "TaskMonitor → MailboxStore: send({ type:'task_subscribe', payload:{ capability_filter:filters } })",
+    "MailboxStore → TaskMonitor: result { message_id }",
+    "RouteHandler → Worker: { body: result }",
+
+    "--- Unsubscribe ---",
+    "Worker → RouteHandler: POST /task/unsubscribe",
+    "RouteHandler → TaskMonitor: unsubscribe()",
+    "TaskMonitor → MailboxStore: setState('task_subscription', JSON{enabled:false, unsubscribed_at})",
+    "TaskMonitor → MailboxStore: send({ type:'task_unsubscribe', payload:{} })",
+    "MailboxStore → TaskMonitor: result { message_id }",
+    "RouteHandler → Worker: { body: result }",
+
+    "--- Record Claim ---",
+    "Worker → RouteHandler: POST /task/claim { task_id }",
+    "RouteHandler → MailboxStore: send({ type:'task_claim', payload:body, priority:'high' })",
+    "RouteHandler → TaskMonitor: recordClaim(body.task_id)",
+    "TaskMonitor → TaskMonitor: _stats.tasks_claimed++; last_claim_at = Date.now()",
+    "TaskMonitor → MailboxStore: setState('task_monitor_stats', JSON.stringify(getMetrics()))",
+    "RouteHandler → Worker: { body: result }",
+
+    "--- Record Complete ---",
+    "Worker → RouteHandler: POST /task/complete { task_id, started_at }",
+    "RouteHandler → MailboxStore: send({ type:'task_complete', payload:body })",
+    "RouteHandler → TaskMonitor: recordComplete(body.task_id, body.started_at)",
+    "TaskMonitor → TaskMonitor: _stats.tasks_completed++; compute avg_completion_ms (rolling 100)",
+    "TaskMonitor → MailboxStore: setState('task_monitor_stats', JSON.stringify(getMetrics()))",
+    "RouteHandler → Worker: { body: result }",
+
+    "--- Record Failed ---",
+    "Worker → RouteHandler: (implicitly via task fail path)",
+    "RouteHandler → TaskMonitor: recordFailed(taskId)",
+    "TaskMonitor → TaskMonitor: _stats.tasks_failed++",
+    "TaskMonitor → MailboxStore: setState('task_monitor_stats', JSON.stringify(getMetrics()))",
+
+    "--- Get Metrics ---",
+    "Worker → RouteHandler: GET /task/metrics",
+    "RouteHandler → TaskMonitor: getMetrics()",
+    "TaskMonitor → MailboxStore: countPending({ direction:'inbound' })",
+    "MailboxStore → TaskMonitor: pendingCount (number)",
+    "TaskMonitor → RouteHandler: { subscribed, tasks_received, tasks_claimed, tasks_completed, tasks_failed, tasks_pending, last_claim_at, last_complete_at, avg_completion_ms }",
+    "RouteHandler → Worker: { body: metrics }",
+
+    "--- Heartbeat Meta (LifecycleManager) ---",
+    "LifecycleManager → TaskMonitor: getHeartbeatMeta()",
+    "TaskMonitor → MailboxStore: countPending({ direction:'inbound' })",
+    "TaskMonitor → LifecycleManager: { task_subscription:bool, task_metrics:{ pending, claimed, completed, failed, avg_completion_ms } }"
+  ],
+  "key_relationships": [
+    "ProxyServer creates TaskMonitor (composition)",
+    "TaskMonitor depends_on MailboxStore (state persistence, message sending, pending count)",
+    "RouteHandler depends_on TaskMonitor (passed as argument to buildRoutes)",
+    "LifecycleManager depends_on TaskMonitor (via getTaskMeta callback in ProxyServer)",
+    "TaskMonitor guards subscribed getter via store.getState('task_subscription')"
+  ],
+  "method_signatures": [
+    "constructor({ store, logger }): void",
+    "get subscribed(): boolean — reads store.getState('task_subscription')",
+    "subscribe(filters: string[]): { message_id }",
+    "unsubscribe(): { message_id }",
+    "recordClaim(taskId: string): void",
+    "recordComplete(taskId: string, startedAt: number|null): void",
+    "recordFailed(taskId: string): void",
+    "recordTaskReceived(count: number = 1): void — in-memory only, no persistence",
+    "getMetrics(): MetricsObject",
+    "getHeartbeatMeta(): HeartbeatMetaObject",
+    "_restoreStats(): void — called in constructor"
+  ],
+  "state_keys": [
+    "'task_subscription' — JSON: { enabled, filters?, subscribed_at? | unsubscribed_at }",
+    "'task_monitor_stats' — JSON: tasks_claimed, tasks_completed, tasks_failed, tasks_received, last_claim_at, last_complete_at, avg_completion_ms"
+  ],
+  "important_notes": [
+    "avg_completion_ms uses rolling window of last 100 completion durations",
+    "tasks_received is in-memory only (not persisted to store)",
+    "All record* methods persist stats to store via setState after updating in-memory _stats",
+    "subscribe/unsubscribe both persist to store AND emit a message to the hub via store.send()",
+    "RouteHandler falls back to direct store.send() if taskMonitor is null (optional dependency)",
+    "getHeartbeatMeta() is wired into LifecycleManager heartbeat via a callback lambda in ProxyServer"
+  ],
+  "source_files_analyzed": [
+    "src/proxy/task/monitor.js",
+    "src/proxy/server/routes.js",
+    "src/proxy/index.js",
+    "test/taskMonitor.test.js"
+  ]
+}

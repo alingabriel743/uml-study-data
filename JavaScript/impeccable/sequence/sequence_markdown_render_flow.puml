@@ -1,0 +1,174 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceParticipant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequenceArrowColor #495057
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceGroupBorderColor #6C757D
+skinparam sequenceGroupBackgroundColor #E9ECEF
+skinparam noteBackgroundColor #FFF9C4
+skinparam noteBorderColor #F9A825
+
+title Markdown Render Flow
+
+participant "build-sub-pages.js\n(generateSubPages)" as Caller
+participant "sub-pages-data.js\n(buildSubPageData)" as SubPageData
+participant "utils.js\n(replacePlaceholders)" as ReplacePH
+participant "utils.js\n(prefixSkillReferences)" as PrefixRefs
+participant "build-sub-pages.js\n(renderSkillDetail)" as RenderSkill
+participant "render-markdown.js\n(renderMarkdown)" as RenderMD
+participant "render-markdown.js\n(createRenderer)" as CreateRenderer
+participant "render-markdown.js\n(resolveHref)" as ResolveHref
+participant "marked\n(external)" as Marked
+
+== Data Initialisation ==
+
+Caller -> SubPageData: buildSubPageData(rootDir)
+activate SubPageData
+
+SubPageData -> SubPageData: readSourceFiles(rootDir)
+note right: returns { skills: rawSkills }
+
+SubPageData -> SubPageData: knownSkillIds = new Set(skills.map(s => s.id))
+note right: Set<string> of all valid skill IDs
+
+SubPageData --> Caller: { skills, knownSkillIds, skillsByCategory, rules, tutorials }
+deactivate SubPageData
+
+== Skill Body Pre-processing (per skill / provider) ==
+
+Caller -> ReplacePH: replacePlaceholders(skill.body, provider, commandNames, allSkillNames)
+activate ReplacePH
+
+ReplacePH -> ReplacePH: lookup PROVIDER_PLACEHOLDERS[provider]
+note right: resolves {{model}}, {{config_file}},\n{{ask_instruction}}, {{command_prefix}},\n{{available_commands}}
+
+ReplacePH -> ReplacePH: result.replace(regex, cmdPrefix)
+note right: swaps '/' invocations\nwhen provider cmdPrefix ≠ '/'
+
+ReplacePH --> Caller: substituted skillBody string
+deactivate ReplacePH
+
+Caller -> PrefixRefs: prefixSkillReferences(skillBody, prefix, allSkillNames, commandPrefix)
+activate PrefixRefs
+
+PrefixRefs -> PrefixRefs: sort skillNames desc by length
+note right: avoids partial-match collisions\n(e.g. "foo-bar" before "foo")
+
+PrefixRefs -> PrefixRefs: rewrite /skillname and 'the X skill' references
+PrefixRefs --> Caller: prefixed content string
+deactivate PrefixRefs
+
+== Skill Detail HTML Rendering ==
+
+Caller -> RenderSkill: renderSkillDetail(skill, knownSkillIds)
+activate RenderSkill
+
+RenderSkill -> RenderMD: renderMarkdown(skill.body, { knownSkillIds, currentSkillId: skill.id })
+activate RenderMD
+
+RenderMD -> CreateRenderer: createRenderer({ knownSkillIds, currentSkillId })
+activate CreateRenderer
+
+CreateRenderer -> CreateRenderer: renderer.heading({ tokens, depth })\noverride: slugify / extract {#custom-id} → <hN id='...'>
+CreateRenderer -> CreateRenderer: renderer.link({ href, title, tokens })\noverride: call resolveHref → emit <a> with rel/target
+CreateRenderer -> CreateRenderer: renderer.code({ text, lang })\noverride: glass-terminal code-block-wrap HTML
+
+CreateRenderer --> RenderMD: configured marked.Renderer
+deactivate CreateRenderer
+
+RenderMD -> Marked: marked.parse(markdown, { renderer, gfm: true, breaks: false })
+activate Marked
+
+loop per heading token
+    Marked -> CreateRenderer: renderer.heading(tokens, depth)
+    activate CreateRenderer
+    CreateRenderer --> Marked: <hN id="slug">...</hN>
+    deactivate CreateRenderer
+end
+
+loop per link token
+    Marked -> CreateRenderer: renderer.link(href, title, tokens)
+    activate CreateRenderer
+    CreateRenderer -> ResolveHref: resolveHref(href, { knownSkillIds, currentSkillId })
+    activate ResolveHref
+
+    alt https?:// or mailto:
+        ResolveHref --> CreateRenderer: { href, external: true }
+    else starts with '#'
+        ResolveHref --> CreateRenderer: { href (unchanged), external: false }
+    else reference/foo.md + currentSkillId
+        ResolveHref --> CreateRenderer: { href: '#reference-foo', external: false }
+    else /skill-id in knownSkillIds
+        ResolveHref --> CreateRenderer: { href: '/skills/skill-id', external: false }
+    else bare skill-id in knownSkillIds
+        ResolveHref --> CreateRenderer: { href: '/skills/skill-id', external: false }
+    else unknown
+        ResolveHref --> CreateRenderer: { href (pass-through), external: false }
+    end
+
+    deactivate ResolveHref
+    CreateRenderer --> Marked: <a href="..." [rel="noopener" target="_blank"]>
+    deactivate CreateRenderer
+end
+
+Marked --> RenderMD: HTML string
+deactivate Marked
+
+RenderMD --> RenderSkill: HTML string (main body)
+deactivate RenderMD
+
+opt skill.editorial.body exists
+    RenderSkill -> RenderMD: renderMarkdown(skill.editorial.body, { knownSkillIds, currentSkillId })
+    activate RenderMD
+    RenderMD --> RenderSkill: HTML string (editorial)
+    deactivate RenderMD
+end
+
+loop each reference file in skill.references
+    RenderSkill -> RenderMD: renderMarkdown(ref.content, { knownSkillIds, currentSkillId })
+    activate RenderMD
+    RenderMD --> RenderSkill: HTML string (reference)
+    deactivate RenderMD
+
+    RenderSkill -> RenderSkill: slugify(ref.name)
+    note right: generates stable anchor id\nfor <details> block
+end
+
+RenderSkill --> Caller: assembled HTML body string
+deactivate RenderSkill
+
+== Tutorial HTML Rendering ==
+
+Caller -> RenderSkill: renderTutorialDetail(tutorial, knownSkillIds)
+activate RenderSkill
+
+note over RenderSkill: No currentSkillId —\ncross-page skill links only
+
+RenderSkill -> RenderMD: renderMarkdown(tutorial.body, { knownSkillIds })
+activate RenderMD
+RenderMD --> RenderSkill: HTML string
+deactivate RenderMD
+
+RenderSkill --> Caller: tutorial HTML body string
+deactivate RenderSkill
+
+@enduml

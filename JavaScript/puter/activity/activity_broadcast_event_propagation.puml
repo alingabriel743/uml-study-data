@@ -1,0 +1,205 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #DEE2E6
+    DiamondBorderColor #495057
+}
+skinparam swimlaneBorderColor #6C757D
+skinparam swimlaneTitleFontColor #212529
+skinparam swimlaneTitleFontStyle bold
+
+title Broadcast and Event Propagation
+
+' ═══════════════════════════════════════════════════════════════
+' FLOW 1 — Outbound Broadcast (outer.* event → Redis + Webhooks)
+' ═══════════════════════════════════════════════════════════════
+
+|EventService|
+start
+:Emit outer.* event\n(internal application event);
+
+|BroadcastService|
+:outBroadcastEventHandler triggered;
+if (meta.from_outside == true?) then (yes)
+  :Drop event\n(loop prevention guard);
+  stop
+else (no)
+endif
+:Normalize event metadata\n(#normalizeMeta → safeMeta);
+:Build outboundEvent\n{ key, data, meta: safeMeta };
+
+fork
+  ' ── Redis publish branch (async, fire-and-forget) ──
+  :publishWebhookEventsToRedis() [async];
+  if (event key matches\nouter.pub or outer.pub.*?) then (yes)
+    :Build JSON payload\n{ sourceId: redisSourceId, events };
+    |Redis PubSub|
+    :Publish to channel\n'broadcast.webhook.events';
+  else (no)
+    :Skip — key not outer.pub;
+  endif
+fork again
+  ' ── Webhook batch / flush branch ──
+  |BroadcastService|
+  :enqueueOutboundEvent(outboundEvent);
+  :Compute dedupKey =\nJSON.stringify(event);
+  :Store in outboundEventsByDedupKey Map\n(overwrite on duplicate key);
+  :scheduleOutboundFlush();
+  if (flush timer\nalready set?) then (yes)
+    :No-op — timer pending;
+  else (no)
+    :Set timer → outboundFlushMs\n(default 5 000 ms);
+    :— Timer fires: flushOutboundEvents() —;
+    if (outboundIsFlushing == true\nOR no queued events?) then (yes)
+      :Skip flush;
+    else (no)
+      :Lock outboundIsFlushing = true;
+      :Drain outboundEventsByDedupKey\n(collect all events, clear map);
+      :For each peer in webhookPeers\n→ sendWebhookToPeer(peer, events);
+      :Resolve peer webhook_url\nand webhook secret;
+      :Increment per-peer nonce counter\n(#outgoingNonceByPeer);
+      :Capture Unix timestamp\n= floor(Date.now() / 1000);
+      :rawBody = JSON.stringify({ events });
+      :Compute HMAC-SHA256 over\n"{timestamp}.{nonce}.{rawBody}";
+      :Build signed HTTP headers:\nX-Broadcast-Peer-Id\nX-Broadcast-Timestamp\nX-Broadcast-Nonce\nX-Broadcast-Signature\nContent-Type / Content-Length;
+      |Webhook Peers (HTTP)|
+      :POST batched events\nto peer webhook URL\n(axios, 15 s timeout);
+      if (HTTP response 2xx?) then (no)
+        :Throw error → caller\nlogs as warning (non-fatal);
+      else (yes)
+        :Delivery confirmed;
+      endif
+      |BroadcastService|
+      :Unlock outboundIsFlushing = false;
+      if (new events queued\nduring flush?) then (yes)
+        :Re-schedule flush;
+      else (no)
+      endif
+    endif
+  endif
+end fork
+
+stop
+
+' ═══════════════════════════════════════════════════════════════
+' FLOW 2 — Incoming Webhook Request (POST /broadcast/webhook)
+' ═══════════════════════════════════════════════════════════════
+
+|BroadcastService|
+start
+:POST /broadcast/webhook\nrequest received;
+if (rawBody missing or\nbody not valid object?) then (yes)
+  :400 Bad Request;
+  stop
+else (no)
+endif
+if (normalizeIncomingPayload\nfails?) then (yes)
+  :400 Bad Request;
+  stop
+else (no)
+endif
+if (X-Broadcast-Peer-Id\nheader missing?) then (yes)
+  :403 Forbidden;
+  stop
+else (no)
+endif
+if (peerId == localPeerId?) then (yes)
+  :200 OK — ignored: self-peer;
+  stop
+else (no)
+endif
+if (peer unknown or\nno webhook_secret configured?) then (yes)
+  :403 Forbidden;
+  stop
+else (no)
+endif
+if (X-Broadcast-Timestamp missing\nor not numeric?) then (yes)
+  :400 Bad Request;
+  stop
+else (no)
+endif
+if (timestamp outside replay\nwindow [now − window … now + 60s]?) then (yes)
+  :400 Bad Request;
+  stop
+else (no)
+endif
+if (nonce replay detected\n(#isNonceReplayForPeer)?) then (yes)
+  :403 Forbidden — anti-replay;
+  stop
+else (no)
+endif
+if (HMAC-SHA256 signature\nmismatch?) then (yes)
+  :403 Forbidden;
+  stop
+else (no)
+endif
+:Update incomingLastNonceByPeer\nfor this peer;
+
+fork
+  :publishWebhookEventsToRedis\n(fan-out to other cluster nodes);
+  |Redis PubSub|
+  :Publish to 'broadcast.webhook.events';
+fork again
+  |BroadcastService|
+  :emitIncomingEventsSequentially\n(from_outside = true);
+  |EventService|
+  :Receive events\n(from_outside flag set —\nprevents outbound re-broadcast);
+end fork
+
+|BroadcastService|
+:Return 200 { ok: true };
+stop
+
+' ═══════════════════════════════════════════════════════════════
+' FLOW 3 — Inbound Redis PubSub Message (cluster fan-in)
+' ═══════════════════════════════════════════════════════════════
+
+|Redis PubSub|
+start
+:Message arrives on\n'broadcast.webhook.events' channel;
+
+|BroadcastService|
+:handleRedisPubSubMessage;
+if (channel ≠ redisPubSubChannel?) then (yes)
+  :Ignore — wrong channel;
+  stop
+else (no)
+endif
+if (JSON parse error?) then (yes)
+  :Log warning and discard;
+  stop
+else (no)
+endif
+if (payload.sourceId ==\nown redisSourceId?) then (yes)
+  :Ignore — own published message;
+  stop
+else (no)
+endif
+:normalizeIncomingPayload;
+:Filter: outer.pub events only;
+:emitIncomingEventsSequentially\n(from_outside = true);
+
+|EventService|
+:Receive events\n(from_outside flag set);
+stop
+
+@enduml

@@ -1,0 +1,166 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    DividerBackgroundColor #DEE2E6
+    GroupBackgroundColor #E9ECEF
+}
+
+title Distributed Training Setup
+
+actor "Train Script" as script
+
+participant "Trainer" as trainer
+participant "distributed\n(module)" as distmod
+participant "pynvml /\nDevice / CUDA" as hw
+participant "torch.distributed\n(NCCL)" as torchdist
+participant "parallel_state\n(Megatron)" as mpstate
+participant "DistributedDataParallel\n(custom DDP)" as ddp
+participant "Model" as model
+participant "ddp_sync_grad\n(ctx mgr)" as syncctx
+participant "GradScaler" as scaler
+
+== Trainer Initialization ==
+
+script -> trainer : __init__(config)
+activate trainer
+
+trainer -> distmod : init()
+activate distmod
+
+distmod -> hw : pynvml.nvmlInit()
+distmod -> hw : Device(local_rank)  [set GPU affinity]
+distmod -> hw : torch.cuda.set_device(local_rank)
+distmod -> torchdist : init_process_group(\n  backend='nccl',\n  init_method='env://',\n  timeout=timedelta)
+activate torchdist
+torchdist --> distmod : process group created
+deactivate torchdist
+distmod -> hw : cudaDeviceSetLimit()\n[L2 fetch granularity]
+distmod --> trainer : device handle
+deactivate distmod
+
+trainer -> mpstate : initialize_model_parallel(\n  pipeline_model_parallel_size,\n  tensor_model_parallel_size,\n  context_parallel_size)
+activate mpstate
+mpstate --> trainer : model parallel state ready
+deactivate mpstate
+
+trainer -> mpstate : sequence_parallel =\n  config.model_parallel.sequence_parallel
+note right of mpstate
+  Sets CUDA_DEVICE_MAX_CONNECTIONS=1
+  when sequence_parallel=True
+end note
+
+deactivate trainer
+
+== Training Start — Model Setup ==
+
+script -> trainer : train(model, dataloader_train, dataloader_val)
+activate trainer
+
+trainer -> model : to('cuda')
+activate model
+model --> trainer : model on GPU
+deactivate model
+
+alt DDP mode (config.trainer.ddp)
+
+    trainer -> distmod : parallel_model_wrapper(config_ddp, model)
+    activate distmod
+
+    distmod -> mpstate : get_data_parallel_group(\n  with_context_parallel=True)
+    activate mpstate
+    mpstate --> distmod : ddp_process_group
+    deactivate mpstate
+
+    distmod -> ddp : DistributedDataParallel(\n  model,\n  device_ids=[local_rank],\n  find_unused_parameters,\n  static_graph,\n  broadcast_buffers,\n  process_group=ddp_group)
+    activate ddp
+    ddp --> distmod : model_ddp (wrapped)
+    deactivate ddp
+
+    distmod --> trainer : model_ddp
+    deactivate distmod
+
+else FSDP mode
+
+    note over trainer
+      model_ddp = model (bare, no wrapper)
+      on_after_backward / on_before_zero_grad
+      called directly on model
+    end note
+
+end
+
+== Training Step — Gradient Synchronization ==
+
+trainer -> syncctx : ddp_sync_grad(model_ddp,\n  enabled = (grad_accum_iter == grad_accum_steps - 1))
+activate syncctx
+
+syncctx -> model : require_backward_grad_sync = enabled
+note right of syncctx
+  Disables AllReduce on intermediate
+  gradient accumulation steps.
+  Incompatible with static_graph=True.
+end note
+
+trainer -> ddp : training_step(data, iteration)
+activate ddp
+
+ddp -> model : module.forward =\n  wrapped_training_step
+note right of ddp
+  Forward-redirect: patches module.forward
+  so DDP's implicit self() call routes
+  into module.training_step()
+end note
+
+ddp -> ddp : self(*args, **kwargs)\n[triggers DDP hooks]
+note right of ddp
+  DDP forward hooks prepare
+  AllReduce buckets (NCCL)
+end note
+
+ddp -> model : module.training_step(*args)
+activate model
+model --> ddp : loss
+deactivate model
+
+ddp --> trainer : loss
+deactivate ddp
+
+trainer -> scaler : scale(loss).backward()
+activate scaler
+scaler --> trainer : gradients computed
+deactivate scaler
+note right of trainer
+  AllReduce via NCCL fires here
+  (if require_backward_grad_sync=True)
+end note
+
+syncctx -> model : [finally] require_backward_grad_sync\n= old_value   [restore state]
+deactivate syncctx
+
+deactivate trainer
+
+@enduml

@@ -1,0 +1,383 @@
+{
+  "scope": "lyra1_diffusion_networks",
+  "title": "Lyra-1 Diffusion Neural Networks (DIT)",
+  "diagram_type": "class",
+  "source_files_analyzed": [
+    "cosmos_predict1/diffusion/networks/general_dit.py",
+    "cosmos_predict1/diffusion/networks/general_dit_multiview.py",
+    "cosmos_predict1/diffusion/networks/general_dit_video_conditioned.py",
+    "cosmos_predict1/diffusion/networks/general_dit_video_conditioned_multiview.py",
+    "cosmos_predict1/diffusion/module/attention.py",
+    "cosmos_predict1/diffusion/module/blocks.py",
+    "cosmos_predict1/diffusion/module/pretrained_vae.py"
+  ],
+
+  "classes": [
+    {
+      "name": "GeneralDIT",
+      "module": "networks/general_dit.py",
+      "inherits": ["nn.Module"],
+      "key_attributes": [
+        "max_img_h: int", "max_img_w: int", "max_frames: int",
+        "in_channels: int", "out_channels: int",
+        "patch_spatial: tuple", "patch_temporal: int",
+        "model_channels: int", "num_blocks: int", "num_heads: int",
+        "block_x_format: str",
+        "use_adaln_lora: bool", "adaln_lora_dim: int",
+        "pos_emb_cls: str", "cp_group: ProcessGroup"
+      ],
+      "composed_of": [
+        "x_embedder: PatchEmbed",
+        "pos_embedder: VideoRopePosition3DEmb",
+        "extra_pos_embedder: LearnablePosEmbAxis",
+        "t_embedder: Sequential(Timesteps, TimestepEmbedding)",
+        "blocks: ModuleDict[str, GeneralDITTransformerBlock]",
+        "final_layer: FinalLayer",
+        "affline_norm: RMSNorm | Identity"
+      ],
+      "methods": [
+        "forward(x, timesteps, crossattn_emb, crossattn_mask, fps, image_size, padding_mask, scalar_feature, data_type, latent_condition, latent_condition_sigma, condition_video_augment_sigma, **kwargs) -> Tensor",
+        "forward_before_blocks(x, timesteps, crossattn_emb, ...) -> dict",
+        "prepare_embedded_sequence(x_B_C_T_H_W, fps, padding_mask, latent_condition, latent_condition_sigma) -> Tuple[Tensor, Tensor, Tensor]",
+        "decoder_head(x_B_T_H_W_D, emb_B_D, crossattn_emb, origin_shape, crossattn_mask, adaln_lora_B_3D) -> Tensor",
+        "build_patch_embed()",
+        "build_pos_embed()",
+        "build_decode_head()",
+        "initialize_weights()",
+        "enable_context_parallel(cp_group: ProcessGroup)",
+        "disable_context_parallel()",
+        "is_context_parallel_enabled: bool [property]"
+      ]
+    },
+    {
+      "name": "MultiviewGeneralDIT",
+      "module": "networks/general_dit_multiview.py",
+      "inherits": ["GeneralDIT"],
+      "extra_attributes": [
+        "n_views: int", "view_condition_dim: int",
+        "concat_view_embedding: bool", "traj_condition_dim: int",
+        "concat_traj_embedding: bool", "add_repeat_frame_embedding: bool"
+      ],
+      "extra_composed": [
+        "view_embeddings: nn.Embedding(n_views, view_condition_dim)",
+        "traj_embeddings: nn.Linear(192, traj_condition_dim) [optional]",
+        "repeat_frame_embedding: nn.Linear(1, view_condition_dim) [optional]",
+        "pos_embedder: MultiviewVideoRopePosition3DEmb [overrides]",
+        "extra_pos_embedder: MultiviewSinCosPosEmbAxis [overrides]"
+      ],
+      "overridden_methods": [
+        "build_patch_embed() -- adds view/traj channels to in_channels",
+        "build_pos_embed() -- uses MultiviewVideoRopePosition3DEmb + MultiviewSinCosPosEmbAxis",
+        "prepare_embedded_sequence(..., trajectory, frame_repeat) -- concatenates view embeddings",
+        "forward_before_blocks(...) -- passes trajectory/frame_repeat kwargs"
+      ]
+    },
+    {
+      "name": "VideoExtendGeneralDIT",
+      "module": "networks/general_dit_video_conditioned.py",
+      "inherits": ["GeneralDIT"],
+      "extra_attributes": [
+        "add_augment_sigma_embedding: bool"
+      ],
+      "extra_composed": [
+        "augment_sigma_embedder: Sequential(Timesteps, TimestepEmbedding) [optional]"
+      ],
+      "overridden_methods": [
+        "forward(..., video_cond_bool, condition_video_indicator, condition_video_input_mask, condition_video_augment_sigma, condition_video_pose) -- prepends condition_video_input_mask to x channels",
+        "forward_before_blocks(..., condition_video_augment_sigma) -- adds augment sigma to affine emb",
+        "build_additional_timestamp_embedder() -- creates augment_sigma_embedder if needed",
+        "initialize_weights() -- initializes augment_sigma_embedder weights"
+      ],
+      "notes": "in_channels defaults to 16+1 (extra mask channel). Augment sigma added to affline_emb_B_D when enabled."
+    },
+    {
+      "name": "MultiviewVideoExtendGeneralDIT",
+      "module": "networks/general_dit_video_conditioned_multiview.py",
+      "inherits": ["MultiviewGeneralDIT"],
+      "extra_attributes": [],
+      "overridden_methods": [
+        "forward(..., condition_video_input_mask, condition_video_pose, ...) -- handles multiview CP split, prepends mask to x, delegates to super().forward()"
+      ],
+      "notes": "in_channels auto-incremented by 1 for mask. Handles CP group rearranging with V (views) dimension."
+    },
+
+    {
+      "name": "BaseAttentionOp",
+      "module": "module/attention.py",
+      "inherits": ["nn.Module"],
+      "notes": "Empty base class for custom attention backends (e.g., TE DotProductAttention)."
+    },
+    {
+      "name": "Attention",
+      "module": "module/attention.py",
+      "inherits": ["nn.Module"],
+      "key_attributes": [
+        "to_q: Sequential(Linear, norm)", "to_k: Sequential(Linear, norm)", "to_v: Sequential(Linear, norm)",
+        "to_out: Sequential(Linear, Dropout)",
+        "attn_op: DotProductAttention | sdpa",
+        "backend: str ('transformer_engine' | 'torch')",
+        "heads: int", "dim_head: int",
+        "qkv_norm_mode: str", "qkv_format: str",
+        "is_selfattn: bool"
+      ],
+      "methods": [
+        "cal_qkv(x, context, mask, rope_emb) -> Tuple[q, k, v]",
+        "cal_attn(q, k, v, mask) -> Tensor",
+        "forward(x, context, mask, rope_emb) -> Tensor"
+      ],
+      "notes": "Supports self-attn (context=None) and cross-attn. RoPE applied to q,k in self-attn only. QKV norm is per-head."
+    },
+    {
+      "name": "FeedForward",
+      "module": "module/attention.py",
+      "inherits": ["nn.Module"],
+      "key_attributes": [
+        "layer1: Linear(d_model, d_ff)",
+        "layer2: Linear(d_ff, d_model)",
+        "dropout: Dropout",
+        "activation: callable",
+        "is_gated: bool",
+        "linear_gate: Linear [optional, when is_gated=True]"
+      ],
+      "methods": ["forward(x) -> Tensor"]
+    },
+    {
+      "name": "GPT2FeedForward",
+      "module": "module/attention.py",
+      "inherits": ["FeedForward"],
+      "notes": "Uses GELU activation. Wraps activation+layer2 in gradient checkpoint for memory efficiency.",
+      "methods": ["forward(x) -> Tensor"]
+    },
+
+    {
+      "name": "Timesteps",
+      "module": "module/blocks.py",
+      "inherits": ["nn.Module"],
+      "key_attributes": ["num_channels: int"],
+      "methods": ["forward(timesteps) -> Tensor [sinusoidal embedding, shape (B, D)]"]
+    },
+    {
+      "name": "TimestepEmbedding",
+      "module": "module/blocks.py",
+      "inherits": ["nn.Module"],
+      "key_attributes": [
+        "linear_1: Linear(in_features, out_features)",
+        "activation: SiLU",
+        "linear_2: Linear(out_features, out_features | 3*out_features)",
+        "use_adaln_lora: bool"
+      ],
+      "methods": ["forward(sample) -> Tuple[emb_B_D, adaln_lora_B_3D]"],
+      "notes": "When use_adaln_lora=True, linear_2 outputs 3*out_features (LoRA delta for adaLN)."
+    },
+    {
+      "name": "PatchEmbed",
+      "module": "module/blocks.py",
+      "inherits": ["nn.Module"],
+      "key_attributes": [
+        "spatial_patch_size: int", "temporal_patch_size: int",
+        "proj: Sequential(Rearrange, Linear)"
+      ],
+      "methods": ["forward(x: BCTHW) -> Tensor (B,T,H,W,C)"],
+      "notes": "Uses einops Rearrange to fold spatiotemporal patches then linear projection."
+    },
+    {
+      "name": "FinalLayer",
+      "module": "module/blocks.py",
+      "inherits": ["nn.Module"],
+      "key_attributes": [
+        "norm_final: LayerNorm(elementwise_affine=False)",
+        "linear: Linear(hidden_size, patch_spatial^2 * patch_temporal * out_channels)",
+        "adaLN_modulation: Sequential(SiLU, Linear[, Linear])",
+        "use_adaln_lora: bool", "n_adaln_chunks: int=2"
+      ],
+      "methods": ["forward(x_BT_HW_D, emb_B_D, adaln_lora_B_3D) -> Tensor"],
+      "notes": "Outputs unpatchified prediction. adaLN modulation has optional LoRA path."
+    },
+    {
+      "name": "VideoAttn",
+      "module": "module/blocks.py",
+      "inherits": ["nn.Module"],
+      "key_attributes": [
+        "x_format: str", "n_views: int",
+        "attn: Attention"
+      ],
+      "methods": ["forward(x, context, crossattn_mask, rope_emb_L_1_1_D) -> Tensor"],
+      "notes": "Flattens T,H,W into sequence before Attention. Handles multiview batching (v*b) when n_views>1 and context given."
+    },
+    {
+      "name": "DITBuildingBlock",
+      "module": "module/blocks.py",
+      "inherits": ["nn.Module"],
+      "key_attributes": [
+        "block: VideoAttn | GPT2FeedForward",
+        "block_type: str ('cross_attn'|'full_attn'|'mlp')",
+        "norm_state: LayerNorm(elementwise_affine=False)",
+        "adaLN_modulation: Sequential(SiLU, Linear[, Linear])",
+        "n_adaln_chunks: int=3",
+        "use_adaln_lora: bool"
+      ],
+      "methods": ["forward(x, emb_B_D, crossattn_emb, crossattn_mask, rope_emb_L_1_1_D, adaln_lora_B_3D) -> Tensor"],
+      "notes": "Core DiT block. adaLN produces shift/scale/gate triplet. gate acts as residual weight."
+    },
+    {
+      "name": "GeneralDITTransformerBlock",
+      "module": "module/blocks.py",
+      "inherits": ["nn.Module"],
+      "key_attributes": [
+        "blocks: ModuleList[DITBuildingBlock]",
+        "x_format: str"
+      ],
+      "methods": ["forward(x, emb_B_D, crossattn_emb, crossattn_mask, rope_emb_L_1_1_D, adaln_lora_B_3D, extra_per_block_pos_emb) -> Tensor"],
+      "notes": "Wraps a configurable sequence of DITBuildingBlocks (e.g. FA-CA-MLP). Adds extra_per_block_pos_emb at start."
+    },
+
+    {
+      "name": "BaseVAE",
+      "module": "module/pretrained_vae.py",
+      "inherits": ["torch.nn.Module", "ABC"],
+      "key_attributes": ["channel: int", "name: str"],
+      "properties": ["latent_ch -> int", "spatial_compression_factor -> int [NotImplemented]"],
+      "abstract_methods": ["encode(state: Tensor) -> Tensor", "decode(latent: Tensor) -> Tensor"]
+    },
+    {
+      "name": "BasePretrainedImageVAE",
+      "module": "module/pretrained_vae.py",
+      "inherits": ["BaseVAE"],
+      "key_attributes": ["dtype: torch.dtype", "is_image: bool"],
+      "methods": [
+        "register_mean_std(vae_dir: str)",
+        "encode(state: Tensor) -> Tensor [no_grad, normalizes with mean/std]",
+        "decode(latent: Tensor) -> Tensor [no_grad, denormalizes]",
+        "reset_dtype()"
+      ],
+      "notes": "encoder and decoder loaded by subclasses. encode/decode apply (x - mean)/std normalization."
+    },
+    {
+      "name": "JITVAE",
+      "module": "module/pretrained_vae.py",
+      "inherits": ["BasePretrainedImageVAE"],
+      "key_attributes": ["encoder: torch.jit.ScriptModule", "decoder: torch.jit.ScriptModule"],
+      "methods": ["load_encoder(vae_dir: str)", "load_decoder(vae_dir: str)"]
+    },
+    {
+      "name": "VideoTokenizerInterface",
+      "module": "module/pretrained_vae.py",
+      "inherits": ["ABC"],
+      "abstract_methods": [
+        "encode(state) -> Tensor", "decode(latent) -> Tensor",
+        "get_latent_num_frames(num_pixel_frames) -> int",
+        "get_pixel_num_frames(num_latent_frames) -> int"
+      ],
+      "abstract_properties": [
+        "spatial_compression_factor", "temporal_compression_factor",
+        "spatial_resolution", "pixel_chunk_duration", "latent_chunk_duration"
+      ]
+    },
+    {
+      "name": "BasePretrainedVideoTokenizer",
+      "module": "module/pretrained_vae.py",
+      "inherits": ["ABC"],
+      "key_attributes": [
+        "_pixel_chunk_duration: int", "_temporal_compress_factor: int",
+        "max_enc_batch_size: int", "max_dec_batch_size: int"
+      ],
+      "methods": [
+        "encode(state) -> Tensor [chunked, batched]",
+        "decode(latent) -> Tensor [chunked, batched]",
+        "transform_encode_state_shape(state) -> Tensor",
+        "transform_decode_state_shape(latent) -> Tensor",
+        "get_latent_num_frames(num_pixel_frames) -> int",
+        "get_pixel_num_frames(num_latent_frames) -> int"
+      ],
+      "properties": ["pixel_chunk_duration", "latent_chunk_duration", "temporal_compression_factor"]
+    },
+    {
+      "name": "VideoJITTokenizer",
+      "module": "module/pretrained_vae.py",
+      "inherits": ["BasePretrainedVideoTokenizer", "JITVAE", "VideoTokenizerInterface"],
+      "extra_attributes": ["_spatial_compression_factor: int", "_spatial_resolution: str"],
+      "properties": ["spatial_compression_factor", "spatial_resolution"]
+    },
+    {
+      "name": "JointImageVideoTokenizer",
+      "module": "module/pretrained_vae.py",
+      "inherits": ["BaseVAE", "VideoTokenizerInterface"],
+      "key_attributes": ["image_vae: nn.Module", "video_vae: nn.Module", "squeeze_for_image: bool"],
+      "methods": [
+        "encode_image(state) -> Tensor",
+        "decode_image(latent) -> Tensor",
+        "encode(state) -> Tensor [routes T==1 to image_vae]",
+        "decode(latent) -> Tensor [routes T==1 to image_vae]",
+        "reset_dtype()"
+      ]
+    },
+    {
+      "name": "JointImageVideoSharedJITTokenizer",
+      "module": "module/pretrained_vae.py",
+      "inherits": ["JointImageVideoTokenizer"],
+      "methods": ["load_weights(vae_dir: str) [loads encoder, decoder, mean/std for both image_vae and video_vae]"],
+      "notes": "image_vae must be JITVAE; video_vae must be VideoJITTokenizer. Shared JIT weights."
+    }
+  ],
+
+  "inheritance_hierarchy": [
+    "nn.Module <- GeneralDIT <- MultiviewGeneralDIT <- MultiviewVideoExtendGeneralDIT",
+    "nn.Module <- GeneralDIT <- VideoExtendGeneralDIT",
+    "nn.Module <- Attention",
+    "nn.Module <- FeedForward <- GPT2FeedForward",
+    "nn.Module <- BaseAttentionOp",
+    "nn.Module <- DITBuildingBlock",
+    "nn.Module <- GeneralDITTransformerBlock",
+    "nn.Module <- VideoAttn",
+    "nn.Module <- PatchEmbed",
+    "nn.Module <- FinalLayer",
+    "nn.Module <- Timesteps",
+    "nn.Module <- TimestepEmbedding",
+    "nn.Module,ABC <- BaseVAE <- BasePretrainedImageVAE <- JITVAE <- VideoJITTokenizer",
+    "ABC <- BasePretrainedVideoTokenizer <- VideoJITTokenizer",
+    "ABC <- VideoTokenizerInterface <- VideoJITTokenizer",
+    "BaseVAE,VideoTokenizerInterface <- JointImageVideoTokenizer <- JointImageVideoSharedJITTokenizer"
+  ],
+
+  "key_compositions": [
+    "GeneralDIT *-- PatchEmbed (x_embedder)",
+    "GeneralDIT *-- VideoRopePosition3DEmb (pos_embedder)",
+    "GeneralDIT *-- LearnablePosEmbAxis (extra_pos_embedder)",
+    "GeneralDIT *-- GeneralDITTransformerBlock (blocks[0..N-1])",
+    "GeneralDIT *-- FinalLayer (final_layer)",
+    "GeneralDIT *-- Timesteps+TimestepEmbedding (t_embedder)",
+    "MultiviewGeneralDIT *-- nn.Embedding (view_embeddings)",
+    "MultiviewGeneralDIT *-- MultiviewVideoRopePosition3DEmb (pos_embedder)",
+    "MultiviewGeneralDIT *-- MultiviewSinCosPosEmbAxis (extra_pos_embedder)",
+    "VideoExtendGeneralDIT *-- Timesteps+TimestepEmbedding (augment_sigma_embedder, optional)",
+    "GeneralDITTransformerBlock *-- DITBuildingBlock (blocks[0..M-1])",
+    "DITBuildingBlock *-- VideoAttn | GPT2FeedForward (block)",
+    "VideoAttn *-- Attention (attn)",
+    "Attention *-- BaseAttentionOp (attn_op: DotProductAttention)",
+    "JointImageVideoTokenizer *-- JITVAE (image_vae)",
+    "JointImageVideoTokenizer *-- VideoJITTokenizer (video_vae)"
+  ],
+
+  "forward_flow": [
+    "GeneralDIT.forward -> forward_before_blocks -> prepare_embedded_sequence -> x_embedder(PatchEmbed) + pos_embedder(RoPE) + extra_pos_embedder",
+    "forward_before_blocks -> t_embedder(Timesteps + TimestepEmbedding) -> affline_emb_B_D, adaln_lora_B_3D",
+    "GeneralDIT.forward -> loop blocks (GeneralDITTransformerBlock.forward)",
+    "GeneralDITTransformerBlock.forward -> optional extra_per_block_pos_emb add -> loop DITBuildingBlock.forward",
+    "DITBuildingBlock.forward -> adaLN_modulation(emb) -> shift/scale/gate -> norm_state -> VideoAttn or GPT2FeedForward -> gated residual",
+    "VideoAttn.forward -> rearrange THWBD -> Attention.forward -> cal_qkv (RoPE applied) -> cal_attn (TE DotProductAttention) -> to_out",
+    "GeneralDIT.forward -> decoder_head -> FinalLayer(final_layer) -> rearrange to B,C,T,H,W"
+  ],
+
+  "important_notes": [
+    "Block config string (e.g. 'FA-CA-MLP') determines sequence of DITBuildingBlock types per transformer layer.",
+    "AdaLN-LoRA: when use_adaln_lora=True, TimestepEmbedding returns 3D LoRA delta added to each block's adaLN_modulation output.",
+    "RoPE embeddings (VideoRopePosition3DEmb) applied per-head in Attention.cal_qkv for self-attention only.",
+    "Context parallelism: blocks use TE DotProductAttention with cp_group set for sequence-parallel attention.",
+    "VideoExtendGeneralDIT concatenates condition_video_input_mask as an extra channel dimension to x before forwarding.",
+    "MultiviewGeneralDIT multiplexes n_views into the batch/temporal dimension; view_embeddings are concatenated as channel input.",
+    "BaseVAE is declared twice in pretrained_vae.py (lines 24 and 217) — same definition, likely a copy artifact.",
+    "VideoJITTokenizer uses multiple inheritance (MRO): BasePretrainedVideoTokenizer.encode/decode wrap JITVAE.encode/decode with chunking logic.",
+    "JointImageVideoTokenizer routes T==1 tensors to image_vae and T>1 to video_vae.",
+    "Tensor formats: BTHWD (batch-first) and THWBD (sequence-first); blocks must all agree on x_format."
+  ]
+}

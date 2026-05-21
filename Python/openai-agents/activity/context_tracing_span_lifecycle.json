@@ -1,0 +1,161 @@
+{
+  "scope": "tracing_span_lifecycle",
+  "title": "Tracing Span and Trace Lifecycle",
+  "diagram_type": "activity",
+  "description": "Lifecycle of traces and spans: creation, start/end events fanned out through SynchronousMultiTracingProcessor to all registered processors",
+
+  "key_participants": [
+    "Caller (Runner / user code)",
+    "TraceCtxManager",
+    "create_trace_for_run()",
+    "DefaultTraceProvider",
+    "SynchronousMultiTracingProcessor",
+    "TraceImpl / NoOpTrace",
+    "SpanImpl / NoOpSpan",
+    "Scope (contextvars)",
+    "TracingProcessor (registered processors)"
+  ],
+
+  "trace_lifecycle_flow": [
+    "START: Caller enters TraceCtxManager.__enter__()",
+    "TraceCtxManager calls create_trace_for_run(workflow_name, trace_id, group_id, metadata, tracing, disabled)",
+    "create_trace_for_run checks Scope.get_current_trace() — if trace already active, return None (skip creation)",
+    "IF reattach_resumed_trace=True AND trace_id was already started AND settings match → call reattach_trace() → return ReattachedTrace (no on_trace_start fired)",
+    "ELSE call trace() → DefaultTraceProvider.create_trace()",
+    "DefaultTraceProvider._refresh_disabled_flag(): check OPENAI_AGENTS_DISABLE_TRACING env var and manual override",
+    "IF disabled → return NoOpTrace (no processor callbacks, no-op context management)",
+    "ELSE → return TraceImpl(name, trace_id, group_id, metadata, processor=SynchronousMultiTracingProcessor)",
+    "TraceCtxManager calls trace.start(mark_as_current=True)",
+    "TraceImpl.start(): set _started=True, call _processor.on_trace_start(self), _mark_trace_id_started(trace_id), Scope.set_current_trace(self)",
+    "SynchronousMultiTracingProcessor.on_trace_start(trace): iterate _processors tuple, call each processor.on_trace_start(trace), catch+log errors",
+    "WORKFLOW RUNS (spans created inside trace context)",
+    "END: Caller exits TraceCtxManager.__exit__()",
+    "TraceCtxManager calls trace.finish(reset_current=True)",
+    "TraceImpl.finish(): call _processor.on_trace_end(self), Scope.reset_current_trace(token)",
+    "SynchronousMultiTracingProcessor.on_trace_end(trace): iterate _processors tuple, call each processor.on_trace_end(trace), catch+log errors"
+  ],
+
+  "span_lifecycle_flow": [
+    "START: Caller uses span as context manager (e.g. `with agent_span(...) as span`)",
+    "SpanImpl.__enter__() calls self.start(mark_as_current=True)",
+    "SpanImpl.start(): check not already started, set _started_at = util.time_iso()",
+    "SpanImpl calls _processor.on_span_start(self)",
+    "SynchronousMultiTracingProcessor.on_span_start(span): iterate _processors tuple, call each processor.on_span_start(span), catch+log errors",
+    "Scope.set_current_span(self) — makes this span the active span in contextvar",
+    "OPERATION RUNS (nested spans auto-inherit parent_id from Scope.get_current_span())",
+    "END: SpanImpl.__exit__() calls self.finish(reset_current=True)",
+    "SpanImpl.finish(): set _ended_at = util.time_iso()",
+    "SpanImpl calls _processor.on_span_end(self)",
+    "SynchronousMultiTracingProcessor.on_span_end(span): iterate _processors tuple, call each processor.on_span_end(span), catch+log errors",
+    "Scope.reset_current_span(token) — restores previous active span"
+  ],
+
+  "span_creation_flow": [
+    "DefaultTraceProvider.create_span(span_data, span_id, parent, disabled)",
+    "_refresh_disabled_flag() — check env + manual disabled state",
+    "IF disabled → return NoOpSpan(span_data)",
+    "IF parent is None: resolve from Scope.get_current_span() and Scope.get_current_trace()",
+    "  IF no current trace → log error, return NoOpSpan",
+    "  IF current trace is NoOpTrace or current span is NoOpSpan → return NoOpSpan",
+    "  parent_id = current_span.span_id (or None if root span), trace_id from current_trace",
+    "IF parent is Trace: trace_id = parent.trace_id, parent_id = None",
+    "IF parent is Span: parent_id = parent.span_id, trace_id = parent.trace_id",
+    "Return SpanImpl(trace_id, span_id, parent_id, processor=SynchronousMultiTracingProcessor, span_data, tracing_api_key, trace_metadata)"
+  ],
+
+  "fan_out_logic": {
+    "class": "SynchronousMultiTracingProcessor",
+    "inherits": "TracingProcessor",
+    "storage": "_processors: tuple[TracingProcessor, ...] (thread-safe via threading.Lock on add/set)",
+    "methods": [
+      "add_tracing_processor(processor) — append to tuple (thread-safe)",
+      "set_processors(processors) — replace tuple (thread-safe)",
+      "on_trace_start(trace) — fan-out: for each processor call on_trace_start, catch+log Exception",
+      "on_trace_end(trace) — fan-out: for each processor call on_trace_end, catch+log Exception",
+      "on_span_start(span) — fan-out: for each processor call on_span_start, catch+log Exception",
+      "on_span_end(span) — fan-out: for each processor call on_span_end, catch+log Exception",
+      "shutdown() — fan-out: for each processor call shutdown, catch+log Exception",
+      "force_flush() — fan-out: for each processor call force_flush, catch+log Exception"
+    ],
+    "error_handling": "Errors in individual processors are caught and logged; other processors still execute"
+  },
+
+  "disabled_paths": {
+    "NoOpTrace": "Created when tracing is globally disabled (env or manual). No processor callbacks. Context management still works via Scope.",
+    "NoOpSpan": "Created when span creation has no valid parent trace, parent is NoOp, or tracing is disabled. No processor callbacks. Scope management still works.",
+    "ReattachedTrace": "Used on resume of an interrupted run. Does NOT fire on_trace_start — only marks trace as current in Scope."
+  },
+
+  "context_management": {
+    "class": "Scope",
+    "mechanism": "Python contextvars (async-safe, concurrency-safe)",
+    "operations": [
+      "Scope.set_current_trace(trace) → returns Token",
+      "Scope.reset_current_trace(token) → restores previous",
+      "Scope.get_current_trace() → returns active Trace | None",
+      "Scope.set_current_span(span) → returns Token",
+      "Scope.reset_current_span(token) → restores previous",
+      "Scope.get_current_span() → returns active Span | None"
+    ],
+    "nesting": "Each span stores _prev_span_token; on finish resets to parent span. Enables automatic parent_id resolution."
+  },
+
+  "provider_initialization": {
+    "global_singleton": "GLOBAL_TRACE_PROVIDER in setup.py",
+    "lazy_init": "get_trace_provider() initializes DefaultTraceProvider + registers default_processor() on first access",
+    "atexit": "shutdown registered via atexit to flush/close processors on process exit",
+    "customization": [
+      "add_trace_processor(p) → DefaultTraceProvider.register_processor(p) → SynchronousMultiTracingProcessor.add_tracing_processor(p)",
+      "set_trace_processors([p1, p2]) → replaces all processors"
+    ]
+  },
+
+  "key_class_relationships": [
+    "SynchronousMultiTracingProcessor extends TracingProcessor",
+    "DefaultTraceProvider extends TraceProvider",
+    "DefaultTraceProvider composes SynchronousMultiTracingProcessor (1:1)",
+    "TraceImpl holds reference to SynchronousMultiTracingProcessor (as TracingProcessor)",
+    "SpanImpl holds reference to SynchronousMultiTracingProcessor (as TracingProcessor)",
+    "TraceCtxManager delegates to create_trace_for_run() and Trace lifecycle",
+    "TracingProcessor is abstract interface — concrete: BatchTraceProcessor, custom processors",
+    "TracingExporter is separate interface used by BatchTraceProcessor for backend export"
+  ],
+
+  "decision_points": [
+    "Is tracing globally disabled? (env OPENAI_AGENTS_DISABLE_TRACING or set_tracing_disabled) → NoOp path",
+    "Is there already an active trace in context? → Skip trace creation (use existing)",
+    "Is this a resumed trace with matching state? → ReattachedTrace (no on_trace_start)",
+    "Is parent span/trace a NoOp? → Propagate NoOp to child span",
+    "Is GeneratorExit raised in __exit__? → Skip current span/trace reset (generator cleanup)"
+  ],
+
+  "span_data_types": [
+    "AgentSpanData", "GenerationSpanData", "FunctionSpanData",
+    "GuardrailSpanData", "HandoffSpanData", "TranscriptionSpanData",
+    "SpeechSpanData", "SpeechGroupSpanData", "CustomSpanData"
+  ],
+
+  "export_format": {
+    "span": "{ object: 'trace.span', id, trace_id, parent_id, started_at, ended_at, span_data: SpanData.export(), error, metadata? }",
+    "trace": "{ object: 'trace', id, workflow_name, group_id, metadata }"
+  },
+
+  "important_notes": [
+    "All 4 lifecycle hooks (on_trace_start, on_trace_end, on_span_start, on_span_end) fire synchronously on the calling thread",
+    "Processor errors are isolated — one failing processor does not stop others",
+    "Thread safety: SynchronousMultiTracingProcessor uses a Lock for mutations; reads iterate a snapshot tuple",
+    "span_id format: 'span_<24 hex chars>'; trace_id format: 'trace_<32 hex chars>'",
+    "BatchTraceProcessor (default) batches export; call flush_traces() for immediate delivery in workers"
+  ],
+
+  "source_files_analyzed": [
+    "src/agents/tracing/provider.py",
+    "src/agents/tracing/processor_interface.py",
+    "src/agents/tracing/spans.py",
+    "src/agents/tracing/traces.py",
+    "src/agents/tracing/setup.py",
+    "src/agents/tracing/context.py",
+    "src/agents/tracing/scope.py (via grep)",
+    "docs/tracing.md"
+  ]
+}

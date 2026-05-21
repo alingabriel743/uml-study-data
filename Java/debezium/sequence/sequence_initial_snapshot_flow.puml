@@ -1,0 +1,289 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #F1F3F5
+    GroupBackgroundColor #E9ECEF
+    GroupBorderColor #6C757D
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Initial Database Snapshot Flow
+
+participant "ChangeEventSource\nCoordinator" as coordinator
+participant "RelationalSnapshot\nChangeEventSource" as relational #E3F2FD
+participant "BinlogSnapshot\nChangeEventSource" as binlog
+participant "BinlogConnector\nConnection" as connection
+participant "SnapshotterService" as snapshotter
+participant "BinlogOffset\nContext" as offsetCtx
+participant "BinlogDatabase\nSchema" as schema
+participant "EventDispatcher" as dispatcher
+participant "SnapshotReceiver" as receiver
+
+note over relational, binlog
+  Template Method pattern:
+  RelationalSnapshotChangeEventSource.doExecute()
+  calls abstract hooks in BinlogSnapshotChangeEventSource
+end note
+
+coordinator -> binlog : execute(context, previousOffset, snapshottingTask)
+activate binlog
+
+binlog -> relational : super.execute()
+activate relational
+
+relational -> relational : doExecute(context, previousOffset,\nsnapshotContext, snapshottingTask)
+
+== Step 1: Pre-Snapshot ==
+
+relational -> binlog : preSnapshot()
+activate binlog
+binlog -> binlog : preSnapshotAction.run()
+deactivate binlog
+
+== Step 2: Connection & Prepare ==
+
+relational -> connection : createSnapshotConnection()
+activate connection
+connection -> connection : setAutoCommit(false)
+connection --> relational : connection ready
+deactivate connection
+
+relational -> binlog : prepare(partition, onDemand)
+activate binlog
+binlog -> binlog : new BinlogSnapshotContext(partition, "")
+binlog --> relational : snapshotContext
+deactivate binlog
+
+== Step 3: Determine Captured Tables ==
+
+relational -> binlog : getAllTableIds(ctx)
+activate binlog
+binlog -> connection : getAllTableIds(catalogName)
+activate connection
+connection --> binlog : Set<TableId>
+deactivate connection
+binlog --> relational : allTableIds
+deactivate binlog
+
+relational -> relational : determineCapturedTables()\n(apply table/database filters\n→ ctx.capturedTables)
+
+relational -> relational : createConnectionPool(ctx)\n(build JdbcConnection pool)
+
+== Step 4: Lock Tables ==
+
+relational -> binlog : lockTablesForSchemaSnapshot(context, ctx)
+activate binlog
+
+binlog -> connection : setTransactionIsolation(\nTRANSACTION_REPEATABLE_READ)
+binlog -> connection : executeWithoutCommitting(\n'SET SESSION lock_wait_timeout=...')
+
+alt Global lock available
+    binlog -> snapshotter : getSnapshotLock()\n.tableLockingStatement()
+    activate snapshotter
+    snapshotter --> binlog : "FLUSH TABLES WITH READ LOCK"
+    deactivate snapshotter
+    binlog -> connection : executeWithoutCommitting(\n'FLUSH TABLES WITH READ LOCK')
+    binlog -> binlog : startLockHeartbeat()\n(SELECT 1 every 30s)
+    binlog -> connection : executeWithoutCommitting(\n'START TRANSACTION WITH\nCONSISTENT SNAPSHOT')
+else Per-table lock fallback
+    binlog -> connection : executeWithoutCommitting(\n'FLUSH TABLES <list> WITH READ LOCK')
+    binlog -> binlog : startLockHeartbeat()
+end
+
+deactivate binlog
+
+== Step 5: Determine Snapshot Offset ==
+
+relational -> binlog : determineSnapshotOffset(ctx, previousOffset)
+activate binlog
+
+binlog -> binlog : getInitialOffsetContext(connectorConfig)
+binlog -> binlog : setOffsetContextBinlogPositionAndGtidDetails\nForSnapshot(offsetCtx, connection, snapshottingService)
+
+binlog -> offsetCtx : setBinlogStartPoint(binlogFilename, position)
+activate offsetCtx
+offsetCtx --> binlog : ok
+deactivate offsetCtx
+
+opt GTID mode enabled
+    binlog -> offsetCtx : setCompletedGtidSet(gtidSet)
+end
+
+binlog -> binlog : tryStartingSnapshot(ctx)\n(mark snapshot started in offset)
+deactivate binlog
+
+== Step 6: Read Table Structure ==
+
+relational -> binlog : readTableStructure(context, ctx,\npreviousOffset, snapshottingTask)
+activate binlog
+
+binlog -> connection : readCharsetSystemVariables()
+activate connection
+connection --> binlog : charset info
+deactivate connection
+
+binlog -> connection : readDatabaseCollations()
+activate connection
+connection --> binlog : Map<String, DatabaseLocales>
+deactivate connection
+
+loop for each captured table
+    binlog -> binlog : addSchemaEvent(ctx, catalog,\n'DROP TABLE IF EXISTS ...')
+    binlog -> connection : query('SHOW CREATE TABLE ...')
+    activate connection
+    connection --> binlog : DDL string
+    deactivate connection
+    binlog -> schema : parseSnapshotDdl(partition, ddl,\ndatabase, offset, time)
+    activate schema
+    schema -> schema : parseDdl() via ddlParser.parse()
+    schema -> schema : emitChangeEvent()\n→ SchemaChangeEvent (CREATE/ALTER/DROP)
+    schema --> binlog : schemaEvents list
+    deactivate schema
+end
+
+deactivate binlog
+
+== Step 7: Persist Schema History ==
+
+relational -> binlog : createSchemaChangeEventsForTables\n(context, ctx, snapshottingTask)
+activate binlog
+
+loop for each SchemaChangeEvent
+    binlog -> schema : skipSchemaChangeEvent(event)
+    activate schema
+    schema --> binlog : false (process event)
+    deactivate schema
+    binlog -> offsetCtx : event(tableId, clock.currentTime())
+    binlog -> dispatcher : dispatchSchemaChangeEvent(\npartition, offset, tableId, receiver)
+    activate dispatcher
+    dispatcher --> binlog : dispatched
+    deactivate dispatcher
+end
+
+binlog -> schema : tableIds().forEach(id ->\n  snapshotContext.tables\n  .overwriteTable(tableFor(id)))
+
+deactivate binlog
+
+relational -> binlog : releaseSchemaSnapshotLocks(ctx)
+activate binlog
+note right of binlog : Minimal locking: release global lock\nearly to reduce lock hold time
+binlog -> connection : executeWithoutCommitting('UNLOCK TABLES')
+deactivate binlog
+
+== Step 8: Snapshot Data ==
+
+relational -> relational : createDataEvents(context, ctx,\nconnectionPool, overrides)
+
+relational -> dispatcher : getSnapshotChangeEventReceiver()
+activate dispatcher
+dispatcher --> relational : snapshotReceiver
+deactivate dispatcher
+
+alt Legacy mode (one thread per table)
+    loop for each captured table
+        relational -> connection : getEstimatedTableSize(tableId)
+        activate connection
+        connection --> relational : rowCount
+        deactivate connection
+        relational -> snapshotter : getSnapshotQuery()\n.snapshotQuery(tableId, columns)
+        activate snapshotter
+        snapshotter --> relational : SELECT statement
+        deactivate snapshotter
+        relational -> binlog : readTableStatement(jdbcConnection, rowCount)
+        activate binlog
+        binlog -> connection : executeQuery(selectStatement)
+        activate connection
+        connection --> binlog : ResultSet (rows)
+        deactivate connection
+        loop for each row
+            binlog -> dispatcher : dispatchSnapshotEvent(\npartition, tableId,\nchangeRecordEmitter, snapshotReceiver)
+            activate dispatcher
+            dispatcher --> binlog : ok
+            deactivate dispatcher
+        end
+        deactivate binlog
+    end
+else Chunked mode (parallel chunks)
+    relational -> relational : ChunkBoundaryCalculator\n.calculateBoundaries(), createChunks()
+    loop for each chunk
+        relational -> dispatcher : dispatchSnapshotEvent()\nwith FIRST/LAST markers
+    end
+end
+
+relational -> binlog : releaseDataSnapshotLocks(ctx)
+activate binlog
+
+alt Global lock held
+    binlog -> binlog : globalUnlock()
+    binlog -> binlog : stopLockHeartbeat()
+    binlog -> connection : executeWithoutCommitting('UNLOCK TABLES')
+else Per-table lock held
+    binlog -> binlog : tableUnlock()
+    binlog -> binlog : stopLockHeartbeat()
+    binlog -> connection : executeWithoutCommitting('UNLOCK TABLES')
+end
+
+opt delayedSchemaSnapshotTables non-empty
+    binlog -> binlog : createSchemaEventsForTables()
+    binlog -> dispatcher : dispatchSchemaChangeEvent()
+end
+
+deactivate binlog
+
+relational -> offsetCtx : preSnapshotCompletion()
+activate offsetCtx
+offsetCtx --> relational : ok
+deactivate offsetCtx
+
+relational -> receiver : completeSnapshot()
+activate receiver
+receiver --> relational : ok
+deactivate receiver
+
+relational -> offsetCtx : postSnapshotCompletion()
+activate offsetCtx
+offsetCtx --> relational : ok
+deactivate offsetCtx
+
+== Step 9: Post-Snapshot ==
+
+relational -> binlog : postSnapshot()
+activate binlog
+binlog -> binlog : lastEventProcessor.accept(\nrecord → mark SNAPSHOT_KEY=LAST)
+deactivate binlog
+
+relational -> dispatcher : alwaysDispatchHeartbeatEvent(\npartition, offset)
+activate dispatcher
+dispatcher --> relational : ok
+deactivate dispatcher
+
+relational --> coordinator : SnapshotResult.completed(ctx.offset)
+deactivate relational
+deactivate binlog
+
+@enduml

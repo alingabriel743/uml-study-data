@@ -1,0 +1,235 @@
+{
+  "scope": "tracing_processors_providers",
+  "title": "Tracing – Processors & Providers",
+  "diagram_type": "class",
+  "source_files_analyzed": [
+    "src/agents/tracing/processor_interface.py",
+    "src/agents/tracing/processors.py",
+    "src/agents/tracing/provider.py",
+    "src/agents/tracing/setup.py"
+  ],
+
+  "classes": [
+    {
+      "name": "TracingProcessor",
+      "type": "abstract",
+      "module": "processor_interface",
+      "methods": [
+        "on_trace_start(trace: Trace) -> None [abstract]",
+        "on_trace_end(trace: Trace) -> None [abstract]",
+        "on_span_start(span: Span[Any]) -> None [abstract]",
+        "on_span_end(span: Span[Any]) -> None [abstract]",
+        "shutdown() -> None [abstract]",
+        "force_flush() -> None [abstract]"
+      ],
+      "notes": "All methods must be thread-safe and non-blocking"
+    },
+    {
+      "name": "TracingExporter",
+      "type": "abstract",
+      "module": "processor_interface",
+      "methods": [
+        "export(items: list[Trace | Span[Any]]) -> None [abstract]"
+      ]
+    },
+    {
+      "name": "BatchTraceProcessor",
+      "type": "concrete",
+      "module": "processors",
+      "extends": "TracingProcessor",
+      "attributes": [
+        "_exporter: TracingExporter",
+        "_queue: Queue[Trace | Span[Any]]",
+        "_max_queue_size: int = 8192",
+        "_max_batch_size: int = 128",
+        "_schedule_delay: float = 5.0",
+        "_export_trigger_size: int",
+        "_next_export_time: float",
+        "_worker_thread: Thread | None",
+        "_thread_start_lock: Lock",
+        "_export_lock: Lock",
+        "_shutdown_event: Event"
+      ],
+      "methods": [
+        "__init__(exporter, max_queue_size=8192, max_batch_size=128, schedule_delay=5.0, export_trigger_ratio=0.7)",
+        "on_trace_start(trace) -> None  [enqueues trace, starts background thread]",
+        "on_trace_end(trace) -> None  [no-op]",
+        "on_span_start(span) -> None  [no-op]",
+        "on_span_end(span) -> None  [enqueues span, starts background thread]",
+        "shutdown(timeout=None) -> None",
+        "force_flush() -> None",
+        "_ensure_thread_started() -> None  [lazy daemon thread start]",
+        "_run() -> None  [background loop: checks time/queue, calls _export_batches]",
+        "_export_batches(force=False) -> None  [drains queue, calls exporter.export(batch)]"
+      ],
+      "notes": "Lazy background daemon thread. Triggers export when queue >= export_trigger_size OR schedule_delay elapsed."
+    },
+    {
+      "name": "ConsoleSpanExporter",
+      "type": "concrete",
+      "module": "processors",
+      "extends": "TracingExporter",
+      "methods": [
+        "export(items: list[Trace | Span[Any]]) -> None  [prints to stdout]"
+      ]
+    },
+    {
+      "name": "BackendSpanExporter",
+      "type": "concrete",
+      "module": "processors",
+      "extends": "TracingExporter",
+      "attributes": [
+        "_api_key: str | None",
+        "_organization: str | None",
+        "_project: str | None",
+        "endpoint: str = 'https://api.openai.com/v1/traces/ingest'",
+        "max_retries: int = 3",
+        "base_delay: float = 1.0",
+        "max_delay: float = 30.0",
+        "_client: httpx.Client  [connection pooling, timeout=60s]",
+        "_OPENAI_TRACING_MAX_FIELD_BYTES: int = 100_000 [class const]"
+      ],
+      "methods": [
+        "__init__(api_key, organization, project, endpoint, max_retries, base_delay, max_delay)",
+        "set_api_key(api_key: str) -> None",
+        "api_key -> str  [cached_property, falls back to OPENAI_API_KEY env]",
+        "organization -> str  [cached_property, falls back to OPENAI_ORG_ID env]",
+        "project -> str  [cached_property, falls back to OPENAI_PROJECT_ID env]",
+        "export(items: list[Trace | Span[Any]]) -> None  [groups by tracing_api_key, POSTs with exponential backoff]",
+        "close() -> None",
+        "_should_sanitize_for_openai_tracing_api() -> bool",
+        "_sanitize_for_openai_tracing_api(payload_item) -> dict",
+        "_truncate_span_field_value(value) -> Any",
+        "_sanitize_generation_usage_for_openai_tracing_api(usage) -> dict | None"
+      ],
+      "notes": "Groups items by tracing_api_key. Sanitizes/truncates input/output fields to 100KB. Retry with exponential backoff + 10% jitter."
+    },
+    {
+      "name": "SynchronousMultiTracingProcessor",
+      "type": "concrete",
+      "module": "provider",
+      "extends": "TracingProcessor",
+      "attributes": [
+        "_processors: tuple[TracingProcessor, ...]",
+        "_lock: Lock"
+      ],
+      "methods": [
+        "__init__()",
+        "add_tracing_processor(tracing_processor: TracingProcessor) -> None",
+        "set_processors(processors: list[TracingProcessor]) -> None",
+        "on_trace_start(trace) -> None  [fan-out to all processors]",
+        "on_trace_end(trace) -> None  [fan-out]",
+        "on_span_start(span) -> None  [fan-out]",
+        "on_span_end(span) -> None  [fan-out]",
+        "shutdown() -> None  [fan-out]",
+        "force_flush() -> None  [fan-out]"
+      ],
+      "notes": "Uses immutable tuple for safe iteration under concurrent modification. Errors per-processor are logged, not raised."
+    },
+    {
+      "name": "TraceProvider",
+      "type": "abstract",
+      "module": "provider",
+      "methods": [
+        "register_processor(processor: TracingProcessor) -> None [abstract]",
+        "set_processors(processors: list[TracingProcessor]) -> None [abstract]",
+        "get_current_trace() -> Trace | None [abstract]",
+        "get_current_span() -> Span[Any] | None [abstract]",
+        "set_disabled(disabled: bool) -> None [abstract]",
+        "time_iso() -> str [abstract]",
+        "gen_trace_id() -> str [abstract]",
+        "gen_span_id() -> str [abstract]",
+        "gen_group_id() -> str [abstract]",
+        "create_trace(name, trace_id, group_id, metadata, disabled, tracing) -> Trace [abstract]",
+        "create_span(span_data, span_id, parent, disabled) -> Span[TSpanData] [abstract]",
+        "force_flush() -> None [default no-op]",
+        "shutdown() -> None [default no-op]"
+      ]
+    },
+    {
+      "name": "DefaultTraceProvider",
+      "type": "concrete",
+      "module": "provider",
+      "extends": "TraceProvider",
+      "attributes": [
+        "_multi_processor: SynchronousMultiTracingProcessor",
+        "_env_disabled: bool | None  [lazy from OPENAI_AGENTS_DISABLE_TRACING]",
+        "_manual_disabled: bool | None",
+        "_disabled: bool"
+      ],
+      "methods": [
+        "__init__()  [creates SynchronousMultiTracingProcessor]",
+        "register_processor(processor) -> None  [delegates to _multi_processor]",
+        "set_processors(processors) -> None  [delegates to _multi_processor]",
+        "get_current_trace() -> Trace | None  [via Scope]",
+        "get_current_span() -> Span | None  [via Scope]",
+        "set_disabled(disabled) -> None",
+        "_refresh_disabled_flag() -> None  [env + manual override logic]",
+        "time_iso() -> str  [datetime.now(UTC).isoformat()]",
+        "gen_trace_id() -> str  [trace_{uuid4().hex}]",
+        "gen_span_id() -> str  [span_{uuid4().hex[:24]}]",
+        "gen_group_id() -> str  [group_{uuid4().hex[:24]}]",
+        "create_trace(name, trace_id, group_id, metadata, disabled, tracing) -> Trace  [returns NoOpTrace if disabled, else TraceImpl]",
+        "create_span(span_data, span_id, parent, disabled) -> Span  [returns NoOpSpan if disabled or no active trace, else SpanImpl]",
+        "force_flush() -> None  [delegates to _multi_processor]",
+        "shutdown() -> None  [delegates to _multi_processor]"
+      ]
+    }
+  ],
+
+  "module_level_elements": [
+    {
+      "file": "processors.py",
+      "items": [
+        "default_exporter() -> BackendSpanExporter  [singleton, lazy init, thread-safe]",
+        "default_processor() -> BatchTraceProcessor  [singleton, lazy init, wraps default_exporter()]",
+        "_global_exporter: BackendSpanExporter | None",
+        "_global_processor: BatchTraceProcessor | None",
+        "_global_lock: Lock"
+      ]
+    },
+    {
+      "file": "setup.py",
+      "items": [
+        "GLOBAL_TRACE_PROVIDER: TraceProvider | None  [module-level singleton]",
+        "set_trace_provider(provider: TraceProvider) -> None  [registers atexit shutdown]",
+        "get_trace_provider() -> TraceProvider  [lazy init: DefaultTraceProvider + default_processor(), registers atexit]",
+        "_shutdown_global_trace_provider()  [atexit callback]"
+      ]
+    }
+  ],
+
+  "key_relationships": [
+    "BatchTraceProcessor extends TracingProcessor",
+    "ConsoleSpanExporter extends TracingExporter",
+    "BackendSpanExporter extends TracingExporter",
+    "SynchronousMultiTracingProcessor extends TracingProcessor",
+    "TraceProvider is abstract interface",
+    "DefaultTraceProvider extends TraceProvider",
+    "BatchTraceProcessor composes TracingExporter (1 exporter)",
+    "DefaultTraceProvider composes SynchronousMultiTracingProcessor (1:1)",
+    "SynchronousMultiTracingProcessor aggregates TracingProcessor (0..*)",
+    "setup.get_trace_provider() creates DefaultTraceProvider + registers default_processor()",
+    "default_processor() creates BatchTraceProcessor(default_exporter())",
+    "default_exporter() creates BackendSpanExporter"
+  ],
+
+  "initialization_chain": [
+    "get_trace_provider() [setup.py]",
+    "→ DefaultTraceProvider()",
+    "→ DefaultTraceProvider.register_processor(default_processor())",
+    "→ default_processor() = BatchTraceProcessor(default_exporter())",
+    "→ default_exporter() = BackendSpanExporter()",
+    "→ atexit registers _shutdown_global_trace_provider()"
+  ],
+
+  "important_notes": [
+    "All singleton init is lazy (not at import time) to avoid side effects in fork-based environments",
+    "BatchTraceProcessor background thread is also lazily started on first span/trace enqueue",
+    "OPENAI_AGENTS_DISABLE_TRACING env var disables tracing; returns NoOpTrace/NoOpSpan",
+    "BackendSpanExporter endpoint: POST https://api.openai.com/v1/traces/ingest with OpenAI-Beta: traces=v1 header",
+    "BackendSpanExporter sanitizes span input/output fields to max 100KB for OpenAI API compliance",
+    "SynchronousMultiTracingProcessor allows multiple processors (fan-out pattern) for custom exporters",
+    "create_span() falls back to NoOpSpan if no active trace in Scope (Scope uses contextvars)"
+  ]
+}

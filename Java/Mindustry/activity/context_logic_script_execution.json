@@ -1,0 +1,151 @@
+{
+  "scope": "logic_script_execution",
+  "title": "Logic Script Compilation & Execution",
+  "diagram_type": "activity",
+  "key_participants": [
+    "LogicBuild (LogicBlock.LogicBuild)",
+    "LAssembler",
+    "LParser",
+    "LogicIO",
+    "LStatement (abstract)",
+    "LInstruction (interface)",
+    "LExecutor",
+    "LVar"
+  ],
+
+  "phases": [
+    "1. Compilation (one-time, triggered by code change)",
+    "2. Loading (executor initialization)",
+    "3. Per-tick execution loop",
+    "4. Per-instruction dispatch"
+  ],
+
+  "compilation_flow": [
+    "START: User code string available in LogicBuild.code",
+    "LogicBuild calls LAssembler.assemble(code, privileged)",
+    "LAssembler.assemble() calls LAssembler.read(data, privileged)",
+    "LAssembler.read() creates new LParser(text, privileged) and calls parse()",
+    "LParser.parse(): clear jumps & jumpLocations, loop over chars while pos < length && line < maxInstructions(1000)",
+    "  [branch] char == '\\n' / ';' / ' ' → skip (pos++)",
+    "  [branch] char == '\\r' → pos += 2",
+    "  [default] → call statement()",
+    "statement(): tokenize line into tokens[] (max 16 tokens)",
+    "  [branch] tok==0 → discard blank line",
+    "  [branch] tok==1 && token ends with ':' → store jumpLocations[label] = line",
+    "  [else] checkRead() applies legacy op-name renames (atan2→angle, dst→len)",
+    "  [branch] tokens[0]=='jump' && tokens[1] is a label → store JumpIndex for deferred resolution",
+    "  LogicIO.read(tokens, tok) → LStatement (or null)",
+    "  [branch] st == null && LAssembler.customParsers has key → custom mod parser",
+    "  [branch] !privileged && st.privileged() → replace with InvalidStatement",
+    "  [branch] st == null → add InvalidStatement",
+    "  statements.add(st); line++",
+    "After loop: resolve jump labels → set JumpStatement.destIndex from jumpLocations map",
+    "  [branch] label not found → throw RuntimeException('Undefined jump location')",
+    "LParser.parse() returns Seq<LStatement>",
+    "LAssembler maps each LStatement.build(asm) → LInstruction (null results filtered out)",
+    "LAssembler.var(symbol) resolution for each operand:",
+    "  [branch] Vars.logicVars.get(symbol) != null → return global const LVar",
+    "  [branch] symbol starts/ends with '\"' → create string-constant LVar",
+    "  [branch] parseDouble() succeeds → create numeric-constant LVar (hex/binary/color supported)",
+    "  [else] putVar(symbol) → create/reuse mutable LVar",
+    "LAssembler.assemble() returns populated LAssembler (vars map + instructions[])"
+  ],
+
+  "loading_flow": [
+    "LogicBuild calls executor.load(LAssembler asm)",
+    "executor.load(): nameMap = null",
+    "Copy non-constant vars from asm.vars → executor.vars[], assign sequential ids",
+    "executor.instructions = asm.instructions",
+    "executor.counter = asm.getVar('@counter') [numval=0, isobj=false]",
+    "executor.unit   = asm.getVar('@unit')    [const null object]",
+    "executor.thisv  = asm.getVar('@this')    [const null object]",
+    "executor.ipt    = asm.putConst('@ipt', build.ipt)"
+  ],
+
+  "per_tick_execution_loop": [
+    "LogicBuild.updateTile() called every game tick",
+    "[guard] state.rules.disableWorldProcessors && privileged → return (skip)",
+    "[guard] !enabled || !executor.initialized() → return (skip)",
+    "Cap accumulator: if accumulator > maxInstructionScale * ipt → accumulator = maxInstructionScale * ipt",
+    "WHILE accumulator >= 1.0:",
+    "  executor.runOnce()",
+    "  [branch] executor.yield == true → executor.yield = false; BREAK",
+    "  accumulator -= 1",
+    "accumulator += edelta() * ipt  [fractional instruction budget accrues over time]"
+  ],
+
+  "run_once_flow": [
+    "executor.runOnce():",
+    "[branch] counter.numval >= instructions.length OR counter.numval < 0 → counter.numval = 0 (wrap)",
+    "[branch] counter.numval < instructions.length:",
+    "  counter.isobj = false",
+    "  fetch instructions[(int)counter.numval]",
+    "  counter.numval++ (pre-advance program counter)",
+    "  instruction.run(this)"
+  ],
+
+  "instruction_dispatch_branches": [
+    "EndI.run()     → counter.numval = instructions.length (force end-of-program next cycle wrap)",
+    "NoOpI.run()    → no-op",
+    "JumpI.run()    → if condition(comp0,comp1) satisfied: counter.numval = address",
+    "WaitI.run()    → if time elapsed: continue; else: counter.numval-- (re-execute), yield=true",
+    "OpI.run()      → dest = op.function(a, b) or op.objFunction2(a,b) if both objects",
+    "PrintI.run()   → append value to exec.textBuffer (string or number formatting)",
+    "PrintCharI.run() → append (char)floor(value.numval) to textBuffer",
+    "PrintFlushI.run() → flush textBuffer to target MessageBlock",
+    "UnitBindI.run() → bind next unit of UnitType from team cache to exec.unit",
+    "SetI.run()     → to = from (LVar assignment)",
+    "OpI.run() (equal op) → compare a==b by value or object identity",
+    "GetLinkI.run() → output = exec.links[index.numval]",
+    "SenseI.run()   → output = target.sense(position) property lookup",
+    "ControlI.run() → send control command to target Building/Unit",
+    "DrawI.run()    → push draw command to exec.graphicsBuffer",
+    "RadarI.run()   → search for nearest/farthest unit matching filters"
+  ],
+
+  "key_data_structures": {
+    "LVar": "name:String, numval:double, objval:Object, isobj:boolean, constant:boolean, id:int",
+    "LInstruction": "interface { void run(LExecutor exec) }",
+    "LStatement": "abstract class; build(LAssembler)→LInstruction; write(StringBuilder); privileged():boolean",
+    "LExecutor.fields": "instructions:LInstruction[], vars:LVar[], counter/unit/thisv/ipt:LVar, yield:boolean, accumulator owned by LogicBuild, graphicsBuffer:LongSeq, textBuffer:StringBuilder, links:Building[], team:Team",
+    "LAssembler.fields": "vars:OrderedMap<String,LVar>, instructions:LInstruction[], privileged:boolean, customParsers:ObjectMap<String,Func>"
+  },
+
+  "key_relationships": [
+    "LogicBuild owns LExecutor (composition)",
+    "LExecutor owns LInstruction[] and LVar[] (composition)",
+    "LAssembler creates LInstruction[] via LStatement.build()",
+    "LParser produces Seq<LStatement> consumed by LAssembler",
+    "LStatement is abstract; LStatements inner classes are concrete implementations",
+    "LExecutor.load(LAssembler) transfers assembled state into executor",
+    "LogicIO.read(tokens,tok) maps token arrays → LStatement instances",
+    "LAssembler.customParsers allows mod-injected statement parsers"
+  ],
+
+  "conditions_and_guards": [
+    "maxInstructions = 1000 (hard parse limit enforced by LParser)",
+    "maxJumps = 500 (max jump labels per script)",
+    "tokens per line <= 16 (LParser.tokens array size)",
+    "privileged flag gates access to privileged LStatements",
+    "state.rules.logicUnitControl gates UnitBind execution",
+    "state.rules.disableWorldProcessors gates privileged processor ticks",
+    "executor.yield breaks tick loop early (used by WaitI)",
+    "accumulator budget caps at maxInstructionScale * ipt per tick"
+  ],
+
+  "static_script_execution": [
+    "LExecutor.runLogicScript(code) / runLogicScript(code, maxInstructions, loop)",
+    "Creates bare LExecutor with privileged=true",
+    "Assembles inline, then loops up to maxInstructions calling runOnce()",
+    "Breaks if counter out of bounds (non-loop mode) or yield==true"
+  ],
+
+  "important_notes": "Two execution contexts: (1) in-world LogicBuild processor — tick-rate limited by ipt/accumulator, stateful across ticks; (2) runLogicScript() static helper for one-shot scripted events. Variable resolution happens at assemble-time (LAssembler.var()); runtime LVars are pre-resolved references. Jump label resolution is deferred to end of parse, allowing forward references.",
+
+  "source_files_analyzed": [
+    "core/src/mindustry/logic/LExecutor.java",
+    "core/src/mindustry/logic/LAssembler.java",
+    "core/src/mindustry/logic/LParser.java",
+    "core/src/mindustry/world/blocks/logic/LogicBlock.java (grep only)"
+  ]
+}

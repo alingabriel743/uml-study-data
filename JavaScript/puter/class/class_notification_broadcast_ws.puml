@@ -1,0 +1,226 @@
+@startuml notification_broadcast_ws
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #F9A825
+}
+
+title Notification, Broadcast & WebSocket Push
+
+' ─────────────────────────────────────────
+' Abstract base
+' ─────────────────────────────────────────
+abstract class BaseService {
+    #services
+    #config
+    #global_config
+    #log
+    #errors
+    #modules
+    +_construct(): void
+    +_init(): void
+    +require(name: string): Service
+}
+
+' ─────────────────────────────────────────
+' Core event bus
+' ─────────────────────────────────────────
+package "Event Bus" {
+
+    class EventService {
+        -listeners_: {}
+        -global_listeners_: []
+        +_construct(): void
+        +__on_boot_ready(): void
+        +emit(key: string, data: any, meta?: object): Promise<void>
+        +on(selector: string, callback: Function): Detacher
+        +on_all(callback: Function): void
+        +get_scoped(scope: string): ScopedEventBus
+    }
+    note right of EventService
+        Wildcard matching:
+        'outer.*' catches all
+        'outer.X.Y.Z' events
+    end note
+
+    class ScopedEventBus {
+        -event_bus: EventService
+        -scope: string
+        +emit(key: string, data: any): Promise<void>
+        +on(key: string, callback: Function): Detacher
+    }
+    note right of ScopedEventBus
+        Proxy that prepends
+        scope prefix to all keys
+    end note
+
+}
+
+' ─────────────────────────────────────────
+' Broadcast (cluster-wide delivery)
+' ─────────────────────────────────────────
+package "Broadcast" {
+
+    class BroadcastService {
+        -peersByKey: {}
+        -webhookPeers: []
+        -incomingLastNonceByPeer: Map
+        -outgoingNonceByPeer: Map
+        -outboundEventsByDedupKey: Map
+        -outboundFlushTimer: Timer|null
+        -outboundIsFlushing: boolean
+        -dedupFallbackCounter: number
+        -webhookReplayWindowSeconds: number
+        -outboundFlushMs: number
+        -webhookHostHeader: string|null
+        -webhookProtocol: string
+        -redisPubSubChannel: string
+        -redisSubscriber: RedisClient|null
+        -redisSourceId: string
+        +_init(): Promise<void>
+        +outBroadcastEventHandler(key, data, meta): Promise<void>
+        -enqueueOutboundEvent(event): void
+        -createDedupKey(event): string
+        -scheduleOutboundFlush(): void
+        -flushOutboundEvents(): Promise<void>
+        -sendWebhookToPeer(peer_config, events): Promise<void>
+        -initRedisPubSub(): Promise<void>
+        -publishWebhookEventsToRedis(events): Promise<void>
+        -handleRedisPubSubMessage(channel, message): Promise<void>
+        -emitIncomingEventsSequentially(events): Promise<void>
+        -isNonceReplayForPeer(params): boolean
+        -handleWebhookRequest(req, res): Promise<void>
+        +__on_install_routes(_, {app}): Promise<void>
+    }
+    note right of BroadcastService
+        Subscribes 'outer.*' on EventService.
+        Deduplicates + batches outbound webhooks (~5 s).
+        Redis pubsub for cluster-wide delivery.
+        POST /broadcast/webhook protected by
+        HMAC-SHA256 + nonce + ±300 s timestamp.
+    end note
+
+}
+
+' ─────────────────────────────────────────
+' WebSocket push delivery
+' ─────────────────────────────────────────
+package "WebSocket Push" {
+
+    class WSPushService {
+        -svc_event: EventService
+        +{static} LOG_DEBUG: boolean
+        +_init(): Promise<void>
+        +_on_fs_create(key, data): Promise<void>
+        +_on_fs_update(key, data): Promise<void>
+        +_on_fs_move(key, data): Promise<void>
+        +_on_fs_pending(key, data): Promise<void>
+        +_on_upload_progress(key, data): Promise<void>
+        +_on_submission_done(key, data): Promise<void>
+        +_on_outer_gui(key, {user_id_list, response}, meta): Promise<void>
+        -_update_user_ts(user_id_list, timestamp, metadata): Promise<void>
+    }
+    note right of WSPushService
+        Fan-out point to SocketIO.
+        _on_outer_gui() iterates user_id_list
+        → svc_socketio.send({room: user_id})
+        → emits sent-to-user.{key} back on EventService
+    end note
+
+}
+
+' ─────────────────────────────────────────
+' Notification persistence & delivery
+' ─────────────────────────────────────────
+package "Notifications" {
+
+    class NotificationService {
+        -db: DatabaseWriteHandle
+        -merged_on_user_connected_: {}
+        -notifs_pending_write: {}
+        +{static} MODULES: { uuidv4, express }
+        +_construct(): void
+        +_init(): Promise<void>
+        +__on_install_routes(_, {app}): void
+        +on_user_connected({user}): Promise<void>
+        +do_on_user_connected({user}): Promise<void>
+        +on_sent_to_user({user_id, response}): Promise<void>
+        +notify(selector: Function, notification: object): Promise<void>
+    }
+    note right of NotificationService
+        notify() → emits outer.gui.notif.message
+        → DB insert → outer.gui.notif.persisted.
+        on_user_connected() → DB SELECT unseen
+        → emits outer.gui.notif.unreads.
+        Routes: POST /notif/mark-ack, /notif/mark-read
+    end note
+
+    class UsernameNotifSelector <<factory>> {
+        +apply(username: string): async (self) => user_id[]
+    }
+
+    class UserIDNotifSelector <<factory>> {
+        +apply(user_id): async (self) => [user_id]
+    }
+
+}
+
+' ─────────────────────────────────────────
+' External / infrastructure dependencies
+' ─────────────────────────────────────────
+package "External Dependencies" {
+    class SocketIOService <<external>> {
+        +send(room: object, key: string, data: any): void
+    }
+    class RedisClient <<external>> {
+        +publish(channel: string, message: string): void
+        +subscribe(channel: string): void
+    }
+    class Database <<external>> {
+        +read(query: string, params: any[]): Promise<Row[]>
+        +write(query: string, params: any[]): Promise<void>
+    }
+}
+
+' ─────────────────────────────────────────
+' Inheritance
+' ─────────────────────────────────────────
+EventService        --|> BaseService
+BroadcastService    --|> BaseService
+WSPushService       --|> BaseService
+NotificationService --|> BaseService
+
+' ─────────────────────────────────────────
+' Composition / association
+' ─────────────────────────────────────────
+EventService "1" *-- "0..*" ScopedEventBus : creates via get_scoped()
+
+' Service-locator dependencies (runtime)
+BroadcastService    ..> EventService       : subscribes 'outer.*'\nemits via svcEvent
+BroadcastService    ..> RedisClient        : pubsub publish/subscribe
+WSPushService       ..> EventService       : subscribes fs.*\nouter.gui.*\nputer-exec.*
+WSPushService       ..> SocketIOService    : send(room, key, data)
+NotificationService ..> EventService       : subscribes web.socket.user-connected\nsent-to-user.*\nemits outer.gui.notif.*
+NotificationService ..> Database           : read/write notification table
+NotificationService ..> UsernameNotifSelector : uses
+NotificationService ..> UserIDNotifSelector   : uses
+
+' Event flow annotations
+WSPushService ..> NotificationService : emits sent-to-user.notif.message\n→ NotificationService.on_sent_to_user()
+
+@enduml

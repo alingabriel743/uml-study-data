@@ -1,0 +1,286 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipantBorderColor #495057
+skinparam sequenceParticipantBackgroundColor #F8F9FA
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceGroupBorderColor #6C757D
+skinparam sequenceGroupBackgroundColor #E9ECEF
+skinparam noteBorderColor #ADB5BD
+skinparam noteBackgroundColor #FFF3CD
+
+title Hosting Request Routing and Site Config
+
+actor Client
+participant "puterSiteMiddleware" as MW
+participant "runInternal" as RI
+participant "PuterSiteService" as PSS
+participant "FilesystemService" as FS
+participant "AclService" as ACL
+participant "AuthService" as AUTH
+participant "DatabaseService" as DB
+participant "EventService" as EVT
+participant "LLRead" as LLR
+participant "SiteConfigParser" as SCP
+
+== Entry & Subdomain Detection ==
+
+Client -> MW : HTTP request(req, res, next)
+activate MW
+
+MW -> MW : isSubdomain?\n(hostname ends with staticHostingDomain\nor privateAppHostingDomain)\nor req.is_custom_domain?
+
+alt not a hosted subdomain / custom domain
+    MW --> Client : next() — not a hosted request
+else hosted request
+    MW -> RI : await runInternal(req, res, next)
+    activate RI
+end
+
+== Subdomain & Site Resolution ==
+
+RI -> RI : hostMatchesPrivateDomain(req.hostname)\n→ isPrivateHostedRequest
+RI -> RI : getSubdomainFromHostedRequest(req)\n→ subdomain
+
+alt hostname === staticHostingDomain (bare domain)
+    RI --> Client : 301 res.redirect(staticHostingBaseDomainRedirect)
+end
+
+alt username site (subdomain ends with '.at')
+    RI -> FS : node(NodePathSelector\n'/username/Public/index.html'))
+    activate FS
+    FS --> RI : usernameRootNode
+    deactivate FS
+else regular subdomain
+    RI -> PSS : get_subdomain(subdomain, {is_custom_domain})
+    activate PSS
+    PSS --> RI : site | null
+    deactivate PSS
+
+    alt site === null
+        RI --> Client : 404 "Subdomain not found"
+    end
+
+    RI -> RI : helpers.get_user({id: site.user_id})\n→ subdomainOwner
+
+    alt subdomainOwner.suspended
+        RI --> Client : 404 (owner suspended)
+    end
+end
+
+== Private App Resolution ==
+
+RI -> RI : helpers.get_app({id: site.associated_app_id})\n→ associatedApp
+
+RI -> RI : resolvePrivateAppForHostedSite\n({req, site, services, associatedApp})
+activate RI
+
+    RI -> RI : buildPrivateAppIndexUrlCandidates(req)\n→ indexUrlCandidates[]
+
+    alt no associatedApp
+        RI -> DB : SELECT * FROM apps\nWHERE owner_user_id=?\nAND is_private=1\nAND index_url IN (...)
+        activate DB
+        DB --> RI : privateApp | null
+        deactivate DB
+    end
+
+deactivate RI
+
+note right of RI : privateApp resolved
+
+== Private Host Redirect ==
+
+alt privateApp enabled && !hostMatchesPrivateDomain
+    RI -> RI : buildPrivateHostRedirectUrl(req, privateApp)
+    note right of RI
+        getPrivateHostingDomainForRedirect()
+        getSubdomainFromHostedRequest(req)
+        build: protocol://subdomain.privateDomain + originalUrl
+    end note
+    RI --> Client : 302 res.redirect(privateHostRedirectUrl)
+end
+
+alt associated_app_id && !privateApp && path=/
+    RI --> Client : 302 res.redirect(originUrl/app/name/)
+end
+
+== Root Directory & ACL Check ==
+
+RI -> FS : node(NodeInternalIDSelector\n(site.root_dir_id))\n→ rootNode
+activate FS
+FS --> RI : rootNode
+deactivate FS
+
+RI -> ACL : check(subdomainActor, rootNode, 'read')
+activate ACL
+ACL --> RI : permitted | denied
+deactivate ACL
+
+alt !subdomainRootPath
+    RI --> Client : 502 respondHtmlError
+end
+
+== Auth Context Evaluation ==
+
+alt public hosted site (!privateApp)
+    RI -> AUTH : resolvePublicHostedIdentity\n(req, services, appUid)
+    activate AUTH
+    note right of AUTH
+        1. verifyPublicHostedActorToken(cookie)
+        2. authenticate_from_token(sessionToken)
+        3. resolvePrivateBootstrapIdentityFromToken(bootstrapToken)
+    end note
+    AUTH --> RI : identity {userUid, sessionUuid, source}
+    deactivate AUTH
+
+    RI -> AUTH : createPublicHostedActorToken\n({appUid, userUid, ...})
+    activate AUTH
+    AUTH --> RI : publicHostedActorToken
+    deactivate AUTH
+
+    RI -> RI : res.cookie(publicHostedActorCookieName, token)
+    note right of RI : req.actor set for public hosted site
+
+else private app access gate enabled
+    RI -> AUTH : resolvePrivateIdentity\n(req, services, appUid)
+    activate AUTH
+    note right of AUTH
+        1. verifyPrivateAssetToken(privateCookie)
+        2. authenticate_from_token(sessionToken)
+        3. authenticate_from_token(bootstrapToken)\n   + resolvePrivateBootstrapIdentityFromToken()
+    end note
+    AUTH --> RI : identity | null
+    deactivate AUTH
+
+    alt no identity
+        RI --> Client : 200 HTML respondPrivateLoginBootstrap\n(Puter.js sign-in page)
+    end
+
+    RI -> EVT : emit('app.privateAccess.check', event)
+    activate EVT
+    EVT --> RI : {allowed: true|false}
+    deactivate EVT
+
+    alt !allowed
+        RI --> Client : 302 res.redirect(getPrivateDeniedRedirectUrl())
+    end
+
+    alt allowed && !hasValidPrivateCookie
+        RI -> AUTH : createPrivateAssetToken()
+        activate AUTH
+        AUTH --> RI : privateToken
+        deactivate AUTH
+        RI -> RI : res.cookie(privateCookieName, token)
+    end
+end
+
+== Protected Site Actor (site.protected) ==
+
+alt site.protected
+    RI -> AUTH : authenticate_from_token(query token)
+    activate AUTH
+    AUTH --> RI : userActor
+    deactivate AUTH
+    RI -> RI : PermissionService.scan\n(userActor, 'site:uid#....:access')\n→ Actor.create(SiteActorType, {site})\n→ siteActor
+end
+
+== File Serving ==
+
+RI -> FS : node(NodePathSelector(filepath))\n→ targetNode
+activate FS
+FS --> RI : targetNode
+deactivate FS
+
+RI -> FS : targetNode.fetchEntry()
+activate FS
+FS --> RI : entry | null
+deactivate FS
+
+alt !targetNode.exists()
+    RI -> RI : respond404({path}, req, res, next, subdomainRootPath)
+    activate RI
+
+    RI -> SCP : getSiteErrorConfig(req, subdomainRootPath)
+    activate SCP
+        SCP -> FS : node(NodePathSelector('.puter_site_config'))
+        activate FS
+        FS --> SCP : configNode
+        deactivate FS
+        SCP -> LLR : run({no_acl:true, fsNode:configNode})
+        activate LLR
+        LLR --> SCP : stream
+        deactivate LLR
+        SCP -> SCP : streamToBuffer(stream) → text
+        SCP -> SCP : parseSiteErrorConfig(text)
+        note right of SCP
+            1. parseJsonConfig → tries:
+               • parseCloudfrontRules\n               (CustomErrorResponses[])
+               • parseVercelRules\n               (rewrites/routes[])
+               • parseKeyedRules\n               (errors/errorPages keyed obj)
+            2. parseNginxStyleConfig (fallback)
+            → config {exactRules, classRules, defaultRule}
+        end note
+        SCP --> RI : config
+    deactivate SCP
+
+    RI -> SCP : getSiteErrorRule(config, 404)
+    activate SCP
+    note right of SCP
+        Lookup order:
+        exactRules[404]
+        → classRules['4xx']
+        → defaultRule
+    end note
+    SCP --> RI : rule {file, status}
+    deactivate SCP
+
+    alt rule.file exists
+        RI -> FS : getSiteFileNode(rule.file)
+        activate FS
+        FS --> RI : errorFileNode
+        deactivate FS
+        RI -> LLR : streamSiteFile({req, res, fsNode, status:404})
+        activate LLR
+        LLR --> Client : 404 custom error page
+        deactivate LLR
+    else rule.status only
+        RI --> Client : respondHtmlError({status})
+    else no rule
+        RI --> Client : 404 /404.html or default HTML error
+    end
+
+    deactivate RI
+else file exists — serve it
+    RI -> LLR : run({no_acl:true, actor, fsNode:targetNode, range?})
+    activate LLR
+    LLR --> RI : readStream
+    deactivate LLR
+
+    RI --> Client : stream.pipe(res) — 200 file response
+    deactivate RI
+end
+
+alt stream error during serving
+    RI -> SCP : getSiteErrorConfig → getSiteErrorRule(500)
+    SCP --> RI : rule
+    RI --> Client : respondSiteError (500 custom or HTML)
+end
+
+deactivate MW
+
+@enduml

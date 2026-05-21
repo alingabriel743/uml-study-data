@@ -1,0 +1,176 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #F1F3F5
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #6C757D
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #E9ECEF
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Prompt Upsampler Inference Flow\n(AR-based Mistral-12B Instruct — Cosmos-UpsamplePrompt1-12B-Text2World)
+
+actor "Caller / main()" as main
+
+participant "GuardrailPresets" as guardrail
+participant "create_prompt_upsampler()" as cpu
+participant "AutoRegressiveModel\n(Mistral-12B Instruct)" as arm
+participant "TextTokenizer" as tok
+participant "run_chat_completion()" as rcc
+participant "chat_completion()" as cc
+participant "clean_text()" as ct
+
+== Standalone Inference Path ==
+
+main -> guardrail : create_text_guardrail_runner(checkpoint_dir)
+activate guardrail
+guardrail --> main : guardrail_runner
+deactivate guardrail
+
+main -> guardrail : run_text_guardrail(input_prompt, guardrail_runner)
+activate guardrail
+guardrail --> main : is_safe
+deactivate guardrail
+
+alt is_safe == False
+    main -> main : abort — unsafe input prompt
+end
+
+main -> cpu : create_prompt_upsampler(checkpoint_dir / prompt_upsampler_dir)
+activate cpu
+cpu -> cpu : create_text_model_config(\n  model_ckpt_path, tokenizer_path,\n  model_family='mistral', model_size='12b',\n  is_instruct=True, max_batch_size=1,\n  max_seq_len=1024)
+note right : Returns (model_config, tokenizer_config)
+cpu -> arm : AutoRegressiveModel.build(model_config, tokenizer_config).to('cuda')
+activate arm
+arm --> cpu : prompt_upsampler
+deactivate arm
+cpu --> main : prompt_upsampler
+deactivate cpu
+
+main -> rcc : run_chat_completion(prompt_upsampler, input_prompt, temperature=0.01)
+activate rcc
+rcc -> rcc : build dialogs = [[{\n  role: 'user',\n  content: 'Upsample the short caption\n  to a long caption: <input>'\n}]]
+
+rcc -> cc : chat_completion(model, dialogs,\n  max_gen_len=512, temperature=0.01,\n  top_p=None, top_k=None, logprobs=False)
+activate cc
+
+note over cc : Tokenizer type branch:\nImageTextTokenizer (VLM/Video2World)\nvs TextTokenizer (Text2World — this path)
+
+cc -> tok : text_tokenizer.apply_chat_template(\n  dialog, generation_prefix='',\n  add_generation_prompt=True)
+activate tok
+tok --> cc : prompt_tokens
+deactivate tok
+
+cc -> arm : generate(prompt_tokens,\n  max_gen_len=512, temperature=0.01,\n  top_k=None, top_p=None,\n  compile_sampling=False, compile_prefill=False)
+activate arm
+arm --> cc : (generation_tokens, generation_logprobs)
+deactivate arm
+
+loop for each t in generation_tokens
+    cc -> tok : text_tokenizer.decode(t)
+    activate tok
+    tok --> cc : decoded content
+    deactivate tok
+end
+
+cc --> rcc : List[ChatPrediction(\n  generation={role:'assistant', content:...})]
+deactivate cc
+
+rcc -> ct : clean_text(results[0]['generation']['content'])
+activate ct
+note right of ct : Post-processing:\n• Normalize newlines\n• Remove '- **...**' sections (<10 words)\n• Strip leading prefixes / punctuation\n• Normalize whitespace
+ct --> rcc : upsampled_prompt
+deactivate ct
+
+rcc --> main : upsampled_prompt
+deactivate rcc
+
+main -> guardrail : run_text_guardrail(upsampled_prompt, guardrail_runner)
+activate guardrail
+guardrail --> main : is_safe
+deactivate guardrail
+
+alt is_safe == False
+    main -> main : abort — unsafe upsampled prompt
+end
+
+main -> main : log.info(upsampled_prompt)
+
+== Pipeline Integration Path (DiffusionText2WorldGenerationPipeline) ==
+
+participant "DiffusionText2World\nGenerationPipeline" as pipeline
+
+note over pipeline : __init__(enable_prompt_upsampler,\noffload_prompt_upsampler, prompt_upsampler_dir, ...)
+
+opt enable_prompt_upsampler AND NOT offload_prompt_upsampler
+    pipeline -> cpu : _load_prompt_upsampler_model()\n→ create_prompt_upsampler(ckpt_dir/upsampler_dir)
+    activate cpu
+    cpu --> pipeline : self.prompt_upsampler
+    deactivate cpu
+    note right of pipeline : Eager load (GPU resident)
+end
+
+pipeline -> guardrail : _run_guardrail_on_prompt_with_offload(prompt)
+activate guardrail
+guardrail --> pipeline : is_safe
+deactivate guardrail
+
+alt enable_prompt_upsampler AND word_count(prompt) <= word_limit_to_skip_upsampler
+    pipeline -> pipeline : _run_prompt_upsampler_on_prompt_with_offload(prompt)
+    activate pipeline
+
+    opt offload_prompt_upsampler == True
+        pipeline -> cpu : _load_prompt_upsampler_model()
+        activate cpu
+        cpu --> pipeline : self.prompt_upsampler
+        deactivate cpu
+        note right : Lazy load to GPU
+    end
+
+    pipeline -> rcc : _run_prompt_upsampler_on_prompt(prompt)\n→ run_chat_completion(self.prompt_upsampler, prompt)
+    activate rcc
+    rcc --> pipeline : upsampled_prompt
+    deactivate rcc
+
+    opt offload_prompt_upsampler == True
+        pipeline -> pipeline : _offload_prompt_upsampler_model()\n[del self.prompt_upsampler;\ngc.collect(); cuda.empty_cache()]
+        note right : Free GPU memory
+    end
+
+    deactivate pipeline
+end
+
+pipeline -> guardrail : run_text_guardrail(upsampled_prompt, guardrail_runner)
+activate guardrail
+guardrail --> pipeline : is_safe
+deactivate guardrail
+
+pipeline -> pipeline : _run_text_embedding_on_prompt_with_offload([upsampled_prompt])
+note right : Proceed to diffusion generation
+
+@enduml

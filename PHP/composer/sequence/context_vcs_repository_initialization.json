@@ -1,0 +1,112 @@
+{
+  "scope": "VCS Repository Initialization",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Caller",
+    "VcsRepository",
+    "VcsDriverInterface",
+    "GitHubDriver",
+    "GitBitbucketDriver",
+    "VcsDriver",
+    "VersionParser",
+    "ArrayLoader",
+    "VersionCacheInterface",
+    "IOInterface"
+  ],
+  "class_hierarchy": [
+    "VcsDriverInterface (interface) — defines: initialize(), getComposerInformation(), getRootIdentifier(), getBranches(), getTags(), getDist(), getSource(), getUrl(), hasComposerFile(), cleanup(), supports()",
+    "VcsDriver (abstract) implements VcsDriverInterface",
+    "GitHubDriver extends VcsDriver",
+    "GitBitbucketDriver extends VcsDriver",
+    "GitLabDriver extends VcsDriver",
+    "GitDriver extends VcsDriver",
+    "HgDriver extends VcsDriver",
+    "VcsRepository extends ArrayRepository implements ConfigurableRepositoryInterface"
+  ],
+  "constructor_flow": [
+    "VcsRepository::__construct(repoConfig, io, config, httpDownloader, dispatcher?, process?, drivers?, versionCache?)",
+    "Registers driver map: github=>GitHubDriver, gitlab=>GitLabDriver, bitbucket/git-bitbucket=>GitBitbucketDriver, forgejo=>ForgejoDriver, git=>GitDriver, hg=>HgDriver, perforce=>PerforceDriver, fossil=>FossilDriver, svn=>SvnDriver",
+    "Sets url, io, type (repoConfig['type'] ?? 'vcs'), config, repoConfig, versionCache, httpDownloader, processExecutor"
+  ],
+  "interaction_flow": [
+    "Caller → VcsRepository: initialize() [called lazily by ArrayRepository]",
+    "VcsRepository → VcsRepository: getDriver()",
+    "  getDriver: if type matches key in drivers map → instantiate specific driver class directly",
+    "  getDriver: else iterate drivers → call Driver::supports(io, config, url, deep=false) — first pass shallow check",
+    "  getDriver: else iterate drivers → call Driver::supports(io, config, url, deep=true) — second pass deep check",
+    "  getDriver: new DriverClass(repoConfig, io, config, httpDownloader, processExecutor)",
+    "  getDriver: driver->initialize()",
+    "VcsRepository → VcsDriverInterface: hasComposerFile(driver->getRootIdentifier())",
+    "VcsRepository → VcsDriverInterface: getComposerInformation(rootIdentifier) — reads packageName",
+    "VcsRepository → VcsDriverInterface: getTags() → map[tagName => identifier]",
+    "  loop tags: validateTag(tag) via VersionParser::normalize(tag)",
+    "  loop tags: getCachedPackageVersion(tag, identifier) → VersionCacheInterface::getVersionPackage()",
+    "  loop tags: driver->getComposerInformation(identifier)",
+    "  loop tags: preProcess(driver, data, identifier) → driver->getDist(identifier), driver->getSource(identifier)",
+    "  loop tags: loader->load(packageData) → addPackage(package)",
+    "VcsRepository → VcsDriverInterface: getBranches() → map[branchName => identifier]",
+    "  reorder: rootIdentifier branch moved to front",
+    "  loop branches: validateBranch(branch) via VersionParser::normalizeBranch()",
+    "  loop branches: getCachedPackageVersion(version, identifier)",
+    "  loop branches: driver->getComposerInformation(identifier)",
+    "  loop branches: preProcess(driver, data, identifier)",
+    "  loop branches: loader->load(packageData) → addPackage(package)",
+    "VcsRepository → VcsDriverInterface: cleanup()"
+  ],
+  "driver_initialization_detail": {
+    "GitHubDriver::initialize()": [
+      "Regex-parse URL to extract owner, repository, originUrl",
+      "Create Cache instance at cache-repo-dir/originUrl/owner/repo",
+      "If use-github-api=false or no-api=true → setupGitDriver(url) and return (fallback to GitDriver)",
+      "Otherwise → fetchRootIdentifier() → HTTP GET api.github.com/repos/{owner}/{repo} → sets repoData, rootIdentifier"
+    ],
+    "GitHubDriver::supports()": [
+      "Regex match https/git/git@ GitHub URL",
+      "Check originUrl in config github-domains list",
+      "Check openssl extension loaded"
+    ],
+    "GitBitbucketDriver::initialize()": [
+      "Regex-parse HTTPS bitbucket.org URL to extract owner, repository",
+      "Set originUrl='bitbucket.org'",
+      "Create Cache instance at cache-repo-dir/bitbucket.org/owner/repo",
+      "NOTE: does NOT fetch API data on init — deferred to getRootIdentifier()/getTags()/getBranches() via getRepoData()"
+    ],
+    "GitBitbucketDriver::getRootIdentifier()": [
+      "If rootIdentifier not cached → call getRepoData()",
+      "getRepoData() → HTTP GET api.bitbucket.org/2.0/repositories/{owner}/{repo} → sets branchesUrl, tagsUrl, vcsType, cloneHttpsUrl",
+      "rootIdentifier = repoData['mainbranch']['name'] ?? 'master'",
+      "If vcsType != 'git' → throw RuntimeException (hg no longer supported)"
+    ],
+    "GitBitbucketDriver::supports()": [
+      "Regex match HTTPS bitbucket.org URL",
+      "Check openssl extension loaded"
+    ]
+  },
+  "key_relationships": [
+    "VcsRepository depends_on VcsDriverInterface (via driver map, instantiation, and calls)",
+    "VcsRepository depends_on VersionParser (validateTag, validateBranch, normalizeBranch)",
+    "VcsRepository depends_on ArrayLoader / ValidatingArrayLoader (load package data)",
+    "VcsRepository depends_on VersionCacheInterface (optional cache lookup)",
+    "GitHubDriver depends_on GitHub util (OAuth handling), Cache (HTTP response caching)",
+    "GitBitbucketDriver depends_on Bitbucket util (OAuth), Cache, optional fallback VcsDriver",
+    "GitHubDriver has optional gitDriver fallback (delegates to GitDriver when no-api=true)",
+    "GitBitbucketDriver has optional fallbackDriver (set on auth failure)"
+  ],
+  "alt_flows": [
+    "ALT: type key matches drivers map → skip supports() detection, instantiate directly",
+    "ALT: GitHubDriver use-github-api=false → delegates all calls to internal GitDriver instance",
+    "ALT: GitBitbucketDriver auth failure → fallbackDriver set, all calls proxied to fallback",
+    "ALT: cachedPackage found → addPackage(cached), skip getComposerInformation()",
+    "ALT: cachedPackage===false (cached empty) → add to emptyReferences, skip",
+    "ALT: TransportException 401/403/429/5xx → rethrown, others logged and skipped",
+    "ALT: no packages found after all tags+branches → throw InvalidRepositoryException"
+  ],
+  "important_notes": "VcsRepository.getDriver() does two passes of supports(): first shallow (url regex only), then deep (may do network calls). initialize() is protected and called lazily. preProcess() ensures name consistency across all tags/branches using root identifier's packageName. Tags strip 'release-' prefix. Branch versions are always 'dev-{branch}' or use x-wildcard form. driver.cleanup() called at end of initialize().",
+  "source_files_analyzed": [
+    "src/Composer/Repository/VcsRepository.php",
+    "src/Composer/Repository/Vcs/VcsDriverInterface.php",
+    "src/Composer/Repository/Vcs/VcsDriver.php",
+    "src/Composer/Repository/Vcs/GitHubDriver.php",
+    "src/Composer/Repository/Vcs/GitBitbucketDriver.php"
+  ]
+}

@@ -1,0 +1,138 @@
+{
+  "scope": "hitl_resume_and_approval_flow",
+  "title": "HITL Resume & Approval Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Caller",
+    "Runner (run.py)",
+    "RunResult / RunResultStreaming",
+    "RunState",
+    "RunContextWrapper",
+    "resolve_interrupted_turn (turn_resolution.py)",
+    "_select_function_tool_runs_for_resume (tool_planning.py)",
+    "_build_plan_for_resume_turn (tool_planning.py)",
+    "resolve_approval_status (tool_execution.py)",
+    "_execute_tool_plan (tool_planning.py)",
+    "_collect_tool_interruptions (tool_planning.py)",
+    "append_approval_error_output (approvals.py)",
+    "update_run_state_after_resume (session_persistence.py)",
+    "save_resumed_turn_items (session_persistence.py)",
+    "Session"
+  ],
+  "interaction_flow": [
+    "--- INITIAL RUN: run suspends ---",
+    "Caller → Runner: Runner.run(agent, input)",
+    "Runner → run_single_turn: get model response + call execute_tools_and_side_effects()",
+    "execute_tools_and_side_effects → _build_plan_for_fresh_turn: build ToolExecutionPlan",
+    "_build_plan_for_fresh_turn → _execute_tool_plan: execute all tool runs",
+    "_execute_tool_plan → _collect_tool_interruptions: gather ToolApprovalItems needing approval",
+    "_collect_tool_interruptions → execute_tools_and_side_effects: return interruptions list",
+    "execute_tools_and_side_effects → Runner: return SingleStepResult(next_step=NextStepInterruption([ToolApprovalItem...]))",
+    "Runner → RunResult: expose result.interruptions = [ToolApprovalItem...]",
+    "Runner → Caller: return RunResult with .interruptions populated",
+
+    "--- HUMAN DECISION PHASE ---",
+    "Caller → RunResult: result.to_state() → RunState",
+    "RunState._current_step = NextStepInterruption(interruptions=[...])",
+    "Caller → RunState: state.approve(interruption, always_approve=False) OR state.reject(interruption, rejection_message=...)",
+    "RunState → RunContextWrapper: approve_tool(item) → _approvals[tool_name].approved.add(call_id) OR reject_tool(item) → _approvals[tool_name].rejected.add(call_id)",
+    "Caller (optional) → RunState: state.to_string() / to_json() — serialize for durable storage",
+    "Caller (optional) → RunState: RunState.from_json(agent, stored) — deserialize from storage",
+
+    "--- RESUME ---",
+    "Caller → Runner: Runner.run(agent, state=run_state) [or Runner.run_streamed]",
+    "Runner: detect run_state._current_step is NextStepInterruption → 'Continuing from interruption'",
+    "Runner → resolve_interrupted_turn(bindings, original_input, generated_items, last_model_response, last_processed_response, run_state=run_state)",
+
+    "--- INSIDE resolve_interrupted_turn ---",
+    "resolve_interrupted_turn → _pending_approvals_from_state(): read run_state._current_step.interruptions as list[ToolApprovalItem]",
+    "resolve_interrupted_turn → index_approval_items_by_call_id(pending_approval_items): build approval_items_by_call_id map",
+    "resolve_interrupted_turn → _build_tool_output_index(original_pre_step_items): build output_index (already-completed call_ids)",
+
+    "resolve_interrupted_turn → _select_function_tool_runs_for_resume(processed_response.functions, ...): filter which function runs to re-execute",
+    "_select_function_tool_runs_for_resume: for each ToolRunFunction run:",
+    "  → output_exists_checker(run): if output already in pre_step_items → skip (already done)",
+    "  → context_wrapper.get_approval_status(tool_name, call_id): returns True/False/None",
+    "  → if approval_status is False: record_rejection(call_id, tool_call, function_tool) → append rejection error item",
+    "  → if approval_status is True: add to selected (approved runs)",
+    "  → if not requires_approval: add to selected (no approval needed)",
+    "  → if approval_status is None: pending_interruption_adder(pending_item_builder(run)) → still blocked",
+    "_select_function_tool_runs_for_resume → resolve_interrupted_turn: return function_tool_runs (approved subset)",
+
+    "resolve_interrupted_turn → _collect_runs_by_approval(shell_calls, ...): same filter logic for ShellTool runs",
+    "resolve_interrupted_turn → _collect_runs_by_approval(apply_patch_calls, ...): same filter for ApplyPatchTool runs",
+    "resolve_interrupted_turn → _collect_runs_by_approval(custom_tool_calls, ...): same filter for custom tool runs",
+
+    "resolve_interrupted_turn → _build_plan_for_resume_turn(processed_response, function_runs=function_tool_runs, shell_calls=approved_shell, apply_patch_calls=approved_apply_patch, custom_tool_calls=approved_custom, pending_interruptions=..., ...): build ToolExecutionPlan",
+    "_build_plan_for_resume_turn → _collect_mcp_approval_plan: handle hosted MCP approvals",
+    "_build_plan_for_resume_turn → resolve_interrupted_turn: return ToolExecutionPlan",
+
+    "resolve_interrupted_turn → _execute_tool_plan(plan, bindings, hooks, context_wrapper, run_config): execute approved tools in parallel",
+    "_execute_tool_plan → execute_function_tool_calls / execute_shell_calls / execute_apply_patch_calls / execute_custom_tool_calls: run approved tools",
+    "_execute_tool_plan → resolve_interrupted_turn: return (function_results, guardrail_results, computer_results, ...)",
+
+    "resolve_interrupted_turn → _collect_tool_interruptions(function_results, custom_tool_results, ...): collect any NEW nested interruptions",
+    "resolve_interrupted_turn → _make_unique_item_appender: deduplicate items",
+    "resolve_interrupted_turn → _build_tool_result_items: assemble new_step_items from all results",
+
+    "resolve_interrupted_turn (branch: still has pending_interruptions):",
+    "  → return SingleStepResult(next_step=NextStepInterruption(interruptions=[...]))",
+    "resolve_interrupted_turn (branch: all resolved):",
+    "  → _append_mcp_callback_results: handle MCP callback approvals",
+    "  → continue to execute_handoffs / execute_final_output / check_for_final_output_from_tools",
+    "  → return SingleStepResult(next_step=NextStepRunAgain | NextStepFinalOutput | NextStepHandoff)",
+
+    "--- BACK IN Runner (run.py ~L850) ---",
+    "Runner → resumed_turn_items(turn_result): split into generated_items + session_items",
+    "Runner → update_run_state_after_resume(run_state, turn_result, generated_items, session_items):",
+    "  run_state._original_input = copy_input_items(turn_result.original_input)",
+    "  run_state._generated_items = generated_items",
+    "  run_state._session_items = session_items",
+    "  run_state._current_step = turn_result.next_step",
+    "Runner → save_resumed_turn_items(session, items=turn_session_items, persisted_count, response_id): persist to session store",
+    "save_resumed_turn_items → Session.add_items(items): write to session backend",
+
+    "Runner (if next_step still NextStepInterruption): save RunResult with interruptions → return to Caller again",
+    "Runner (if next_step resolved): is_resumed_state = False → continue normal turn loop → final output"
+  ],
+  "key_relationships": [
+    "Runner orchestrates the full resume lifecycle — detects NextStepInterruption state and delegates to resolve_interrupted_turn",
+    "RunState.approve/reject → RunContextWrapper._approvals dict (persisted across serialization)",
+    "resolve_interrupted_turn reads approval decisions via context_wrapper.get_approval_status(tool_name, call_id)",
+    "_select_function_tool_runs_for_resume uses approval_items_by_call_id + output_index to skip already-done/rejected calls",
+    "_build_plan_for_resume_turn composes ToolExecutionPlan from pre-filtered approved run lists",
+    "append_approval_error_output emits synthetic ToolCallOutputItem for rejected calls (model sees why tool was blocked)",
+    "update_run_state_after_resume mutates RunState in place after resume: sets _original_input, _generated_items, _session_items, _current_step",
+    "save_resumed_turn_items persists new tool outputs to Session store (skips already-persisted items via persisted_count)",
+    "Partial approval supported: unresolved interruptions re-surface on next run, resolved ones execute normally"
+  ],
+  "key_data_structures": {
+    "ToolApprovalItem": "agent, raw_item (tool call), tool_name, tool_namespace, tool_origin, tool_lookup_key",
+    "NextStepInterruption": "interruptions: list[ToolApprovalItem] — signals run is suspended",
+    "RunState._current_step": "NextStepInterruption when suspended; cleared after resume completes",
+    "RunState._approvals (via RunContextWrapper)": "dict[tool_name, ApprovalRecord(approved: bool|set, rejected: bool|set, rejection_message?)]",
+    "ToolExecutionPlan": "function_runs, computer_actions, custom_tool_calls, shell_calls, apply_patch_calls, local_shell_calls, pending_interruptions, approved_mcp_responses, mcp_requests_with_callback",
+    "SingleStepResult": "original_input, model_response, pre_step_items, new_step_items, next_step, tool_guardrail_results, processed_response",
+    "approval_items_by_call_id": "dict[call_id, ToolApprovalItem] — fast lookup of pending approvals"
+  },
+  "important_notes": [
+    "Resume does NOT re-query the LLM — it replays the last processed_response with resolved approvals",
+    "already-executed outputs are skipped via _build_tool_output_index (avoids double-execution)",
+    "always_approve=True / always_reject=True persist decisions for ALL future calls to that tool in the same run (sticky decisions survive serialization)",
+    "rejection_message per call overrides run-wide RunConfig.tool_error_formatter",
+    "Nested Agent.as_tool() interruptions surface on the outer run's interruptions list — outer RunState handles them, not the nested runner",
+    "Streaming resume: same flow via start_streaming(is_resumed_state=True) → resolves interruptions then streams new output",
+    "Session integration: save_resumed_turn_items uses persisted_count to avoid re-persisting already saved items after retries"
+  ],
+  "source_files_analyzed": [
+    "src/agents/run_internal/tool_planning.py",
+    "src/agents/run_internal/tool_execution.py",
+    "src/agents/run_internal/session_persistence.py",
+    "src/agents/run_internal/approvals.py",
+    "src/agents/run_internal/turn_resolution.py",
+    "src/agents/run_internal/run_loop.py",
+    "src/agents/run_state.py",
+    "src/agents/run.py",
+    "docs/human_in_the_loop.md"
+  ]
+}

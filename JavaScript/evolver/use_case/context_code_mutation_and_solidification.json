@@ -1,0 +1,176 @@
+{
+  "scope": "code_mutation_and_solidification",
+  "title": "Code Mutation & Solidification",
+  "diagram_type": "use_case",
+  "description": "Apply mutations to code, run tests, solidify changes, and open self-PRs on git (GEP code evolution workflow)",
+
+  "actors": [
+    {
+      "name": "GEP Engine (Evolver)",
+      "type": "primary",
+      "description": "Autonomous evolver daemon that triggers evolution cycles. Calls evolve.run(), then awaits solidify approval."
+    },
+    {
+      "name": "Developer",
+      "type": "primary",
+      "description": "Human who may review pending mutations via 'node index.js review' before solidifying. Can approve or reject."
+    },
+    {
+      "name": "GitHub / gh CLI",
+      "type": "external_system",
+      "description": "External git hosting. Receives self-PR via 'gh pr create' when mutation qualifies."
+    },
+    {
+      "name": "Test Runner (node/npm/npx)",
+      "type": "external_system",
+      "description": "Executes validation commands (npm test, node scripts/validate.js, npx vitest) during solidify gating."
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC-1",
+      "name": "Build Mutation",
+      "actor": "GEP Engine (Evolver)",
+      "module": "src/gep/mutation.js",
+      "exported_fn": "buildMutation({ signals, selectedGene, driftEnabled, allowHighRisk, personalityState })",
+      "description": "Constructs a Mutation object with id (mut_*), category (repair/optimize/innovate), risk_level (low/medium/high), trigger_signals. Category is selected based on signal types (error signals → repair, opportunity → innovate, stable plateau → optimize/innovate). High-risk personality (rigor<0.4, risk_tolerance>0.6) downgrades innovate to optimize."
+    },
+    {
+      "id": "UC-2",
+      "name": "Validate Mutation",
+      "actor": "GEP Engine (Evolver)",
+      "module": "src/gep/mutation.js",
+      "exported_fn": "isValidMutation(m), normalizeMutation(m)",
+      "description": "Validates that a mutation has required fields (type='Mutation', id, category in [repair/optimize/innovate], trigger_signals, target, expected_effect, risk_level). normalizeMutation fills defaults (category=optimize, risk_level=low)."
+    },
+    {
+      "id": "UC-3",
+      "name": "Check Blast Radius & Constraints",
+      "actor": "GEP Engine (Evolver)",
+      "module": "src/gep/policyCheck.js (called from solidify.js)",
+      "exported_fn": "checkConstraints({ gene, blast, blastRadiusEstimate, repoRoot })",
+      "description": "Enforces file/line limits from gene.constraints.max_files. Severity levels: within_limit, approaching_limit (>80%), exceeded, critical_overrun (>2x), hard_cap_breach (system cap). Detects hollow_commit (only GEP metadata changed, no real code). Blocks critical_path_modified (skills/evolver/) unless EVOLVE_ALLOW_SELF_MODIFY=true."
+    },
+    {
+      "id": "UC-4",
+      "name": "Run Validation Tests",
+      "actor": "Test Runner (node/npm/npx)",
+      "module": "src/gep/solidify.js (orchestrates), src/gep/policyCheck.js (isValidationCommandAllowed)",
+      "exported_fn": "validation via execSync(cmd) with whitelist check",
+      "description": "Runs allowed validation commands (node scripts/*.js, npm test, npx vitest). Blocks shell operators (&&, ;), backtick injection, node -e/--eval, curl, rm. Results fed into computeProcessScores and buildExecutionTrace."
+    },
+    {
+      "id": "UC-5",
+      "name": "Compute Process Scores",
+      "actor": "GEP Engine (Evolver)",
+      "module": "src/gep/solidify.js",
+      "exported_fn": "computeProcessScores({ constraintCheck, validation, protocolViolations, canary, blast, geneUsed, signals, mutation })",
+      "description": "Produces scored metrics: validation_pass_rate (0..1, ratio of passing validation results; 0.5 if empty), blast_control (0 for hollow commits). Used to build the Capsule outcome score."
+    },
+    {
+      "id": "UC-6",
+      "name": "Build Execution Trace",
+      "actor": "GEP Engine (Evolver)",
+      "module": "src/gep/executionTrace.js",
+      "exported_fn": "buildExecutionTrace({ gene, mutation, signals, blast, constraintCheck, validation, canary, outcomeStatus, startedAt, collaborationContext })",
+      "description": "Builds desensitized trace at level none/minimal/standard/collaboration (env EVOLVER_TRACE_LEVEL). Minimal: gene_id, mutation_category, signals_matched, outcome, files_changed_count, validation_result, blast_radius. Standard: adds file_types, validation_commands, error_signatures, tool_chain, canary_ok. Collaboration: adds role_decision, context_consumption, delegations, review_feedback."
+    },
+    {
+      "id": "UC-7",
+      "name": "Solidify (Commit) Changes",
+      "actor": "GEP Engine (Evolver)",
+      "module": "src/gep/solidify.js",
+      "exported_fn": "solidify({ ... }) / readStateForSolidify()",
+      "description": "Main solidify gate. Checks constraintCheck.ok, validation.ok, no protocolViolations. If all pass: stages + commits via git. Records last_solidify in evolution_solidify_state.json. Builds execution trace and triggers maybeCreatePR. If invoked interactively ('node index.js solidify'), reads last_run from state, shows mutation summary, prompts developer to approve/reject."
+    },
+    {
+      "id": "UC-8",
+      "name": "Rollback Changes",
+      "actor": "GEP Engine (Evolver)",
+      "module": "src/gep/gitOps.js",
+      "exported_fn": "rollbackTracked(repoRoot), rollbackNewUntrackedFiles({ repoRoot, baselineUntracked })",
+      "description": "On solidify failure or rejection: rollbackTracked respects EVOLVER_ROLLBACK_MODE (hard=git reset --hard, stash=git stash push, none=skip). rollbackNewUntrackedFiles deletes newly created untracked files (skips CRITICAL_PROTECTED_FILES/CRITICAL_PROTECTED_PREFIXES) and removes empty dirs. Triggered after failed constraint/validation checks."
+    },
+    {
+      "id": "UC-9",
+      "name": "Create Self-PR",
+      "actor": "GitHub / gh CLI",
+      "module": "src/gep/selfPR.js",
+      "exported_fn": "maybeCreatePR({ capsule, event, mutation, gene, blastRadius })",
+      "description": "Env-gated (EVOLVER_SELF_PR=true). Qualification gates: score>=SELF_PR_MIN_SCORE, streak>=SELF_PR_MIN_STREAK, mutation.category=='optimize', mutation.risk=='low', filesChanged<=SELF_PR_MAX_FILES, linesChanged<=SELF_PR_MAX_LINES, all changed files are public+non-obfuscated (not in OBFUSCATED_FILES set), no secrets in diff (fullLeakCheck). Cooldown: 24h (SELF_PR_COOLDOWN_MS). Dedup: SHA256 of file contents, keeps last 20 hashes. Flow: clone repo → checkout branch (evolver-bot/mutation-<capsuleId>) → copy files → git add/commit → push → gh pr create --label auto-mutation. Never auto-merges."
+    },
+    {
+      "id": "UC-10",
+      "name": "Review Pending Mutation",
+      "actor": "Developer",
+      "module": "index.js (review command)",
+      "exported_fn": "node index.js review",
+      "description": "Developer reviews last_run state from evolution_solidify_state.json. Displays mutation category, risk_level, rationale, blast radius. Prompts for approval (y/n). On approval: calls solidify(). On rejection: calls rejectPendingRun() → marks last_solidify.rejected=true, triggers rollback."
+    },
+    {
+      "id": "UC-11",
+      "name": "Capture Diff Snapshot",
+      "actor": "GEP Engine (Evolver)",
+      "module": "src/gep/gitOps.js",
+      "exported_fn": "captureDiffSnapshot(repoRoot), gitListChangedFiles({ repoRoot })",
+      "description": "Collects unstaged (git diff) + staged (git diff --cached) diffs, truncates to 8000 chars. gitListChangedFiles merges diff --name-only, --cached --name-only, ls-files --others into a Set. Used by solidify to determine blast radius."
+    }
+  ],
+
+  "use_case_relationships": [
+    { "type": "include", "from": "UC-7 Solidify Changes", "to": "UC-3 Check Blast Radius & Constraints", "note": "solidify always checks constraints before committing" },
+    { "type": "include", "from": "UC-7 Solidify Changes", "to": "UC-4 Run Validation Tests", "note": "solidify runs all validation commands" },
+    { "type": "include", "from": "UC-7 Solidify Changes", "to": "UC-5 Compute Process Scores", "note": "scores computed from validation + constraint results" },
+    { "type": "include", "from": "UC-7 Solidify Changes", "to": "UC-6 Build Execution Trace", "note": "trace built regardless of success/failure" },
+    { "type": "include", "from": "UC-7 Solidify Changes", "to": "UC-11 Capture Diff Snapshot", "note": "snapshot taken to measure blast radius" },
+    { "type": "extend", "from": "UC-8 Rollback Changes", "to": "UC-7 Solidify Changes", "note": "rollback triggered when solidify gates fail" },
+    { "type": "extend", "from": "UC-9 Create Self-PR", "to": "UC-7 Solidify Changes", "note": "self-PR triggered post successful solidify if gates pass" },
+    { "type": "include", "from": "UC-1 Build Mutation", "to": "UC-2 Validate Mutation", "note": "mutation validated immediately after building" },
+    { "type": "include", "from": "UC-10 Review Pending Mutation", "to": "UC-7 Solidify Changes", "note": "developer approval triggers solidify" },
+    { "type": "extend", "from": "UC-8 Rollback Changes", "to": "UC-10 Review Pending Mutation", "note": "developer rejection triggers rollback" }
+  ],
+
+  "key_data_objects": [
+    "Mutation: { type:'Mutation', id:'mut_*', category:'repair|optimize|innovate', risk_level:'low|medium|high', trigger_signals:[], target, expected_effect, rationale }",
+    "Capsule: { id, outcome: { score }, success_streak, trigger:[] }",
+    "BlastRadius: { files, lines, changed_files:[], all_changed_files:[] }",
+    "ValidationResult: { ok:bool, results:[{ ok, cmd, err }] }",
+    "ConstraintCheck: { ok:bool, violations:[], warnings:[] }",
+    "ExecutionTrace: { gene_id, mutation_category, outcome, files_changed_count, validation_result, blast_radius, tool_chain, error_signatures, created_at }",
+    "SolidifyState: evolution_solidify_state.json → { last_run, last_solidify: { run_id, rejected } }",
+    "SelfPRState: self_pr_state.json → { lastPRAt, recentDiffHashes:[] (max 20) }"
+  ],
+
+  "key_guards_and_conditions": [
+    "Mutation category selection: error signals → repair; opportunity signals → innovate; plateau+drift → innovate; else → optimize",
+    "High-risk personality (rigor<0.4 || risk_tolerance>0.65) downgrades innovate→optimize, caps risk_level to medium",
+    "Solidify commit gates: constraintCheck.ok && validation.ok && protocolViolations.length==0",
+    "EVOLVER_ROLLBACK_MODE: hard (default) | stash | none",
+    "Self-PR qualification: EVOLVER_SELF_PR=true, category==optimize, risk==low, files<=MAX, lines<=MAX, no obfuscated files, no leaks, not in cooldown, not duplicate diff",
+    "Protected paths (never rolled back or PRd): CRITICAL_PROTECTED_FILES=[MEMORY.md, SOUL.md, .env, package.json, ...], CRITICAL_PROTECTED_PREFIXES=[skills/feishu-*/,skills/evolver/,...]",
+    "Validation command whitelist: node scripts/*.js, npm test|run|ci, npx <tool> — blocks &&, ;, |, backtick, $(, node -e/--eval/--print/-p"
+  ],
+
+  "environment_variables": [
+    "EVOLVER_SELF_PR=true — enables self-PR creation",
+    "EVOLVER_ROLLBACK_MODE=hard|stash|none — controls rollback behavior",
+    "EVOLVER_TRACE_LEVEL=none|minimal|standard|collaboration — controls execution trace verbosity",
+    "EVOLVE_ALLOW_SELF_MODIFY=true — permits mutation of skills/evolver/ (critical path)",
+    "EVOLUTION_DIR — override directory for state files"
+  ],
+
+  "source_files_analyzed": [
+    "src/gep/mutation.js (obfuscated — analyzed via test/mutation.test.js)",
+    "src/gep/solidify.js (obfuscated — analyzed via test/solidify-helpers.test.js + index.js usage)",
+    "src/gep/gitOps.js (readable — full analysis)",
+    "src/gep/selfPR.js (readable — full analysis)",
+    "src/gep/executionTrace.js (readable — full analysis)",
+    "test/mutation.test.js",
+    "test/solidify-helpers.test.js",
+    "test/selfPR.test.js",
+    "index.js (solidify command flow)"
+  ],
+
+  "important_notes": "mutation.js and solidify.js are deliberately obfuscated (listed in selfPR.js OBFUSCATED_FILES set — never included in public self-PRs). The solidify flow is the core gating mechanism: build mutation → check constraints → run tests → compute scores → build trace → commit or rollback → optionally create self-PR. Self-PR uses a temporary clone workdir (self_pr_workdir) that is cleaned up post-PR. Evolver uses a PID lock file (evolver.pid) to prevent concurrent runs. Ralph-loop gating prevents a new cycle while a solidify is pending."
+}

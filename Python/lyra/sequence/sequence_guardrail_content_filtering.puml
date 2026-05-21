@@ -1,0 +1,314 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F0F0F0
+    BoxBorderColor #6C757D
+    GroupBackgroundColor #EEF2FF
+    GroupBorderColor #7986CB
+    DividerBackgroundColor #E9ECEF
+    DividerBorderColor #6C757D
+    NoteBackgroundColor #FFFDE7
+    NoteBorderColor #F9A825
+}
+
+title Guardrail Content Filtering Flow
+
+participant "BaseWorldGenerationPipeline" as pipeline
+participant "guardrail_presets" as presets
+participant "GuardrailRunner" as runner
+participant "Blocklist" as blocklist
+participant "LlamaGuard3" as llamaguard
+participant "VideoContentSafetyFilter" as vcsf
+participant "SigLIPEncoder" as siglip
+participant "VideoSafetyModel" as vsmodel
+participant "RetinaFaceFilter" as retina
+participant "retinaface_utils" as rfutils
+participant "blur_utils" as blur
+participant "io_utils" as io
+
+== Initialization: Load Text Guardrail ==
+
+pipeline -> pipeline: __init__() [has_text_input and not disable_guardrail]
+activate pipeline
+
+pipeline -> pipeline: _load_text_guardrail(checkpoint_dir)
+activate pipeline
+
+pipeline -> presets: create_text_guardrail_runner(checkpoint_dir)
+activate presets
+
+presets -> blocklist: <<create>> Blocklist(checkpoint_dir)
+activate blocklist
+blocklist --> presets: blocklist instance
+deactivate blocklist
+
+presets -> llamaguard: <<create>> LlamaGuard3(checkpoint_dir)
+activate llamaguard
+llamaguard --> presets: llamaguard instance
+deactivate llamaguard
+
+presets -> runner: <<create>> GuardrailRunner(\n  safety_models=[Blocklist, LlamaGuard3])
+activate runner
+runner --> presets: text_guardrail
+deactivate runner
+
+presets --> pipeline: text_guardrail: GuardrailRunner
+deactivate presets
+deactivate pipeline
+
+== Initialization: Load Video Guardrail ==
+
+pipeline -> pipeline: _load_video_guardrail(checkpoint_dir)
+activate pipeline
+
+pipeline -> presets: create_video_guardrail_runner(checkpoint_dir)
+activate presets
+
+presets -> vcsf: <<create>> VideoContentSafetyFilter(checkpoint_dir)
+activate vcsf
+
+vcsf -> siglip: <<create>> SigLIPEncoder(checkpoint_dir, device, dtype)
+activate siglip
+siglip --> vcsf: encoder instance
+deactivate siglip
+
+vcsf -> vsmodel: <<create>> VideoSafetyModel(ModelConfig(\n  input_size=1152, num_classes=7))
+activate vsmodel
+vsmodel -> vsmodel: torch.load(safety_filter.pt)
+vsmodel -> vsmodel: model.load_state_dict(state_dict)
+vsmodel --> vcsf: model instance
+deactivate vsmodel
+
+vcsf --> presets: vcsf instance
+deactivate vcsf
+
+presets -> retina: <<create>> RetinaFaceFilter(checkpoint_dir)
+activate retina
+
+retina -> rfutils: load_model(net, checkpoint_path, cpu)
+activate rfutils
+rfutils -> rfutils: torch.load(Resnet50_Final.pth)
+rfutils -> rfutils: _remove_prefix(state_dict)
+rfutils -> rfutils: _check_keys(model, state_dict)
+rfutils -> rfutils: model.load_state_dict()
+rfutils --> retina: loaded RetinaFace net
+deactivate rfutils
+
+retina --> presets: retina instance
+deactivate retina
+
+presets -> runner: <<create>> GuardrailRunner(\n  safety_models=[VideoContentSafetyFilter],\n  postprocessors=[RetinaFaceFilter])
+activate runner
+runner --> presets: video_guardrail
+deactivate runner
+
+presets --> pipeline: video_guardrail: GuardrailRunner
+deactivate presets
+deactivate pipeline
+
+== Text Guardrail Check (on prompt) ==
+
+pipeline -> pipeline: _run_guardrail_on_prompt_with_offload(prompt)
+activate pipeline
+
+note over pipeline: If offload_guardrail_models=True:\nload guardrail → run → delete + gc.collect() + cuda.empty_cache()
+
+pipeline -> pipeline: _run_guardrail_on_prompt(prompt)
+activate pipeline
+
+pipeline -> presets: run_text_guardrail(prompt, text_guardrail)
+activate presets
+
+presets -> runner: run_safety_check(prompt)
+activate runner
+
+runner -> blocklist: is_safe(prompt)
+activate blocklist
+blocklist --> runner: (is_safe: bool, message: str)
+deactivate blocklist
+
+alt Blocklist passes
+    runner -> llamaguard: is_safe(prompt)
+    activate llamaguard
+    llamaguard --> runner: (is_safe: bool, message: str)
+    deactivate llamaguard
+end
+
+runner --> presets: (is_safe: bool, message: str)
+deactivate runner
+
+alt not safe
+    presets -> presets: log.critical("GUARDRAIL BLOCKED")
+    presets --> pipeline: False
+else safe
+    presets --> pipeline: True
+end
+
+deactivate presets
+deactivate pipeline
+deactivate pipeline
+
+== Video Guardrail Check (on generated frames) ==
+
+pipeline -> pipeline: _run_guardrail_on_video_with_offload(video: np.ndarray)
+activate pipeline
+
+pipeline -> pipeline: _run_guardrail_on_video(video)
+activate pipeline
+
+pipeline -> presets: run_video_guardrail(frames, video_guardrail)
+activate presets
+
+presets -> runner: run_safety_check(frames)
+activate runner
+
+runner -> vcsf: is_safe(frames: Iterable)
+activate vcsf
+
+vcsf -> vcsf: is_safe_frames(frames)
+activate vcsf
+
+loop for each frame sampled @ 2 FPS
+    vcsf -> vcsf: Image.fromarray(frame)
+    vcsf -> vcsf: __infer(pil_image)
+    activate vcsf
+
+    vcsf -> siglip: encode_image(pil_image)
+    activate siglip
+    siglip --> vcsf: image_embs
+    deactivate siglip
+
+    vcsf -> vsmodel: network(image_embs)
+    activate vsmodel
+    vsmodel -> vsmodel: softmax(logits)
+    vsmodel -> vsmodel: argmax → predicted_class
+    note right of vsmodel
+      Classes:
+      0=Safe, 1=Sexual_Content
+      2=Violence, 3=Drugs
+      4=Child_Abuse
+      5=Hate_and_Harassment
+      6=Self-Harm
+    end note
+    vsmodel --> vcsf: predicted_class
+    deactivate vsmodel
+
+    deactivate vcsf
+
+    alt predicted_class != 0 (unsafe)
+        vcsf -> vcsf: break early
+    end
+end
+
+vcsf --> vcsf: is_safe: bool
+deactivate vcsf
+
+vcsf --> runner: (is_safe: bool, message: str)
+deactivate vcsf
+
+runner --> presets: (is_safe: bool, message: str)
+deactivate runner
+
+alt not safe
+    presets -> presets: log.critical("GUARDRAIL BLOCKED")
+    presets --> pipeline: None
+else safe — proceed to face blur
+
+    == Face Blur Postprocessing ==
+
+    presets -> runner: postprocess(frames)
+    activate runner
+
+    runner -> retina: postprocess(frames: np.ndarray)
+    activate retina
+
+    retina -> retina: preprocess_frames(frames)\n[RGB→BGR, subtract mean, permute]
+    retina -> retina: DataLoader(TensorDataset(frames_tensor),\n  batch_size)
+
+    loop per batch
+        retina -> retina: PriorBox(cfg, image_size).forward()\n→ prior_data [first batch only]
+        retina -> retina: RetinaFace.net(batch)\n→ batch_loc, batch_conf
+
+        retina -> retina: blur_detected_faces(frames_slice,\n  batch_loc, batch_conf,\n  prior_data, scale)
+        activate retina
+
+        retina -> rfutils: decode_batch(batch_loc,\n  prior_data, variances)
+        activate rfutils
+        rfutils --> retina: batch_boxes: np.ndarray
+        deactivate rfutils
+
+        loop per frame
+            retina -> rfutils: filter_detected_boxes(boxes, scores,\n  confidence_threshold=0.7,\n  nms_threshold=0.4,\n  top_k=5000, keep_top_k=750)
+            activate rfutils
+            rfutils -> rfutils: np.where(scores > threshold)
+            rfutils -> rfutils: argsort top_k
+            rfutils -> rfutils: py_cpu_nms(dets, nms_threshold)
+            rfutils --> retina: filtered boxes
+            deactivate rfutils
+
+            loop per detected face box
+                alt box >= min_size (20×20 px)
+                    retina -> blur: pixelate_face(face_roi)
+                    activate blur
+                    blur --> retina: blurred_face
+                    deactivate blur
+                    retina -> retina: replace face region in frame
+                end
+            end
+        end
+
+        deactivate retina
+    end
+
+    retina --> runner: processed_frames: np.ndarray
+    deactivate retina
+
+    runner --> presets: postprocessed_frames
+    deactivate runner
+
+    presets --> pipeline: postprocessed_frames
+end
+
+deactivate presets
+deactivate pipeline
+deactivate pipeline
+
+== Save Output ==
+
+pipeline -> io: save_video(filepath, frames, fps)
+activate io
+io -> io: imageio.get_writer(filepath, fps)
+
+loop per frame
+    io -> io: writer.append_data(frame)
+end
+
+io -> io: writer.close()
+io --> pipeline: saved
+deactivate io
+
+deactivate pipeline
+
+@enduml

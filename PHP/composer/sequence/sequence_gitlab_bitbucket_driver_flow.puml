@@ -1,0 +1,331 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #6C757D
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #F1F3F5
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+}
+skinparam noteBorderColor #6C757D
+skinparam noteBackgroundColor #FFF9C4
+
+title GitLab and Bitbucket VCS Driver Flows
+
+participant "VcsRepository" as vcs
+participant "GitLabDriver" as gld
+participant "GitBitbucketDriver" as gbd
+participant "VcsDriver\n(parent)" as parent
+participant "HttpDownloader" as http
+participant "Cache" as cache
+participant "Response" as resp
+participant "GitLab (Util)" as glutil
+participant "Bitbucket (Util)" as bbutil
+participant "GitDriver\n(fallback)" as gitdrv
+
+' ─────────────────────────────────────────────
+== GitLab Driver Flow ==
+' ─────────────────────────────────────────────
+
+vcs -> gld : initialize(url)
+activate gld
+  note right of gld : Preg::isMatch(URL_REGEX)\ndetermineOrigin(configuredDomains)
+  gld -> cache : new Cache(io, cache-repo-dir/origin/ns/repo)
+  activate cache
+  cache --> gld : cache instance
+  deactivate cache
+  gld -> gld : fetchProject()
+  activate gld
+    note right of gld : apiUrl = scheme://originUrl\n/api/v4/projects/namespace%2Frepo
+    gld -> parent : getContents(apiUrl, fetchingRepoData=true)
+    activate parent
+      parent -> http : get(apiUrl)
+      activate http
+      http --> parent : Response
+      deactivate http
+    parent --> gld : Response
+    deactivate parent
+    gld -> resp : decodeJson()
+    activate resp
+    resp --> gld : project[]
+    deactivate resp
+    note right of gld : set $this->project\ncheck project['visibility'] → isPrivate
+  deactivate gld
+deactivate gld
+
+vcs -> gld : getComposerInformation(identifier)
+activate gld
+  gld -> cache : read(identifier)
+  activate cache
+  cache --> gld : cached data or null
+  deactivate cache
+  alt cache miss
+    gld -> gld : getBaseComposerInformation(identifier)
+    activate gld
+      gld -> gld : getFileContent('composer.json', identifier)
+      activate gld
+        note right of gld : resolve branch→hash via getBranches()\napiUrl + /repository/files/{file}/raw?ref={id}
+        gld -> parent : getContents(fileApiUrl)
+        activate parent
+          parent -> http : get(fileApiUrl)
+          activate http
+          http --> parent : Response
+          deactivate http
+        parent --> gld : Response
+        deactivate parent
+        gld -> resp : getBody()
+        activate resp
+        resp --> gld : fileContent (string)
+        deactivate resp
+      deactivate gld
+    deactivate gld
+    gld -> cache : write(identifier, encodedData)
+    activate cache
+    cache --> gld
+    deactivate cache
+  end
+  note right of gld : enrich: source URL from getTags()/getBranches()\nproject['web_url'], project['archived']
+gld --> vcs : composerInfo[]
+deactivate gld
+
+vcs -> gld : getBranches() / getTags()
+activate gld
+  note right of gld : getReferences(type) — paginated loop
+  loop until no next page
+    gld -> parent : getContents(apiUrl+/repository/{type}?per_page=100)
+    activate parent
+      parent -> http : get(url)
+      activate http
+      http --> parent : Response
+      deactivate http
+    parent --> gld : Response
+    deactivate parent
+    gld -> resp : decodeJson()
+    activate resp
+    resp --> gld : refs[] (name → commit.id)
+    deactivate resp
+    note right of gld : cache commits[] for getChangeDate()\ncheck Link header rel=next
+  end
+gld --> vcs : branches[] / tags[]
+deactivate gld
+
+vcs -> gld : getDist(identifier)
+activate gld
+  note right of gld : type=zip\nurl = apiUrl+/repository/archive.zip?sha={id}
+gld --> vcs : ['type'=>'zip', 'url'=>archiveUrl, 'reference'=>id]
+deactivate gld
+
+vcs -> gld : getSource(identifier)
+activate gld
+  note right of gld : getRepositoryUrl():\n  protocol? project[protocol_url_to_repo]\n  isPrivate? ssh_url_to_repo : http_url_to_repo
+gld --> vcs : ['type'=>'git', 'url'=>repoUrl, 'reference'=>id]
+deactivate gld
+
+' ── GitLab auth failure path ──
+vcs -> gld : getContents(url, fetchingRepoData=true)
+activate gld
+  gld -> parent : getContents(url)
+  activate parent
+    parent -> http : get(url)
+    activate http
+    http --> parent : TransportException (401/403/404)
+    deactivate http
+  parent --> gld : TransportException
+  deactivate parent
+  alt 401 / 404 — fetchingRepoData
+    gld -> glutil : new GitLab(io, config)
+    activate glutil
+    gld -> glutil : authorizeOAuth(originUrl)
+    glutil --> gld : token applied
+    deactivate glutil
+    gld -> parent : getContents(url) [retry]
+    activate parent
+    parent -> http : get(url)
+    activate http
+    http --> parent : Response
+    deactivate http
+    parent --> gld : Response
+    deactivate parent
+  else non-interactive && 401/404
+    gld -> gld : attemptCloneFallback()
+    activate gld
+      note right of gld : isPrivate→generateSshUrl()\nelse generatePublicUrl()
+      gld -> gitdrv : new GitDriver([url], io, config, httpDownloader, process)
+      activate gitdrv
+      gld -> gitdrv : initialize()
+      gitdrv --> gld : ready
+      deactivate gitdrv
+    deactivate gld
+    gld --> vcs : dummy Response
+  end
+deactivate gld
+
+' ─────────────────────────────────────────────
+== Bitbucket Driver Flow ==
+' ─────────────────────────────────────────────
+
+vcs -> gbd : initialize(url)
+activate gbd
+  note right of gbd : Preg::isMatch(bitbucket URL regex)\nset owner, repository, originUrl='bitbucket.org'
+  gbd -> cache : new Cache(io, cache-repo-dir/bitbucket.org/owner/repo)
+  activate cache
+  cache --> gbd : cache instance
+  deactivate cache
+deactivate gbd
+
+vcs -> gbd : getRootIdentifier()
+activate gbd
+  gbd -> gbd : getRepoData()
+  activate gbd
+    note right of gbd : fetchWithOAuthCredentials(\n  api 2.0/repositories/owner/repo\n  ?fields=-project,-owner, fetchingRepoData=true)
+    gbd -> parent : getContents(repoApiUrl)
+    activate parent
+      parent -> http : get(repoApiUrl)
+      activate http
+      http --> parent : Response
+      deactivate http
+    parent --> gbd : Response
+    deactivate parent
+    gbd -> resp : decodeJson()
+    activate resp
+    resp --> gbd : repoData[]
+    deactivate resp
+    note right of gbd : parseCloneUrls(repoData['links']['clone'])\nset cloneHttpsUrl, hasIssues, branchesUrl\ntagsUrl, homeUrl, website, vcsType
+  deactivate gbd
+  note right of gbd : rootIdentifier = repoData['mainbranch']['name'] ?? 'master'
+gbd --> vcs : rootIdentifier (branch name)
+deactivate gbd
+
+vcs -> gbd : getComposerInformation(identifier)
+activate gbd
+  gbd -> cache : read(identifier)
+  activate cache
+  cache --> gbd : cached data or null
+  deactivate cache
+  alt cache miss
+    gbd -> gbd : getBaseComposerInformation(identifier)
+    activate gbd
+      gbd -> gbd : getFileContent('composer.json', identifier)
+      activate gbd
+        note right of gbd : resolve branch→hash via getBranches() if '/' in id\nfetchWithOAuthCredentials(\n  api/2.0/repositories/owner/repo/src/{id}/composer.json)
+        gbd -> parent : getContents(fileApiUrl)
+        activate parent
+          parent -> http : get(fileApiUrl)
+          activate http
+          http --> parent : Response
+          deactivate http
+        parent --> gbd : Response
+        deactivate parent
+        gbd -> resp : getBody()
+        activate resp
+        resp --> gbd : fileContent (string)
+        deactivate resp
+      deactivate gbd
+    deactivate gbd
+    gbd -> cache : write(identifier, encodedData)
+    activate cache
+    cache --> gbd
+    deactivate cache
+  end
+  note right of gbd : enrich: source URL with hash from getTags()/getBranches()\nhasIssues, homeUrl/website
+gbd --> vcs : composerInfo[]
+deactivate gbd
+
+vcs -> gbd : getBranches() / getTags()
+activate gbd
+  note right of gbd : fetchWithOAuthCredentials(branchesUrl/tagsUrl\n  ?pagelen=100&fields=values.name,values.target.hash,...)
+  loop until no 'next' URL
+    gbd -> parent : getContents(listUrl)
+    activate parent
+      parent -> http : get(listUrl)
+      activate http
+      http --> parent : Response
+      deactivate http
+    parent --> gbd : Response
+    deactivate parent
+    gbd -> resp : decodeJson()
+    activate resp
+    resp --> gbd : page[] (name → target.hash)
+    deactivate resp
+    note right of gbd : follow 'next' field in response
+  end
+gbd --> vcs : branches[] / tags[]
+deactivate gbd
+
+vcs -> gbd : getDist(identifier)
+activate gbd
+  note right of gbd : type=zip\nurl = https://bitbucket.org/owner/repo/get/{id}.zip
+gbd --> vcs : ['type'=>'zip', 'url'=>zipUrl, 'reference'=>id]
+deactivate gbd
+
+vcs -> gbd : getSource(identifier)
+activate gbd
+  note right of gbd : getUrl() → cloneHttpsUrl
+gbd --> vcs : ['type'=>vcsType (git), 'url'=>cloneHttpsUrl, 'reference'=>id]
+deactivate gbd
+
+' ── Bitbucket auth failure path ──
+vcs -> gbd : fetchWithOAuthCredentials(url, fetchingRepoData=true)
+activate gbd
+  gbd -> parent : getContents(url)
+  activate parent
+    parent -> http : get(url)
+    activate http
+    http --> parent : TransportException (401/403/404)
+    deactivate http
+  parent --> gbd : TransportException
+  deactivate parent
+  alt !hasAuthentication — try OAuth
+    gbd -> bbutil : new Bitbucket(io, config)
+    activate bbutil
+    gbd -> bbutil : authorizeOAuth(originUrl)
+    bbutil --> gbd : credentials applied
+    deactivate bbutil
+    gbd -> parent : getContents(url) [retry]
+    activate parent
+    parent -> http : get(url)
+    activate http
+    http --> parent : Response
+    deactivate http
+    parent --> gbd : Response
+    deactivate parent
+  else non-interactive && fetchingRepoData
+    gbd -> gbd : attemptCloneFallback()
+    activate gbd
+      note right of gbd : generateSshUrl()\n→ git@bitbucket.org:owner/repo.git
+      gbd -> gitdrv : new GitDriver([sshUrl], io, config, httpDownloader, process)
+      activate gitdrv
+      gbd -> gitdrv : initialize()
+      gitdrv --> gbd : ready
+      deactivate gitdrv
+    deactivate gbd
+    gbd --> vcs : dummy Response
+  end
+deactivate gbd
+
+@enduml

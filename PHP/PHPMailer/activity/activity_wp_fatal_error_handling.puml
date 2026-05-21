@@ -1,0 +1,197 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam ArrowColor #495057
+skinparam NoteBackgroundColor #FFF3CD
+skinparam NoteBorderColor #FFC107
+
+title WordPress Fatal Error Handling\n(WP 5.2+ — WSOD Protection)
+
+|WordPress Bootstrap|
+start
+:WP core bootstrap begins;
+note right
+  Called early during WP init —
+  must be set before plugins load
+end note
+:wp_register_fatal_error_handler();
+
+if (wp_is_fatal_error_handler_enabled()?) then (enabled)
+  note right
+    Checks WP_DISABLE_FATAL_ERROR_HANDLER constant
+    + filter 'wp_fatal_error_handler_enabled'
+  end note
+else (disabled)
+  :Exit — handler not registered;
+  stop
+endif
+
+if (WP_CONTENT_DIR/fatal-error-handler.php\nexists and is readable?) then (yes — custom drop-in)
+  :Load custom fatal-error-handler.php drop-in;
+  note right
+    Must return object with handle()
+    method; should extend
+    WP_Fatal_Error_Handler
+  end note
+else (no)
+  :Instantiate default\nWP_Fatal_Error_Handler;
+endif
+
+:register_shutdown_function([$handler, 'handle']);
+note right
+  Registered with PHP to fire
+  automatically at script shutdown
+end note
+
+|PHP Runtime|
+:PHP script execution ends;
+:PHP triggers registered\nshutdown functions;
+
+|WP_Fatal_Error_Handler|
+:handle() is invoked;
+
+if (WP_SANDBOX_SCRAPING\nconstant is true?) then (yes)
+  :Return silently\n(sandbox scraping active);
+  stop
+else (no)
+endif
+
+if (wp_is_maintenance_mode()?) then (yes)
+  :Return silently\n(updates in progress);
+  stop
+else (no)
+endif
+
+:detect_error();
+:Call PHP error_get_last();
+
+if (error_get_last() returns null?) then (null — no error)
+  :Return — no fatal error recorded;
+  stop
+else (error found)
+endif
+
+:should_handle_error($error);
+note right
+  Whitelist: E_ERROR, E_PARSE,
+  E_USER_ERROR, E_COMPILE_ERROR,
+  E_RECOVERABLE_ERROR
+end note
+
+if (Error type in\nhandled whitelist?) then (no)
+  :apply_filters(\n  'wp_should_handle_php_error',\n  false, $error\n);
+  if (Filter returns true?) then (yes)
+    :Error accepted via filter;
+  else (no)
+    :Return null — error ignored;
+    stop
+  endif
+else (yes)
+endif
+
+:Load default textdomain\n(if $wp_locale not set);
+
+|Recovery Mode|
+if (!is_multisite() AND\nwp_recovery_mode()->is_initialized()?) then (yes)
+  :wp_recovery_mode()->handle_error($error);
+  note right
+    May send recovery email to admin.
+    Returns true (handled) or WP_Error.
+    Recovery mode only active on single-site.
+  end note
+  :$handled = result (true or WP_Error);
+else (no — multisite or not initialized)
+  :$handled = false;
+endif
+
+|WP_Fatal_Error_Handler|
+if (is_admin() OR\n!headers_sent()?) then (yes — can output)
+  :display_error_template($error, $handled);
+else (no — headers already sent on frontend)
+  :Skip template output;
+  stop
+endif
+
+if (WP_CONTENT_DIR/php-error.php\nexists and is readable?) then (yes — custom drop-in)
+  :require_once php-error.php;
+  note right
+    Custom drop-in takes full control
+    of HTTP status code and HTML output
+  end note
+  stop
+else (no)
+  :display_default_error_template(\n  $error, $handled\n);
+endif
+
+|Error Display|
+:Ensure __() translation function available\n(wp_load_translations_early if needed);
+:Ensure wp_die() available\n(require functions.php if needed);
+:Ensure WP_Error class available\n(require class-wp-error.php if needed);
+
+if ($handled === true AND\nwp_is_recovery_mode()?) then (yes — in recovery mode)
+  :Message: "critical error …\nputting it in recovery mode.\nCheck Themes and Plugins.";
+else (no)
+  if (is_protected_endpoint() AND\nwp_recovery_mode()->is_initialized()?) then (yes — protected endpoint)
+    if (is_multisite()?) then (yes)
+      :Message: "reach out to your\nsite administrator";
+    else (no — single site)
+      :Message: "check your site admin\nemail inbox for instructions";
+    endif
+  else (no — unprotected / not initialized)
+    :Message: "There has been a\ncritical error on this website.";
+  endif
+endif
+
+:apply_filters(\n  'wp_php_error_message',\n  $message, $error\n);
+note right
+  Allows plugins/themes to
+  customise the error message
+end note
+
+:apply_filters(\n  'wp_php_error_args',\n  {response: 500, exit: false},\n  $error\n);
+note right
+  exit:false — PHP continues
+  after wp_die so shutdown
+  completes normally
+end note
+
+:new WP_Error(\n  'internal_server_error',\n  $message,\n  ['error' => $error]\n);
+
+:wp_die($wp_error, '', $args);
+note right
+  Sends HTTP 500 status.
+  Outputs styled HTML error page.
+  All messages are i18n-ready.
+end note
+
+stop
+
+@enduml

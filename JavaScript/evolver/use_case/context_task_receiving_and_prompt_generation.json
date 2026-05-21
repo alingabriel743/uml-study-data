@@ -1,0 +1,219 @@
+{
+  "scope": "task_receiving_and_prompt_generation",
+  "title": "Task Receiving & Prompt Generation",
+  "diagram_type": "use_case",
+  "description": "Covers how the GEP agent receives tasks from the Hub/peers, scores and claims them, generates the evolution prompt, and produces proactive clarifying questions.",
+
+  "actors": [
+    {
+      "name": "GEP Evolution Cycle",
+      "type": "primary",
+      "description": "Orchestrator that drives the receive → select → claim → prompt → question loop"
+    },
+    {
+      "name": "Hub (evomap.ai)",
+      "type": "external_system",
+      "description": "A2A hub at A2A_HUB_URL; exposes /a2a/fetch, /a2a/task/claim, /a2a/task/complete, /a2a/work/*"
+    },
+    {
+      "name": "Peer Agent",
+      "type": "external_system",
+      "description": "Other agents sending/receiving messages via mailbox transport"
+    },
+    {
+      "name": "Post-Solidify Hook",
+      "type": "secondary",
+      "description": "Caller that triggers urgent question generation after a failed solidify cycle"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Fetch Tasks from Hub",
+      "actor": "GEP Evolution Cycle",
+      "module": "taskReceiver.js",
+      "method": "fetchTasks(opts?: { questions? })",
+      "description": "POST /a2a/fetch with gep-a2a protocol message; returns available tasks plus optional questions_created and relevant_lessons from Hub",
+      "extends": ["UC7"]
+    },
+    {
+      "id": "UC2",
+      "name": "Select Best Task",
+      "actor": "GEP Evolution Cycle",
+      "module": "taskReceiver.js",
+      "method": "selectBestTask(tasks, memoryEvents)",
+      "description": "Scores open tasks using composite formula (ROI + capability match + completion rate + bounty). Strategy configurable via TASK_STRATEGY env (greedy / balanced / conservative). Always resumes already-claimed task first.",
+      "includes": ["UC2a", "UC2b"]
+    },
+    {
+      "id": "UC2a",
+      "name": "Estimate Capability Match",
+      "actor": "GEP Evolution Cycle",
+      "module": "taskReceiver.js",
+      "method": "estimateCapabilityMatch(task, memoryEvents) → 0.0-1.0",
+      "description": "Jaccard signal overlap × 40% + weighted success rate from MemoryGraph × 60%"
+    },
+    {
+      "id": "UC2b",
+      "name": "Score Task",
+      "actor": "GEP Evolution Cycle",
+      "module": "taskReceiver.js",
+      "method": "scoreTask(task, capabilityMatch) → { composite, factors }",
+      "description": "Applies strategy weights to roi/capability/completion/bounty factors. Normalises against reference maxima."
+    },
+    {
+      "id": "UC3",
+      "name": "Claim Task on Hub",
+      "actor": "GEP Evolution Cycle",
+      "module": "taskReceiver.js",
+      "method": "claimTask(taskId, opts?: { commitment_deadline }) → boolean",
+      "description": "POST /a2a/task/claim. Deadline estimated via estimateCommitmentDeadline() from task difficulty."
+    },
+    {
+      "id": "UC4",
+      "name": "Complete Task on Hub",
+      "actor": "GEP Evolution Cycle",
+      "module": "taskReceiver.js",
+      "method": "completeTask(taskId, assetId) → boolean",
+      "description": "POST /a2a/task/complete with result asset ID (sha256:... of published capsule)"
+    },
+    {
+      "id": "UC5",
+      "name": "Claim & Complete Worker Pool Task",
+      "actor": "GEP Evolution Cycle",
+      "module": "taskReceiver.js",
+      "method": "claimAndCompleteWorkerTask(taskId, resultAssetId) → { ok, assignment_id?, error? }",
+      "description": "Atomic claim+complete for /a2a/work/* endpoints. Called after solidify to avoid holding expiring assignments.",
+      "includes": ["UC5a", "UC5b"]
+    },
+    {
+      "id": "UC5a",
+      "name": "Claim Worker Task",
+      "module": "taskReceiver.js",
+      "method": "claimWorkerTask(taskId) → assignment | null"
+    },
+    {
+      "id": "UC5b",
+      "name": "Complete Worker Task",
+      "module": "taskReceiver.js",
+      "method": "completeWorkerTask(assignmentId, resultAssetId) → boolean"
+    },
+    {
+      "id": "UC6",
+      "name": "Extract Signals from Task",
+      "actor": "GEP Evolution Cycle",
+      "module": "taskReceiver.js",
+      "method": "taskToSignals(task) / taskToSignalsWithPrivacy(task) → string[]",
+      "description": "Converts task.signals CSV + title words into a signals array; adds external_task, bounty_task, and optionally privacy_computing / sealed_tool"
+    },
+    {
+      "id": "UC7",
+      "name": "Detect Privacy / Sealed Computing Task",
+      "actor": "GEP Evolution Cycle",
+      "module": "taskReceiver.js",
+      "method": "detectPrivacyTask(task) → { toolId, blobIds } | null",
+      "description": "Delegates to privacyClient.parsePrivacyParams(body) to extract sealed tool/blob references"
+    },
+    {
+      "id": "UC8",
+      "name": "Generate GEP Evolution Prompt",
+      "actor": "GEP Evolution Cycle",
+      "module": "prompt.js (obfuscated)",
+      "method": "buildGepPrompt(opts) → string",
+      "description": "Builds the full Genome Evolution Protocol prompt string. Includes: protocol header, object model (Gene, Capsule, Mutation, PersonalityState, EvolutionEvent), constitutional ethics, cycleId, signals, hubMatchedBlock, recentHistory, hubLessons, strategyPolicy, capsule/gene/capability candidates.",
+      "key_inputs": [
+        "nowIso", "context", "signals", "selector", "parentEventId", "selectedGene",
+        "capsuleCandidates", "genesPreview", "capsulesPreview", "capabilityCandidatesPreview",
+        "externalCandidatesPreview", "hubMatchedBlock", "cycleId", "recentHistory",
+        "failedCapsules", "hubLessons", "strategyPolicy", "initialUserPrompt"
+      ]
+    },
+    {
+      "id": "UC9",
+      "name": "Generate Standard Proactive Questions",
+      "actor": "GEP Evolution Cycle",
+      "module": "questionGenerator.js",
+      "method": "generateQuestions(opts: { signals, recentEvents, sessionTranscript, memorySnippet }) → Question[]",
+      "description": "Rate-limited (≤1/30 min). Returns ≤3 highest-priority questions. Triggered by signals: recurring_error, capability_gap, evolution_saturation, consecutive_failure_streak_N (≥3), user_feature_request, perf_bottleneck, hub_search_miss_with_problem, repair_loop_detected, plateau_pivot_required/suggested.",
+      "extends": ["UC11"]
+    },
+    {
+      "id": "UC10",
+      "name": "Generate Urgent Questions (Post-Solidify)",
+      "actor": "Post-Solidify Hook",
+      "module": "questionGenerator.js",
+      "method": "generateUrgentQuestions(opts) → Question[]",
+      "description": "Bypasses standard cooldown; separate 5-min rate limit. Returns ≤2 questions. Triggered by: validationFailed, lowConfidence, llmReviewRejected, zeroBlastRadius, taskCompletionFailed.",
+      "extends": ["UC11"]
+    },
+    {
+      "id": "UC11",
+      "name": "Deduplicate & Rate-Limit Questions",
+      "module": "questionGenerator.js",
+      "description": "isDuplicate() uses word-overlap Jaccard (>0.7 = duplicate). State persisted in question_generator_state.json (lastAskedAt, lastUrgentAt, recentQuestions[30])."
+    },
+    {
+      "id": "UC12",
+      "name": "Piggyback Questions on Fetch Request",
+      "actor": "GEP Evolution Cycle",
+      "module": "taskReceiver.js",
+      "method": "fetchTasks({ questions: Question[] })",
+      "description": "Questions from generateQuestions() are embedded in the /a2a/fetch payload; Hub creates bounties from them. Response may include questions_created."
+    },
+    {
+      "id": "UC13",
+      "name": "Send Message via Mailbox",
+      "actor": "GEP Evolution Cycle",
+      "module": "mailboxTransport.js",
+      "method": "mailboxTransport.send(message) → POST /mailbox/send",
+      "description": "Sends a typed A2A message via the local proxy. Routes through getProxyUrl()."
+    },
+    {
+      "id": "UC14",
+      "name": "Receive Messages via Mailbox",
+      "actor": "GEP Evolution Cycle",
+      "module": "mailboxTransport.js",
+      "method": "mailboxTransport.receive(opts?) → POST /mailbox/poll → messages[]",
+      "description": "Polls mailbox for messages by type/channel. Used for peer task distribution."
+    },
+    {
+      "id": "UC15",
+      "name": "Register Mailbox Transport",
+      "actor": "GEP Evolution Cycle",
+      "module": "mailboxTransport.js",
+      "method": "registerMailboxTransport() → registerTransport('mailbox', mailboxTransport)",
+      "description": "Registers the mailbox transport with a2aProtocol so other GEP modules can use it."
+    }
+  ],
+
+  "key_relationships": [
+    "GEP Evolution Cycle uses taskReceiver to fetch, score, select, and claim tasks",
+    "taskReceiver.fetchTasks() piggybacked with questions from questionGenerator (UC12 extends UC1)",
+    "taskReceiver depends_on a2aProtocol (getNodeId, buildHubHeaders, registerTransport)",
+    "taskReceiver depends_on privacyClient (parsePrivacyParams) for sealed tasks",
+    "questionGenerator depends_on paths (getEvolutionDir) for state persistence",
+    "mailboxTransport depends_on proxy/server/settings (getProxyUrl) and a2aProtocol (registerTransport)",
+    "prompt.js (buildGepPrompt) is obfuscated; API recovered from test file; called by evolution cycle with signals + task context",
+    "generateUrgentQuestions triggered by Post-Solidify Hook, separate from standard cycle-start path",
+    "UC9 (generateQuestions) and UC10 (generateUrgentQuestions) both extend UC11 (deduplicate/rate-limit)"
+  ],
+
+  "important_notes": [
+    "prompt.js is a heavily obfuscated file; only the exported API (buildGepPrompt) is known from tests",
+    "TASK_STRATEGY env controls scoring weights: greedy (80% bounty), balanced (35% ROI + 30% cap), conservative (45% capability)",
+    "TASK_MIN_CAPABILITY_MATCH env (default 0.1) filters tasks below capability threshold",
+    "Commitment deadlines derived from difficulty: low→15min, medium→30min, high→60min, very_high→120min; capped at 5min–24h",
+    "Questions are typed { question: string, amount: number, signals: string[] }; amount always 0 (Hub sets bounty amount)",
+    "mailboxTransport communicates via a local HTTP proxy, not directly to Hub"
+  ],
+
+  "source_files_analyzed": [
+    "src/gep/taskReceiver.js",
+    "src/gep/prompt.js (obfuscated — API from test/prompt.test.js)",
+    "src/gep/questionGenerator.js",
+    "src/gep/mailboxTransport.js",
+    "test/prompt.test.js",
+    "test/questionGenerator.test.js"
+  ]
+}

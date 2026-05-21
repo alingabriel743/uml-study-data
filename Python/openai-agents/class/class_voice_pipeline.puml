@@ -1,0 +1,311 @@
+@startuml voice_pipeline
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #F9A825
+}
+
+title Voice – Pipeline & Models
+
+' ─────────────────────────────────────────
+' Package: Pipeline
+' ─────────────────────────────────────────
+package "voice/pipeline" {
+
+    class VoicePipeline {
+        -workflow: VoiceWorkflowBase
+        -stt_model: STTModel | None
+        -tts_model: TTSModel | None
+        -_stt_model_name: str | None
+        -_tts_model_name: str | None
+        -config: VoicePipelineConfig
+        --
+        +__init__(workflow, stt_model, tts_model, config)
+        +async run(audio_input): StreamedAudioResult
+        -_get_stt_model(): STTModel
+        -_get_tts_model(): TTSModel
+        -async _process_audio_input(audio_input): str
+        -async _run_single_turn(audio_input): StreamedAudioResult
+        -async _run_multi_turn(audio_input): StreamedAudioResult
+    }
+
+    class VoicePipelineConfig <<dataclass>> {
+        +model_provider: VoiceModelProvider
+        +tracing_disabled: bool = False
+        +tracing: TracingConfig | None = None
+        +trace_include_sensitive_data: bool = True
+        +trace_include_sensitive_audio_data: bool = True
+        +workflow_name: str = "Voice Agent"
+        +group_id: str
+        +trace_metadata: dict | None = None
+        +stt_settings: STTModelSettings
+        +tts_settings: TTSModelSettings
+    }
+
+    class StreamedAudioResult {
+        -tts_model: TTSModel
+        -tts_settings: TTSModelSettings
+        +total_output_text: str
+        +instructions: str
+        -_voice_pipeline_config: VoicePipelineConfig
+        -_text_buffer: str
+        -_queue: asyncio.Queue[VoiceStreamEvent]
+        -_ordered_tasks: deque[Queue]
+        -_dispatcher_task: asyncio.Task | None
+        --
+        +__init__(tts_model, tts_settings, voice_pipeline_config)
+        +async stream(): AsyncIterator[VoiceStreamEvent]
+        -async _add_text(text: str)
+        -async _turn_done()
+        -async _done()
+        -async _stream_audio(text, local_queue, finish_turn)
+        -async _dispatch_audio()
+        -async _add_error(error)
+    }
+
+}
+
+' ─────────────────────────────────────────
+' Package: Workflow
+' ─────────────────────────────────────────
+package "voice/workflow" {
+
+    abstract class VoiceWorkflowBase {
+        {abstract} +async run(transcription: str): AsyncIterator[str]
+        +async on_start(): AsyncIterator[str]
+    }
+
+    class SingleAgentVoiceWorkflow {
+        -_input_history: list[TResponseInputItem]
+        -_current_agent: Agent[Any]
+        -_callbacks: SingleAgentWorkflowCallbacks | None
+        --
+        +__init__(agent: Agent, callbacks)
+        +async run(transcription: str): AsyncIterator[str]
+    }
+
+    class SingleAgentWorkflowCallbacks {
+        +on_run(workflow: SingleAgentVoiceWorkflow, transcription: str): None
+    }
+
+    class VoiceWorkflowHelper {
+        +{static} async stream_text_from(result: RunResultStreaming): AsyncIterator[str]
+    }
+
+}
+
+' ─────────────────────────────────────────
+' Package: Abstract Models
+' ─────────────────────────────────────────
+package "voice/model" {
+
+    abstract class STTModel {
+        {abstract} +model_name: str
+        --
+        {abstract} +async transcribe(input, settings, trace_sensitive_data, trace_sensitive_audio): str
+        {abstract} +async create_session(input, settings, ...): StreamedTranscriptionSession
+    }
+
+    abstract class TTSModel {
+        {abstract} +model_name: str
+        --
+        {abstract} +async run(text: str, settings: TTSModelSettings): AsyncIterator[bytes]
+    }
+
+    abstract class StreamedTranscriptionSession {
+        {abstract} +async transcribe_turns(): AsyncIterator[str]
+        {abstract} +async close(): None
+    }
+
+    abstract class VoiceModelProvider {
+        {abstract} +get_stt_model(model_name: str | None): STTModel
+        {abstract} +get_tts_model(model_name: str | None): TTSModel
+    }
+
+    class STTModelSettings <<dataclass>> {
+        +prompt: str | None = None
+        +language: str | None = None
+        +temperature: float | None = None
+        +turn_detection: dict | None = None
+    }
+
+    class TTSModelSettings <<dataclass>> {
+        +voice: TTSVoice | None = None
+        +buffer_size: int = 120
+        +dtype: DTypeLike = int16
+        +transform_data: Callable | None = None
+        +instructions: str
+        +text_splitter: Callable[[str], tuple[str,str]]
+        +speed: float | None = None
+    }
+
+}
+
+' ─────────────────────────────────────────
+' Package: OpenAI Implementations
+' ─────────────────────────────────────────
+package "voice/models/openai" {
+
+    class OpenAISTTModel {
+        -model: str
+        -_client: AsyncOpenAI
+        --
+        +__init__(model: str, openai_client: AsyncOpenAI)
+        +model_name: str
+        +async transcribe(input, settings, ...): str
+        +async create_session(input, settings, ...): OpenAISTTTranscriptionSession
+    }
+
+    class OpenAISTTTranscriptionSession {
+        +connected: bool
+        -_client: AsyncOpenAI
+        -_model: str
+        -_settings: STTModelSettings
+        -_turn_detection: dict
+        -_input_queue: asyncio.Queue
+        -_output_queue: asyncio.Queue
+        -_websocket: ClientConnection | None
+        -_turn_audio_buffer: list[NDArray]
+        -_tracing_span: Span[TranscriptionSpanData] | None
+        --
+        +async transcribe_turns(): AsyncIterator[str]
+        +async close(): None
+        -async _event_listener(): None
+        -async _configure_session(): None
+        -async _setup_connection(ws): None
+        -async _handle_events(): None
+        -async _stream_audio(audio_queue): None
+        -async _process_websocket_connection(): None
+        -_cleanup_tasks(): None
+    }
+
+    class OpenAITTSModel {
+        -model: str
+        -_client: AsyncOpenAI
+        --
+        +__init__(model: str, openai_client: AsyncOpenAI)
+        +model_name: str
+        +async run(text: str, settings: TTSModelSettings): AsyncIterator[bytes]
+    }
+
+    class ErrorSentinel <<dataclass>> {
+        +error: Exception
+    }
+
+    class SessionCompleteSentinel {
+    }
+
+}
+
+' ─────────────────────────────────────────
+' Package: Audio Input
+' ─────────────────────────────────────────
+package "voice/input" {
+
+    class AudioInput <<dataclass>> {
+        +buffer: NDArray[int16 | float32]
+        +frame_rate: int = 24000
+        +sample_width: int = 2
+        +channels: int = 1
+        --
+        +to_audio_file(): tuple[str, BytesIO, str]
+        +to_base64(): str
+    }
+
+    class StreamedAudioInput {
+        +queue: asyncio.Queue[NDArray | None]
+        --
+        +__init__()
+        +async add_audio(audio: NDArray | None)
+    }
+
+}
+
+' ─────────────────────────────────────────
+' Inheritance
+' ─────────────────────────────────────────
+SingleAgentVoiceWorkflow   --|> VoiceWorkflowBase
+OpenAISTTModel             --|> STTModel
+OpenAITTSModel             --|> TTSModel
+OpenAISTTTranscriptionSession --|> StreamedTranscriptionSession
+
+' ─────────────────────────────────────────
+' Composition / Aggregation
+' ─────────────────────────────────────────
+VoicePipeline *-- VoicePipelineConfig           : config
+VoicePipeline o-- VoiceWorkflowBase             : workflow
+VoicePipeline o-- STTModel                      : stt_model
+VoicePipeline o-- TTSModel                      : tts_model
+VoicePipeline ..> AudioInput                    : accepts (single-turn)
+VoicePipeline ..> StreamedAudioInput            : accepts (multi-turn)
+VoicePipeline ..> StreamedAudioResult           : creates
+
+VoicePipelineConfig *-- VoiceModelProvider      : model_provider
+VoicePipelineConfig *-- STTModelSettings        : stt_settings
+VoicePipelineConfig *-- TTSModelSettings        : tts_settings
+
+StreamedAudioResult o-- TTSModel                : tts_model
+StreamedAudioResult o-- TTSModelSettings        : tts_settings
+StreamedAudioResult o-- VoicePipelineConfig     : _voice_pipeline_config
+
+SingleAgentVoiceWorkflow o-- SingleAgentWorkflowCallbacks : callbacks (optional)
+SingleAgentVoiceWorkflow ..> VoiceWorkflowHelper           : uses
+
+OpenAISTTModel ..> OpenAISTTTranscriptionSession : creates via create_session()
+OpenAISTTTranscriptionSession *-- ErrorSentinel           : uses
+OpenAISTTTranscriptionSession *-- SessionCompleteSentinel : uses
+
+' ─────────────────────────────────────────
+' Notes
+' ─────────────────────────────────────────
+note right of VoicePipeline
+  <b>Dispatch Rules</b>
+  AudioInput → _run_single_turn()
+    (REST: audio/transcriptions)
+  StreamedAudioInput → _run_multi_turn()
+    (WebSocket: OpenAI Realtime API)
+  Models are lazy-loaded via
+  VoicePipelineConfig.model_provider
+end note
+
+note right of OpenAISTTTranscriptionSession
+  <b>Realtime API</b>
+  Connects to wss://api.openai.com/v1/realtime
+  intent=transcription
+  Default turn detection: semantic_vad
+  Inactivity timeout: 1000s
+end note
+
+note bottom of TTSModelSettings
+  <b>Defaults</b>
+  voice = "ash"
+  buffer_size = 120
+  dtype = int16 (PCM 24 kHz)
+  text_splitter = sentence-based
+end note
+
+note bottom of StreamedAudioResult
+  <b>Ordered audio delivery</b>
+  Uses deque of local queues to emit
+  TTS PCM audio in generation order.
+  Emits: VoiceStreamEventAudio /
+         VoiceStreamEventLifecycle /
+         VoiceStreamEventError
+end note
+
+@enduml

@@ -1,0 +1,200 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    GroupBackgroundColor #DEE2E6
+    GroupBorderColor #6C757D
+}
+
+title Autoregressive Token Sampling
+
+actor Caller
+
+participant "ARBaseGeneration\nPipeline" as pipeline
+participant "AutoRegressive\nModel" as armodel
+participant "VideoTokenizer" as tokenizer
+participant "SamplingUtils\n(prefill / decode)" as sampling
+participant "Transformer" as transformer
+participant "TransformerBlock\n(×N layers)" as block
+participant "Attention\n(Self + Cross)" as attention
+
+== Setup & Tokenization ==
+
+Caller -> pipeline: generate(inp_vid, sampling_config,\nnum_input_frames, seed)
+activate pipeline
+
+pipeline -> pipeline: _run_model_with_offload(inp_vid, ...)
+activate pipeline
+
+pipeline -> pipeline: _run_model(inp_vid, ...)
+
+pipeline -> pipeline: generate_partial_tokens_from_data_batch(\ndata_batch, num_tokens_to_generate, ...)
+activate pipeline
+
+pipeline -> tokenizer: tokenize(data_batch)
+activate tokenizer
+tokenizer --> pipeline: data_tokens, token_boundaries
+deactivate tokenizer
+
+note right of pipeline
+  Input context tokens are sliced:
+  input_tokens = data_tokens[0 : -num_tokens_to_generate]
+end note
+
+pipeline -> pipeline: generate_video_from_tokens(\nprompt_tokens, latent_shape,\nvideo_start_boundary, max_gen_len, ...)
+
+== AutoRegressiveModel.generate ==
+
+pipeline -> armodel: generate(prompt_tokens, max_gen_len,\ntemperature, top_k/top_p, context, seed)
+activate armodel
+
+note right of armodel
+  Optionally compile:
+  • decode_one_token → torch.compile(reduce-overhead)
+  • prefill → torch.compile(dynamic)
+end note
+
+armodel -> armodel: prepare seq buffer [B, total_len]\ninput_pos = arange(0, prompt_len)
+
+== Prefill Phase ==
+
+armodel -> sampling: prefill(model, input_pos,\ntokens=prompt_tokens,\ntemperature, top_k/top_p, context)
+activate sampling
+
+sampling -> transformer: forward(tokens, input_pos,\ncontext, context_mask)
+activate transformer
+
+transformer -> transformer: tok_embeddings(tokens) → h
+transformer -> transformer: _create_attention_mask(input_pos)\n→ causal_mask[input_pos]
+transformer -> transformer: _prepare_layer_kwargs(\nrope, mask, context, context_mask)
+
+loop for each TransformerBlock (layer 0..N-1)
+    transformer -> block: forward(h, rope, input_pos,\nmask, context, context_mask)
+    activate block
+
+    block -> attention: self_attention(attention_norm(h),\nrope, input_pos, mask)
+    activate attention
+    note right of attention: Masked self-attention\nwith RoPE + KV cache update
+    attention --> block: attn_out
+    deactivate attention
+
+    block -> block: h = h + attn_out  ── residual
+
+    opt cross-attention enabled (video2world)
+        block -> attention: cross_attention(cross_attention_norm(h),\nrope, input_pos, context_mask, context)
+        activate attention
+        note right of attention: Cross-attention over\ntext conditioning context
+        attention --> block: cross_attn_out
+        deactivate attention
+        block -> block: h = h + cross_attn_out  ── residual
+    end
+
+    block -> block: out = h + feed_forward(ffn_norm(h))
+    block --> transformer: out
+    deactivate block
+end
+
+transformer -> transformer: norm(h) → final layer norm
+transformer -> transformer: output(h) → logits [B, seq_len, vocab_size]
+transformer --> sampling: logits
+deactivate transformer
+
+sampling -> sampling: sample_top_k / sample_top_p\n(logits[:, -1, :], temperature)
+note right of sampling: Nucleus (top-p) or top-k\nsampling on last-position logits
+sampling --> armodel: next_token [B, 1]
+deactivate sampling
+
+armodel -> armodel: seq[:, prompt_len] = next_token\ninput_pos = tensor([prompt_len])
+
+== Decode Phase (Autoregressive Loop) ==
+
+armodel -> sampling: decode_n_tokens(model, cur_token,\ninput_pos, num_new_tokens=max_gen_len-1,\nstop_tokens, temperature, top_k/top_p)
+activate sampling
+
+loop t = 0 .. num_new_tokens-1  [stop if all EOS reached]
+
+    sampling -> sampling: decode_one_token(model,\ntokens=cur_token, input_pos, ...)
+    activate sampling
+
+    sampling -> transformer: forward(tokens=cur_token [B,1],\ninput_pos, context, context_mask)
+    activate transformer
+
+    note right of transformer
+      Single-token decode:
+      KV cache is updated in Attention
+      using input_pos as current index
+    end note
+
+    transformer -> block: forward(h, rope, input_pos, mask, context)
+    activate block
+    block -> attention: self_attention (updates KV cache\nat position input_pos)
+    attention --> block: attn_out
+    opt cross-attention
+        block -> attention: cross_attention(context)
+        attention --> block: cross_attn_out
+    end
+    block -> block: FFN + residuals
+    block --> transformer: out
+    deactivate block
+
+    transformer --> sampling: logits [B, 1, vocab_size]
+    deactivate transformer
+
+    sampling -> sampling: sample_top_k / sample_top_p\n→ next_token [B, 1]
+    sampling --> sampling: new_tokens.append(next_token)
+    deactivate sampling
+
+    sampling -> sampling: input_pos += 1\ncur_token = next_token
+    sampling -> sampling: eos_reached |= isin(next_token, stop_tokens)
+
+end
+
+sampling --> armodel: new_tokens  [list of B×1 tensors]
+deactivate sampling
+
+armodel -> armodel: torch.cat(generated_tokens, dim=1)\nseq[:, prompt_len+1:] = generated_tokens
+armodel --> pipeline: generation_tokens [B, total_seq_len]
+deactivate armodel
+
+== Post-Processing & Decoding ==
+
+pipeline -> pipeline: generation_tokens = generation_tokens[:, video_start_boundary:]\nreshape → indices_tensor [B, T, H, W]
+
+pipeline -> tokenizer: video_tokenizer.decode(indices_tensor)
+activate tokenizer
+note right of tokenizer: Discrete token indices\ndecoded to pixel frames
+tokenizer --> pipeline: video_decoded [B, C, T, H, W]
+deactivate tokenizer
+
+pipeline -> pipeline: normalize: (video * 0.5 + 0.5).clamp(0,1)
+
+pipeline --> pipeline: (video_decoded, indices_tensor)
+deactivate pipeline
+deactivate pipeline
+
+pipeline --> Caller: output_video [T, H, W, C]
+deactivate pipeline
+
+@enduml

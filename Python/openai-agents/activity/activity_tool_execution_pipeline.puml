@@ -1,0 +1,221 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+}
+skinparam swimlane {
+    BorderColor #495057
+    TitleBackgroundColor #DEE2E6
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam note {
+    BackgroundColor #E8F4FD
+    BorderColor #6C9EC4
+    FontColor #1a3a55
+}
+
+title Tool Execution Pipeline
+
+|Runner|
+start
+:Model response contains tool_runs[]\n(list of ToolRunFunction items);
+:Call execute_function_tool_calls(\n  bindings, tool_runs, hooks,\n  context_wrapper, config\n);
+
+|BatchExecutor|
+:Instantiate _FunctionToolBatchExecutor\nisolate_parallel_failures = (batch_size > 1);
+:resolve_enabled_function_tools(\n  execution_agent, context_wrapper\n) → available_function_tools[];
+note right
+  Filters the tool list down to
+  tools available to the current agent
+  at this point in the run.
+end note
+
+fork
+  :asyncio.create_task(_run_single_tool())\nfor ToolRunFunction #1;
+fork again
+  :asyncio.create_task(_run_single_tool())\nfor ToolRunFunction #N;
+end fork
+
+note right
+  True asyncio parallelism — one task
+  per tool call in the batch.
+end note
+
+|_run_single_tool|
+:normalize_tool_call_for_function_tool\n(tool_call, func_tool);
+:Open function_span(trace_tool_name)\nfor distributed tracing;
+:Build ToolContext.from_agent_context(\n  context_wrapper, call_id,\n  tool_namespace, agent, run_config\n);
+
+' ─── APPROVAL GATING ────────────────────────────────────────
+:_maybe_execute_tool_approval(\n  func_tool, tool_call\n);
+:function_needs_approval()\n→ parse JSON args, evaluate\nneeds_approval (bool | async callable);
+
+if (Tool requires approval?) then (yes)
+  if (Approval status stored\nin RunContextWrapper?) then (None — no decision yet)
+
+    |Human Approver|
+    :Run execution pauses;
+    :ToolApprovalItem surfaces in\nRunResult.interruptions\n(tool_name, agent, arguments,\ncall_id, tool_namespace, tool_origin);
+    note right
+      Caller calls result.to_state(),
+      then state.approve(interruption) or
+      state.reject(interruption, rejection_message=...).
+      State is serializable (to_json / to_string)
+      for long-running approval workflows.
+    end note
+    :Human reviews and decides;
+
+    if (Decision?) then (approved)
+      :Store approval in RunContextWrapper\n(always_approve=True → sticky\nacross future calls this run);
+      |_run_single_tool|
+      :Proceed to tool body execution;
+    else (rejected)
+      :Resolve rejection message\n(per-call rejection_message\n> RunConfig.tool_error_formatter\n> SDK REJECTION_MESSAGE constant);
+      |_run_single_tool|
+      :Return rejection FunctionToolResult\n(run_item = ToolCallOutputItem);
+      |BatchExecutor|
+      :Record task result;
+      stop
+    endif
+
+  elseif (True — previously approved) then
+    |_run_single_tool|
+    :Proceed — decision already cached\nin RunContextWrapper;
+  else (False — previously rejected)
+    :Resolve rejection message;
+    :Return rejection FunctionToolResult;
+    |BatchExecutor|
+    :Record task result;
+    stop
+  endif
+else (no approval needed)
+endif
+
+' ─── TOOL BODY EXECUTION ─────────────────────────────────────
+|_run_single_tool|
+:_execute_single_tool_body();
+
+:_execute_tool_input_guardrails(\n  func_tool, tool_context, agent\n);
+if (Input guardrail tripped?) then (yes)
+  note right
+    ToolInputGuardrailTripwireTriggered
+    is the highest-priority failure type.
+  end note
+  :Return input-guardrail rejection message;
+
+  |BatchExecutor|
+  :_raise_failure_after_draining_siblings()\n[HIGH PRIORITY failure path];
+  :Partition sibling tasks:\n  cancellable (not in post_invoke phase)\n  vs post_invoke_tasks;
+  :asyncio.cancel() all cancellable siblings;
+  :_drain_cancelled_tasks() with timeout;
+  :Await post_invoke_tasks up to\n_FUNCTION_TOOL_POST_INVOKE_WAIT_SECONDS;
+  :_merge_late_function_tool_failure()\n(priority: InputGuardrail > OutputGuardrail\n> AgentsException > generic error);
+  :Re-raise merged, highest-priority error;
+  stop
+else (no)
+endif
+
+:hooks.on_tool_start()\n+ agent_hooks.on_tool_start()\n[asyncio.gather — fired in parallel];
+
+:asyncio.create_task(\n  _invoke_tool_and_run_post_invoke()\n);
+:asyncio.shield(invoke_task)\n→ invoke_function_tool(\n    function_tool, tool_context, args\n  );
+note right
+  asyncio.shield() protects the
+  in-flight invocation from being
+  cancelled by a sibling task failure.
+end note
+
+if (Invocation outcome?) then (CancelledError — sibling failed)
+  :maybe_invoke_function_tool_failure_error_function();
+  if (failure_error_function set?) then (yes — recover)
+    :Return error-as-result\n(tool output = error message);
+  else (no / re-raise)
+    |BatchExecutor|
+    :Record failure; drain siblings;
+    stop
+  endif
+else if (Timeout exceeded?) then (yes)
+  if (timeout_behavior?) then (error_as_result — default)
+    :Return ToolTimeoutError message\nas tool output to model;
+  else (raise_exception)
+    :Raise ToolTimeoutError;
+    |BatchExecutor|
+    :_raise_failure_after_draining_siblings();
+    stop
+  endif
+else (success — result returned)
+endif
+
+|_run_single_tool|
+:Set task_state.in_post_invoke_phase = True;
+note right
+  After this flag is set, the task is
+  shielded from cancellation during
+  sibling failure teardown and gets a
+  dedicated post-invoke timeout window.
+end note
+
+:_execute_tool_output_guardrails(\n  func_tool, tool_context, agent, real_result\n);
+if (Output guardrail tripped?) then (yes)
+  :Return output-guardrail rejection;
+  |BatchExecutor|
+  :_raise_failure_after_draining_siblings()\n[MEDIUM PRIORITY failure path];
+  stop
+else (no)
+endif
+
+:hooks.on_tool_end()\n+ agent_hooks.on_tool_end()\n[asyncio.gather — fired in parallel];
+:Return final_result to BatchExecutor;
+
+' ─── RESULT COLLECTION ───────────────────────────────────────
+|BatchExecutor|
+:asyncio.wait(pending_tasks, FIRST_COMPLETED)\n→ drain loop until all tasks done;
+:_record_completed_function_tool_tasks();
+
+if (Any task failure detected?) then (yes)
+  :_raise_failure_after_draining_siblings();
+  stop
+else (no — all tasks succeeded)
+endif
+
+:_build_function_tool_results()\n→ assemble FunctionToolResult[] list;
+note right
+  Each FunctionToolResult contains:
+  • tool — the FunctionTool definition
+  • output — serialized result string
+  • run_item — ToolCallOutputItem |
+                ToolApprovalItem | None
+  • interruptions — nested Agent.as_tool()
+                    unresolved approvals
+  • agent_run_result — nested agent result
+
+  If nested interruptions are unresolved,
+  run_item = None (suppresses tool output
+  until all approvals are resolved).
+end note
+
+|Runner|
+:Return (\n  function_tool_results[],\n  tool_input_guardrail_results[],\n  tool_output_guardrail_results[]\n);
+stop
+
+@enduml

@@ -1,0 +1,203 @@
+@startuml activity_llm_session_initialization
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #212529
+    EndColor #212529
+    BarColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam noteFontSize 11
+skinparam noteBorderColor #6C757D
+skinparam noteBackgroundColor #F1F3F5
+
+title LLM Session Initialization & Switching
+
+|GeneraticAgent|
+start
+
+:GeneraticAgent.__init__();
+note right
+  Entry point for
+  agent construction
+end note
+
+|llmcore|
+
+:Access **mykeys** attribute\n(lazy via __getattr__);
+:_load_mykeys();
+
+if (mykey.py importable?) then (yes)
+    :Import mykey module\n→ return dict;
+else (no)
+    if (mykey.json exists?) then (yes)
+        :Read mykey.json\n→ parse dict;
+    else (no)
+        :Raise Exception\n"No API key source found";
+        stop
+    endif
+endif
+
+:Return **mykeys** dict\n{key_name → cfg_dict};
+
+|GeneraticAgent|
+
+:Receive mykeys dict;
+note right
+  Keys accepted only if name
+  contains 'api', 'config', or 'cookie'
+end note
+
+:Iterate mykeys.items()\n(filter: 'api' OR 'config' OR 'cookie' in key);
+
+|Session Factory|
+
+fork
+    :Process each qualifying key;
+    if ('native' in key name?) then (yes)
+        if ('claude' in key name?) then (yes)
+            :NativeClaudeSession(cfg)\n→ NativeToolClient(session);
+            note right: Native Claude API\nwith tool calling support
+        else (no / 'oai' in key)
+            :NativeOAISession(cfg)\n→ NativeToolClient(session);
+            note right: Native OAI streaming\n(overrides raw_ask)
+        endif
+        :Append ToolClient to llm_sessions;
+    else (no)
+        if ('claude' in key name?) then (yes)
+            :ClaudeSession(cfg)\n→ ToolClient(session);
+            note right: Claude API\nSSE streaming + prompt-caching
+        elseif ('oai' in key name?) then (yes)
+            :LLMSession(cfg)\n→ ToolClient(session);
+            note right: OpenAI-compatible API\nchat_completions or responses
+        elseif ('mixin' in key name?) then (yes)
+            :Store placeholder dict\n{'mixin_cfg': cfg};
+            note right: Resolved in\nsecond pass
+        else (unknown)
+            :silently pass / skip key;
+        endif
+        :Append entry to llm_sessions;
+    endif
+fork again
+    :Exception on any session\n→ silently skip (pass);
+end fork
+
+|GeneraticAgent|
+
+:--- SECOND PASS: Resolve Mixin Placeholders ---;
+
+repeat
+    if (entry is dict with 'mixin_cfg'?) then (yes)
+        :MixinSession(all_sessions, cfg);
+        note right
+          Resolves llm_nos indices
+          to backend references
+        end note
+        if (All sub-sessions same group\n(Native or non-Native)?) then (yes)
+            if (first sub-session is Native?) then (yes)
+                :NativeToolClient(mixin_session);
+            else (no)
+                :ToolClient(mixin_session);
+            endif
+            :Replace placeholder\nwith resolved MixinSession;
+        else (no)
+            :Print WARN\nskip mixin entry;
+        endif
+    endif
+repeat while (more entries in llm_sessions?) is (yes) not (no)
+
+:self.llmclients = llm_sessions\nself.llm_no = 0\nself.llmclient = llmclients[0];
+note right
+  Active client defaults
+  to first in list
+end note
+
+:END __init__\n(agent ready);
+
+|GeneraticAgent|
+
+' =========================================
+' next_llm: Session Switching
+' =========================================
+
+partition "**next_llm(n=-1) — Session Switch**" {
+    :Call next_llm(n);
+
+    if (n < 0?) then (yes)
+        :new_no = (llm_no + 1)\n% len(llmclients);
+    else (no)
+        :new_no = n\n% len(llmclients);
+    endif
+
+    :lastc = self.llmclient\n(save current client);
+    :self.llmclient = llmclients[new_no]\nself.llm_no = new_no;
+    :Transfer history:\nllmclient.backend.history\n= lastc.backend.history;
+    :Reset:\nllmclient.last_tools = '';
+    note right
+      Optimization: forces full
+      tool schema on next call
+    end note
+    :get_llm_name()\n→ '{SessionClassName}/{backend.name}';
+
+    ' =========================================
+    ' load_tool_schema
+    ' =========================================
+    if (name contains 'glm'\nOR 'minimax' OR 'kimi'?) then (yes)
+        :load_tool_schema(suffix='_cn');
+        note right: CJK-optimised schema
+    else (no)
+        :load_tool_schema(suffix='');
+        note right: Default schema
+    endif
+}
+
+|Tool Schema Loader|
+
+partition "**load_tool_schema(suffix)**" {
+    :Open assets/tools_schema{suffix}.json\n→ raw JSON string;
+
+    if (os.name != 'nt'\n(non-Windows)?) then (yes)
+        :Replace 'powershell' → 'bash'\nin raw JSON string;
+    else (no Windows)
+        :Keep JSON as-is;
+    endif
+
+    :TOOLS_SCHEMA = json.loads(result)\n(update global);
+    note right
+      Global schema used by
+      agent_runner_loop on all
+      subsequent tool calls
+    end note
+}
+
+|GeneraticAgent|
+
+:Session switch complete\n→ new LLM active with transferred history;
+stop
+
+@enduml

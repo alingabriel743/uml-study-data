@@ -1,0 +1,128 @@
+{
+  "scope": "filesystem_entry_crud",
+  "title": "File System Entry CRUD Operations",
+  "diagram_type": "activity",
+  "key_participants": ["Caller", "FSEntryController", "enqueue_", "exec_", "BaseOperation", "Insert", "Update", "Delete", "db"],
+
+  "activities": [
+    {
+      "operation": "insert(entry)",
+      "steps": [
+        "Validate entry fields against allowedForCreate (sanitize) and requiredForCreate ['uuid','parent_uid'] (throw if missing)",
+        "Instantiate Insert op (extends BaseOperation, STATUS_PENDING)",
+        "Call enqueue_(op)"
+      ]
+    },
+    {
+      "operation": "update(uuid, entry)",
+      "steps": [
+        "Sanitize entry fields against allowedForUpdate ['name','parent_uid','user_id','modified','shortcut_to','metadata','thumbnail','size','path']",
+        "Instantiate Update op with uuid + sanitized entry (STATUS_PENDING)",
+        "Call enqueue_(op)"
+      ]
+    },
+    {
+      "operation": "delete(uuid)",
+      "steps": [
+        "Instantiate Delete op with uuid (STATUS_PENDING)",
+        "Call enqueue_(op)"
+      ]
+    }
+  ],
+
+  "enqueue_flow": [
+    "START: enqueue_(op)",
+    "LOOP [while currentState.queue.length > max_queue OR deferredState.queue.length > max_queue]: await queueSizePromise (backpressure)",
+    "GUARD: if op not instanceof BaseOperation → throw Error('Invalid operation')",
+    "BRANCH: if status === STATUS_READY → use currentState; else → use deferredState",
+    "Register op.uuid in state.updating_uuids[]; push op to state.queue",
+    "BRANCH: if entryListeners_[op.uuid] exists → fire all listeners, delete key (notify waiters)",
+    "Call checkShouldExec_()",
+    "await op.awaitDone() [suspends caller until op.status = STATUS_DONE]",
+    "Return op to caller"
+  ],
+
+  "exec_flow": [
+    "START: checkShouldExec_() → if STATUS_READY AND queue non-empty → exec_()",
+    "GUARD: if status !== STATUS_READY → throw 'Duplicate exec_ call'",
+    "Capture reference to currentState.queue",
+    "Set status = STATUS_RUNNING_JOB",
+    "FOR each op in queue: set op.status = STATUS_RUNNING",
+    "Batch write: db.batch_write(queue.map(op => op.getStatement()))",
+    "FOR each op in queue: set op.status = STATUS_DONE (resolves TeePromise, unblocks awaitDone callers)",
+    "Call flipState_(): currentState ← deferredState; reset deferredState; resolve queueSizePromise",
+    "Set status = STATUS_READY",
+    "Call checkShouldExec_() (process next deferred batch if present)"
+  ],
+
+  "get_flow": [
+    "START: get(uuid, fetch_entry_options)",
+    "Iterate currentState.queue: for ops matching uuid, call op.apply(answer) to accumulate state",
+    "Iterate deferredState.queue: same (apply called twice — possible bug)",
+    "BRANCH: if answer.is_diff → fetch base entry from DB via find(NodeUIDSelector(uuid)) then merge: { ...base_entry, ...answer.entry }",
+    "Return answer.entry (may be undefined if no queued ops and not fetched)"
+  ],
+
+  "waitForEntry_flow": [
+    "START: waitForEntry(node, callback)",
+    "Extract NodeUIDSelector from node; if null → return immediately (no selector available)",
+    "BRANCH: if uuid already in currentState.updating_uuids OR deferredState.updating_uuids → invoke callback() immediately",
+    "Else: register callback in entryListeners_['uid:<uuid>']",
+    "Return detach handle { detach() } to allow unsubscription"
+  ],
+
+  "find_flow": [
+    "START: find(selector, fetch_entry_options)",
+    "BRANCH RootNodeSelector → return selector.entry directly",
+    "BRANCH NodePathSelector → findByPath(path) [iterates path parts, queries by parent_uid+name; traces if tracer provided]",
+    "BRANCH NodeUIDSelector → findByUID(uuid) [db.tryHardRead WHERE uuid=?]",
+    "BRANCH NodeInternalIDSelector → findByID(id) [db.tryHardRead WHERE id=?]",
+    "BRANCH NodeChildSelector → resolve parent recursively via find(selector.parent), then findNameInParent(parentUUID, name), then find(NodeInternalIDSelector(id))"
+  ],
+
+  "state_model": {
+    "status": ["STATUS_READY", "STATUS_RUNNING_JOB"],
+    "currentState": "active queue being processed",
+    "deferredState": "ops enqueued while job running; promoted via flipState_() after batch commit",
+    "updating_uuids": "map of uuid → queue positions, used for waitForEntry checks"
+  },
+
+  "operation_sql": {
+    "Insert": "INSERT INTO fsentries (fields...) VALUES (?...)",
+    "Update": "UPDATE fsentries SET field=? WHERE uuid=? LIMIT 1",
+    "Delete": "DELETE FROM fsentries WHERE uuid=? LIMIT 1",
+    "findByUID": "SELECT <defaultProperties> FROM fsentries WHERE uuid=? LIMIT 1",
+    "findByID": "SELECT <defaultProperties> FROM fsentries WHERE id=? LIMIT 1",
+    "findByPath": "SELECT ... FROM fsentries WHERE path=? LIMIT 1 (fast path); else walk parts by parent_uid+name",
+    "fast_get_descendants": "Recursive CTE over fsentries starting at parent_uid",
+    "get_recursive_size": "Recursive CTE SUM(size)"
+  },
+
+  "key_relationships": [
+    "Insert extends BaseOperation",
+    "Update extends BaseOperation",
+    "Delete extends BaseOperation",
+    "FSEntryController creates Insert/Update/Delete ops and enqueues them",
+    "FSEntryController depends_on db (read, tryHardRead, batch_write)",
+    "FSEntryController depends_on TeePromise (per-op done promise + queue-size promise)",
+    "FSEntryController depends_on svc_params (registers max_queue parameter)",
+    "FSEntryController depends_on selectors: RootNodeSelector, NodeChildSelector, NodeUIDSelector, NodePathSelector, NodeInternalIDSelector"
+  ],
+
+  "important_notes": [
+    "Write ops (insert/update/delete) go through a two-state queue with backpressure at max_queue (default 50)",
+    "Concurrent writes while STATUS_RUNNING_JOB land in deferredState; promoted after current batch commits",
+    "entryListeners_ allows consumers to wait until a specific UUID is enqueued (waitForEntry), fired on enqueue not on DB commit",
+    "get() reads pending state from queue before hitting DB (optimistic read), but deferredState.apply is called twice — likely a bug",
+    "flipState_() resolves queueSizePromise to unblock any backpressure waiters",
+    "db.batch_write executes all ops in a single batch; individual op STATUS_DONE resolves each caller's awaitDone TeePromise"
+  ],
+
+  "source_files_analyzed": [
+    "extensions/legacyFileSystem/fsentries/FSEntryController.js",
+    "extensions/legacyFileSystem/fsentries/BaseOperation.js",
+    "extensions/legacyFileSystem/fsentries/Insert.js",
+    "extensions/legacyFileSystem/fsentries/Update.js",
+    "extensions/legacyFileSystem/fsentries/Delete.js"
+  ]
+}

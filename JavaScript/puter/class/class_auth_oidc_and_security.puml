@@ -1,0 +1,237 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #F9A825
+}
+
+title OIDC, OTP & Security Services
+
+' ─────────────────────────────────────────
+' External / framework base
+' ─────────────────────────────────────────
+package "Framework" {
+    abstract class "concepts.Service" as ConceptsService {
+    }
+
+    abstract class BaseService {
+        #services
+        #config
+        #global_config
+        #log
+        #args
+        #service_name
+        +_construct(): void
+        +_init(): void
+        +require(module): any
+    }
+
+    ConceptsService <|-- BaseService
+}
+
+' ─────────────────────────────────────────
+' Auth Services
+' ─────────────────────────────────────────
+package "services/auth" {
+
+    class OIDCService {
+        -"#googleDiscovery": object|null
+        +db: DatabaseConnection
+        +providers: object
+        --constants--
+        {static} GOOGLE_DISCOVERY_URL: string
+        {static} GOOGLE_SCOPES: string[]
+        {static} STATE_EXPIRY_SEC: number = 600
+        {static} VALID_OIDC_FLOWS: string[]
+        --
+        +_init(): void
+        +getProviderConfig(providerId): Promise<ProviderConfig|null>
+        +getCallbackUrlForFlow(flow): string|null
+        +getAuthorizationUrl(providerId, state, flow): Promise<string|null>
+        +signState(payload): string
+        +verifyState(token): object|null
+        +exchangeCodeForTokens(providerId, code, redirectUri): Promise<object|null>
+        +getUserInfo(providerId, accessToken): Promise<object|null>
+        +findUserByProviderSub(providerId, providerSub): Promise<User|null>
+        +linkProviderToUser(userId, providerId, providerSub, refreshToken?): Promise<void>
+        +createUserFromOIDC(providerId, claims): Promise<OutcomeObject>
+        +getEnabledProviderIds(): Promise<string[]>
+        -"#getGoogleDiscovery"(): Promise<object|null>
+    }
+
+    class OTPService {
+        {static} MODULES: {otpauth, crypto, "hi-base32"}
+        --
+        +create_secret(label): {url, secret}
+        +create_recovery_code(): string
+        +verify(label, secret, code): boolean
+        -gen_otp_secret_(): string
+    }
+
+    class AntiCSRFService {
+        +map_session_to_tokens: Map
+        --
+        +_construct(): void
+        +'__on_install.routes'(): void
+        +create_token(session): string
+        +consume_token(session, token): boolean
+        -generate_token_(): string
+    }
+
+}
+
+' ─────────────────────────────────────────
+' Supporting Services
+' ─────────────────────────────────────────
+package "services" {
+
+    class SUService {
+        -sys_user_: TeePromise
+        -sys_actor_: TeePromise
+        --
+        +_construct(): void
+        +'__on_boot.consolidation'(): Promise<void>
+        +get_system_user(): Promise<User>
+        +get_system_actor(): Promise<Actor>
+        +sudo(actor?, callback): Promise<T>
+    }
+
+    class VerifiedGroupService {
+        --
+        +_init(): void
+        +'user.email-confirmed'(_, {user_uid}): void
+    }
+
+}
+
+' ─────────────────────────────────────────
+' Utility / Model classes
+' ─────────────────────────────────────────
+package "util / models" {
+
+    class CircularQueue {
+        -capacity: number = 10
+        -items: any[]
+        --
+        +push(item): void
+        +maybe_consume(item): boolean
+    }
+
+    class Actor {
+        +type: ActorType
+        --
+        {static} +adapt(actor): Actor
+    }
+
+    class OutcomeObject {
+        +success: boolean
+        +value: any
+        +error: any
+    }
+
+    class TeePromise {
+        +resolve(value): void
+        +reject(reason): void
+        +then(...): Promise
+    }
+
+}
+
+' ─────────────────────────────────────────
+' External dependencies (simplified)
+' ─────────────────────────────────────────
+package "External Services" <<Cloud>> {
+    class SignupService <<service>> {
+        +createUser(claims): OutcomeObject
+    }
+    class GetUserService <<service>> {
+        +getUserByUid(uid): User
+    }
+    class DatabaseService <<service>> {
+        +DB_WRITE: Connection
+    }
+    class WebServerService <<service>> {
+        +registerRoute(path, handler): void
+    }
+    class EventService <<service>> {
+        +on(event, handler): void
+    }
+    class GroupService <<service>> {
+        +addUserToGroup(user, group): void
+        +removeUserFromGroup(user, group): void
+    }
+}
+
+' ─────────────────────────────────────────
+' Inheritance
+' ─────────────────────────────────────────
+BaseService <|-- OIDCService
+BaseService <|-- OTPService
+BaseService <|-- AntiCSRFService
+BaseService <|-- SUService
+BaseService <|-- VerifiedGroupService
+
+' ─────────────────────────────────────────
+' Compositions
+' ─────────────────────────────────────────
+AntiCSRFService *-- CircularQueue : "session token store\n(capacity 10)"
+SUService *-- Actor : "sys_actor_"
+SUService *-- TeePromise : "sys_user_ / sys_actor_"
+
+' ─────────────────────────────────────────
+' Dependencies
+' ─────────────────────────────────────────
+OIDCService ..> OutcomeObject : "result wrapping"
+OIDCService ..> SignupService : "createUserFromOIDC"
+OIDCService ..> GetUserService : "findUserByProviderSub"
+OIDCService ..> DatabaseService : "user_oidc_providers"
+
+AntiCSRFService ..> WebServerService : "registers route\nGET /get-anticsrf-token"
+
+SUService ..> GetUserService : "fetch system user"
+
+VerifiedGroupService ..> EventService : "user.email-confirmed"
+VerifiedGroupService ..> GroupService : "promote user group"
+
+note bottom of OIDCService
+  OAuth2 authorization_code flow.
+  JWT-signed state (CSRF protection).
+  Supports Google (discovery) + generic OIDC.
+  DB table: user_oidc_providers
+end note
+
+note bottom of OTPService
+  TOTP (RFC 6238): SHA1, 6 digits.
+  Validation window: delta in [-1, 0, 1].
+  Secrets: base32-encoded 24-char strings.
+  Recovery codes: 8-char base32 tokens.
+end note
+
+note bottom of AntiCSRFService
+  Per-session CircularQueue(10) of random
+  32-byte hex tokens; one-time consumption.
+  Route blocked on api.* subdomain.
+end note
+
+note right of SUService
+  Privilege escalation via Context.sub().
+  System actor resolved once at
+  boot.consolidation phase.
+end note
+
+@enduml

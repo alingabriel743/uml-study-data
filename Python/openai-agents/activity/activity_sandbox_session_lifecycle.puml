@@ -1,0 +1,235 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #DEE2E6
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title Sandbox Session Lifecycle
+
+'─────────────────────────────────────────────
+' PHASE 1 — ACQUIRE AGENT
+'─────────────────────────────────────────────
+|Runner|
+start
+:Invoke Runner.run() with SandboxRunConfig;
+
+|SandboxRuntimeSessionManager|
+:acquire_agent(agent: SandboxAgent);
+
+if (Agent already in\n_acquired_agents?) then (yes)
+  :Return — idempotent re-acquire;
+else (no)
+  :Get or create _SandboxConcurrencyGuard\nfor this agent;
+
+  if (guard.active_runs > 0?) then (yes)
+    #FFCCCC:Raise RuntimeError\n//Concurrent reuse of SandboxAgent forbidden//;
+    stop
+  else (no)
+    :Acquire guard.lock —\nincrement guard.active_runs;
+    :Store agent in _acquired_agents[agent_id];
+    :_ensure_resume_key(agent)\n→ assign stable cross-run resume key\n//(IR-derived key > prior key > deduped name)//;
+  endif
+endif
+
+'─────────────────────────────────────────────
+' PHASE 2 — ENSURE SESSION
+'─────────────────────────────────────────────
+:ensure_session(agent, capabilities, is_resumed_state);
+
+if (Resources already exist\nfor agent_id in\n_resources_by_agent?) then (yes)
+  :Reuse existing _SandboxSessionResources;
+else (no)
+  :_create_resources(agent, capabilities,\nis_resumed_state);
+
+  '--- Three mutually-exclusive creation paths ---
+  if (sandbox_config.session\nis not None?) then (yes)
+
+    note right #E3F2FD
+      **PATH A — Live Injected Session**
+      Session provided externally.
+      owns_session = False →
+      will NOT be stopped or deleted
+      during cleanup.
+    end note
+
+    :_configure_session_materialization\n(session, concurrency_limits);
+    :await session.running()\n→ check if session is already active;
+    :_process_live_session_manifest\n(agent, capabilities, session, running);
+
+    if (Manifest entries\nto apply?) then (yes)
+      :await session._apply_entry_batch\n(entries, base_dir);
+      note right: New Dir entries allowed\nif no mounts are configured.
+    endif
+
+    if (Processed manifest\nchanged?) then (yes)
+      :Update session.state with\nnew Manifest;
+    endif
+
+    :Return _SandboxSessionResources\n(session, client=None, owns_session=False);
+
+  elseif (Resume state payload\navailable in RunState._sandbox?) then (yes)
+
+    note right #E8F5E9
+      **PATH B — Resume from State**
+      Deserialize and re-attach prior session.
+      owns_session = True →
+      session will be stopped/deleted on cleanup.
+    end note
+
+    :_resume_state_payload_for_agent() →\nlookup sessions_by_agent\nby resume key or agent name;
+
+    |BaseSandboxClient|
+    :deserialize_session_state(payload)\n→ SandboxSessionState\n//(session_id, snapshot, manifest, ports)//;
+
+    |SandboxRuntimeSessionManager|
+    :_process_resumed_state_manifest() →\napply Capability manifest transforms;
+    :TRACE: custom_span('sandbox.resume_session');
+
+    |BaseSandboxClient|
+    :await client.resume(explicit_state)\n→ resumed BaseSandboxSession;
+
+    |SandboxRuntimeSessionManager|
+    :_configure_session_materialization\n(resumed_session, concurrency_limits);
+    :Return _SandboxSessionResources\n(session=resumed_session,\nclient, owns_session=True);
+
+  else (no — create fresh)
+
+    note right #FFFDE7
+      **PATH C — Fresh Session**
+      Brand-new sandbox from snapshot/manifest.
+      owns_session = True →
+      session will be stopped/deleted on cleanup.
+    end note
+
+    :_resolve_manifest(agent) →\nagent.default_manifest\nor sandbox_config.manifest;
+    :_agent_run_as_user(agent) → User | None;
+    :_process_manifest(capabilities, manifest,\nrun_as_user) → apply Capability\ntransforms + inject run_as user;
+    :Validate sandbox_config.options\n//(required if client lacks default options)//;
+    :TRACE: custom_span('sandbox.create_session');
+
+    |BaseSandboxClient|
+    :await client.create(\n  snapshot=_resolve_snapshot_spec(),\n  manifest=manifest,\n  options=options\n) → new BaseSandboxSession;
+
+    |SandboxRuntimeSessionManager|
+    :_configure_session_materialization\n(session, concurrency_limits);
+    :_ensure_session_manifest_has_run_as_user\n(session, agent);
+    :Return _SandboxSessionResources\n(session, client, owns_session=True);
+
+  endif
+endif
+
+:Store resources in _resources_by_agent[agent_id];
+:Set _current_agent_id = agent_id;
+
+'─────────────────────────────────────────────
+' PHASE 3 — ENSURE STARTED
+'─────────────────────────────────────────────
+|_SandboxSessionResources|
+:ensure_started();
+
+if (_started AND\nawait session.running()?) then (yes)
+  :Return — session already running;
+elseif (NOT owns_session AND\nawait session.running()?) then (injected)
+  :Set _started = True; return;
+else (start needed)
+  :await session.start();
+  :Set _started = True;
+endif
+
+'─────────────────────────────────────────────
+' AGENT EXECUTION
+'─────────────────────────────────────────────
+|Runner|
+:Execute agent turns —\nmodel operates on sandbox workspace\n//(filesystem tools, shell, skills, memory)//;
+
+'─────────────────────────────────────────────
+' PHASE 4 — CLEANUP & STATE SERIALIZATION
+'─────────────────────────────────────────────
+|SandboxRuntimeSessionManager|
+:cleanup() — finalize run;
+:TRACE: custom_span('sandbox.cleanup_sessions');
+:Iterate all _resources_by_agent values;
+
+|_SandboxSessionResources|
+if (owns_session?) then (yes)
+  :Acquire _cleanup_lock\n//(idempotent — guard _cleaned flag)//;
+  :await session.run_pre_stop_hooks();
+  :await session.stop();
+  :await session.shutdown();
+
+  if (client is not None AND\nsession is SandboxSession?) then (yes)
+    |BaseSandboxClient|
+    :await client.delete(session);
+    |_SandboxSessionResources|
+  endif
+
+  :await session._aclose_dependencies();
+  note right: First error is accumulated.\nRemaining cleanup steps run\nregardless of individual failures.
+else (no)
+  :Skip stop / delete\n//(injected live session — not owned)//;
+endif
+
+'─────────────────────────────────────────────
+' PHASE 5 — SERIALIZE RESUME STATE
+'─────────────────────────────────────────────
+|SandboxRuntimeSessionManager|
+if (No cleanup_error?) then (yes)
+  :serialize_resume_state();
+
+  if (sandbox_config is None?) then (yes)
+    :Return existing RunState\npayload as-is (pass-through);
+  elseif (sandbox_config.session\nis not None?) then (yes)
+    :Return None\n//(no resume for injected session)//;
+  elseif (No _current_agent_id\nor no sandbox client?) then (yes)
+    :Return existing RunState\npayload as-is;
+  else (serialize)
+    :_serialize_sessions_by_agent(client) →\nmerge legacy entries + current resources;
+    :Build resume state dict:\n  • backend_id\n  • current_agent_key\n  • current_agent_name\n  • session_state (SandboxSessionState)\n  • sessions_by_agent map;
+  endif
+else (error occurred)
+  note right: serialize_resume_state()\nskipped due to cleanup error.
+endif
+
+'─────────────────────────────────────────────
+' PHASE 6 — RELEASE RESOURCES
+'─────────────────────────────────────────────
+:_resources_by_agent.clear() [finally block];
+:_current_agent_id = None;
+:_release_agents() —\ndecrement guard.active_runs for\nall acquired agents; clear tracking dicts;
+
+if (cleanup_error\nexists?) then (yes)
+  #FFCCCC:Re-raise accumulated cleanup_error;
+  stop
+endif
+
+|Runner|
+:Receive resume_state →\nstored in RunState._sandbox\nfor next-run sandbox resume;
+stop
+
+@enduml

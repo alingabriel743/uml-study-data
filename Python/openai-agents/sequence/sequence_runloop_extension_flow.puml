@@ -1,0 +1,261 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #E9ECEF
+    NoteBackgroundColor #FFF3CD
+    NoteBorderColor #856404
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+title Runloop Extension: Resource Query & Sandbox Agent
+
+actor "Orchestrator\n(main)" as main
+
+box "Runloop Extension Client" #EEF2FF
+    participant "RunloopSandboxClient" as rsc
+    participant "RunloopPlatformClient" as rpc
+    participant "AsyncRunloopSDK" as sdk
+end box
+
+box "Agent SDK" #F0FFF4
+    participant "Runner" as runner
+    participant "query_agent\n(Agent)" as qa
+    participant "verification_agent\n(SandboxAgent)" as sa
+end box
+
+box "Function Tools" #FFF8E1
+    participant "query_runloop_secret\n(@function_tool)" as fts
+    participant "query_runloop_network_policy\n(@function_tool)" as ftnp
+end box
+
+participant "RunloopSandboxSession" as session
+
+== Initialisation ==
+
+main -> rsc : __init__(bearer_token, base_url)
+activate rsc
+rsc -> sdk : AsyncRunloopSDK(bearer_token, base_url)
+rsc -> rpc : RunloopPlatformClient(sdk)
+rsc --> main : client ready
+deactivate rsc
+
+== Phase 1: Public Resource Discovery ==
+
+main -> rpc : _preflight_public_resources(client)
+activate rpc
+rpc -> sdk : blueprints.list_public(limit=3)
+sdk --> rpc : blueprint list
+rpc -> sdk : benchmarks.list_public(limit=3)
+sdk --> rpc : benchmark list
+rpc --> main : public resources logged
+deactivate rpc
+
+== Phase 2: Agent Resource Discovery (Resource Query) ==
+
+main -> main : _run_resource_query_phase(client, model, stream,\n  managed_secret_name, network_policy_name)
+activate main
+
+main -> main : _build_resource_query_tools(client, ...)
+note right
+  Creates two @function_tool closures that
+  capture query_results dict and RunloopSandboxClient.
+  tool_choice='required' forces both to be called.
+end note
+
+main -> qa : Agent(name="Runloop Resource Discovery Guide",\n  tools=[query_runloop_secret, query_runloop_network_policy],\n  tool_choice="required")
+activate qa
+
+main -> runner : Runner.run(query_agent, prompt,\n  RunConfig(workflow_name="resource_query"))
+activate runner
+
+runner -> qa : invoke agent turn
+activate qa
+
+runner -> fts : query_runloop_secret(name=managed_secret_name)
+activate fts
+fts -> rpc : platform.secrets.get(name)
+rpc --> fts : secret resource or 404
+fts --> runner : RunloopResourceQueryResult\n(found=True/False, id?, description?)
+deactivate fts
+
+runner -> ftnp : query_runloop_network_policy(name=network_policy_name)
+activate ftnp
+ftnp -> rpc : platform.network_policies.list(name=name)
+rpc --> ftnp : policy list
+ftnp -> rpc : network_policies.get(id).get_info()
+rpc --> ftnp : policy details
+ftnp --> runner : RunloopResourceQueryResult\n(found=True/False, id?, description?)
+deactivate ftnp
+
+runner --> qa : tool results
+deactivate qa
+runner --> main : RunResult (final_output)
+deactivate runner
+
+main -> main : validate both tools were called\n(raises RuntimeError if not)
+main --> main : (query_results: dict[str, RunloopResourceQueryResult], output: str)
+deactivate main
+
+note over main
+  RunloopResourceQueryResult fields:
+  resource_type, name, found, id?, description?
+end note
+
+== Phase 3: Persistent Resource Bootstrap ==
+
+main -> rpc : _bootstrap_persistent_resources(client,\n  managed_secret_name, managed_secret_value,\n  network_policy_name, network_policy_id_override,\n  query_results, axon_name)
+activate rpc
+
+alt secret not found
+    rpc -> sdk : platform.secrets.create(name, value)
+    sdk --> rpc : secret created
+end
+
+alt policy not found and no id_override
+    rpc -> sdk : platform.network_policies.create(name, allow_all=True, ...)
+    sdk --> rpc : policy or 409/400 conflict
+    note right : Conflict-safe: catches 409/400-already-exists\nand re-queries by name to reuse existing policy
+end
+
+opt axon demo enabled
+    rpc -> sdk : axons.create(...)
+    rpc -> sdk : axons.query_sql("CREATE TABLE ...")
+    rpc -> sdk : axons.batch_sql("INSERT ...")
+    rpc -> sdk : axons.publish(event)
+end
+
+rpc --> main : dict[str, RunloopResourceBootstrapResult]\n(action: created | reused | override)
+deactivate rpc
+
+== Phase 4: Sandbox Creation ==
+
+main -> main : _build_manifest(workspace_root, context)\n→ Manifest(README.md, checklist.md, platform_context.json)
+main -> sa : _build_sandbox_agent(model, manifest, managed_secret_name)\n→ SandboxAgent(capabilities=[WorkspaceShellCapability()],\n  tool_choice="required")
+
+main -> rsc : RunloopSandboxClientOptions(blueprint_name,\n  pause_on_exit=True, exposed_ports,\n  launch_parameters, tunnel, gateways,\n  mcp, managed_secrets)
+
+main -> rsc : create(manifest, options)
+activate rsc
+
+rsc -> sdk : _upsert_runloop_managed_secrets(sdk, managed_secrets)\n→ sdk.secret.create / sdk.secret.update per env_var
+
+rsc -> rsc : _runloop_create_kwargs(blueprint_id, blueprint_name,\n  env_vars, name, user_parameters,\n  launch_parameters, tunnel, gateways,\n  mcp, metadata, secrets)
+
+rsc -> sdk : devbox.create(timeout, **create_kwargs)
+sdk --> rsc : devbox object
+
+rsc -> rsc : RunloopSandboxSessionState(session_id, manifest,\n  devbox_id, pause_on_exit, timeouts,\n  exposed_ports, user_parameters,\n  launch_parameters, tunnel, gateways,\n  mcp, metadata, secret_refs)
+
+rsc -> session : RunloopSandboxSession.from_state(state, sdk, devbox)
+activate session
+
+rsc -> rsc : _wrap_session(inner, instrumentation)
+rsc --> main : SandboxSession
+deactivate rsc
+
+== Phase 5: Workspace & Tunnel Setup ==
+
+main -> session : start()\n→ BaseSandboxSession.start()\n(provisions manifest, env, accounts)
+session --> main : session started
+
+main -> session : write(RUNTIME_CONTEXT_PATH, json_payload)
+
+main -> session : _start_http_server(session, port, workspace_root)\n→ exec("python -m http.server ...", shell=True, timeout=10)
+session --> main : HTTP server pid
+
+main -> session : resolve_exposed_port(http_port)
+session --> main : endpoint(host, port, tls)
+
+main -> main : _poll_http_preview(preview_url,\n  expected_substring, timeout_s)\n→ _fetch_text() polling loop
+note right : Polls until expected content\nappears or timeout expires
+
+== Phase 6: Sandbox Agent Verification ==
+
+main -> runner : _run_sandbox_agent(verification_agent, prompt,\n  session, workflow_name, stream)
+activate runner
+
+runner -> sa : Runner.run(agent, prompt,\n  RunConfig(\n    sandbox=SandboxRunConfig(session=session),\n    workflow_name=workflow_name))
+activate sa
+
+note over sa
+  SandboxAgent executes via WorkspaceShellCapability:
+  pwd, find, read files, verify managed secret,
+  create agent proof file at AGENT_PROOF_PATH
+end note
+
+sa -> session : shell commands (pwd, find, cat, write proof)
+session --> sa : command outputs
+
+sa --> runner : agent turn complete
+deactivate sa
+runner --> main : final_output (str)
+deactivate runner
+
+main -> session : read(AGENT_PROOF_PATH)
+session --> main : proof_text
+
+== Phase 7: Sandbox Suspend ==
+
+main -> session : aclose()
+activate session
+session -> sdk : devbox.suspend()
+sdk --> session : suspend initiated
+session -> sdk : devbox.await_suspended()
+sdk --> session : devbox suspended
+session --> main : session closed (pause_on_exit=True → suspended)
+deactivate session
+
+== Phase 8: Sandbox Resume & Verification ==
+
+main -> rsc : resume(session.state)
+activate rsc
+rsc -> sdk : devbox.from_id(devbox_id)
+rsc -> sdk : devbox.get_info()
+sdk --> rsc : devbox status
+
+alt devbox is suspended
+    rsc -> sdk : devbox.resume()
+    rsc -> sdk : devbox.await_running()
+    sdk --> rsc : devbox running
+end
+
+rsc -> session : RunloopSandboxSession.from_state(state, sdk, devbox,\n  _skip_start=True)
+activate session
+rsc --> main : resumed SandboxSession
+deactivate rsc
+
+main -> session : resumed.start() [_skip_start=True]\n→ checks snapshot restorable,\n  fingerprint match,\n  reapply ephemeral manifest
+session --> main : resumed session ready
+
+main -> session : resumed.read(RUNTIME_CONTEXT_PATH)
+session --> main : runtime context JSON
+
+main -> session : resumed.read(AGENT_PROOF_PATH)
+session --> main : proof text (persisted across suspend/resume)
+
+main -> session : resumed.aclose() [pause_on_exit=False]\n→ devbox.shutdown()
+session -> sdk : devbox.shutdown()
+sdk --> session : shutdown complete
+session --> main : session closed (deleted)
+deactivate session
+
+main -> rsc : close()
+rsc -> sdk : sdk.aclose()
+rsc --> main : client closed
+
+@enduml

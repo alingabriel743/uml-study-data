@@ -1,0 +1,281 @@
+{
+  "scope": "networking_and_wisp_protocol",
+  "title": "Networking and WISP Protocol",
+  "diagram_type": "use_case",
+  "description": "Establishing WISP tunnels, registering connections, writing/closing channels, managing workers and services",
+
+  "actors": [
+    {
+      "name": "Client Application",
+      "description": "JS code consuming PWispHandler or WorkersHandler APIs"
+    },
+    {
+      "name": "WISP Server",
+      "description": "Remote WebSocket server implementing the WISP protocol"
+    },
+    {
+      "name": "Puter Platform",
+      "description": "Auth, KV store, apps registry, and driver subsystem (puter.* globals)"
+    },
+    {
+      "name": "Worker Service Backend",
+      "description": "Server-side driver: worker-service (create/destroy/getFilePaths/getLoggingUrl)"
+    }
+  ],
+
+  "systems": [
+    {
+      "name": "PWispHandler",
+      "file": "src/puter-js/src/modules/networking/PWispHandler.js",
+      "boundary": "WISP Tunnel Manager"
+    },
+    {
+      "name": "WorkersHandler",
+      "file": "src/puter-js/src/modules/Workers.js",
+      "boundary": "Worker Lifecycle Manager"
+    },
+    {
+      "name": "ServiceManager",
+      "file": "src/putility/src/system/ServiceManager.js",
+      "boundary": "Service Registry & Lifecycle"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC01",
+      "name": "Establish WISP Tunnel",
+      "actor": "Client Application",
+      "system": "PWispHandler",
+      "description": "Open WebSocket to wispURL; on CONTINUE(streamID=0) set _bufferMax and fire onReady; set up auto-reconnect on close",
+      "trigger": "new PWispHandler(wispURL, puterAuth)",
+      "key_steps": [
+        "new WebSocket(wispURL)",
+        "ws.onmessage → parseIncomingPacket",
+        "CONTINUE[streamID=0] → set _bufferMax, call onReady()",
+        "ws.onclose → setTimeout(setup, 1000)"
+      ]
+    },
+    {
+      "id": "UC02",
+      "name": "Authenticate INFO Handshake",
+      "actor": "WISP Server",
+      "system": "PWispHandler",
+      "description": "On receiving INFO packet from server, send back INFO packet with puterAuth token if provided",
+      "trigger": "Server sends INFO packet",
+      "key_steps": [
+        "parseIncomingPacket → type INFO",
+        "ws.send(createWispPacket({ packetType: INFO, streamID: 0, puterAuth }))"
+      ]
+    },
+    {
+      "id": "UC03",
+      "name": "Register TCP Connection",
+      "actor": "Client Application",
+      "system": "PWispHandler",
+      "description": "Allocate a new stream ID, store callbacks, send CONNECT packet to server",
+      "trigger": "pwispHandler.register(host, port, { dataCallBack, closeCallBack })",
+      "key_steps": [
+        "streamID = _nextStreamID++",
+        "streamMap.set(streamID, { queue:[], buffer:_bufferMax, dataCallBack, closeCallBack })",
+        "ws.send(createWispPacket({ CONNECT, TCP, streamID, hostname, port }))",
+        "return streamID"
+      ]
+    },
+    {
+      "id": "UC04",
+      "name": "Write Data to Stream",
+      "actor": "Client Application",
+      "system": "PWispHandler",
+      "description": "Send DATA packet if buffer available; otherwise queue data for later flush",
+      "trigger": "pwispHandler.write(streamID, data)",
+      "key_steps": [
+        "if streamData.buffer > 0: buffer--, ws.send(DATA packet)",
+        "else: streamData.queue.push(data)"
+      ]
+    },
+    {
+      "id": "UC05",
+      "name": "Handle Buffer Flow Control",
+      "actor": "WISP Server",
+      "system": "PWispHandler",
+      "description": "On CONTINUE packet update stream buffer; flush queued data via _continue()",
+      "trigger": "Server sends CONTINUE packet for a stream",
+      "key_steps": [
+        "streamMap.get(streamID).buffer = remainingBuffer",
+        "_continue(streamID) → iterate queue, call write() for each item"
+      ]
+    },
+    {
+      "id": "UC06",
+      "name": "Receive Stream Data",
+      "actor": "WISP Server",
+      "system": "PWispHandler",
+      "description": "On DATA packet, deliver payload copy to registered dataCallBack",
+      "trigger": "Server sends DATA packet",
+      "key_steps": [
+        "parseIncomingPacket → type DATA",
+        "streamMap.get(streamID).dataCallBack(payload.slice(0))"
+      ]
+    },
+    {
+      "id": "UC07",
+      "name": "Close Stream Channel",
+      "actor": "Client Application",
+      "system": "PWispHandler",
+      "description": "Send CLOSE packet with reason 0x02 to terminate a stream",
+      "trigger": "pwispHandler.close(streamID)",
+      "key_steps": [
+        "ws.send(createWispPacket({ CLOSE, streamID, reason: 0x02 }))"
+      ]
+    },
+    {
+      "id": "UC08",
+      "name": "Handle Remote Stream Close",
+      "actor": "WISP Server",
+      "system": "PWispHandler",
+      "description": "On server-initiated CLOSE, invoke registered closeCallBack",
+      "trigger": "Server sends CLOSE packet for a stream",
+      "key_steps": [
+        "streamMap.get(streamID).closeCallBack(reason)"
+      ]
+    },
+    {
+      "id": "UC09",
+      "name": "Create Worker",
+      "actor": "Client Application",
+      "system": "WorkersHandler",
+      "description": "Authenticate, resolve or create sandbox app, call driver 'create', store worker URL in KV",
+      "trigger": "workersHandler.create(workerName, filePath, appName)",
+      "key_steps": [
+        "puter.ui.authenticateWithPuter() if needed",
+        "puter.apps.get/create sandbox-{workerName}",
+        "make_driver_method(['authorization','filePath','workerName','appId'], 'workers', 'worker-service', 'create')",
+        "puter.kv.set('user-workers', currentWorkers)"
+      ]
+    },
+    {
+      "id": "UC10",
+      "name": "Execute Worker",
+      "actor": "Client Application",
+      "system": "WorkersHandler",
+      "description": "Proxy a fetch Request to the worker, injecting puter-auth header",
+      "trigger": "workersHandler.exec(...args)",
+      "key_steps": [
+        "new Request(...args)",
+        "req.headers.set('puter-auth', puter.authToken)",
+        "return fetch(req)"
+      ]
+    },
+    {
+      "id": "UC11",
+      "name": "List Workers",
+      "actor": "Client Application",
+      "system": "WorkersHandler",
+      "description": "Retrieve all worker file paths via driver call",
+      "trigger": "workersHandler.list()",
+      "key_steps": [
+        "make_driver_method([], 'workers', 'worker-service', 'getFilePaths')()"
+      ]
+    },
+    {
+      "id": "UC12",
+      "name": "Get Worker",
+      "actor": "Client Application",
+      "system": "WorkersHandler",
+      "description": "Retrieve a single worker's info by name",
+      "trigger": "workersHandler.get(workerName)",
+      "key_steps": [
+        "make_driver_method(['workerName'], 'workers', 'worker-service', 'getFilePaths')(workerName)",
+        "return driverCall[0]"
+      ]
+    },
+    {
+      "id": "UC13",
+      "name": "Delete Worker",
+      "actor": "Client Application",
+      "system": "WorkersHandler",
+      "description": "Destroy worker via driver, remove from KV store",
+      "trigger": "workersHandler.delete(workerName)",
+      "key_steps": [
+        "make_driver_method(['authorization','workerName'], 'workers', 'worker-service', 'destroy')",
+        "puter.kv.set('user-workers', updated)"
+      ]
+    },
+    {
+      "id": "UC14",
+      "name": "Stream Worker Logs",
+      "actor": "Client Application",
+      "system": "WorkersHandler",
+      "description": "Open WebSocket to logging endpoint, return EventTarget/ReadableStream-compatible log handle",
+      "trigger": "workersHandler.getLoggingHandle(workerName)",
+      "key_steps": [
+        "make_driver_method([], 'workers', 'worker-service', 'getLoggingUrl')()",
+        "new WebSocket(`${loggingEndpoint}/${authToken}/${workerName}`)",
+        "return logStreamObject (EventTarget + start/cancel/close)"
+      ]
+    },
+    {
+      "id": "UC15",
+      "name": "Register Service",
+      "actor": "Client Application",
+      "system": "ServiceManager",
+      "description": "Instantiate service via factory, add to registry, trigger dependency-aware init",
+      "trigger": "serviceManager.register(name, factory, options)",
+      "key_steps": [
+        "factory.create({ parameters, context })",
+        "services_m_[name] = { name, instance, status: Registering }",
+        "maybe_init_(name)"
+      ]
+    },
+    {
+      "id": "UC16",
+      "name": "Initialize Service with Dependencies",
+      "actor": "ServiceManager",
+      "system": "ServiceManager",
+      "description": "Check if all dependencies are Running; if so init immediately, else queue as Pending until deps are ready",
+      "trigger": "maybe_init_(name) called after registration or dependency init",
+      "key_steps": [
+        "get_depends() via TService interface",
+        "get_waiting_for_(depends) → pending list",
+        "If empty: init_service_(name)",
+        "Else: status=Pending, add to waiting_[dependency]",
+        "init_service_: status=Initializing → service_impl.init() → status=Running",
+        "Notify dependents via maybe_init_, fire init_listeners_"
+      ]
+    },
+    {
+      "id": "UC17",
+      "name": "Retrieve Running Service",
+      "actor": "Client Application",
+      "system": "ServiceManager",
+      "description": "Synchronously get a Running service instance; returns undefined if not yet Running",
+      "trigger": "serviceManager.get(name) or serviceManager.aget(name)",
+      "key_steps": [
+        "get(name): check status === Running, return instance",
+        "aget(name): await wait_for_init([name]), then get(name)"
+      ]
+    }
+  ],
+
+  "key_relationships": [
+    "Client Application initiates all use cases in PWispHandler and WorkersHandler",
+    "WISP Server triggers UC02 (INFO handshake), UC05 (CONTINUE/flow control), UC06 (DATA receive), UC08 (remote close)",
+    "PWispHandler depends_on parsers.js: createWispPacket, parseIncomingPacket, packet type constants",
+    "WorkersHandler depends_on puter.* globals: authToken, ui, apps, kv, whoami",
+    "WorkersHandler depends_on utils.make_driver_method for all backend calls",
+    "WorkersHandler depends_on getAbsolutePathForApp for filePath resolution",
+    "WorkersHandler communicates_with Worker Service Backend via Puter driver framework",
+    "ServiceManager extends AdvancedBase, uses TService interface for get_depends/init",
+    "ServiceManager manages dependency graph: Pending → Initializing → Running lifecycle",
+    "ServiceManager notifies init_listeners_ on each service becoming Running"
+  ],
+
+  "important_notes": "PWispHandler uses WISP over WebSocket (binary arraybuffer). Stream IDs auto-increment from 1; streamID=0 is reserved for control (CONTINUE init, INFO auth). Buffer-based flow control: data queued when buffer=0, flushed on CONTINUE. WorkersHandler uses sandbox app pattern (sandbox-{workerName}) for user tokens. ServiceManager supports async dependency resolution with cascading init via waiting_ map.",
+
+  "source_files_analyzed": [
+    "src/puter-js/src/modules/networking/PWispHandler.js",
+    "src/puter-js/src/modules/Workers.js",
+    "src/putility/src/system/ServiceManager.js"
+  ]
+}

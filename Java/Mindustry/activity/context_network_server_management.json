@@ -1,0 +1,231 @@
+{
+  "scope": "network_server_management",
+  "title": "Network Server Management",
+  "diagram_type": "activity",
+  "key_participants": ["ServerControl", "NetServer", "Administration", "NetConnection", "Player", "CommandHandler"],
+
+  "main_activities": [
+    "Server Startup & Initialization",
+    "Player Connection Validation",
+    "Server Command Processing",
+    "Admin Action Enforcement",
+    "World State Broadcast (Sync)",
+    "Game Over / Map Rotation",
+    "Autosave & Periodic Maintenance"
+  ],
+
+  "activity_flows": {
+
+    "server_startup": [
+      "ServerControl.setup(args) called",
+      "Initialize logger, formatter, Time.deltaProvider",
+      "registerCommands() → registers all handler commands",
+      "Load shuffle mode from settings",
+      "Register event listeners: GameOverEvent, WorldLoadEvent, Trigger.update, PlayEvent",
+      "Schedule periodic save: netServer.admins.forceSave() + Core.settings.forceSave() every 60s",
+      "toggleSocket(Config.socketInput.bool())",
+      "On ServerLoadEvent: start serverInput thread (reads stdin), print 'Server loaded'"
+    ],
+
+    "player_connection_flow": [
+      "net.handleServer(Connect.class): fire ConnectionEvent → check isIPBanned/isSubnetBanned → if banned: con.kick(KickReason.banned)",
+      "net.handleServer(ConnectPacket.class):",
+      "  [Guard] if con.kicked → return",
+      "  [Guard] if Steam address → override uuid from address",
+      "  [Check] isIPBanned || isSubnetBanned → kick(banned)",
+      "  [Check] hasBegunConnecting → kick(idInUse)",
+      "  [Check] uuid==null || usid==null → kick(idInUse)",
+      "  [Check] isIDBanned(uuid) || isNameBanned(name) → kick(banned)",
+      "  [Check] Time.millis() < getKickTime(uuid, ip) → kick(recentKick)",
+      "  [Check] playerLimit exceeded && !admin → kick(playerLimit)",
+      "  [Check] mod incompatibility → kick(incompatible mods message)",
+      "  [Check] !isWhitelisted(uuid, usid) → save info, Call.infoMessage, kick(whitelist)",
+      "  [Check] version/type mismatch && !allowCustomClients → kick(typeMismatch/customClient)",
+      "  [Check] strict mode: duplicate name → kick(nameInUse); duplicate uuid/usid → kick(idInUse)",
+      "  fixName(packet.name); if empty → kick(nameEmpty)",
+      "  admins.updatePlayerJoined(uuid, ip, name)",
+      "  [Check] version mismatch → kick(serverOutdated/clientOutdated)",
+      "  Player.create(); assign admin status, con, name, locale, color",
+      "  player.team(assignTeam(player))",
+      "  sendWorldData(player): NetworkIO.writeWorld → DeflaterOutputStream → player.con.sendStream(WorldStream)",
+      "  Events.fire(PlayerConnect(player))",
+      "connectConfirm(player) [called from client]:",
+      "  if kicked → return",
+      "  player.add()",
+      "  Events.fire(PlayerConnectionConfirmed)",
+      "  con.hasConnected = true",
+      "  if showConnectMessages: Call.sendMessage('[player] has connected')",
+      "  if motd != 'off': player.sendMessage(Config.motd.string())",
+      "  Events.fire(PlayerJoin(player))"
+    ],
+
+    "player_disconnect_flow": [
+      "net.handleServer(Disconnect.class): if con.player != null → onDisconnect(player, reason)",
+      "onDisconnect: if !hasDisconnected && hasConnected → Events.fire(PlayerLeave), Call.sendMessage('[player] has disconnected'), Call.playerDisconnect(id)",
+      "player.remove(); con.hasDisconnected = true"
+    ],
+
+    "server_command_processing": [
+      "stdin thread reads line → Core.app.post(() → handleCommandString(line))",
+      "OR socket input → handleCommandString(line)",
+      "handler.handleMessage(line) dispatches to registered command:",
+      "  host [map] [mode] → logic.reset(), world.loadMap(), logic.play(), netServer.openServer()",
+      "  stop → net.closeServer(), cancelPlayTask(), state.set(menu)",
+      "  kick <name> → player.kick(KickReason.kick)",
+      "  ban <type> <target> → admins.banPlayerID/banPlayerIP/banPlayer, kick all newly-banned players",
+      "  unban <ip/id> → admins.unbanPlayerIP/unbanPlayerID",
+      "  admin add/remove <name/id> → admins.adminPlayer/unAdminPlayer, update player.admin flag",
+      "  whitelist add/remove <id> → admins.whitelist/unwhitelist",
+      "  config [name] [value] → Config.set(value), Core.settings.forceSave()",
+      "  subnet-ban add/remove → admins.addSubnetBan/removeSubnetBan",
+      "  name-ban add/remove → admins.addNameBan / bannedNames.remove",
+      "  dos-ban add/remove → admins.blacklistDos/unBlacklistDos",
+      "  say <msg> → Call.sendMessage('[Server]: msg')",
+      "  pause on/off → state.set(paused/playing)",
+      "  gameover → Events.fire(GameOverEvent)",
+      "  save/load/loadautosave → SaveIO.save/load, netServer.openServer()",
+      "  runwave → logic.runWave()",
+      "  playerlimit → admins.setPlayerLimit(n)"
+    ],
+
+    "admin_action_enforcement": [
+      "adminRequest(player, other, action) [called from client]:",
+      "  [Guard] !player.admin && !player.isLocal → warn ACCESS DENIED, return",
+      "  [Guard] other==null || (other.admin && !isLocal) → warn, return",
+      "  Events.fire(AdminRequestEvent)",
+      "  switch(action):",
+      "    ban → admins.banPlayerID(uuid) + banPlayerIP(address) + other.kick(banned)",
+      "    kick → other.kick(KickReason.kick)",
+      "    wave → logic.skipWave()",
+      "    trace → admins.getInfo(uuid), build TraceInfo, Call.traceInfo(player.con, other, info)",
+      "    switchTeam → other.team(team)"
+    ],
+
+    "client_snapshot_processing": [
+      "clientSnapshot(player, snapshotID, unitID, dead, x, y, ...) [unreliable from client]:",
+      "  if snapshotID < con.lastReceivedClientSnapshot → return (out of order)",
+      "  Validate/clamp NaN/Inf coordinates",
+      "  Update con.viewX/Y/Width/Height",
+      "  If player.isBuilder(): for each build plan → admins.allowAction(breakBlock/placeBlock):",
+      "    if not allowed → Call.removeQueueBlock(player.con, ...), add to rejectedRequests",
+      "    if allowed → unit.plans().addLast(req)",
+      "  If !dead: unit.controlWeapons, aim, mineTile, move/trns with max-speed cap",
+      "    if verifyPosition && dist > correctDist → Call.setPosition(player.con, newx, newy)",
+      "  unit.readSyncManual(fbuffer)",
+      "  con.lastReceivedClientSnapshot = snapshotID"
+    ],
+
+    "world_sync_broadcast": [
+      "NetServer.update() called each frame:",
+      "  if state.isGame() && net.server(): handle PvP auto-pause, call sync()",
+      "sync():",
+      "  writeBlockSnapshots() → for each synced building: build.writeSync → Call.blockSnapshot(sent, bytes)",
+      "  for each player: writeEntitySnapshot(player) → Call.entitySnapshot(player.con, ...)",
+      "  periodic: healthSyncTime → Call.buildHealthUpdate for changed buildings",
+      "  periodic: planPreviewSyncTime → sync client build plan previews between players",
+      "  periodic: blockSyncTime → full block sync"
+    ],
+
+    "chat_message_flow": [
+      "Player sends chat message [client command]",
+      "admins.filterMessage(player, message):",
+      "  for each ChatFilter: f.filter(player, message)",
+      "  Anti-spam filter: if resetTime>0 && timeSince(lastMessageTime) < resetTime → suppress, increment messageInfractions",
+      "    if messageInfractions >= messageSpamKick → player.con.kick(spam, 2min)",
+      "  Duplicate message filter: same message within 10s → suppress",
+      "  if returned non-null: Call.sendMessage(chatFormatter.format(player, message))",
+      "/t command: send only to teammates",
+      "/a command: send only to admins (requires player.admin)"
+    ],
+
+    "votekick_flow": [
+      "/votekick [player] [reason] client command:",
+      "  [Check] enableVotekick disabled → reject",
+      "  [Check] < 3 players → reject",
+      "  [Check] currentlyKicking != null → 'vote already in progress'",
+      "  [Check] target is admin/local/different team → reject",
+      "  [Check] cooldown not expired → reject",
+      "  Create VoteSession(target), session.vote(player, 1), reset cooldown, currentlyKicking = session",
+      "/vote y/n/c:",
+      "  admin + 'c' → cancel session, currentlyKicking = null",
+      "  Validate not already voted, not self, not different team",
+      "  currentlyKicking.vote(player, sign)",
+      "  On threshold reached (votesRequired = 2 + (size>4 ? 1 : 0)): target.con.kick(votekick)"
+    ],
+
+    "game_over_map_rotation": [
+      "Events.on(GameOverEvent): gameOverListener invoked",
+      "Log game-over info (wave/winner)",
+      "maps.getNextMap(lastMode, state.map)",
+      "If map found:",
+      "  Call.infoMessage(winner/next map info)",
+      "  state.gameOver = true; Call.updateGameOver(winner)",
+      "  play(() → world.loadMap(map, map.applyRules(lastMode)))",
+      "If no map:",
+      "  netServer.kickAll(KickReason.gameover)",
+      "  state.set(State.menu); net.closeServer()"
+    ],
+
+    "autosave_flow": [
+      "Trigger.update event fires each frame",
+      "if state.isPlaying() && Config.autosave.bool():",
+      "  if autosaveCount.get(spacing * 60):",
+      "    find auto_ saves, delete oldest if >= autosaveAmount",
+      "    fileName = 'auto_<map>_<date>.msav'",
+      "    SaveIO.save(file) → log 'Autosave completed' or err",
+      "if Config.autoPause.bool():",
+      "  if no players → state.set(paused), autoPaused=true",
+      "  else if autoPaused → state.set(playing), autoPaused=false"
+    ]
+  },
+
+  "key_relationships": [
+    "ServerControl implements ApplicationListener, holds CommandHandler handler",
+    "NetServer implements ApplicationListener, holds Administration admins, CommandHandler clientCommands",
+    "Administration holds: bannedIPs, whitelist, chatFilters, actionFilters, subnetBans, dosBlacklist, kickedIPs, bannedNames, playerInfo(ObjectMap<String,PlayerInfo>)",
+    "NetServer.admins: Administration (composition)",
+    "NetConnection (con) is field on Player; holds uuid, usid, address, kicked, hasConnected flags",
+    "Administration.Config: inner static class with all server config values",
+    "Administration.PlayerInfo: persistent per-player data (banned, admin, lastKicked, ips, names, etc.)",
+    "Administration.PlayerAction: poolable action object used by actionFilters",
+    "ChatFilter, ActionFilter: functional interfaces registered into Administration"
+  ],
+
+  "conditions_and_guards": [
+    "isIPBanned / isSubnetBanned → kick(banned)",
+    "isIDBanned / isNameBanned → kick(banned)",
+    "getKickTime > now → kick(recentKick)",
+    "playerLimit > 0 && players >= limit && !admin → kick(playerLimit)",
+    "mod incompatibility → kick with detail message",
+    "!isWhitelisted → kick(whitelist)",
+    "version/type mismatch → kick(typeMismatch/customClient/serverOutdated/clientOutdated)",
+    "strict mode: duplicate name/uuid → kick(nameInUse/idInUse)",
+    "empty name after fixName → kick(nameEmpty)",
+    "antiSpam: message rate > limit → suppress/kick",
+    "antiSpam: action rate > interactRateLimit → deny/kick",
+    "adminRequest: !admin && !isLocal → deny with warning",
+    "clientSnapshot: snapshotID out of order → discard",
+    "clientSnapshot: verifyPosition && dist > correctDist → teleport correct",
+    "autoPause: no players → pause; players join → unpause",
+    "pvpAutoPause: < 2 teams have players → pause"
+  ],
+
+  "important_notes": [
+    "NetServer registers all packet handlers in constructor (Connect, Disconnect, ConnectPacket)",
+    "connectConfirm is @Remote called from client AFTER world data is received",
+    "sendWorldData uses Deflater compression; world serialized via NetworkIO.writeWorld",
+    "Administration.forceSave() persists to Core.settings JSON; called by scheduled timer every 60s",
+    "VoteSession uses threshold: 2 votes, or 3 if >4 players; 5-min cooldown per voter",
+    "clientSnapshot is unreliable UDP, ordered by snapshotID; position correction via Call.setPosition",
+    "sync() sends block snapshots + entity snapshots every snapshotInterval (default 200ms)",
+    "ServerControl.gameOverListener selects next map via maps.getNextMap(lastMode, currentMap)",
+    "Socket input (TCP) mirrors stdin command handling via toggleSocket()",
+    "Config values: antiSpam, strict, whitelist, enableVotekick, motd, autosave, autoPause, roundExtraTime, packetSpamLimit, chatSpamLimit"
+  ],
+
+  "source_files_analyzed": [
+    "core/src/mindustry/core/NetServer.java",
+    "server/src/mindustry/server/ServerControl.java",
+    "core/src/mindustry/net/Administration.java"
+  ]
+}

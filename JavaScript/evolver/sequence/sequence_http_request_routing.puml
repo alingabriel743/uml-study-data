@@ -1,0 +1,183 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #E9ECEF
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #DEE2E6
+    DividerBackgroundColor #CED4DA
+    DividerBorderColor #6C757D
+}
+
+title HTTP Request Routing and Dispatch
+
+actor Client
+participant "ProxyHttpServer" as server
+participant "matchPath()" as matchPath
+participant "parseBody()" as parseBody
+participant "RouteHandler" as handler
+participant "MailboxStore\n(store)" as store
+participant "proxyHandlers" as proxy
+participant "Extensions\n(dmHandler / sessionHandler\n/ taskMonitor)" as extensions
+participant "sendJson()" as sendJson
+
+Client -> server : HTTP request\n(method, url, body)
+activate server
+
+server -> server : url = new URL(req.url)\nrouteKey = "${req.method} ${url.pathname}"
+
+server -> server : _matchRoute(method, pathname)
+activate server
+
+loop for each [pattern, handler] in this.routes
+    server -> matchPath : matchPath(routePath, pathname)
+    activate matchPath
+    note right of matchPath
+        Splits both pattern and pathname
+        into segments. Matches exact
+        segments or captures :param tokens.
+    end note
+    matchPath --> server : params{} | null
+    deactivate matchPath
+end
+
+alt no route matched
+    server --> sendJson : sendJson(res, 404,\n{ error: "Not found", path })
+    activate sendJson
+    sendJson --> Client : 404 Not Found (JSON)
+    deactivate sendJson
+    deactivate server
+else route matched → { handler, params }
+    deactivate server
+
+    alt method is POST or PUT
+        server -> parseBody : parseBody(req)
+        activate parseBody
+        note right of parseBody
+            Buffers incoming chunks,
+            then JSON.parse(chunks.join(""))
+        end note
+        parseBody --> server : body{}
+        deactivate parseBody
+    end
+
+    server -> server : query = Object.fromEntries\n(url.searchParams)
+
+    server -> handler : await handler({ body, query, params })
+    activate handler
+
+    alt mailbox route
+        handler -> store : send() / poll() / ack()\nlist() / getById(params.id)
+        activate store
+        store --> handler : result
+        deactivate store
+
+    else asset route
+        alt asset validate / fetch / search
+            handler -> proxy : assetValidate(body)\nassetFetch(body) / assetSearch(body)
+            activate proxy
+            proxy --> handler : result
+            deactivate proxy
+        else asset submit / submissions
+            handler -> store : send({ type: "asset_submit" })\nor list() + _messages lookup
+            activate store
+            store --> handler : result
+            deactivate store
+        end
+
+    else task route
+        alt subscribe / unsubscribe / metrics
+            handler -> extensions : taskMonitor.subscribe()\nunsubscribe() / getMetrics()
+            activate extensions
+            extensions --> handler : result
+            deactivate extensions
+        else claim / complete
+            handler -> store : send(claimMsg)
+            activate store
+            store --> handler : stored
+            deactivate store
+            handler -> extensions : taskMonitor.recordClaim()\nor recordComplete()
+            activate extensions
+            extensions --> handler : ok
+            deactivate extensions
+        else task list
+            handler -> store : poll({ type: "task_available" })
+            activate store
+            store --> handler : tasks[]
+            deactivate store
+        end
+
+    else dm route
+        alt dmHandler available
+            handler -> extensions : dmHandler.send()\npoll() / list()
+            activate extensions
+            extensions --> handler : result
+            deactivate extensions
+        else fallback
+            handler -> store : send() / poll() / list()
+            activate store
+            store --> handler : result
+            deactivate store
+        end
+
+    else session route
+        alt sessionHandler available
+            handler -> extensions : sessionHandler.createSession()\njoinSession() / leaveSession()\nsendMessage() / delegateSubtask()\nsubmitResult() / pollInvites()\nlistActiveSessions()
+            activate extensions
+            extensions --> handler : result
+            deactivate extensions
+        else fallback
+            handler -> store : send() / poll() / list()
+            activate store
+            store --> handler : result
+            deactivate store
+        end
+
+    else proxy system route (/proxy/status, /proxy/config, /proxy/hub-status)
+        handler -> store : countPending() + getState()
+        activate store
+        store --> handler : status{}
+        deactivate store
+    end
+
+    handler --> server : { status?, body } | result
+    deactivate handler
+
+    server -> sendJson : sendJson(res,\nresult.status || 200,\nresult.body || result)
+    activate sendJson
+    sendJson --> Client : HTTP response\n(JSON payload, Content-Type,\nContent-Length)
+    deactivate sendJson
+end
+
+opt error thrown during handling
+    server -> sendJson : sendJson(res,\nerr.statusCode || 500,\n{ error: err.message })
+    activate sendJson
+    sendJson --> Client : 5xx Error Response (JSON)
+    deactivate sendJson
+end
+
+deactivate server
+
+@enduml

@@ -1,0 +1,124 @@
+{
+  "scope": "sandbox_session_lifecycle",
+  "title": "Sandbox Session Lifecycle",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Caller",
+    "SandboxSession",
+    "BaseSandboxSession",
+    "SandboxSessionState",
+    "Snapshot",
+    "ManifestApplier",
+    "Instrumentation"
+  ],
+  "class_summary": {
+    "SandboxSession": "Decorator/wrapper around BaseSandboxSession. Adds @instrumented_op audit events and SDK tracing spans. Holds _inner: BaseSandboxSession, _instrumentation: Instrumentation, _seq: int. Delegates all ops to _inner.",
+    "BaseSandboxSession": "Abstract base defining full lifecycle. Key state flags: _start_workspace_state_preserved, _start_system_state_preserved, _start_workspace_root_ready. Concurrency: _max_manifest_entry_concurrency, _max_local_dir_file_concurrency.",
+    "SandboxSessionState": "Pydantic model: session_id (UUID), snapshot (SnapshotBase), manifest (Manifest), workspace_root_ready (bool), snapshot_fingerprint (str|None), exposed_ports (tuple[int,...]). Subclass registry via 'type' discriminator.",
+    "Instrumentation": "Holds sinks; emits SandboxSessionStartEvent / SandboxSessionFinishEvent. flush() on aclose."
+  },
+  "interaction_flow": {
+    "startup": [
+      "Caller → SandboxSession: start()  [or async with entry via __aenter__]",
+      "SandboxSession @instrumented_op('start') → _annotate(op='start', run=_inner.start)",
+      "_annotate → Instrumentation: emit SandboxSessionStartEvent(op='start')",
+      "_annotate → BaseSandboxSession: _inner.start()",
+      "BaseSandboxSession.start() → _ensure_backend_started()  [provider hook, default no-op]",
+      "BaseSandboxSession.start() → reads state.workspace_root_ready → sets _start_workspace_root_ready",
+      "BaseSandboxSession.start() → _probe_workspace_root_for_preserved_resume()",
+      "  _probe: if workspace_state_preserved AND NOT workspace_root_ready → exec('test -d <workspace_root>', timeout=10s)",
+      "  _probe: result.ok() → _mark_workspace_root_ready_from_probe() → sets state.workspace_root_ready=True",
+      "BaseSandboxSession.start() → _prepare_backend_workspace()  [provider hook, default no-op]",
+      "BaseSandboxSession.start() → _ensure_runtime_helpers()  [installs each RuntimeHelperScript]",
+      "BaseSandboxSession.start() → _start_workspace()",
+      "  _start_workspace: snapshot.restorable(dependencies)?",
+      "    YES → _can_reuse_restorable_snapshot_workspace()?",
+      "      YES (workspace preserved + fingerprint matches) → _reapply_ephemeral_manifest_on_resume() → apply_manifest(only_ephemeral=True)",
+      "      NO (drifted or fresh) → _restore_snapshot_into_workspace_on_resume()",
+      "        → _clear_workspace_root_on_resume()",
+      "        → snapshot.restore(dependencies) → workspace_archive",
+      "        → hydrate_workspace(workspace_archive)",
+      "        → if !system_state_preserved: provision_manifest_accounts()",
+      "        → _reapply_ephemeral_manifest_on_resume()",
+      "    NO snapshot restorable → _can_reuse_preserved_workspace_on_resume()?",
+      "      YES → _reapply_ephemeral_manifest_on_resume()",
+      "      NO → _apply_manifest(provision_accounts=True)  [full manifest materialization via ManifestApplier]",
+      "BaseSandboxSession.start(): on exception → _after_start_failed() + _wrap_start_error(e) + raise",
+      "BaseSandboxSession.start() → _after_start()  [provider bookkeeping hook]",
+      "BaseSandboxSession.start() → state.workspace_root_ready = True",
+      "_annotate → Instrumentation: emit SandboxSessionFinishEvent(op='start', ok=True, duration_ms=...)"
+    ],
+    "stop_persist": [
+      "Caller → SandboxSession: stop()  [or via aclose()]",
+      "SandboxSession @instrumented_op('stop') → _annotate → _inner.stop()",
+      "BaseSandboxSession.stop() → _before_stop() → pty_terminate_all()",
+      "BaseSandboxSession.stop() → _persist_snapshot()",
+      "  _persist_snapshot: if NoopSnapshot → return (skip)",
+      "  _persist_snapshot → _compute_and_cache_snapshot_fingerprint()  [sha256 of workspace tar]",
+      "  _persist_snapshot → persist_workspace() → workspace_archive (io.IOBase)",
+      "  _persist_snapshot → snapshot.persist(workspace_archive, dependencies)",
+      "  _persist_snapshot → sets state.snapshot_fingerprint + state.snapshot_fingerprint_version",
+      "BaseSandboxSession.stop(): on exception → _wrap_stop_error(e)",
+      "BaseSandboxSession.stop(): finally → _after_stop()"
+    ],
+    "shutdown": [
+      "Caller → SandboxSession: shutdown()  [or via aclose()]",
+      "SandboxSession @instrumented_op('shutdown') → _annotate → _inner.shutdown()",
+      "BaseSandboxSession.shutdown() → _before_shutdown() → pty_terminate_all()",
+      "BaseSandboxSession.shutdown() → _shutdown_backend()  [provider-specific teardown, default no-op]",
+      "BaseSandboxSession.shutdown() → _after_shutdown()"
+    ],
+    "aclose_full_lifecycle": [
+      "Caller → SandboxSession: aclose()  [or __aexit__]",
+      "SandboxSession.aclose() → super().aclose()  [BaseSandboxSession.aclose()]",
+      "BaseSandboxSession.aclose() → run_pre_stop_hooks()  [user-registered async hooks, run-once guard]",
+      "BaseSandboxSession.aclose() → stop()  [persist snapshot]",
+      "BaseSandboxSession.aclose() → shutdown()  [teardown backend]",
+      "BaseSandboxSession.aclose(): finally → _aclose_dependencies()",
+      "SandboxSession.aclose(): finally → _instrumentation.flush()"
+    ]
+  },
+  "concurrency_limits": {
+    "SandboxConcurrencyLimits fields": "manifest_entries (int|None), local_dir_files (int|None)",
+    "defaults": "DEFAULT_MAX_MANIFEST_ENTRY_CONCURRENCY, DEFAULT_MAX_LOCAL_DIR_FILE_CONCURRENCY (from run_config)",
+    "set_path": "SandboxSession._set_concurrency_limits(limits) → super()._set_concurrency_limits() + _inner._set_concurrency_limits()",
+    "usage": "_max_manifest_entry_concurrency passed to ManifestApplier; _max_local_dir_file_concurrency used per LocalDir file staging"
+  },
+  "state_preservation_logic": {
+    "_start_workspace_state_preserved": "Set by provider via _set_start_state_preserved(workspace=True). Signals workspace files from prior run may still exist.",
+    "_start_system_state_preserved": "Set alongside workspace flag. Controls whether OS users/groups need re-provisioning.",
+    "_start_workspace_root_ready": "Captures state.workspace_root_ready at start-time. Probed via exec test if preserved but not yet marked ready.",
+    "reuse_decision": "Reuse preserved workspace only if _start_workspace_state_preserved=True AND workspace_root_ready=True."
+  },
+  "instrumentation_flow": {
+    "@instrumented_op decorator": "Wraps async method: calls _annotate(op, start_data, run, finish_data, ok, outputs)",
+    "_annotate": "Opens custom_span if tracing active → emit StartEvent → await run() → emit FinishEvent(duration_ms, ok, stdout, stderr)",
+    "instrumented ops": ["start", "stop", "shutdown", "exec", "read", "write", "running", "resolve_exposed_port", "persist_workspace", "hydrate_workspace"],
+    "events": "SandboxSessionStartEvent + SandboxSessionFinishEvent (fields: session_id, seq, op, span_id, trace_id, data, ok, duration_ms, error_type, error_code)"
+  },
+  "key_relationships": [
+    "SandboxSession extends BaseSandboxSession",
+    "SandboxSession composes BaseSandboxSession (_inner)",
+    "SandboxSession composes Instrumentation",
+    "BaseSandboxSession owns SandboxSessionState (state)",
+    "SandboxSessionState holds Manifest + SnapshotBase",
+    "BaseSandboxSession uses ManifestApplier for manifest materialization",
+    "BaseSandboxSession delegates to Dependencies for external resource lifecycle"
+  ],
+  "important_notes": [
+    "stop() is persistence-ONLY (snapshot). Resource teardown is in shutdown().",
+    "aclose() = run_pre_stop_hooks + stop + shutdown + close_dependencies.",
+    "__aenter__ calls start(); __aexit__ calls aclose().",
+    "NoopSnapshot skips all snapshot persistence in _persist_snapshot.",
+    "_ensure_backend_started and _prepare_backend_workspace are provider hooks (default no-op) — overridden by e.g. Docker/Unix backends.",
+    "Concurrency limits flow: SandboxRunConfig → SandboxSession._set_concurrency_limits → BaseSandboxSession + ManifestApplier.",
+    "Snapshot fingerprint (sha256 of workspace tar) enables skip-restore optimization on preserved resume.",
+    "SandboxSession.aclose() calls super().aclose() first, then flushes instrumentation in finally block."
+  ],
+  "source_files_analyzed": [
+    "src/agents/sandbox/session/base_sandbox_session.py",
+    "src/agents/sandbox/session/sandbox_session.py",
+    "src/agents/sandbox/session/sandbox_session_state.py",
+    "docs/sandbox_agents.md"
+  ]
+}

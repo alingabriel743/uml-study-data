@@ -1,0 +1,263 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipant underline
+skinparam sequenceBoxBackgroundColor #E9ECEF
+skinparam sequenceBoxBorderColor #6C757D
+skinparam sequenceLifeLineBorderColor #495057
+skinparam sequenceGroupBorderColor #495057
+skinparam sequenceGroupBackgroundColor #F0F4FF
+skinparam sequenceGroupHeaderFontStyle bold
+skinparam noteBorderColor #6C757D
+skinparam noteBackgroundColor #FFF9C4
+
+title Offset Management and Persistence Flow
+
+participant "Kafka Connect\nFramework" as KC order 10
+participant "BaseSourceTask" as BST order 20
+participant "OffsetReader" as OR order 30
+participant "MySqlOffsetContext\n.Loader" as Loader order 40
+participant "BinlogOffsetContext" as BOC order 50
+participant "BinlogPartition" as BP order 60
+participant "BinlogSourceInfo" as BSI order 70
+participant "TransactionContext" as TC order 80
+participant "IncrementalSnapshot\nContext" as ISC order 90
+participant "ChangeEventSource\nCoordinator" as CESC order 100
+participant "BinlogStreamingChange\nEventSource" as BSCES order 110
+
+== STARTUP / RECOVERY ==
+
+KC -> BST : start(config)
+activate BST
+
+BST -> BST : getPreviousOffsets(\n  BinlogPartition.Provider,\n  MySqlOffsetContext.Loader)
+activate BST
+
+BST -> OR : new OffsetReader(\n  offsetStorageReader, loader)
+activate OR
+
+BST -> BP : getSourcePartition()
+activate BP
+BP --> BST : Map { server → serverName }
+deactivate BP
+
+BST -> OR : offsets(partitions)
+OR -> KC : offsetStorageReader.offset(\n  partitionKey)
+activate KC
+KC --> OR : stored offset Map<String,?>
+deactivate KC
+
+OR -> Loader : load(Map<String,?> offset)
+activate Loader
+
+Loader -> TC : TransactionContext.load(offset)
+activate TC
+TC --> Loader : TransactionContext
+deactivate TC
+
+Loader -> ISC : IncrementalSnapshotContext.load(offset)
+activate ISC
+ISC --> Loader : IncrementalSnapshotContext
+deactivate ISC
+
+Loader -> BOC : new MySqlOffsetContext(\n  snapshot, snapshotCompleted,\n  TransactionContext, IncrementalSnapshotContext,\n  new SourceInfo)
+activate BOC
+
+Loader -> BOC : setBinlogStartPoint(\n  binlogFilename, binlogPosition)
+note right of BOC
+  restartBinlogFilename = filename
+  restartBinlogPosition = position
+end note
+
+Loader -> BOC : setInitialSkips(\n  eventsToSkip, rowsToSkip)
+note right of BOC
+  Enables mid-transaction resume:\n  restartEventsToSkip, restartRowsToSkip
+end note
+
+Loader -> BOC : setCompletedGtidSet(gtidSet)
+note right of BOC
+  restartGtidSet = gtidSet (null-safe)
+end note
+
+Loader --> OR : BinlogOffsetContext (recovered)
+deactivate Loader
+
+OR --> BST : Map<Partition, OffsetContext>
+deactivate OR
+deactivate BST
+
+BST -> CESC : start(recovered BinlogOffsetContext)
+activate CESC
+CESC -> BSCES : execute(context, partition, offsetContext)
+activate BSCES
+deactivate BST
+
+== PER-EVENT OFFSET UPDATE (Streaming) ==
+
+loop for each binlog event
+
+    BSCES -> BOC : setEventPosition(\n  positionOfCurrentEvent, eventSizeInBytes)
+    activate BOC
+    note right of BOC
+      [if NOT inTransaction]
+      restartBinlogPosition = pos + size
+      restartRowsToSkip = 0
+      restartEventsToSkip = 0
+    end note
+    deactivate BOC
+
+    BSCES -> BOC : event(tableId, timestamp)
+    activate BOC
+    BOC -> BSI : setSourceTime(timestamp)
+    activate BSI
+    BSI --> BOC
+    deactivate BSI
+    BOC -> BSI : tableEvent(tableId)
+    activate BSI
+    BSI --> BOC
+    deactivate BSI
+    deactivate BOC
+
+    BSCES -> BOC : setRowNumber(\n  eventRowNumber, totalNumberOfRows)
+    activate BOC
+    BOC -> BSI : setRowNumber(eventRowNumber)
+    activate BSI
+    BSI --> BOC
+    deactivate BSI
+    note right of BOC
+      [if not last row]
+        restartRowsToSkip = eventRowNumber + 1
+      [else]
+        restartRowsToSkip = totalNumberOfRows
+    end note
+    deactivate BOC
+
+    BSCES -> BOC : getOffset()
+    activate BOC
+    BOC -> BOC : offsetUsingPosition(restartRowsToSkip)\n→ Map { server_id, gtids, file,\n        pos, event, row, ts_sec }
+    BOC -> TC : store(offset)
+    activate TC
+    TC --> BOC : offset + tx metadata
+    deactivate TC
+    BOC -> ISC : store(offset)
+    activate ISC
+    ISC --> BOC : offset + incremental snapshot state
+    deactivate ISC
+    BOC --> BSCES : offsetMap
+    deactivate BOC
+
+    BSCES -> KC : emit SourceRecord(\n  partition = BinlogPartition.getSourcePartition(),\n  offset = getOffset())
+    activate KC
+    KC --> BSCES : ack
+    deactivate KC
+
+end
+
+== TRANSACTION BOUNDARIES ==
+
+group GTID Event
+    BSCES -> BOC : startGtid(gtid, gtidSet)
+    activate BOC
+    note right of BOC
+      restartGtidSet = currentGtidSet
+      currentGtidSet = trimmedGtidSet
+    end note
+    deactivate BOC
+end
+
+group BEGIN Event
+    BSCES -> BOC : startNextTransaction()
+    activate BOC
+    note right of BOC
+      restartBinlogFilename = sourceInfo.binlogFilename()
+      restartBinlogPosition = sourceInfo.binlogPosition()
+      inTransaction = true
+      setTransactionId()
+    end note
+    deactivate BOC
+end
+
+group Per-event inside transaction
+    BSCES -> BOC : completeEvent()
+    activate BOC
+    note right of BOC : ++restartEventsToSkip
+    deactivate BOC
+
+    BSCES -> BOC : changeEventCompleted()
+    activate BOC
+    note right of BOC : restartRowsToSkip = 0
+    deactivate BOC
+end
+
+group COMMIT Event
+    BSCES -> BOC : commitTransaction()
+    activate BOC
+    note right of BOC
+      restartGtidSet = currentGtidSet
+      restartBinlogPosition = pos + eventSize
+      restartRowsToSkip = 0
+      restartEventsToSkip = 0
+      inTransaction = false
+    end note
+    deactivate BOC
+end
+
+== PERIODIC FLUSH TO KAFKA CONNECT OFFSET STORAGE ==
+
+KC -> BST : commitRecord(SourceRecord, RecordMetadata)
+activate BST
+note right of BST
+  Called after Kafka producer ack
+  (NOT after binlog read)
+end note
+BST -> BST : updateLastOffset(\n  record.sourcePartition(),\n  record.sourceOffset())
+deactivate BST
+
+KC -> BST : commit()
+activate BST
+note right of BST : Periodic flush trigger
+BST -> BST : shouldPerformCommit.set(true)
+deactivate BST
+
+KC -> BST : poll()
+activate BST
+BST -> BST : performCommit()\n[if shouldPerformCommit]
+note right of BST
+  Called inside poll() to serialize
+  with task lifecycle
+end note
+
+loop for each partition in lastOffsets
+    BST -> CESC : commitOffset(partition, lastOffset)
+    activate CESC
+    CESC -> BSCES : commitOffset(partition, offset)\n[if not locked & streamingSource non-null]
+    activate BSCES
+    BSCES -> KC : offsetStorageWriter.persist(offset)
+    activate KC
+    KC --> BSCES : persisted
+    deactivate KC
+    deactivate BSCES
+    deactivate CESC
+end
+
+deactivate BST
+deactivate BSCES
+deactivate CESC
+deactivate BOC
+
+@enduml

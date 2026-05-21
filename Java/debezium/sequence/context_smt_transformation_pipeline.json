@@ -1,0 +1,101 @@
+{
+  "scope": "smt_transformation_pipeline",
+  "title": "Single Message Transform (SMT) Pipeline",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "JMH Runner",
+    "SmtOverheadPerf",
+    "FilterSmtPerf",
+    "TransformState (SmtOverheadPerf)",
+    "TransformState (FilterSmtPerf)",
+    "NewRecord",
+    "NoOp",
+    "NativeFilter",
+    "Filter (ScriptingTransformation)",
+    "ScriptingEngine (Jsr223/GraalJs/Wasm)",
+    "SourceRecord",
+    "Envelope"
+  ],
+  "interaction_flow": [
+    "== SmtOverheadPerf Setup ==",
+    "JMH Runner → TransformState(SmtOverheadPerf).doSetup(): build Schema (struct 'dummyenv', field 'op')",
+    "TransformState → SourceRecord: new SourceRecord(topic='top1', partition=1, schema, value='d') [delete]",
+    "TransformState → SourceRecord: new SourceRecord(topic='top1', partition=1, schema, value='c') [create]",
+    "TransformState → NewRecord: new NewRecord(); newRecord.configure({})",
+    "TransformState → NoOp: new NoOp(); noop.configure({})",
+
+    "== SmtOverheadPerf Benchmarks ==",
+    "JMH Runner → SmtOverheadPerf.newRecord(state): [Benchmark, Throughput, μs]",
+    "SmtOverheadPerf → NewRecord.apply(state.create)",
+    "NewRecord → SourceRecord.newRecord(topic, partition, keySchema, key, valueSchema, value, timestamp, headers): returns new SourceRecord copy",
+    "NewRecord → SmtOverheadPerf: return new SourceRecord",
+
+    "JMH Runner → SmtOverheadPerf.noop(state): [Benchmark, Throughput, μs]",
+    "SmtOverheadPerf → NoOp.apply(state.create)",
+    "NoOp → SmtOverheadPerf: return record (unchanged passthrough)",
+
+    "JMH Runner → SmtOverheadPerf.base(state): [Benchmark baseline — empty body]",
+
+    "== FilterSmtPerf Setup ==",
+    "JMH Runner → TransformState(FilterSmtPerf).doSetup(): build Schema, SourceRecords (delete op='d', create op='c')",
+    "TransformState → NativeFilter: new NativeFilter(); nativeFilter.configure({})",
+    "TransformState → Filter: new Filter<>() as groovyFilter; configure({language='jsr223.groovy', condition='value.op == 'd''})",
+    "TransformState → Filter: new Filter<>() as jsFilter; configure({language='jsr223.graal.js', condition='value.get(op) == d'})",
+    "TransformState → Filter: new Filter<>() as chicoryFilter; configure({language='wasm.chicory', condition=<wasm file path>})",
+    "TransformState → Filter: new Filter<>() as chicoryInterpreterFilter; configure({language='wasm.chicory-interpreter', condition=<wasm file path>})",
+
+    "== FilterSmtPerf.java benchmark (NativeFilter) ==",
+    "JMH Runner → FilterSmtPerf.java(state)",
+    "FilterSmtPerf → NativeFilter.apply(state.create): record.value() != null → Envelope op='c' != 'd' → return record [pass]",
+    "FilterSmtPerf → NativeFilter.apply(state.create): same → return record [pass]",
+    "FilterSmtPerf → NativeFilter.apply(state.delete): op='d' == DELETE.code() → return null [filtered out]",
+
+    "== FilterSmtPerf scripting benchmarks (groovy/js/chicory/chicoryInterpreter) ==",
+    "JMH Runner → FilterSmtPerf.groovy(state) [also .javascript(), .chicory(), .chicoryInterpreter()]",
+    "FilterSmtPerf → Filter.apply(state.create) → ScriptingTransformation.apply(record)",
+    "ScriptingTransformation: check topicPattern (null → skip) → call doApply(record)",
+    "Filter.doApply(record) → ScriptingEngine.eval(record, Boolean.class)",
+    "ScriptingEngine (Jsr223Engine/GraalJsEngine/WasmEngine) → evaluate condition expression against record",
+    "ScriptingEngine → Filter.doApply: return Boolean result",
+    "Filter.doApply: result==true ? return record : return null",
+    "FilterSmtPerf → Filter.apply(state.delete): condition evaluates true for op='d' → return null [filtered]"
+  ],
+  "key_relationships": [
+    "NewRecord implements Transformation<SourceRecord>, Versioned (inner class of SmtOverheadPerf)",
+    "NoOp implements Transformation<SourceRecord>, Versioned (inner class of SmtOverheadPerf)",
+    "NativeFilter implements Transformation<SourceRecord>, Versioned (inner class of FilterSmtPerf)",
+    "Filter<R> extends ScriptingTransformation<R> (io.debezium.transforms)",
+    "ScriptingTransformation<R> implements Transformation<R>, Versioned, ConfigDescriptor",
+    "ScriptingTransformation delegates to ScriptingEngine (Jsr223Engine | GraalJsEngine | WasmEngine) selected by 'language' config",
+    "Filter.doApply → engine.eval(record, Boolean.class) → returns record if true, null if false",
+    "NativeFilter directly reads Envelope.Operation.DELETE.code() to check op field",
+    "TransformState (JMH @State(Scope.Thread)) owns all transform instances and test SourceRecords",
+    "SmtManager<R> provides isValidEnvelope(), isValidSchemaChange(), isValidHeartBeat() validation helpers used by other SMTs"
+  ],
+  "filter_decision_logic": {
+    "NativeFilter": "if value==null → pass; if op==DELETE.code() → return null (drop); else → pass",
+    "Filter (scripting)": "engine.eval(condition, record) → Boolean; true → drop (return null); false → pass (return record)",
+    "NoOp": "always returns record unchanged",
+    "NewRecord": "always returns a new SourceRecord copy with same fields"
+  },
+  "scripting_engine_variants": [
+    "Jsr223Engine: language=jsr223.groovy or jsr223.graal.js — evaluates JSR-223 scripts",
+    "GraalJsEngine: language=jsr223.graal.js with extra config",
+    "WasmEngine: language=wasm.chicory or wasm.chicory-interpreter — loads .wasm file as condition"
+  ],
+  "benchmark_config": {
+    "mode": "Throughput",
+    "time_unit": "MICROSECONDS",
+    "fork": 1,
+    "warmup": "10 iterations x 1s",
+    "measurement": "3 iterations x 2s"
+  },
+  "important_notes": "Both benchmarks use JMH @State(Scope.Thread). FilterSmtPerf applies each filter 3x per benchmark invocation (create, create, delete). NativeFilter uses direct Java op-code check; Filter uses pluggable scripting engine. SmtManager is NOT used in these benchmarks — it is the helper for other production SMTs (ExtractNewRecordState, PartitionRouting, etc.) to validate envelope schema before transforming.",
+  "source_files_analyzed": [
+    "debezium-microbenchmark/src/main/java/io/debezium/performance/core/SmtOverheadPerf.java",
+    "debezium-microbenchmark/src/main/java/io/debezium/performance/core/FilterSmtPerf.java",
+    "debezium-scripting/debezium-scripting/src/main/java/io/debezium/transforms/Filter.java",
+    "debezium-scripting/debezium-scripting/src/main/java/io/debezium/transforms/ScriptingTransformation.java",
+    "debezium-connect-plugins/src/main/java/io/debezium/transforms/SmtManager.java"
+  ]
+}

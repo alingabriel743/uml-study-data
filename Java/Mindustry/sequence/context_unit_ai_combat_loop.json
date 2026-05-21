@@ -1,0 +1,119 @@
+{
+  "scope": "unit_ai_combat_loop",
+  "title": "Unit AI Combat Decision Loop",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "GameLoop",
+    "UnitComp",
+    "WeaponsComp",
+    "AIController",
+    "FlyingAI/GroundAI (subclass)",
+    "WeaponMount",
+    "Weapon",
+    "BulletType",
+    "Units (static)"
+  ],
+  "interaction_flow": [
+    "GameLoop → UnitComp: update() [every tick]",
+    "UnitComp → UnitComp: type.update(self()) — UnitType tick hook",
+    "UnitComp → WeaponsComp: update() — component chaining (generated entity)",
+    "WeaponsComp → Weapon: update(unit, mount) [for each WeaponMount in mounts[]]",
+    "UnitComp → AIController: controller.updateUnit() [only if !net.client() && !dead && shouldUpdateController()]",
+
+    "AIController.updateUnit(): check useFallback() — if true and fallback != null → fallback.updateUnit() and return",
+    "AIController → AIController: updateVisuals() — wobble, lookAt(prefRotation()) for flying units",
+    "AIController → AIController: updateTargeting() — calls updateWeapons() if unit.hasWeapons()",
+    "AIController → AIController: updateMovement() — empty in base; subclasses override",
+
+    "AIController.updateWeapons(): retarget() checks timer (40t no-target / 90t with-target)",
+    "AIController → Units: findMainTarget(x, y, range, targetAir, targetGround) → closestTarget()",
+    "AIController → Units: invalid(target) → invalidateTarget(target, team, x, y) — nulls stale target",
+    "AIController [loop mounts]: for each WeaponMount mount",
+    "  AIController → Weapon: weapon.range() → bullet.range",
+    "  AIController [if singleTarget]: mount.target = target (shared target)",
+    "  AIController [else]: findTarget(mountX, mountY, wrange, collidesAir, collidesGround)",
+    "  AIController [if autoDropBombs & !shoot]: Units.closestTarget() for bomberTarget",
+    "  AIController → Predict: intercept(unit, mount.target, weapon.bullet) → Vec2 aim",
+    "  AIController → WeaponMount: set mount.aimX, mount.aimY, mount.shoot=true, mount.rotate=true",
+    "  AIController → UnitComp: unit.isShooting |= mount.shoot",
+    "  AIController [if shoot]: unit.aimX = mount.aimX, unit.aimY = mount.aimY",
+
+    "FlyingAI.updateMovement() [extends AIController]:",
+    "  [if target != null && unit.hasWeapons()]",
+    "    [if type.circleTarget]: AIController.circleAttack(type.circleTargetRadius)",
+    "    [else]: AIController.moveTo(target, type.range * 0.8f) + unit.lookAt(target)",
+    "  [if target==null && waves]: moveTo(getClosestSpawner(), dropZoneRadius + 130f)",
+    "AIController.moveTo(target, circleLength): vec.set(target).sub(unit), vec.setLength(speed * length), unit.movePref(vec)",
+    "AIController.circleAttack(circleLength): vec.set(target).sub(unit), adjust angle, vec.setLength(prefSpeed()), unit.movePref(vec)",
+    "UnitComp.movePref(vec): if omniMovement → moveAt(vec) else rotateMove(vec)",
+    "UnitComp.moveAt(vector, accel): tmp1=vector; delta=tmp1-vel limited to accel*len*dt; vel.add(delta)",
+    "UnitComp.rotateMove(vec): moveAt(Tmp.v2.trns(rotation, vec.len())); rotation = Angles.moveToward(rotation, vec.angle(), rotateSpeed*dt)",
+
+    "Weapon.update(unit, mount) [called by WeaponsComp each tick]:",
+    "  mount.reload -= Time.delta * unit.reloadMultiplier",
+    "  update warmup: mount.warmup = lerpDelta(warmup, warmupTarget, shootWarmupSpeed) where warmupTarget=(mount.shoot||continuous bullet) ? 1 : 0",
+    "  [if !controllable && autoTarget]: weapon self-targets via findTarget(); sets mount.shoot, mount.aimX/Y",
+    "  [if rotate && (mount.rotate||mount.shoot)]: mount.rotation = Angles.moveToward(rotation, targetRotation, rotateSpeed*dt)",
+    "  fire condition check: mount.shoot && can && !killShooter && ammo>0 && warmup>=minWarmup && reload<=0 && within(shootCone)",
+    "  [fire]: Weapon.shoot(unit, mount, bulletX, bulletY, shootAngle)",
+    "  mount.reload = reload (reset)",
+
+    "Weapon.shoot(unit, mount, bulletX, bulletY, rotation):",
+    "  unit.apply(shootStatus, shootStatusDuration)",
+    "  [if firstShotDelay>0]: mount.charging=true, chargeSound.at(), bullet.chargeEffect.at()",
+    "  shoot.shoot(barrelCounter, (xOff,yOff,angle,delay,mover) → bullet(unit,mount,...)) — ShootPattern iterates shots",
+    "  [if delay>0]: Time.run(delay, () → bullet())",
+    "  [else]: bullet(unit, mount, xOffset, yOffset, angleOffset, mover)",
+
+    "Weapon.bullet(unit, mount, ...): BulletType.create(unit, shooter, team, bulletX, bulletY, angle, ...) → spawns Bullet entity",
+    "Weapon.bullet(): ejectEffect.at(), bullet.shootEffect.at(), bullet.smokeEffect.at()",
+    "Weapon.bullet(): unit.vel.add(recoil knockback); mount.recoil=1f; mount.heat=1f"
+  ],
+  "key_conditions": [
+    "updateUnit() only runs server-side: !net.client() && !dead && shouldUpdateController()",
+    "Fallback delegation: if useFallback() && fallback != null → fully delegates, skips rest",
+    "retarget() timer: every 40 ticks if no target, every 90 ticks if has target (randomized at init)",
+    "weapon.controllable && !weapon.noAttack && weapon.aiControllable required for AIController to manage mount",
+    "shoot condition: mount.shoot && canShoot() && reload<=0 && warmup>=minWarmup && Angles.within(rotation, targetRotation, shootCone)",
+    "canShoot(): !disarmed && !(type.canBoost && isFlying())",
+    "autoDropBombs: fallback bomb targeting when within-range check fails for flying units",
+    "singleTarget=true: all mounts share same target; false: each mount finds its own target"
+  ],
+  "key_relationships": [
+    "UnitComp implements Unitc, Weaponsc (and many more) via @Component annotation",
+    "AIController implements UnitController interface (updateUnit, unit(), unit(Unit), afterRead)",
+    "UnitComp.controller: UnitController (composition, holds AIController or subclass)",
+    "UnitComp.mounts: WeaponMount[] (imported from WeaponsComp)",
+    "WeaponMount.weapon: Weapon (reference to UnitType weapon definition)",
+    "Weapon.bullet: BulletType (defines projectile behavior)",
+    "AIController.fallback: AIController (nullable, delegation chain)",
+    "CommandAI.commandController: AIController (optional per-command sub-controller)",
+    "FlyingAI extends AIController — overrides updateMovement()",
+    "GroundAI extends AIController — overrides updateMovement() with pathfind()",
+    "CommandAI extends AIController — overrides updateUnit() entirely, may delegate to commandController",
+    "UnitType.weapons: Seq<Weapon> — weapon definitions cloned to WeaponMount[] at setType()"
+  ],
+  "data_flow_summary": {
+    "targeting": "AIController.updateWeapons() → sets mount.target, mount.aimX, mount.aimY, mount.shoot on each WeaponMount",
+    "movement": "AIController.updateMovement() subclass → moveTo/circleAttack → unit.movePref() → unit.moveAt() → vel mutated",
+    "firing": "WeaponsComp.update() → Weapon.update(unit, mount) reads mount.shoot → Weapon.shoot() → Weapon.bullet() → BulletType.create()",
+    "ordering": "UnitComp.update() runs controller.updateUnit() (targeting+movement); WeaponsComp.update() runs weapon ticks (firing) — both called per entity update()"
+  },
+  "important_notes": [
+    "WeaponsComp.update() and UnitComp.update() are separate component update methods merged by annotation processor into generated Unit class — both run every tick",
+    "AIController sets mount.shoot flag; Weapon.update() (in WeaponsComp) reads that flag and fires — decoupled targeting from bullet creation",
+    "Weapon can also self-target if !controllable && autoTarget=true, bypassing AIController targeting",
+    "CommandAI.updateUnit() overrides entirely: processes stances (mineAuto, etc), then either delegates to commandController.updateUnit() or calls defaultBehavior()",
+    "prefSpeed() = unit.speed() = type.speed * strafePenalty * boostMultiplier * floorSpeedMultiplier",
+    "Predict.intercept() used for lead targeting — weapon.bullet velocity factored into aim point",
+    "Bullet spawned with shooter = MissileAI.shooter (if missile) or unit itself"
+  ],
+  "source_files_analyzed": [
+    "core/src/mindustry/entities/units/AIController.java",
+    "core/src/mindustry/entities/comp/UnitComp.java",
+    "core/src/mindustry/type/Weapon.java",
+    "core/src/mindustry/entities/comp/WeaponsComp.java (grep)",
+    "core/src/mindustry/ai/types/FlyingAI.java (grep)",
+    "core/src/mindustry/ai/types/CommandAI.java (grep)"
+  ]
+}

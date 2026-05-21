@@ -1,0 +1,108 @@
+{
+  "scope": "main_agent_run_loop",
+  "title": "Main Agent Run Loop",
+  "diagram_type": "activity",
+  "source_files_analyzed": ["index.js"],
+
+  "entry_point": "main() — async, triggered via `node index.js [run|--loop|--mad-dog]`",
+
+  "top_level_branches": [
+    "isLoop=true  → daemon loop path (acquireLock → infinite while(true) cycle)",
+    "isLoop=false → single run path (evolve.run() once, exit)"
+  ],
+
+  "activity_flow": [
+    "START: main() parses argv (command, --loop/--mad-dog, --verbose flags)",
+    "DECISION: isLoop?",
+
+    "--- SINGLE RUN PATH ---",
+    "  → evolve.run()  [await]",
+    "  → on error: console.error + process.exit(1)",
+    "  → print post-run hint banner",
+    "  → END",
+
+    "--- DAEMON LOOP PATH ---",
+    "  → patch console.log/warn/error with ISO timestamps",
+    "  → acquireLock()  [write evolver.pid with 'wx' flag]",
+    "    DECISION: lock acquired?",
+    "      NO  → process.exit(0)",
+    "      YES → register process signal handlers (SIGINT, SIGTERM, uncaughtException, unhandledRejection) each call releaseLock()",
+    "  → set EVOLVE_LOOP=true, EVOLVE_BRIDGE (default 'false')",
+    "  → resolve config: minSleepMs, maxSleepMs, idleThresholdMs, pendingSleepMs, maxCyclesPerProcess, maxRssMb, suicideEnabled",
+    "  → start A2A heartbeat/SSE (or Proxy+Mailbox if EVOMAP_PROXY=1 / A2A_TRANSPORT=mailbox)",
+    "  → conditionally auto-start ATP merchantAgent if atpMode=auto|on and hubUrl set",
+    "  → LOOP START: while(true)",
+    "    → cycleCount += 1",
+    "    → readJsonSafe(solidifyStatePath) → st0",
+    "    → DECISION: isPendingSolidify(st0)?",
+    "        YES → sleepMs(max(pendingSleepMs, minSleepMs)) → continue (skip to next iteration)",
+    "        NO  →",
+    "          → record t0 = Date.now()",
+    "          → [TRY] await evolve.run()  → ok=true",
+    "          → DECISION: EVOLVE_BRIDGE === 'false'?",
+    "              YES → readJsonSafe(solidifyStatePath) → stAfterRun",
+    "                  → DECISION: isPendingSolidify(stAfterRun)?",
+    "                      YES → rejectPendingRun(solidifyStatePath)  [writes last_solidify.rejected=true, no git rollback]",
+    "          → [CATCH] log error; ok stays false",
+    "          → dt = Date.now() - t0",
+    "          → DECISION: !ok || dt < idleThresholdMs?",
+    "              YES → currentSleepMs = min(maxSleepMs, max(minSleepMs, currentSleepMs * 2))  [backoff]",
+    "              NO  → currentSleepMs = minSleepMs  [reset]",
+    "          → OMLS idle scheduling: getScheduleRecommendation()",
+    "              if schedule.enabled:",
+    "                omlsMultiplier = schedule.sleep_multiplier",
+    "                if schedule.should_distill → autoDistillFromFailures() if shouldDistillFromFailures()",
+    "                if schedule.should_explore → tryExplore([])",
+    "          → DECISION: suicideEnabled && (cycleCount >= maxCyclesPerProcess || rss > maxRssMb)?",
+    "              YES → spawn(process.execPath, [__filename, ...args], detached)",
+    "                  → releaseLock()",
+    "                  → process.exit(0)",
+    "          → read solidifyStatePath → st1 → check last_run.signals",
+    "          → DECISION: signals include 'force_steady_state'?  saturationMultiplier=4",
+    "          → DECISION: signals include 'evolution_saturation'? saturationMultiplier=2",
+    "          → totalSleepMs = max(minSleepMs, (currentSleepMs + jitter) * saturationMultiplier * omlsMultiplier)",
+    "          → sleepMs(totalSleepMs)",
+    "    → [CATCH loopErr] log + sleepMs(max(minSleepMs, 10000))",
+    "  → LOOP END (infinite)"
+  ],
+
+  "key_functions": {
+    "acquireLock()": "Writes evolver.pid with exclusive flag 'wx'. On EEXIST: reads existing PID, sends signal 0 to probe liveness. If alive → return false (exit). If stale → overwrite and return true. Returns false on error.",
+    "releaseLock()": "Deletes evolver.pid only if stored PID === process.pid.",
+    "isPendingSolidify(state)": "Returns true if state.last_run.run_id exists AND (no last_solidify OR last_solidify.run_id !== last_run.run_id).",
+    "rejectPendingRun(statePath)": "Reads state, sets last_solidify={rejected:true, reason:'loop_bridge_disabled_autoreject_no_rollback'}, writes atomically via .tmp rename. No git rollback.",
+    "evolve.run()": "External: src/evolve — the actual evolution cycle (gene selection, mutation, validation).",
+    "sleepMs(ms)": "Promise-based setTimeout; clamps to 0 on invalid input."
+  },
+
+  "key_decisions": [
+    "isLoop flag → single-run vs daemon-loop",
+    "acquireLock result → proceed vs process.exit(0)",
+    "isPendingSolidify (pre-run) → skip cycle vs execute",
+    "EVOLVE_BRIDGE=false (post-run) → auto-reject pending solidify",
+    "!ok || dt < idleThresholdMs → adaptive sleep backoff vs reset",
+    "suicideEnabled + (cycles/rss threshold) → self-restart via spawn",
+    "signals: force_steady_state / evolution_saturation → sleep multiplier (4x / 2x)"
+  ],
+
+  "state_file": "evolution/evolution_solidify_state.json — fields: last_run.run_id, last_run.signals, last_solidify.run_id, last_solidify.rejected",
+
+  "signal_handlers": [
+    "SIGINT / SIGTERM → releaseLock() + stopEventStream() + process.exit()",
+    "uncaughtException → releaseLock() + process.exit(1)",
+    "unhandledRejection → count; if >= 5 → releaseLock() + process.exit(1)"
+  ],
+
+  "external_modules": [
+    "src/evolve.run() — core evolution cycle",
+    "src/gep/solidify.solidify() — solidify command",
+    "src/gep/a2aProtocol — startHeartbeat, startEventStream, stopEventStream",
+    "src/gep/idleScheduler.getScheduleRecommendation() — OMLS idle window",
+    "src/gep/skillDistiller — autoDistillFromFailures, shouldDistillFromFailures",
+    "src/gep/explore.tryExplore() — idle exploration",
+    "src/proxy.startProxy() — mailbox transport proxy",
+    "src/atp.merchantAgent — ATP auto-start"
+  ],
+
+  "important_notes": "Bridge flag (EVOLVE_BRIDGE) controls whether a pending solidify is auto-rejected after evolve.run(). No git rollback occurs in auto-reject — state-only update. Adaptive sleep doubles on idle/failed cycles, resets to minSleepMs on productive cycles. Self-suicide restarts a detached child process and exits cleanly."
+}

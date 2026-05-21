@@ -1,0 +1,202 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    DividerBackgroundColor #DEE2E6
+    GroupBackgroundColor #F1F3F5
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Compiler: Building the Composer PHAR
+
+participant "Compiler" as compiler
+participant "ProcessExecutor" as proc
+participant "Git" as git
+participant "JsonFile" as jsonfile
+participant "Finder" as finder
+participant "CaBundle" as cabundle
+participant "Phar" as phar
+participant "Timestamps" as timestamps
+participant "Linter" as linter
+
+== Initialization ==
+
+[-> compiler : compile(pharFile)
+activate compiler
+
+compiler -> compiler : unlink(pharFile) [if exists]
+compiler -> proc : new ProcessExecutor()
+activate proc
+
+== Version Detection ==
+
+compiler -> git : buildRevListCommand(process, ['-n1','--format=%H','HEAD'])
+activate git
+git --> compiler : command
+deactivate git
+
+compiler -> proc : execute(command, output, repoDir)
+proc --> compiler : commit hash
+compiler -> compiler : $this->version = commitHash
+
+compiler -> git : buildRevListCommand(process, ['-n1','--format=%ci','HEAD'])
+activate git
+git --> compiler : command
+deactivate git
+
+compiler -> proc : execute(command, output, repoDir)
+proc --> compiler : commit date
+compiler -> compiler : $this->versionDate = commitDate
+
+alt Git tag found (exact match)
+    compiler -> proc : execute(['git','describe','--tags','--exact-match','HEAD'])
+    proc --> compiler : tag name
+    compiler -> compiler : $this->version = tagName
+else Dev build — read branch-alias
+    compiler -> jsonfile : read(composer.json)
+    activate jsonfile
+    jsonfile --> compiler : composerData
+    deactivate jsonfile
+    compiler -> compiler : $this->version = branchAlias + '#' + commitHash
+end
+
+deactivate proc
+
+== PHAR Archive Creation ==
+
+compiler -> phar : new Phar(pharFile, 0, 'composer.phar')
+activate phar
+compiler -> phar : setSignatureAlgorithm(SHA512)
+compiler -> phar : startBuffering()
+
+== Add Composer Source Files (src/Composer/) ==
+
+note over compiler, finder : Pass 1 — PHP sources with whitespace stripping
+compiler -> finder : files().ignoreVCS().name('*.php')\n.notName(Compiler|ClassLoader|InstalledVersions)\n.in('src/Composer/').sort()
+activate finder
+finder --> compiler : srcFileIterator
+deactivate finder
+
+loop for each PHP file in src/Composer/
+    compiler -> compiler : addFile(phar, file, strip=true)
+    note right of compiler
+        getRelativeFilePath(file)
+        file_get_contents()
+        stripWhitespace(content)
+        [for Composer.php: replace\n @package_version@ tokens]
+        phar.addFromString(path, content)
+    end note
+end
+
+compiler -> compiler : addFile(phar, ClassLoader.php, strip=false)
+note right of compiler : Preserve docblocks — no stripping
+compiler -> compiler : addFile(phar, InstalledVersions.php, strip=false)
+
+== Add Resource Files (res/) ==
+
+note over compiler, finder : Pass 2 — res/ resources, no stripping
+compiler -> finder : files().in('res/').sort()
+activate finder
+finder --> compiler : resFileIterator
+deactivate finder
+
+loop for each file in res/
+    compiler -> compiler : addFile(phar, file, strip=false)
+end
+
+== Add Vendor Files (vendor/) ==
+
+note over compiler, finder : Pass 3 — vendor/ with conditional stripping
+compiler -> cabundle : getBundledCaBundlePath()
+activate cabundle
+cabundle --> compiler : caBundlePath
+deactivate cabundle
+
+compiler -> finder : files().ignoreVCS().notPath(...)\n.exclude(Tests/tests/docs).in('vendor/').sort()
+activate finder
+finder --> compiler : vendorFileIterator
+deactivate finder
+
+loop for each file in vendor/
+    alt file has .php extension
+        compiler -> compiler : addFile(phar, file, strip=true)
+    else other file (e.g. LICENSE, CA bundle)
+        compiler -> compiler : addFile(phar, file, strip=false)
+    end
+end
+
+== Add Bin Entry-Point ==
+
+compiler -> compiler : addComposerBin(phar)
+note right of compiler
+    reads bin/composer
+    strips shebang line
+    phar.addFromString('bin/composer', content)
+end note
+
+== Finalize PHAR ==
+
+compiler -> compiler : getStub()
+note right of compiler
+    PHP heredoc with shebang\n+ APC check + Phar availability check
+    Phar::mapPhar('composer.phar')
+    [dev build: define COMPOSER_DEV_WARNING_TIME = now+60days]
+    require 'phar://composer.phar/bin/composer';
+    __HALT_COMPILER();
+end note
+compiler -> phar : setStub(stub)
+compiler -> phar : stopBuffering()
+deactivate phar
+
+compiler -> compiler : addFile(phar, LICENSE, strip=false)
+note right of compiler : Wraps content with newlines
+
+compiler -> compiler : unset(phar)
+note right of compiler : Flushes and finalises PHAR on disk
+
+== Reproducible Timestamps & Re-signing ==
+
+compiler -> timestamps : new Timestamps(pharFile)
+activate timestamps
+compiler -> timestamps : updateTimestamps(versionDate)
+compiler -> timestamps : save(pharFile, SHA512)
+note right of timestamps : Re-signs PHAR with deterministic\ntimestamp for reproducible builds
+timestamps --> compiler : done
+deactivate timestamps
+
+== Lint Validation ==
+
+compiler -> linter : lint(pharFile, excludedFilesList)
+activate linter
+linter --> compiler : lintResult
+deactivate linter
+
+[<-- compiler : PHAR built successfully
+deactivate compiler
+
+@enduml

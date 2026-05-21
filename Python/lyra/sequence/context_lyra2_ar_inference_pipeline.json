@@ -1,0 +1,116 @@
+{
+  "scope": "lyra2_ar_inference_pipeline",
+  "title": "Lyra2 Autoregressive Inference Pipeline",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "CallerScript",
+    "model_loader",
+    "depth_utils",
+    "camera_traj_utils",
+    "run_lyra2_sample",
+    "Lyra2InferencePipeline",
+    "Lyra2Model",
+    "WanVAE",
+    "DA3Model",
+    "Sparse3DCache"
+  ],
+  "interaction_flow": [
+    "CallerScript → model_loader: load_model_from_checkpoint(config_file, experiment_name, checkpoint_path, enable_fsdp=False)",
+    "model_loader → model_loader: get_config_module(config_file) → make_config() → override(config, experiment_opts)",
+    "model_loader → Lyra2Model: instantiate(config.model).cuda() + on_train_start()",
+    "model_loader → model_loader: load .pth via easy_io.load() OR DCP via DistributedCheckpointer + dcp.load()",
+    "model_loader → CallerScript: return (model, config)",
+    "CallerScript → depth_utils: load_da3_model(da3_model_name, device) → da3_model",
+    "CallerScript → depth_utils: load_moge_model(device) → moge_model [optional, for scale alignment]",
+    "CallerScript → depth_utils: _da3_infer_depth_intrinsics_single(da3_model, img_rgb_uint8, target_hw) → (image_chw01, depth_hw, K_33, mask_hw)",
+    "CallerScript → camera_traj_utils: build_camera_trajectory(initial_w2c_44, K_33, center_depth, video_len, trajectory, direction, strength) → (w2cs [T,4,4], Ks [T,3,3])",
+    "camera_traj_utils → camera_utils: create_spiral/horizontal/orbit/dolly_zoom_trajectory(...) [dispatches by trajectory type]",
+    "CallerScript → CallerScript: assemble data_batch {video, t5_text_embeddings, camera_w2c, intrinsics, depth, fps, padding_mask}",
+    "CallerScript → run_lyra2_sample: run_lyra2_sample(model, data_batch, args, da3_model=da3_model)",
+    "run_lyra2_sample → Lyra2Model: _normalize_video_databatch_inplace(data_batch)",
+    "run_lyra2_sample → Lyra2InferencePipeline: __init__(model, args, first_frame, first_depth, first_cam_w2c, first_intrinsics, da3_model)",
+    "Lyra2InferencePipeline → Lyra2InferencePipeline: _get_vae_handles(model) → (vae_iface, vae_wrap, vae_core) [model.tokenizer.model.model chain]",
+    "Lyra2InferencePipeline → WanVAE: _prime_encoder_cache_with_history(init_video, vae_wrap, vae_core, model) → (history_latents, enc_feat_cache)",
+    "WanVAE → Lyra2Model: _vae_encode_range_stream(video_cast, 0, T, skip_first_frame=False) → feats",
+    "WanVAE → Lyra2Model: _encoder_feats_to_normalized_latents(feats) → history_latents",
+    "Lyra2InferencePipeline → WanVAE: _decode_new_latent_chunk(vae_wrap, vae_core, dec_feat_cache, history_latents, latent_offset=0) [warmup/cache prime]",
+    "WanVAE → WanVAE: vae_core.conv2(z) → x; then vae_core.decoder(x[:,:,t:t+1], feat_cache=dec_feat_cache) per frame",
+    "Lyra2InferencePipeline → Sparse3DCache: __init__(downsample=4, store_values=True)",
+    "Lyra2InferencePipeline → Sparse3DCache: add(first_depth_b1hw, first_w2c, first_K, latent_index=0, frame_id=0)",
+    "run_lyra2_sample → run_lyra2_sample: compute num_iters = ceil(tokens_needed / tokens_per_step)",
+    "run_lyra2_sample → run_lyra2_sample: [LOOP] for ar_idx in range(num_iters): slice cam_chunk, intr_chunk, pos_t5 from data_batch",
+    "run_lyra2_sample → Lyra2InferencePipeline: autoregressive_step(cam_w2c_chunk, intrinsics_chunk, t5_text_embeddings, neg_t5, is_last_step)",
+    "Lyra2InferencePipeline → Lyra2InferencePipeline: _append_cameras(cam_w2c_chunk, intrinsics_chunk) → concat to self.cam_w2c, self.intrinsics",
+    "Lyra2InferencePipeline → Lyra2Model: _prepare_lyra2_inputs(history_full, gen_cond, spatial_cache, video, buffer_depth_B_1_H_W, camera_w2c, intrinsics, video_indices) → (latents_full, cond_latent, mask, buffer_cond_latents)",
+    "Lyra2InferencePipeline → Lyra2Model: inference(history_latents=history_window, cond_latent, cond_latent_mask, cond_latent_buffer, guidance, seed, num_steps, shift, t5_text_embeddings, neg_t5_text_embeddings, last_hist_frame, fps, padding_mask) → gen_chunk",
+    "Lyra2InferencePipeline → WanVAE: _decode_new_latent_chunk(vae_wrap, vae_core, dec_feat_cache, gen_chunk, latent_offset=history_latents.shape[2]) → new_generated_frames",
+    "WanVAE → WanVAE: _offload_diffusion_to_cpu(model); unnormalize latent → z; vae_core.conv2(z) → x",
+    "WanVAE → WanVAE: [per-frame loop] vae_core.decoder(x[:,:,t:t+1], feat_cache=dec_feat_cache, feat_idx=[0]) → out_t; concat → video_chunk",
+    "WanVAE → WanVAE: _restore_diffusion_to_gpu(model)",
+    "Lyra2InferencePipeline → Lyra2Model: vae_encode_with_cache(enc_cache, new_generated_frames, start_t, end_t) → (feats_gen, enc_cache_out) [re-encode for history latents]",
+    "Lyra2InferencePipeline → Lyra2Model: _encoder_feats_to_normalized_latents(feats_gen) → gen_chunk_reencoded",
+    "Lyra2InferencePipeline → Lyra2InferencePipeline: cat history_frames, history_latents with new chunk",
+    "Lyra2InferencePipeline → Lyra2InferencePipeline: _update_depth_cache(end_px_idx) [skipped on last step]",
+    "Lyra2InferencePipeline → Lyra2InferencePipeline: _predict_da3_depth_window(da3_model, history_frames, start_index, abs_last_idx, cam_w2c, intrinsics, frame_interval, max_history_frames) → da3_out",
+    "Lyra2InferencePipeline → DA3Model: da3_model.inference(images=[uint8 frames], extrinsics, intrinsics, align_to_input_ext_scale=True, infer_gs=False, process_res=...) → prediction",
+    "Lyra2InferencePipeline → Sparse3DCache: add(depth, w2c, K, latent_index, frame_id) [per new frame in window]",
+    "run_lyra2_sample → Lyra2InferencePipeline: build_outputs(da3_gs_export_stem, log_prefix) → {video, warp_video, use_pose, use_plucker}",
+    "run_lyra2_sample → CallerScript: return result dict {video, warp_video, ...}",
+    "CallerScript → CallerScript: save_img_or_video(video_01, video_path, fps=args.fps)"
+  ],
+  "key_relationships": [
+    "CallerScript depends_on run_lyra2_sample (core AR loop)",
+    "CallerScript depends_on load_model_from_checkpoint (model init)",
+    "CallerScript depends_on build_camera_trajectory (trajectory synthesis)",
+    "run_lyra2_sample creates Lyra2InferencePipeline",
+    "Lyra2InferencePipeline owns Lyra2Model (reference), WanVAE handles (vae_wrap/vae_core), Sparse3DCache (retrieval_cache), DA3Model (local_da3_model)",
+    "Lyra2InferencePipeline calls _predict_da3_depth_window → DA3Model.inference",
+    "Lyra2InferencePipeline calls _decode_new_latent_chunk → WanVAE.decoder (streaming per-frame)",
+    "Lyra2InferencePipeline calls _prime_encoder_cache_with_history → WanVAE + Lyra2Model._vae_encode_range_stream",
+    "Lyra2InferencePipeline calls Lyra2Model.inference (diffusion denoising step)",
+    "Lyra2InferencePipeline calls Lyra2Model._prepare_lyra2_inputs (pose conditioning / warp prep)",
+    "Lyra2Model contains tokenizer → WanVAE wrapper → WanVAE_ core",
+    "load_model_from_checkpoint depends_on DistributedCheckpointer (DCP path) or easy_io (pth path)"
+  ],
+  "key_classes_and_methods": {
+    "Lyra2InferencePipeline": {
+      "file": "lyra_2/_src/inference/lyra2_ar_inference.py",
+      "init_params": ["model", "args", "first_frame", "first_depth", "first_cam_w2c", "first_intrinsics", "da3_model", "cp_group", "base_t5_text_embeddings", "base_neg_t5_text_embeddings", "padding_mask", "fps"],
+      "key_state": ["history_frames [B,C,T,H,W]", "history_latents [B,C,T,H,W]", "enc_feat_cache", "dec_feat_cache", "retrieval_cache (Sparse3DCache)", "buffer_depth_latest [B,1,H,W]", "cam_w2c [B,T,4,4]", "intrinsics [B,T,3,3]", "ar_idx", "tokens_generated"],
+      "key_methods": ["autoregressive_step(cam_w2c_chunk, intrinsics_chunk, t5_text_embeddings, neg_t5, is_last_step)", "_update_depth_cache(end_px_idx)", "_append_cameras(cam_w2c_chunk, intrinsics_chunk)", "_prepare_text_embeddings(t5, neg_t5)", "build_outputs(da3_gs_export_stem, log_prefix)", "save_snapshot()", "revert_to_snapshot()"]
+    },
+    "standalone_functions": {
+      "_get_vae_handles(model)": "returns (vae_iface, vae_wrap, vae_core) from model.tokenizer.model.model",
+      "_prime_encoder_cache_with_history(init_video, vae_wrap, vae_core, model, enable_offload)": "encodes history, clones enc_feat_cache, returns (history_latents, enc_feat_cache)",
+      "_decode_new_latent_chunk(vae_wrap, vae_core, dec_feat_cache, latent_chunk, latent_offset, model, enable_offload)": "streaming decode: unnorm → conv2 → per-frame decoder, returns pixel video_chunk",
+      "_predict_da3_depth_window(*, da3_model, history_frames, start_index, abs_last_idx, cam_w2c, intrinsics, frame_interval, max_history_frames, ...)": "selects strided frame window, calls da3_model.inference, returns {frame_indices, prediction}",
+      "run_lyra2_sample(model, data_batch, args, *, process_group, da3_model, show_progress, log_prefix)": "entry point: init pipeline, AR loop, return build_outputs()",
+      "save_output(to_show, vid_save_path)": "save video to disk"
+    },
+    "load_model_from_checkpoint": {
+      "file": "lyra_2/_src/utils/model_loader.py",
+      "params": ["experiment_name", "checkpoint_path", "config_file", "enable_fsdp", "instantiate_ema", "load_ema_to_reg", "seed", "experiment_opts", "strict"],
+      "steps": ["get_config_module + make_config() + override()", "instantiate(config.model).cuda() + on_train_start()", "load via easy_io (.pth) OR DistributedCheckpointer + dcp.load() (DCP dir)", "return (model, config)"]
+    },
+    "build_camera_trajectory": {
+      "file": "lyra_2/_src/inference/camera_traj_utils.py",
+      "params": ["initial_w2c_44 [4,4]", "K_33 [3,3]", "center_depth float", "video_len int", "trajectory str", "direction str", "strength float"],
+      "returns": "(w2cs [T,4,4], Ks [T,3,3])",
+      "supported_trajectories": ["original", "spiral", "horizontal", "dolly_zoom", "orbit_horizontal", "orbit_vertical", "rotate_spot", "back", "horizontal_zoom", "25+ variants"]
+    }
+  },
+  "ar_loop_logic": {
+    "num_iters": "ceil(tokens_needed / tokens_per_step) where tokens_needed = ceil((num_frames-1) / frames_per_latent)",
+    "per_step": "slice cam_chunk [start_px_idx:end_px_idx] from full trajectory; select t5 embedding by chunk key lookup; call pipeline.autoregressive_step",
+    "depth_update": "after every step except last: run DA3 on strided history window, add new depth+pose entries to Sparse3DCache",
+    "offload_support": "optional CPU offload of diffusion model during VAE encode/decode and DA3 inference"
+  },
+  "important_notes": "Pipeline is FramePack-style: fixed history window (T_hist latents) + growing generated sequence. Camera poses come from either build_camera_trajectory (ZoomGS script) or load_trajectory from .npz (custom_traj script). DA3 depth is updated each AR step for pose conditioning via Sparse3DCache warping. Optional MoGe alignment scales DA3 depth on the first frame. Supports per-chunk T5 text embeddings keyed by frame index. Context-parallel inference supported via megatron process_group.",
+  "source_files_analyzed": [
+    "Lyra-2/lyra_2/_src/inference/lyra2_ar_inference.py",
+    "Lyra-2/lyra_2/_src/utils/model_loader.py",
+    "Lyra-2/lyra_2/_src/inference/camera_traj_utils.py",
+    "Lyra-2/lyra_2/_src/inference/lyra2_custom_traj_inference.py",
+    "Lyra-2/lyra_2/_src/inference/lyra2_zoomgs_inference.py"
+  ]
+}

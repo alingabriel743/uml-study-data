@@ -1,0 +1,402 @@
+{
+  "scope": "sandbox_entries_and_mounts",
+  "title": "Sandbox – Entries & Mounts",
+  "diagram_type": "class",
+  "source_files_analyzed": [
+    "src/agents/sandbox/entries/base.py",
+    "src/agents/sandbox/entries/artifacts.py",
+    "src/agents/sandbox/entries/mounts/base.py",
+    "src/agents/sandbox/entries/mounts/providers/base.py",
+    "src/agents/sandbox/entries/mounts/providers/s3.py",
+    "src/agents/sandbox/entries/mounts/providers/gcs.py",
+    "src/agents/sandbox/entries/mounts/providers/azure_blob.py",
+    "src/agents/sandbox/entries/mounts/providers/r2.py"
+  ],
+
+  "classes": [
+    {
+      "name": "BaseEntry",
+      "module": "entries.base",
+      "stereotype": "abstract",
+      "base_classes": ["BaseModel", "ABC"],
+      "class_vars": ["_subclass_registry: ClassVar[dict[str, type[BaseEntry]]]", "_abstract_entry_base: ClassVar[bool]"],
+      "fields": [
+        "type: str",
+        "description: str | None = None",
+        "ephemeral: bool = False",
+        "group: Group | User | None = None",
+        "is_dir: bool = False",
+        "permissions: Permissions"
+      ],
+      "methods": [
+        "__pydantic_init_subclass__(cls) -> None",
+        "_register_subclass(cls, entry_cls, allow_override) -> type[BaseEntry]",
+        "registered_types(cls) -> dict[str, type[BaseEntry]]",
+        "parse(cls, payload) -> BaseEntry",
+        "_apply_metadata(session, dest) -> None  [async]",
+        "apply(session, dest, base_dir) -> list[MaterializedFile]  [abstract, async]"
+      ],
+      "notes": "Registry pattern: all concrete subclasses auto-register via __pydantic_init_subclass__. parse() dispatches by 'type' field."
+    },
+    {
+      "name": "Dir",
+      "module": "entries.artifacts",
+      "stereotype": "concrete",
+      "base_classes": ["BaseEntry"],
+      "fields": [
+        "type: Literal['dir'] = 'dir'",
+        "is_dir: bool = True",
+        "children: dict[str | Path, BaseEntry] = {}"
+      ],
+      "methods": [
+        "apply(session, dest, base_dir) -> list[MaterializedFile]  [async]"
+      ],
+      "notes": "apply() calls session.mkdir(), _apply_metadata(), then session._apply_entry_batch() for children."
+    },
+    {
+      "name": "File",
+      "module": "entries.artifacts",
+      "stereotype": "concrete",
+      "base_classes": ["BaseEntry"],
+      "fields": ["type: Literal['file'] = 'file'", "content: bytes"],
+      "methods": ["apply(session, dest, base_dir) -> list[MaterializedFile]  [async]"]
+    },
+    {
+      "name": "LocalFile",
+      "module": "entries.artifacts",
+      "stereotype": "concrete",
+      "base_classes": ["BaseEntry"],
+      "fields": ["type: Literal['local_file'] = 'local_file'", "src: Path"],
+      "methods": ["apply(session, dest, base_dir) -> list[MaterializedFile]  [async]"],
+      "notes": "Computes sha256 checksum before upload; raises LocalFileReadError/LocalChecksumError on failure."
+    },
+    {
+      "name": "LocalDir",
+      "module": "entries.artifacts",
+      "stereotype": "concrete",
+      "base_classes": ["BaseEntry"],
+      "fields": ["type: Literal['local_dir'] = 'local_dir'", "is_dir: bool = True", "src: Path | None = None"],
+      "methods": [
+        "apply(session, dest, base_dir, user) -> list[MaterializedFile]  [async]",
+        "_resolve_local_dir_src_root(base_dir) -> Path",
+        "_list_local_dir_files(base_dir, src_root) -> list[Path]",
+        "_list_local_dir_files_pinned(base_dir, src_root) -> list[Path]",
+        "_copy_local_dir_file(base_dir, session, src_root, src, dest_root, user) -> MaterializedFile  [async]"
+      ],
+      "notes": "Uses dir-fd pinning (O_DIRECTORY/O_NOFOLLOW) on Linux. Symlinks are rejected. Concurrent file copy via gather_in_order(). If src is None, creates empty dir only."
+    },
+    {
+      "name": "GitRepo",
+      "module": "entries.artifacts",
+      "stereotype": "concrete",
+      "base_classes": ["BaseEntry"],
+      "fields": [
+        "type: Literal['git_repo'] = 'git_repo'",
+        "is_dir: bool = True",
+        "host: str = 'github.com'",
+        "repo: str",
+        "ref: str",
+        "subpath: str | None = None"
+      ],
+      "methods": [
+        "apply(session, dest, base_dir) -> list[MaterializedFile]  [async]",
+        "_clone_named_ref(session, url, tmp_dir) -> ExecResult  [async]",
+        "_fetch_commit_ref(session, url, tmp_dir) -> ExecResult  [async]",
+        "_looks_like_commit_ref(ref) -> bool  [static]"
+      ],
+      "notes": "Clones into /tmp inside sandbox, then cp -R to dest. Tries fetch-by-commit-sha first for 40-char hashes."
+    },
+    {
+      "name": "Mount",
+      "module": "entries.mounts.base",
+      "stereotype": "abstract",
+      "base_classes": ["BaseEntry"],
+      "class_vars": ["_abstract_entry_base: ClassVar[bool] = True"],
+      "fields": [
+        "is_dir: bool = True",
+        "mount_path: Path | None = None",
+        "ephemeral: bool = True",
+        "read_only: bool = True",
+        "mount_strategy: MountStrategy"
+      ],
+      "methods": [
+        "model_post_init(context) -> None",
+        "in_container_adapter() -> InContainerMountAdapter",
+        "docker_volume_adapter() -> DockerVolumeMountAdapter",
+        "apply(session, dest, base_dir) -> list[MaterializedFile]  [async]",
+        "unmount(session, dest, base_dir) -> None  [async]",
+        "build_in_container_mount_config(session, pattern, include_config_text) -> MountPatternConfig | None  [async]",
+        "supported_in_container_patterns() -> tuple[type[MountPatternBase], ...]",
+        "supported_docker_volume_drivers() -> frozenset[str]",
+        "build_docker_volume_driver_config(strategy) -> tuple[str, dict, bool]",
+        "_resolve_mount_path(session, dest) -> Path",
+        "_resolve_mount_path_for_root(manifest_root, dest) -> Path"
+      ],
+      "notes": "Always ephemeral (snapshots exclude mounts). apply() delegates to mount_strategy.activate(). unmount() delegates to mount_strategy.deactivate(). Permissions on mounts are reset to defaults with a warning."
+    },
+    {
+      "name": "MountStrategyBase",
+      "module": "entries.mounts.base",
+      "stereotype": "abstract",
+      "base_classes": ["BaseModel", "ABC"],
+      "class_vars": ["_subclass_registry: ClassVar[dict[str, type[MountStrategyBase]]]"],
+      "fields": ["type: str"],
+      "methods": [
+        "parse(cls, payload) -> MountStrategyBase",
+        "validate_mount(mount) -> None  [abstract]",
+        "supports_native_snapshot_detach(mount) -> bool",
+        "activate(mount, session, dest, base_dir) -> list[MaterializedFile]  [abstract, async]",
+        "deactivate(mount, session, dest, base_dir) -> None  [abstract, async]",
+        "teardown_for_snapshot(mount, session, path) -> None  [abstract, async]",
+        "restore_after_snapshot(mount, session, path) -> None  [abstract, async]",
+        "build_docker_volume_driver_config(mount) -> tuple[str, dict, bool] | None  [abstract]"
+      ]
+    },
+    {
+      "name": "InContainerMountStrategy",
+      "module": "entries.mounts.base",
+      "stereotype": "concrete",
+      "base_classes": ["MountStrategyBase"],
+      "fields": ["type: Literal['in_container'] = 'in_container'", "pattern: MountPattern"],
+      "methods": [
+        "validate_mount(mount) -> None",
+        "activate(mount, session, dest, base_dir) -> list[MaterializedFile]  [async]",
+        "deactivate(mount, session, dest, base_dir) -> None  [async]",
+        "teardown_for_snapshot(mount, session, path) -> None  [async]",
+        "restore_after_snapshot(mount, session, path) -> None  [async]",
+        "build_docker_volume_driver_config(mount) -> None"
+      ],
+      "notes": "All lifecycle calls delegate to mount.in_container_adapter(). Returns None for docker volume config."
+    },
+    {
+      "name": "DockerVolumeMountStrategy",
+      "module": "entries.mounts.base",
+      "stereotype": "concrete",
+      "base_classes": ["MountStrategyBase"],
+      "fields": [
+        "type: Literal['docker_volume'] = 'docker_volume'",
+        "driver: str",
+        "driver_options: dict[str, str] = {}"
+      ],
+      "methods": [
+        "validate_mount(mount) -> None",
+        "activate(mount, session, dest, base_dir) -> list[MaterializedFile]  [async]",
+        "deactivate(mount, session, dest, base_dir) -> None  [async]",
+        "teardown_for_snapshot(mount, session, path) -> None  [async]",
+        "restore_after_snapshot(mount, session, path) -> None  [async]",
+        "build_docker_volume_driver_config(mount) -> tuple[str, dict, bool] | None"
+      ],
+      "notes": "activate/deactivate are no-ops (backend attaches volumes before session starts). Requires session.supports_docker_volume_mounts()."
+    },
+    {
+      "name": "InContainerMountAdapter",
+      "module": "entries.mounts.base",
+      "stereotype": "helper",
+      "base_classes": [],
+      "fields": ["_mount: Mount"],
+      "methods": [
+        "__init__(mount: Mount)",
+        "validate(strategy: InContainerMountStrategy) -> None",
+        "activate(strategy, session, dest, base_dir) -> list[MaterializedFile]  [async]",
+        "deactivate(strategy, session, dest, base_dir) -> None  [async]",
+        "teardown_for_snapshot(strategy, session, path) -> None  [async]",
+        "restore_after_snapshot(strategy, session, path) -> None  [async]"
+      ],
+      "notes": "Calls mount.build_in_container_mount_config() then strategy.pattern.apply()/unapply()."
+    },
+    {
+      "name": "DockerVolumeMountAdapter",
+      "module": "entries.mounts.base",
+      "stereotype": "helper",
+      "base_classes": [],
+      "fields": ["_mount: Mount"],
+      "methods": [
+        "__init__(mount: Mount)",
+        "validate(strategy: DockerVolumeMountStrategy) -> None",
+        "build_docker_volume_driver_config(strategy) -> tuple[str, dict, bool]"
+      ]
+    },
+    {
+      "name": "_ConfiguredMount",
+      "module": "entries.mounts.providers.base",
+      "stereotype": "abstract",
+      "base_classes": ["Mount", "ABC"],
+      "fields": [],
+      "methods": [
+        "_require_mount_pattern() -> MountPattern",
+        "in_container_adapter() -> InContainerMountAdapter",
+        "docker_volume_adapter() -> DockerVolumeMountAdapter",
+        "_require_session_id_hex(session, mount_type) -> str  [static]",
+        "_join_remote_path(root, prefix) -> str  [static]",
+        "_build_rclone_config(session, pattern, remote_kind, remote_path, required_lines, include_config_text) -> RcloneMountConfig  [async]",
+        "build_in_container_mount_config(session, pattern, include_config_text) -> MountPatternConfig  [abstract, async]"
+      ],
+      "notes": "Provides shared rclone config-building logic for all provider mounts. Overrides both adapter methods to return standard adapters."
+    },
+    {
+      "name": "S3Mount",
+      "module": "entries.mounts.providers.s3",
+      "stereotype": "concrete",
+      "base_classes": ["_ConfiguredMount"],
+      "fields": [
+        "type: Literal['s3_mount'] = 's3_mount'",
+        "bucket: str",
+        "access_key_id: str | None = None",
+        "secret_access_key: str | None = None",
+        "session_token: str | None = None",
+        "prefix: str | None = None",
+        "region: str | None = None",
+        "endpoint_url: str | None = None",
+        "s3_provider: str = 'AWS'"
+      ],
+      "methods": [
+        "supported_in_container_patterns() -> tuple  [returns (RcloneMountPattern, MountpointMountPattern)]",
+        "supported_docker_volume_drivers() -> frozenset  [returns {'mountpoint','rclone'}]",
+        "build_docker_volume_driver_config(strategy) -> tuple[str, dict, bool]",
+        "build_in_container_mount_config(session, pattern, include_config_text) -> MountPatternConfig  [async]",
+        "_rclone_required_lines(remote_name) -> list[str]"
+      ],
+      "notes": "Supports both rclone and aws-mountpoint drivers. Uses env_auth=true when no credentials provided."
+    },
+    {
+      "name": "GCSMount",
+      "module": "entries.mounts.providers.gcs",
+      "stereotype": "concrete",
+      "base_classes": ["_ConfiguredMount"],
+      "fields": [
+        "type: Literal['gcs_mount'] = 'gcs_mount'",
+        "bucket: str",
+        "access_id: str | None = None",
+        "secret_access_key: str | None = None",
+        "prefix: str | None = None",
+        "region: str | None = None",
+        "endpoint_url: str | None = None",
+        "service_account_file: str | None = None",
+        "service_account_credentials: str | None = None",
+        "access_token: str | None = None"
+      ],
+      "methods": [
+        "supported_in_container_patterns() -> tuple  [returns (RcloneMountPattern, MountpointMountPattern)]",
+        "supported_docker_volume_drivers() -> frozenset  [returns {'mountpoint','rclone'}]",
+        "_use_s3_compatible_rclone() -> bool",
+        "_rclone_remote_kind() -> str  [returns 'gcs_s3' for HMAC, else 'gcs']",
+        "build_docker_volume_driver_config(strategy) -> tuple[str, dict, bool]",
+        "build_in_container_mount_config(session, pattern, include_config_text) -> MountPatternConfig  [async]",
+        "_rclone_required_lines(remote_name) -> list[str]",
+        "_s3_compatible_rclone_required_lines(remote_name) -> list[str]"
+      ],
+      "notes": "Dual auth modes: (1) HMAC credentials → rclone S3 backend with GCS provider; (2) native GCS → rclone google cloud storage backend. Default endpoint: https://storage.googleapis.com."
+    },
+    {
+      "name": "AzureBlobMount",
+      "module": "entries.mounts.providers.azure_blob",
+      "stereotype": "concrete",
+      "base_classes": ["_ConfiguredMount"],
+      "fields": [
+        "type: Literal['azure_blob_mount'] = 'azure_blob_mount'",
+        "account: str",
+        "container: str",
+        "endpoint: str | None = None",
+        "identity_client_id: str | None = None",
+        "account_key: str | None = None"
+      ],
+      "methods": [
+        "supported_in_container_patterns() -> tuple  [returns (RcloneMountPattern, FuseMountPattern)]",
+        "supported_docker_volume_drivers() -> frozenset  [returns {'rclone'} only]",
+        "build_docker_volume_driver_config(strategy) -> tuple[str, dict, bool]",
+        "build_in_container_mount_config(session, pattern, include_config_text) -> MountPatternConfig  [async]",
+        "_rclone_required_lines(remote_name) -> list[str]"
+      ],
+      "notes": "Supports rclone (azureblob type) and blobfuse2 (FuseMountPattern). Auth: account_key or MSI (use_msi=true + optional msi_client_id)."
+    },
+    {
+      "name": "R2Mount",
+      "module": "entries.mounts.providers.r2",
+      "stereotype": "concrete",
+      "base_classes": ["_ConfiguredMount"],
+      "fields": [
+        "type: Literal['r2_mount'] = 'r2_mount'",
+        "bucket: str",
+        "account_id: str",
+        "access_key_id: str | None = None",
+        "secret_access_key: str | None = None",
+        "custom_domain: str | None = None"
+      ],
+      "methods": [
+        "_validate_credential_pair() -> None",
+        "supported_in_container_patterns() -> tuple  [returns (RcloneMountPattern,) only]",
+        "supported_docker_volume_drivers() -> frozenset  [returns {'rclone'} only]",
+        "build_docker_volume_driver_config(strategy) -> tuple[str, dict, bool]",
+        "build_in_container_mount_config(session, pattern, include_config_text) -> MountPatternConfig  [async]",
+        "_rclone_required_lines(remote_name) -> list[str]"
+      ],
+      "notes": "Rclone only (no mountpoint/fuse support). Uses rclone S3 backend with provider=Cloudflare. Default endpoint: https://{account_id}.r2.cloudflarestorage.com or custom_domain."
+    }
+  ],
+
+  "relationships": [
+    "BaseEntry <|-- Dir",
+    "BaseEntry <|-- File",
+    "BaseEntry <|-- LocalFile",
+    "BaseEntry <|-- LocalDir",
+    "BaseEntry <|-- GitRepo",
+    "BaseEntry <|-- Mount",
+    "Mount <|-- _ConfiguredMount",
+    "_ConfiguredMount <|-- S3Mount",
+    "_ConfiguredMount <|-- GCSMount",
+    "_ConfiguredMount <|-- AzureBlobMount",
+    "_ConfiguredMount <|-- R2Mount",
+    "MountStrategyBase <|-- InContainerMountStrategy",
+    "MountStrategyBase <|-- DockerVolumeMountStrategy",
+    "Mount *-- MountStrategyBase : mount_strategy (composition, validated on init)",
+    "Dir *-- BaseEntry : children (composition)",
+    "InContainerMountAdapter --> Mount : wraps (_mount)",
+    "DockerVolumeMountAdapter --> Mount : wraps (_mount)",
+    "InContainerMountStrategy --> InContainerMountAdapter : delegates lifecycle via mount.in_container_adapter()",
+    "DockerVolumeMountStrategy --> DockerVolumeMountAdapter : delegates driver config via mount.docker_volume_adapter()",
+    "InContainerMountAdapter --> MountPattern : calls pattern.apply()/unapply()",
+    "BaseEntry --> BaseSandboxSession : uses in apply() / _apply_metadata()",
+    "Mount --> MaterializedFile : produces via apply()",
+    "LocalDir --> MaterializedFile : produces via apply()"
+  ],
+
+  "external_types": {
+    "MountPattern": "Abstract base for in-container mount execution patterns",
+    "RcloneMountPattern": "Runs rclone mount command; builds rclone config file per-session",
+    "MountpointMountPattern": "Runs aws mountpoint-s3; used by S3Mount and GCSMount",
+    "FuseMountPattern": "Runs blobfuse2; used by AzureBlobMount only",
+    "RcloneMountConfig": "Runtime config for RcloneMountPattern (remote_name, remote_path, config_text, read_only)",
+    "MountpointMountConfig": "Runtime config for MountpointMountPattern (bucket, credentials, prefix, etc.)",
+    "FuseMountConfig": "Runtime config for FuseMountPattern (account, container, auth)",
+    "MountPatternConfig": "Union type alias for all pattern config types",
+    "BaseSandboxSession": "Sandbox session interface; provides exec(), mkdir(), write(), state",
+    "MaterializedFile": "Record of a file staged into the sandbox (path + sha256)",
+    "Permissions": "Pydantic model: owner/group/other FileMode + directory flag",
+    "FileMode": "Enum: READ, WRITE, EXEC, ALL combinations"
+  },
+
+  "type_aliases": [
+    "MountStrategy = SerializeAsAny[MountStrategyBase]  # allows polymorphic serialization"
+  ],
+
+  "key_design_patterns": [
+    "Registry pattern on BaseEntry and MountStrategyBase: subclasses auto-register on class creation via __pydantic_init_subclass__; parse() dispatches by 'type' string field",
+    "Strategy pattern: Mount delegates all lifecycle (activate/deactivate/snapshot) to MountStrategyBase subclass",
+    "Adapter pattern: InContainerMountAdapter and DockerVolumeMountAdapter decouple strategy logic from provider-specific config",
+    "Template method: _ConfiguredMount._build_rclone_config() is the shared rclone config builder; providers supply only _rclone_required_lines()",
+    "Dual strategy shapes: same provider mount (e.g. S3Mount) can work as either in-container (rclone/mountpoint CLI) or docker_volume (named Docker volume with driver)"
+  ],
+
+  "business_rules": [
+    "Mount entries are always ephemeral=True; snapshots never persist mount state",
+    "Mount permissions are reset to defaults (755) with a warning; access control must be done at cloud provider level",
+    "Every Mount must support at least one strategy shape (in_container or docker_volume), enforced in model_post_init",
+    "R2Mount only supports rclone (no mountpoint/fuse)",
+    "AzureBlobMount only supports rclone docker driver (not mountpoint)",
+    "GCSMount supports two rclone auth modes: native GCS vs HMAC S3-compatible (detected by presence of access_id+secret_access_key)",
+    "LocalDir rejects symlinks at every level of traversal; uses dir-fd pinning on Linux to prevent TOCTOU race conditions",
+    "GitRepo tries shallow fetch-by-commit-sha first for 7-40 hex refs, falls back to clone --branch"
+  ],
+
+  "important_notes": "All entry types use Pydantic BaseModel with discriminated union dispatched via 'type' literal field. The BaseEntry.parse() factory is the main entry point for deserializing manifest entries. Mount subclasses inherit from _ConfiguredMount (not Mount directly) to get standard adapter implementations. Provider config methods return (driver_name, options_dict, read_only) tuples for docker-volume mode."
+}

@@ -1,0 +1,219 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #212529
+    EndColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title Text-to-World Multiview Generation\n<size:11>(DiffusionText2WorldMultiviewGenerationPipeline)</size>
+
+|Demo Caller|
+start
+:Set random seed (misc.set_random_seed);
+:Validate args (validate_args, type='text2world');
+
+if (num_gpus > 1?) then (yes)
+    :Init distributed process group;
+    :Set up context parallel;
+else (no)
+endif
+
+|Pipeline Initialization|
+:Instantiate DiffusionText2WorldMultiviewGenerationPipeline
+(n_views=6, frame_repeat_negative_condition=10,
+ guidance=7.0, num_steps=35, resolution=480x848);
+:load_model_by_config(DiffusionMultiviewT2WModel)
+ ← Cosmos-Predict1-7B-Text2World-Sample-AV-Multiview;
+
+if (offload_text_encoder_model?) then (no)
+    :Load CosmosT5TextEncoder
+     (google-t5/t5-11b);
+else (yes — lazy load)
+endif
+
+if (disable_guardrail?) then (no)
+    if (offload_guardrails?) then (no)
+        :Load text guardrail model;
+        :Load video guardrail model;
+    else (yes — lazy load)
+    endif
+else (yes — skip)
+endif
+
+if (offload_network?) then (no)
+    :Load network weights → model.pt;
+else (yes — lazy load)
+endif
+
+if (offload_tokenizer?) then (no)
+    :Load tokenizer
+     (Cosmos-Tokenize1-CV8x8x8-720p);
+else (yes — lazy load)
+endif
+
+|Demo Caller|
+if (num_gpus > 1?) then (yes)
+    :pipeline.model.net.enable_context_parallel(process_group);
+else (no)
+endif
+
+if (batch_input_path provided?) then (yes)
+    :Load multiple prompt dicts from file;
+else (no)
+    :Build single 6-view prompt dict
+     {front, left, right, back,
+      back_left, back_right};
+endif
+
+:Iterate over prompt dicts;
+
+|Pipeline Orchestration|
+repeat
+
+    :generate(prompt_dict);
+    note right
+      No guardrail check in
+      multiview generate()
+    end note
+
+    :Extract 6 camera prompts from dict
+     [front, left, right, back, back_left, back_right];
+
+    |Text Encoder (T5)|
+    if (offload_text_encoder_model?) then (yes)
+        :Load CosmosT5TextEncoder;
+    else (no)
+    endif
+
+    :FOR each of 6 camera prompts:
+     text_encoder.encode_prompts([prompt])
+     → (embedding, mask);
+
+    if (offload_text_encoder_model?) then (yes)
+        :Offload CosmosT5TextEncoder;
+    else (no)
+    endif
+
+    |Pipeline Orchestration|
+    :prompt_embeddings ← 6× (embedding, mask) tensors;
+
+    |Diffusion Model|
+    if (offload_network?) then (yes)
+        :Load network weights (model.pt);
+    else (no)
+    endif
+
+    if (offload_tokenizer?) then (yes)
+        :Load tokenizer
+         (Cosmos-Tokenize1-CV8x8x8-720p);
+    else (no)
+    endif
+
+    :get_video_batch_for_multiview_model(
+     model, embeddings, height, width, fps,
+     num_video_frames × n_views=6,
+     frame_repeat_negative_condition=10)
+     → (data_batch, state_shape);
+
+    :generate_world_from_text(
+     model, state_shape,
+     is_negative_prompt=False,
+     data_batch, guidance=7.0,
+     num_steps=35, seed)
+     → latent sample tensor [B, C, T, H, W];
+
+    if (offload_network?) then (yes)
+        :Offload network weights;
+    else (no)
+    endif
+
+    |Tokenizer Decoder|
+    :model.decode(latent sample)
+     → raw_video [B, 3, T, H, W];
+
+    :Normalize:
+     (1.0 + raw_video).clamp(0, 2) / 2;
+
+    :Rearrange frames by view:
+     'b c (v t) h w → b c v t h w'
+      with v = 6 cameras;
+
+    :Reorder views to canonical layout:
+     [1,0,2,4,3,5]
+     → [left, front, right,
+        back_left, back, back_right];
+
+    :Assemble 2×3 grid mosaic:
+     'b c (hv wv) t h w → b c t (hv h) (wv w)'
+      hv=2, wv=3;
+
+    :Convert grid_video → uint8 numpy
+     [T, H×2, W×3, C] at 960×2544;
+
+    :Convert video → uint8 numpy
+     [T, H, W, C] at 480×848;
+
+    if (offload_tokenizer?) then (yes)
+        :Offload tokenizer;
+    else (no)
+    endif
+
+    |Pipeline Orchestration|
+    :Return (videos=[grid_video, video], prompt);
+
+    |Demo Caller|
+    if (result is None — guardrail blocked?) then (yes)
+        :Log guardrail block;
+        note right
+          NOTE: multiview generate()
+          does not call guardrails;
+          result is None only on
+          base class behaviour
+        end note
+    else (no)
+        :save_video(video, H=480, W=848, fps)
+         → {name}.mp4;
+        :save_video(grid_video, H=960, W=2544, fps)
+         → {name}_grid.mp4;
+        :Write 6 camera prompts
+         → {name}.txt;
+    endif
+
+repeat while (more prompt dicts?) is (yes)
+-> no;
+
+if (num_gpus > 1?) then (yes)
+    :Destroy context parallel state;
+else (no)
+endif
+
+stop
+
+@enduml

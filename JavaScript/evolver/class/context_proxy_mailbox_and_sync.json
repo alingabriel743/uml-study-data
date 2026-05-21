@@ -1,0 +1,179 @@
+{
+  "scope": "proxy_mailbox_and_sync",
+  "title": "Proxy Mailbox & Sync",
+  "diagram_type": "class",
+  "source_files_analyzed": [
+    "src/proxy/mailbox/store.js",
+    "src/proxy/sync/engine.js",
+    "src/proxy/sync/inbound.js",
+    "src/proxy/sync/outbound.js"
+  ],
+
+  "classes": [
+    {
+      "name": "MailboxStore",
+      "file": "src/proxy/mailbox/store.js",
+      "constructor": "constructor(dataDir: string)",
+      "private_fields": [
+        "_messagesFile: string  // path to messages.jsonl",
+        "_stateFile: string     // path to state.json",
+        "_messages: Map<id, message>  // in-memory index",
+        "_outbound: string[]    // ordered pending outbound IDs",
+        "_inbound: string[]     // ordered pending inbound IDs",
+        "_state: object         // cursors, node_id, schema_version, etc."
+      ],
+      "public_methods": [
+        "send({type, payload, channel?, priority?, refId?, expiresAt?}): {message_id, status}",
+        "writeInbound({id?, type, payload, channel?, priority?, refId?, expiresAt?}): string",
+        "writeInboundBatch(messages: object[]): string[]",
+        "getById(id): message|null",
+        "poll({channel?, type?, limit?}): message[]          // pending inbound",
+        "pollOutbound({channel?, limit?}): message[]         // pending outbound, priority-sorted",
+        "ack(messageIds: string|string[]): number            // mark inbound delivered",
+        "updateStatus(id, status, {error?, syncedAt?}): void",
+        "updateStatusBatch(updates: {id,status,error?,syncedAt?}[]): void",
+        "incrementRetry(id, error?): void",
+        "list({type, direction?, status?, limit?, offset?}): message[]",
+        "countPending({direction?, channel?}): number",
+        "getCursor(key): any|null",
+        "setCursor(key, value): void",
+        "getState(key): any|null",
+        "setState(key, value): void",
+        "compact(): void   // rewrites JSONL to current state only",
+        "close(): void     // no-op, API-compat placeholder"
+      ],
+      "private_methods": [
+        "_loadState(): void",
+        "_runMigrations(fromVersion, toVersion): void",
+        "_persistState(): void",
+        "_rebuildIndex(): void",
+        "_appendMessage(msg): void",
+        "_appendUpdate(id, fields): void",
+        "_evictFromIndex(id): void"
+      ],
+      "constants_exported": [
+        "DEFAULT_CHANNEL = 'evomap-hub'",
+        "SCHEMA_VERSION = 1",
+        "PROXY_PROTOCOL_VERSION = '0.1.0'"
+      ],
+      "notes": "JSONL persistence for messages; JSON for state. Message statuses: pending|synced|delivered|failed|rejected. Terminal statuses evict from in-memory index. Supports schema migrations via MIGRATIONS registry."
+    },
+    {
+      "name": "SyncEngine",
+      "file": "src/proxy/sync/engine.js",
+      "constructor": "constructor({store, hubUrl, getHeaders, logger?, onInboundReceived?, onAuthError?})",
+      "fields": [
+        "store: MailboxStore",
+        "hubUrl: string",
+        "logger: object",
+        "getHeaders: () => Headers",
+        "onInboundReceived: (count) => void | null",
+        "onAuthError: () => Promise<void> | null",
+        "outbound: OutboundSync",
+        "inbound: InboundSync",
+        "_outTimer: Timeout|null",
+        "_inTimer: Timeout|null",
+        "_running: boolean",
+        "_lastActivity: number"
+      ],
+      "public_methods": [
+        "start(): void   // schedules outbound@500ms, inbound@1000ms",
+        "stop(): void    // clears both timers",
+        "notifyNewOutbound(): void  // triggers early outbound flush at 100ms"
+      ],
+      "private_methods": [
+        "_isIdle(): boolean  // true if > 5 min since last activity",
+        "_handleAuthError(source: string): async void",
+        "_scheduleOutbound(delayMs): void  // recursive timer; calls outbound.flush()",
+        "_scheduleInbound(delayMs): void   // recursive timer; calls inbound.pull() + inbound.ackDelivered()"
+      ],
+      "constants": [
+        "DEFAULT_OUTBOUND_INTERVAL = 5000ms",
+        "IDLE_THRESHOLD = 300000ms (5 min)"
+      ],
+      "timer_logic": "Outbound: 1s if pending>0, else 5s. Inbound: 10s active, 60s idle."
+    },
+    {
+      "name": "InboundSync",
+      "file": "src/proxy/sync/inbound.js",
+      "constructor": "constructor({store, hubUrl, getHeaders, logger?})",
+      "fields": [
+        "store: MailboxStore",
+        "hubUrl: string",
+        "logger: object",
+        "getHeaders: () => Headers"
+      ],
+      "public_methods": [
+        "pull(channel='evomap-hub', limit=50): async {received, cursor}|{received:0, error}",
+        "ackDelivered(channel='evomap-hub'): async {acked}|{acked:0, error}"
+      ],
+      "method_details": {
+        "pull": "POST ${hubUrl}/a2a/mailbox/inbound with {sender_id, proxy_protocol_version, cursor, limit}. Calls store.getCursor(), store.getState('node_id'), store.writeInboundBatch(), store.setCursor(). Timeout: 35s. Throws AuthError on 401/403.",
+        "ackDelivered": "Fetches delivered inbound via store.list(), POST ${hubUrl}/a2a/mailbox/ack with {sender_id, message_ids[]}. Timeout: 10s."
+      },
+      "constants_exported": [
+        "DEFAULT_POLL_INTERVAL_ACTIVE = 10000ms",
+        "DEFAULT_POLL_INTERVAL_IDLE = 60000ms"
+      ]
+    },
+    {
+      "name": "OutboundSync",
+      "file": "src/proxy/sync/outbound.js",
+      "constructor": "constructor({store, hubUrl, getHeaders, logger?})",
+      "fields": [
+        "store: MailboxStore",
+        "hubUrl: string",
+        "logger: object",
+        "getHeaders: () => Headers"
+      ],
+      "public_methods": [
+        "flush(channel='evomap-hub'): async {sent, synced, responses}|{sent:0, error}"
+      ],
+      "method_details": {
+        "flush": "Calls store.pollOutbound({channel, limit:50}). POST ${hubUrl}/a2a/mailbox/outbound with {sender_id, proxy_protocol_version, messages[]}. Timeout: 30s. On success: store.updateStatusBatch(synced), store.incrementRetry(failed if retries<10) or mark failed, store.writeInboundBatch(hub responses), store.setState('last_sync_at'). On network error: store.incrementRetry() for all pending. Throws AuthError on 401/403."
+      },
+      "constants_exported": [
+        "MAX_BATCH = 50",
+        "MAX_RETRIES = 10"
+      ]
+    },
+    {
+      "name": "AuthError",
+      "file": "src/proxy/lifecycle/manager.js",
+      "notes": "External dependency, not in scope. Thrown/caught by InboundSync and OutboundSync on HTTP 401/403. Propagated to SyncEngine._handleAuthError()."
+    }
+  ],
+
+  "relationships": [
+    "SyncEngine COMPOSES OutboundSync  (instantiates in constructor, stores as this.outbound)",
+    "SyncEngine COMPOSES InboundSync   (instantiates in constructor, stores as this.inbound)",
+    "SyncEngine DEPENDS_ON MailboxStore (injected; calls store.countPending())",
+    "OutboundSync DEPENDS_ON MailboxStore (injected; calls pollOutbound, getState, incrementRetry, updateStatusBatch, writeInboundBatch, setState)",
+    "InboundSync DEPENDS_ON MailboxStore  (injected; calls getCursor, getState, writeInboundBatch, setCursor, list)",
+    "OutboundSync IMPORTS PROXY_PROTOCOL_VERSION from MailboxStore module",
+    "InboundSync IMPORTS PROXY_PROTOCOL_VERSION from MailboxStore module",
+    "OutboundSync DEPENDS_ON AuthError (from lifecycle/manager)",
+    "InboundSync DEPENDS_ON AuthError  (from lifecycle/manager)",
+    "SyncEngine DEPENDS_ON AuthError   (instanceof checks in error handlers)"
+  ],
+
+  "message_model": {
+    "fields": "id (UUIDv7), channel, direction (inbound|outbound), type, status, payload, priority (high|normal|low), ref_id, created_at, synced_at, expires_at, retry_count, error",
+    "statuses": "pending → synced|delivered|failed|rejected  (terminal statuses evict from index)"
+  },
+
+  "external_http_api": [
+    "POST ${hubUrl}/a2a/mailbox/outbound  — used by OutboundSync.flush()",
+    "POST ${hubUrl}/a2a/mailbox/inbound   — used by InboundSync.pull()",
+    "POST ${hubUrl}/a2a/mailbox/ack       — used by InboundSync.ackDelivered()"
+  ],
+
+  "key_design_notes": [
+    "MailboxStore is the single persistence layer; all sync classes access it via injection.",
+    "SyncEngine orchestrates both pipelines with adaptive polling intervals.",
+    "OutboundSync can receive hub response messages and writes them back as inbound via store.writeInboundBatch().",
+    "InboundSync uses cursor-based pagination for hub polling.",
+    "AuthError propagates from sync classes up to SyncEngine which calls onAuthError callback.",
+    "MailboxStore uses JSONL append-log with in-memory index; compact() rewrites to current state."
+  ]
+}

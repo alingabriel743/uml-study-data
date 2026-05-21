@@ -1,0 +1,116 @@
+{
+  "scope": "app_launch_and_process_lifecycle",
+  "title": "App Launch and Process Lifecycle",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "User",
+    "UIWindowTaskManager",
+    "LaunchOnInitService",
+    "ExecService",
+    "ProcessService (GUI)",
+    "launch_app (helper)",
+    "puter.apps (API)",
+    "PortalProcess / PseudoProcess",
+    "UIWindow",
+    "IPCService",
+    "AppService (Backend)",
+    "ProcessService (Backend)"
+  ],
+
+  "interaction_flow": [
+    "--- BOOT / GUI READY ---",
+    "GUI ready event → ProcessService._init(): creates InitProcess(NULL_UUID), calls register_(root)",
+    "GUI ready event → LaunchOnInitService._init(): reads gui_params.launch_options.on_initialized, calls run_(command) for each",
+    "LaunchOnInitService.run_(cmd) → window[fn_name](...args)  [for 'window-call' commands]",
+    "ProcessService.__on_gui:ready() → svc_exec.launchApp({app_name}) for each INITRC entry",
+
+    "--- APP LAUNCH (via ExecService.launchApp) ---",
+    "Caller → ExecService.launchApp({app_name, args, pseudonym, file_paths, items}, ipc_context)",
+    "ExecService → IPCService.add_connection({source: caller.uuid, target: child_instance_id})",
+    "ExecService → window.get_apps(process.name)  [fetch source app metadata]",
+    "ExecService (godmode path) → puter.apps.get(app_name)  [get target app info]",
+    "ExecService (godmode path) → puter.fs.sign(target_app.uuid, {path, action:'write'})  [create file signature]",
+    "ExecService → launch_app(launch_options)  [core launch helper]",
+
+    "--- launch_app HELPER ---",
+    "launch_app → puter.apps.get(options.name, {icon_size:64})  [fetch app_info from API]",
+    "launch_app: checks privateAccess decision; may redirect to fallbackAppName recursively",
+    "launch_app (explorer/trash) → new PseudoProcess({uuid, name, parent, meta})",
+    "launch_app (other apps) → new PortalProcess({uuid, name, parent, meta})",
+    "launch_app → ProcessService.register(process)  [register_(process) + attach_to_parent_(process)]",
+    "launch_app → UIWindow({element_uuid, iframe_url, title, icon, ...window_options})  [creates app window/iframe]",
+    "launch_app → fetchUserAppTokenForLaunch({appUid})  [POST /auth/get-user-app-token]",
+
+    "--- PROCESS REGISTRATION ---",
+    "ProcessService.register(process) → register_(process): push to processes[], processes_map, uuid_to_treelist",
+    "ProcessService.register(process) → attach_to_parent_(process): set process.parent=NULL_UUID if unset, push to parent's treelist",
+
+    "--- CHILD APP IPC ATTACH (post-launch) ---",
+    "ExecService: child_process.onchange('ipc_status', PROCESS_IPC_ATTACHED) → send_child_launched_msg({uses_sdk:true})",
+    "ExecService → BroadcastService.sendSavedBroadcastsTo(child_instance_id)",
+    "ExecService: el_win.on('remove') → report_app_closed(child_process.uuid), postMessage({msg:'appClosed'})",
+
+    "--- TASK MANAGER UI ---",
+    "User → UIWindowTaskManager(): gets svc_process, builds table, calls update_tasks()",
+    "UIWindowTaskManager.update_tasks() → ProcessService.get_init() → returns InitProcess",
+    "UIWindowTaskManager.update_tasks() → generate_task_rows([initProcess]) → ProcessService.get_children_of(uuid) recursively",
+    "UIWindowTaskManager: setInterval(update_tasks, 500ms) for live refresh",
+    "User right-click → UIContextMenu({close, force_quit})",
+
+    "--- END PROCESS ---",
+    "User → end_process(uuid, force=false|true)",
+    "end_process → ProcessService.get_by_uuid(uuid)  [look up process]",
+    "end_process: if process.is_init() or force → UIAlert(confirmation message)",
+    "end_process → process.signal(END_SOFT | END_HARD)",
+    "process.signal → triggers teardown; ProcessService.unregister(uuid) removes from map, transfers children to InitProcess",
+
+    "--- PROCESS TEARDOWN (ProcessService.unregister) ---",
+    "ProcessService.unregister(uuid) → delete from processes_map, splice from processes[]",
+    "ProcessService.unregister(uuid) → remove from parent's treelist",
+    "ProcessService.unregister(uuid) → for each child: child.parent = NULL_UUID, attach_to_parent_(child)",
+
+    "--- BACKEND ProcessService (server-side workers) ---",
+    "ProcessService(backend)._init() → process.on('exit', exit_all_)",
+    "ProcessService(backend).start({name, fullpath, command, args, env}) → child_process.spawn(command, args, {shell:true, env, cwd})",
+    "ProcessService(backend).start() → ProxyLogger.attach(proc.stdout), ProxyLogger.attach(proc.stderr)",
+    "ProcessService(backend).start(): proc.on('exit') → remove from instances[]",
+    "ProcessService(backend).exit_all_() → proc.kill() for all instances"
+  ],
+
+  "key_relationships": [
+    "ExecService depends_on ProcessService (GUI) — register/select process",
+    "ExecService depends_on IPCService — add_connection",
+    "ExecService calls launch_app helper — core launch logic",
+    "launch_app creates PortalProcess | PseudoProcess — then registers via ProcessService",
+    "launch_app calls UIWindow — creates the app iframe window",
+    "UIWindowTaskManager reads ProcessService — get_init(), get_children_of(), get_by_uuid()",
+    "UIWindowTaskManager calls end_process() — which calls process.signal()",
+    "ProcessService (GUI) maintains: processes[], processes_map (uuid→process), uuid_to_treelist (parent→children[])",
+    "LaunchOnInitService reads gui_params.launch_options — dispatches window-call commands on boot",
+    "ProcessService (backend) extends BaseService — manages OS-level spawned child processes",
+    "AppService (backend) extends BaseService — CRUD for app records via AppRepository + DB"
+  ],
+
+  "process_types": [
+    "InitProcess — singleton root (NULL_UUID = '00000000-0000-0000-0000-000000000000'), is_init()=true",
+    "PortalProcess — represents an iframe-based app (has references.iframe, references.el_win)",
+    "PseudoProcess — represents explorer/trash windows (no iframe)"
+  ],
+
+  "signal_types": [
+    "END_SOFT — graceful close (imported from definitions.js)",
+    "END_HARD — force kill (imported from definitions.js)"
+  ],
+
+  "important_notes": "Two distinct ProcessServices exist: GUI (src/gui/src/services/ProcessService.js) manages frontend PortalProcess/PseudoProcess trees; Backend (src/backend/src/modules/hostos/ProcessService.js) manages OS-spawned child processes (spawn). ExecService.launchApp is the primary frontend entry point and is also exposed as an IPC handler. launch_app helper is the actual implementation body for app launching. ProcessService.unregister() re-parents orphaned children to InitProcess. UIWindowTaskManager polls every 500ms to refresh the process tree display.",
+
+  "source_files_analyzed": [
+    "src/gui/src/services/ProcessService.js",
+    "src/gui/src/services/ExecService.js",
+    "src/gui/src/services/LaunchOnInitService.js",
+    "src/gui/src/helpers/launch_app.js",
+    "src/gui/src/UI/UIWindowTaskManager.js",
+    "src/backend/src/modules/hostos/ProcessService.js",
+    "src/backend/src/modules/data-access/AppService.js"
+  ]
+}

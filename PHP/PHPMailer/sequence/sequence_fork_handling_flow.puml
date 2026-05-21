@@ -1,0 +1,182 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipantBorderColor #495057
+skinparam sequenceParticipantBackgroundColor #F8F9FA
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceGroupBorderColor #ADB5BD
+skinparam sequenceGroupBackgroundColor #E9ECEF
+skinparam noteBackgroundColor #FFF3CD
+skinparam noteBorderColor #FFC107
+
+title PHP Process Fork Handling Flow
+
+actor "PHP User Code" as PHPUser
+participant "ddtrace_pcntl_fork\n(ddtrace wrapper)" as ForkWrapper
+participant "dd_prefork" as PreFork
+participant "OS / pcntl_fork" as OS
+participant "dd_handle_fork" as HandleFork
+participant "dd_internal_handle_fork\n(child orchestrator)" as InternalFork
+participant "COMSWriter\n(coms.c)" as COMS
+participant "Sidecar\n(ddtrace_sidecar_handle_fork)" as Sidecar
+participant "RemoteConfig\n(ddog agent reader)" as RemoteConfig
+participant "SpanStack" as SpanStack
+participant "Tracer / PRNG\n/ RuntimeID" as TracerState
+
+note over ForkWrapper
+  ddtrace intercepts pcntl_fork (and rfork/forkx
+  on PHP >=8.1/8.2) transparently at MINIT via
+  datadog_php_install_handler — PHP code is unaware.
+end note
+
+PHPUser -> ForkWrapper : pcntl_fork() [intercepted]
+activate ForkWrapper
+
+ForkWrapper -> PreFork : dd_prefork()
+activate PreFork
+
+opt JOIN_BGS_BEFORE_FORK && !SIDECAR_TRACE_SENDER
+    PreFork -> COMS : ddtrace_coms_flush_shutdown_writer_synchronous()\n[flush & stop BGS thread before fork — ASAN builds only]
+    COMS --> PreFork : done
+end
+
+PreFork --> ForkWrapper : pre-fork preparation complete
+deactivate PreFork
+
+ForkWrapper -> OS : dd_pcntl_fork_handler()\n[calls original OS pcntl_fork()]
+activate OS
+
+note over OS
+  POSIX fork: child inherits
+  parent's memory but only the
+  calling thread is duplicated.
+  Inherited BGS thread is invalid!
+end note
+
+OS --> ForkWrapper : pid (0 = child | >0 = parent | -1 = error)
+deactivate OS
+
+ForkWrapper -> HandleFork : dd_handle_fork(return_value)
+activate HandleFork
+
+alt pid == 0 — CHILD PROCESS
+    HandleFork -> InternalFork : dd_internal_handle_fork()
+    activate InternalFork
+
+    group COMSWriter Cleanup (if !SIDECAR_TRACE_SENDER && !WIN32)
+        InternalFork -> COMS : ddtrace_coms_curl_shutdown()\n[shut down inherited curl transport]
+        COMS --> InternalFork : ok
+        InternalFork -> COMS : ddtrace_coms_clean_background_sender_after_fork()\n[kill inherited BGS thread handle]
+        COMS --> InternalFork : ok
+    end
+
+    group Sidecar Reconnect (Rust FFI / ddog)
+        InternalFork -> Sidecar : ddtrace_sidecar_handle_fork()
+        activate Sidecar
+        Sidecar -> Sidecar : ddtrace_force_new_instance_id()\n[assign new sidecar instance ID to child]
+        Sidecar -> Sidecar : ddog_sidecar_transport_drop()\n[drop inherited parent connection]
+        Sidecar -> Sidecar : reconnect()\n[worker→parent listener, or start new master]
+        Sidecar --> InternalFork : sidecar transport ready for child
+        deactivate Sidecar
+    end
+
+    group Remote Config Reset
+        InternalFork -> RemoteConfig : ddog_agent_remote_config_reader_drop()\n[drop inherited shared-memory reader]
+        RemoteConfig --> InternalFork : ok
+        InternalFork -> RemoteConfig : ddog_shutdown_remote_config()\n[reset remote config state]
+        RemoteConfig --> InternalFork : ok
+    end
+
+    group Child Identity & Tracer State
+        InternalFork -> TracerState : ddtrace_seed_prng()\n[reseed PRNG — avoid duplicate IDs]
+        TracerState --> InternalFork : seeded
+        InternalFork -> TracerState : ddtrace_generate_runtime_id()\n[generate new runtime ID for child]
+        TracerState --> InternalFork : new runtime ID
+
+        opt !DD_TRACE_FORKED_PROCESS (default behaviour)
+            InternalFork -> TracerState : ddtrace_disable_tracing_in_current_request()\n[tracing DISABLED in child by default]
+            TracerState --> InternalFork : tracing disabled
+            note right of TracerState
+              Set DD_TRACE_FORKED_PROCESS=true
+              to keep tracing active in child.
+            end note
+        end
+    end
+
+    group Span Stack Reset
+        InternalFork -> SpanStack : ddtrace_free_span_stacks(discard=true)\n[discard all parent spans — not for child to send]
+        SpanStack --> InternalFork : stacks freed
+        InternalFork -> SpanStack : ddtrace_init_span_stacks()\n[initialise fresh span stack for child]
+        SpanStack --> InternalFork : stacks initialised
+
+        opt DD_TRACE_GENERATE_ROOT_SPAN=true
+            InternalFork -> SpanStack : ddtrace_push_root_span()\n[push new root span for child request]
+            SpanStack --> InternalFork : root span pushed
+        end
+    end
+
+    group COMSWriter Reinitialisation (if !SIDECAR && !WIN32)
+        InternalFork -> COMS : ddtrace_coms_init_and_start_writer()\n[start a fresh background sender thread in child]
+        COMS --> InternalFork : writer started
+    end
+
+    group Remote Config Re-attach
+        InternalFork -> RemoteConfig : ddog_agent_remote_config_reader_for_anon_shm()\n[re-attach to shared-memory config segment]
+        RemoteConfig --> InternalFork : reader attached
+    end
+
+    InternalFork --> HandleFork : child initialisation complete
+    deactivate InternalFork
+
+else pid > 0 — PARENT PROCESS
+    note over HandleFork
+      Parent process resumes normally.
+      Writer may need restart if it was
+      stopped before fork (ASAN builds).
+    end note
+
+    opt JOIN_BGS_BEFORE_FORK && !SIDECAR_TRACE_SENDER
+        HandleFork -> COMS : ddtrace_coms_restart_writer()\n[restart BGS thread in parent after fork]
+        COMS --> HandleFork : writer restarted
+    end
+
+else pid == -1 — FORK ERROR
+    note over HandleFork
+      Fork failed — no child created.
+      Parent continues unchanged;
+      no writer or state changes needed.
+    end note
+end
+
+HandleFork --> ForkWrapper : fork handling done
+deactivate HandleFork
+
+ForkWrapper --> PHPUser : returns pid to PHP caller\n(0 in child, child PID in parent, -1 on error)
+deactivate ForkWrapper
+
+note over PHPUser, TracerState
+  PHP API: DDTrace\\Internal\\handle_fork() is a direct PHP-level entry
+  point that also invokes dd_internal_handle_fork() — useful for
+  frameworks that manage their own fork lifecycle.
+  dd_trace_coms_trigger_writer_flush() provides an async flush mechanism
+  for the parent to drain buffered spans before the child diverges.
+  DD_DISTRIBUTED_TRACING=true preserves parent trace/span IDs as
+  distributed context, enabling parent→child trace linking.
+end note
+
+@enduml

@@ -1,0 +1,325 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+title Remote Configuration
+
+' ─────────────────────────────────────────────────
+'  C++ AppSec Remote Config  (dds::remote_config)
+' ─────────────────────────────────────────────────
+package "dds::remote_config  [C++ AppSec RC]" {
+
+    class client_handler {
+        -service_config_: shared_ptr<service_config>
+        -rc_client_: unique_ptr<client>
+        -msubmitter_: shared_ptr<telemetry_submitter>
+        -mutex_: mutex
+        -creation_time_: steady_clock::time_point
+        +{static} from_settings(...): unique_ptr<client_handler>
+        +poll(): void
+        +has_applied_rc(): bool
+    }
+
+    class client {
+        -reader_: unique_ptr<ddog_RemoteConfigReader>
+        -settings_: settings
+        -listeners_: vector<shared_ptr<listener_base>>
+        -listeners_per_product_: unordered_map<product, vector<listener_base*>>
+        -all_products_: unordered_set<product>
+        -last_configs_: set<config>
+        -mutex_: mutex
+        -msubmitter_: shared_ptr<telemetry_submitter>
+        +{static} from_settings(...): unique_ptr<client>
+        +poll(): bool
+        #process_response(new_configs: set<config>): bool
+    }
+
+    struct settings {
+        +enabled: bool
+        +shmem_path: string
+        +operator==()
+        +MSGPACK_DEFINE_MAP(enabled, shmem_path)
+    }
+
+    class product {
+        -name_: string_view
+        +name(): string_view
+        +name_lower(): string
+    }
+
+    struct known_products {
+        +{static} ASM: product
+        +{static} ASM_DD: product
+        +{static} ASM_DATA: product
+        +{static} ASM_FEATURES: product
+        +{static} UNKNOWN: product
+        +{static} for_name(name): product
+    }
+
+    struct config {
+        +shm_path: string
+        +rc_path: string
+        +{static} from_line(line: string_view): config
+        +read(): mapped_memory
+        +config_key(): parsed_config_key
+    }
+
+    class parsed_config_key {
+        -key_: string
+        -source_: string_view
+        -org_id_: uint64
+        -product_: product
+        -config_id_: string_view
+        -name_: string_view
+        +full_key(): string_view
+        +source(): string_view
+        +org_id(): uint64
+        +product(): product
+        +config_id(): string_view
+        +name(): string_view
+        -parse_config_key()
+    }
+
+    class mapped_memory {
+        -ptr_: void*
+        -size_: size_t
+        +operator string_view()
+    }
+
+    note bottom of mapped_memory
+        RAII wrapper for mmap'd
+        shared memory (munmap on destruct)
+    end note
+
+    abstract class listener_base {
+        {abstract} +on_update(config&): void
+        {abstract} +on_unapply(config&): void
+        {abstract} +get_supported_products(): unordered_set<product>
+        {abstract} +init(): void
+        {abstract} +commit(): void
+    }
+
+    class engine_listener {
+        -aggregators_: unordered_map<product, config_aggregator_base::unique_ptr>
+        -engine_: shared_ptr<engine>
+        -ruleset_: rapidjson::Document
+        -to_commit_: unordered_set<config_aggregator_base*>
+        -msubmitter_: shared_ptr<telemetry_submitter>
+        +init(): void
+        +on_update(config&): void
+        +on_unapply(config&): void
+        +commit(): void
+        +get_supported_products(): \{ASM, ASM_DD, ASM_DATA\}
+    }
+
+    class asm_features_listener {
+        -service_config_: shared_ptr<service_config>
+        -ruleset_: rapidjson::Document
+        -aggregator_: config_aggregator_base::unique_ptr
+        +init(): void
+        +on_update(config&): void
+        +on_unapply(config&): void
+        +commit(): void
+        +get_supported_products(): \{ASM_FEATURES\}
+        #parse_asm_activation_config()
+        #parse_auto_user_instrum_config()
+    }
+
+    abstract class config_aggregator_base {
+        {abstract} +init(allocator*): void
+        {abstract} +add(config&): void
+        {abstract} +remove(config&): void
+        {abstract} +aggregate(doc&): void
+    }
+
+    class asm_aggregator {
+        -change_set_: rapidjson::Document
+        +init()
+        +add(config&)
+        +remove(config&)
+        +aggregate(doc&)
+    }
+
+    note right of asm_aggregator
+        Tracks ASM_ADDED and
+        ASM_REMOVED changeset keys
+    end note
+
+    class asm_features_aggregator {
+        -ruleset_: rapidjson::Document
+        +init(allocator*)
+        +add(config&)
+        +remove(config&)
+        +aggregate(doc&)
+    }
+
+    note right of asm_features_aggregator
+        aggregate() merges ruleset_
+        via json_helper::merge_objects
+    end note
+}
+
+' ─────────────────────────────────────────────────
+'  Rust PHP Tracer Remote Config
+' ─────────────────────────────────────────────────
+package "Rust PHP Tracer RC  [components-rs]" {
+
+    class RemoteConfigState <<Rust struct>> {
+        +manager: RemoteConfigManager
+        +live_debugger: LiveDebuggerState
+        +dynamic_config: DynamicConfig
+    }
+
+    note right of RemoteConfigState
+        Per-PHP-thread state.
+        Created by ddog_init_remote_config_state(),
+        returned as Box<RemoteConfigState> to C.
+    end note
+
+    class RemoteConfigManager <<Rust struct>> {
+        +new(ConfigInvariants): RemoteConfigManager
+        +fetch_update(): RemoteConfigUpdate
+        +track_target(Arc<Target>)
+        +get_target(): Option<Arc<Target>>
+        +unload_configs(&[RemoteConfigProduct])
+        +get_path(): Option<String>
+    }
+
+    note right of RemoteConfigManager
+        Reads from shmem.
+        fetch_update() returns
+        Add | Remove | None
+    end note
+
+    class LiveDebuggerState <<Rust struct>> {
+        +spans_map: HashMap<String, i64>
+        +active: HashMap<String, Box<(LiveDebuggingData, MaybeShmLimiter)>>
+        +config_id: String
+        +allow_dfa: Option<Regex>
+        +deny_dfa: Option<Regex>
+        +di_enabled: bool
+    }
+
+    note bottom of LiveDebuggerState
+        Tracks installed probe hook IDs
+        and per-service allow/deny DFA filters
+    end note
+
+    class DynamicConfig <<Rust struct>> {
+        +active_configs: HashMap<String, ActiveDynamicConfig>
+        +merged_configs: Vec<Configs>
+        +old_config_values: HashMap<String, Option<OwnedZendString>>
+    }
+
+    note bottom of DynamicConfig
+        Merged configs computed by
+        priority ordering from all active_configs
+    end note
+
+    class ActiveDynamicConfig <<Rust struct>> {
+        +priority: u8
+        +configs: Vec<Configs>
+    }
+
+    class LiveDebuggerCallbacks <<Rust struct, repr(C)>> {
+        +set_probe: extern fn(Probe, &MaybeShmLimiter) -> i64
+        +remove_probe: extern fn(i64)
+    }
+
+    class LiveDebuggerSetup <<Rust struct, repr(C)>> {
+        +evaluator: &Evaluator
+        +callbacks: LiveDebuggerCallbacks
+    }
+
+    enum DynamicConfigUpdateMode <<Rust enum, repr(C)>> {
+        Read
+        ReadWrite
+        Write
+        Restore
+    }
+
+    enum Configs <<Rust enum>> {
+        TracingHeaderTags
+        TracingSampleRate
+        LogInjectionEnabled
+        TracingTags
+        TracingEnabled
+        TracingSamplingRules
+        DynamicInstrumentationEnabled
+        ExceptionReplayEnabled
+        CodeOriginEnabled
+    }
+
+    note right of Configs
+        Mapped to PHP INI names
+        via map_config_name().
+        Values serialized via map_config_value().
+    end note
+
+    enum RemoteConfigProduct <<Rust enum>> {
+        ApmTracing
+        AsmFeatures
+        LiveDebugger
+        AsmData
+        AsmDD
+        Asm
+    }
+}
+
+' ─────────────────────────────────────────────────
+'  C++ RC — Relationships
+' ─────────────────────────────────────────────────
+
+client_handler *-- client          : rc_client_ (owns)
+client_handler o-- settings        : uses
+client *-- settings                : settings_
+client "1" o-- "0..*" listener_base : listeners_ (shared_ptr)
+client ..> product                 : indexes by product
+client ..> config                  : processes set<config>
+
+engine_listener --|> listener_base
+asm_features_listener --|> listener_base
+
+engine_listener *-- config_aggregator_base : aggregators_ (per product)
+asm_features_listener *-- config_aggregator_base : aggregator_
+
+asm_aggregator --|> config_aggregator_base
+asm_features_aggregator --|> config_aggregator_base
+
+config ..> parsed_config_key       : config_key()
+config ..> mapped_memory           : read()
+parsed_config_key o-- product      : product_
+
+known_products ..> product         : creates static instances
+
+' ─────────────────────────────────────────────────
+'  Rust RC — Relationships
+' ─────────────────────────────────────────────────
+
+RemoteConfigState *-- RemoteConfigManager    : manager (owns)
+RemoteConfigState *-- LiveDebuggerState      : live_debugger (owns)
+RemoteConfigState *-- DynamicConfig          : dynamic_config (owns)
+
+DynamicConfig *-- ActiveDynamicConfig        : active_configs (map)
+ActiveDynamicConfig o-- Configs              : configs (Vec)
+DynamicConfig o-- Configs                   : merged_configs (Vec)
+
+LiveDebuggerSetup *-- LiveDebuggerCallbacks  : callbacks (owns)
+
+RemoteConfigManager ..> RemoteConfigProduct  : unload_configs()
+
+@enduml

@@ -1,0 +1,113 @@
+{
+  "scope": "pipeline_execution",
+  "title": "Pipeline Execution",
+  "diagram_type": "activity",
+  "description": "pipeline() helper orchestrating sequential processing stages: middleware chain → gateway text generation → response construction",
+
+  "entry_point": "TextProvider::prompt(AgentPrompt $prompt) — implemented via GeneratesText trait",
+
+  "activity_steps": [
+    "START: Caller invokes TextProvider::prompt(AgentPrompt $prompt)",
+    "Generate UUID invocation ID via Str::uuid7()",
+    "Call pipeline() → returns new Illuminate\\Pipeline\\Pipeline(Container::getInstance())",
+    "Configure pipeline: .send($prompt).through($middleware).then($terminalCallback)",
+
+    "=== GATHER MIDDLEWARE ===",
+    "[Decision] Is agent faked (Ai::hasFakeGatewayFor)? → YES: prepend fake-recording middleware (Ai::recordPrompt)",
+    "[Decision] Does agent use RemembersConversations trait AND hasConversationParticipant()? → YES: append RememberConversation middleware",
+    "[Decision] Does agent implement HasMiddleware? → YES: append agent's own middleware()",
+
+    "=== PIPELINE RUNS MIDDLEWARE CHAIN (sequential) ===",
+    "Each middleware receives AgentPrompt, can modify it, calls $next($prompt) to continue",
+    "RememberConversation::handle(): calls $next($prompt) first, then on response: create/store conversation + store user+assistant messages",
+
+    "=== TERMINAL CALLBACK (.then) ===",
+    "Store processedPrompt reference",
+    "Dispatch PromptingAgent event(invocationId, prompt)",
+    "[Decision] Agent implements Conversational? → YES: load agent->messages() as base; NO: use empty []",
+    "Append new UserMessage(prompt->prompt, prompt->attachments->all()) to messages array",
+    "Register tool listeners via listenForToolInvocations(invocationId, agent)",
+    "  Tool invocation: dispatch InvokingTool event, assign currentToolInvocationId",
+    "  Tool invoked: dispatch ToolInvoked event with result",
+    "[Decision] Agent implements HasStructuredOutput? → YES: $schema = agent->schema(JsonSchemaTypeFactory); NO: $schema = null",
+    "Call textGateway()->generateText(provider, model, instructions, messages, tools, schema, TextGenerationOptions::forAgent(agent), timeout)",
+    "  Gateway executes LLM API call, handles tool-call loop internally, returns raw GatewayResponse",
+    "  GatewayResponse contains: text, structured?, toolCalls[], toolResults[], steps[Step|StructuredStep], usage, meta, messages[]",
+
+    "=== BUILD RESPONSE ===",
+    "[Decision] Schema is not empty?",
+    "  YES → new StructuredAgentResponse(invocationId, structured, text, usage, meta).withToolCallsAndResults(...).withSteps(steps)",
+    "  NO  → new AgentResponse(invocationId, text, usage, meta).withMessages(messages).withToolCallsAndResults(...).withSteps(steps)",
+
+    "=== POST-PIPELINE (RememberConversation post-hook on response) ===",
+    "[Decision] Agent has no currentConversation()?",
+    "  YES → store->storeConversation(participantId, generateTitle(prompt)) → agent->continue(conversationId, participant)",
+    "  (generateTitle calls textGateway()->generateText with cheapestTextModel for 3-5 word title)",
+    "store->storeUserMessage(conversation, participantId, prompt)",
+    "store->storeAssistantMessage(conversation, participantId, prompt, response)",
+    "response->withinConversation(conversation, participant)",
+
+    "Dispatch AgentPrompted event(invocationId, processedPrompt, response)",
+    "RETURN AgentResponse | StructuredAgentResponse"
+  ],
+
+  "key_participants": [
+    "pipeline() — factory: returns Illuminate\\Pipeline\\Pipeline with IoC container",
+    "GeneratesText (trait) — orchestrator: owns prompt() and gatherMiddlewareFor()",
+    "AiManager — resolves TextProvider instances; textProviderFor(agent) injects fake gateway if needed",
+    "TextProvider (interface) — prompt(), stream(), textGateway(), useTextGateway(), defaultTextModel()",
+    "AgentPrompt — pipeline payload: agent, prompt string, attachments, provider, model, timeout",
+    "Prompt (abstract) — base: prompt string, TextProvider, model",
+    "RememberConversation (middleware) — post-call: stores conversation + messages to ConversationStore",
+    "TextGateway (interface) — generateText(), onToolInvocation(); implemented by provider-specific gateways",
+    "Step — data: text, toolCalls[], toolResults[], finishReason, usage, meta",
+    "StructuredStep extends Step — adds: structured array<string,mixed>",
+    "AgentResponse — final response with messages, toolCalls, toolResults, steps, usage, meta",
+    "StructuredAgentResponse — extends AgentResponse, adds structured output"
+  ],
+
+  "key_decisions": [
+    "Is agent faked? → add fake-recording middleware",
+    "Agent uses RemembersConversations + has participant? → add RememberConversation middleware",
+    "Agent implements HasMiddleware? → merge agent middleware",
+    "Agent implements Conversational? → load prior messages",
+    "Agent implements HasStructuredOutput? → include JSON schema for structured response",
+    "Schema present? → return StructuredAgentResponse vs AgentResponse",
+    "Agent has currentConversation? → create new or reuse conversation"
+  ],
+
+  "data_flow": [
+    "AgentPrompt flows into pipeline as the passable object",
+    "Middleware may transform AgentPrompt (prepend/append/revise prompt text)",
+    "Terminal callback extracts messages, tools, schema from agent",
+    "Gateway returns GatewayResponse → split into typed AgentResponse/StructuredAgentResponse",
+    "Steps[] (Step | StructuredStep) carry per-inference-step detail including tool calls/results",
+    "Post-pipeline middleware enriches response with conversation metadata"
+  ],
+
+  "key_relationships": [
+    "GeneratesText (trait) uses pipeline() helper",
+    "GeneratesText uses AiManager::textProviderFor() for fake gateway injection",
+    "pipeline() wraps Illuminate\\Pipeline\\Pipeline (Laravel pipeline)",
+    "TextProvider implemented by concrete providers (OpenAiProvider, AnthropicProvider, etc.) via GeneratesText trait",
+    "AiManager extends MultipleInstanceManager, creates provider instances (createOpenaiDriver, createAnthropicDriver, etc.)",
+    "StructuredStep extends Step (inheritance)",
+    "AgentPrompt extends Prompt (inheritance)",
+    "RememberConversation depends on ConversationStore + TextProvider"
+  ],
+
+  "important_notes": "The pipeline() helper is a thin factory (functions.php:35) returning Illuminate\\Pipeline. The real orchestration logic lives in GeneratesText::prompt(). Middleware runs BEFORE the terminal callback; RememberConversation stores conversation AFTER (using .then() on the response). Tool invocation events (InvokingTool/ToolInvoked) are fired from within the gateway via registered callbacks. Steps accumulate per LLM call iteration in the tool-call loop inside the gateway layer.",
+
+  "source_files_analyzed": [
+    "functions.php",
+    "src/Providers/Concerns/GeneratesText.php",
+    "src/AiManager.php",
+    "src/Contracts/Providers/TextProvider.php",
+    "src/Prompts/AgentPrompt.php",
+    "src/Prompts/Prompt.php",
+    "src/Middleware/RememberConversation.php",
+    "src/Responses/Data/Step.php",
+    "src/Responses/Data/StructuredStep.php",
+    "diagrams/activity/ir_view_activity.json"
+  ]
+}

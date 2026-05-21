@@ -1,0 +1,125 @@
+@startuml activity_tool_invocation_loop
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #212529
+    EndColor #212529
+}
+
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title Tool Invocation & Tool Call Loop
+
+|Agent / GeneratesText|
+start
+:Agent.prompt(AgentPrompt);
+:Dispatch **PromptingAgent** event;
+:Register tool invocation callbacks\n(InvokingTool / ToolInvoked event dispatchers)\nvia gateway.onToolInvocation();
+:gateway.generateText(\n  provider, model, instructions,\n  messages, tools, schema,\n  options, timeout\n);
+
+|Gateway / ParsesTextResponses|
+:buildTextRequestBody(\n  provider, model, instructions,\n  messages, tools, schema, options\n);
+
+:withErrorHandling → HTTP POST\nto LLM endpoint;
+
+|Error Handling (HandlesFailoverErrors)|
+if (HTTP error?) then (yes)
+    if (HTTP 429?) then (yes)
+        :Throw **RateLimitedException**;
+    elseif (HTTP 503?) then (yes)
+        :Throw **ProviderOverloadedException**;
+    elseif (Insufficient credits?) then (yes)
+        :Throw **InsufficientCreditsException**;
+    else (other)
+        :Throw **AiException**;
+    endif
+    :Dispatch **ProviderFailedOver** event;
+    stop
+else (no)
+endif
+
+|Gateway / ParsesTextResponses|
+:validateTextResponse(data)\n[throws AiException on error/failed status];
+:parseTextResponse(data) →\nprocessResponse(data, steps=[], messages=[], depth=0);
+
+note right
+  **RECURSIVE LOOP**
+  depth increments on each
+  tool-call round-trip
+end note
+
+repeat
+    :Extract from LLM response:\ntext, toolCalls, finishReason,\nusage, citations;
+    :Create **Step**(text, toolCalls, [],\n  finishReason, usage, meta);
+    :Push Step to steps[];
+    :Push **AssistantMessage**(text, toolCalls)\nto messages[];
+
+    if (finishReason == ToolCalls\nAND toolCalls non-empty\nAND depth < maxSteps?) then (yes — continue loop)
+
+        |InvokesTools|
+        :executeToolCalls(toolCalls, tools);
+        repeat
+            :Inspect next **ToolCall**\n(id, name, arguments);
+            if (findTool(toolCall.name, tools)\n[match by class_basename]?) then (found)
+                :Fire **invokingToolCallback**\n→ Dispatch **InvokingTool** event;
+                :tool.handle(new Request(arguments))\n[execute tool logic];
+                :Fire **toolInvokedCallback**\n→ Dispatch **ToolInvoked** event;
+                :Create **ToolResult**\n(id, name, arguments, result, resultId);
+            else (not found)
+                :Skip ToolCall\n(no matching tool);
+            endif
+        repeat while (more ToolCalls?) is (yes)
+        ->no;
+
+        |Gateway / ParsesTextResponses|
+        :Update current Step:\nreplace with Step(text, toolCalls,\n  **toolResults**, finishReason, ...);
+        :Push **ToolResultMessage**(toolResults)\nto messages[];
+        :continueWithToolResults(\n  ..., depth + 1\n):\nbuildFollowUpRequestBody();
+        :withErrorHandling → HTTP POST\nto LLM endpoint\n[same timeout preserved];
+        :validateTextResponse(data);
+        note right
+          Re-enter loop with
+          depth = depth + 1
+        end note
+
+    else (no — exit loop)
+    endif
+
+repeat while (finishReason == ToolCalls\nAND toolCalls non-empty\nAND depth < maxSteps?) is (yes — loop)
+->no — done;
+
+:Build final response:\n**TextResponse** or **StructuredTextResponse**\nwith all steps, toolCalls, toolResults;
+
+|Agent / GeneratesText|
+:Wrap TextResponse into\n**AgentResponse**\n(steps, toolCalls, toolResults, messages);
+:Dispatch **AgentPrompted** event;
+:Return **AgentResponse** to caller;
+stop
+
+@enduml

@@ -1,0 +1,143 @@
+{
+  "scope": "wordpress_rest_api_block_renderer",
+  "title": "WordPress REST API — Block Renderer",
+  "diagram_type": "use_case",
+  "description": "API consumer server-side renders a registered Gutenberg block via the block renderer endpoint",
+
+  "actors": [
+    {
+      "name": "API Consumer",
+      "type": "primary",
+      "description": "External client (editor, plugin, theme) that requests server-side block rendering"
+    },
+    {
+      "name": "WordPress Auth System",
+      "type": "secondary",
+      "description": "Evaluates current_user_can() capability checks (edit_posts, edit_post)"
+    },
+    {
+      "name": "WP_Block_Type_Registry",
+      "type": "secondary",
+      "description": "Singleton registry of all registered Gutenberg block types; provides get_registered(name)"
+    }
+  ],
+
+  "system_boundary": "WordPress REST API (wp/v2)",
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Render Block via REST API",
+      "actor": "API Consumer",
+      "endpoint": "GET|POST /wp/v2/block-renderer/{name}",
+      "params": ["name (path, required)", "attributes (object, optional)", "post_id (integer, optional)", "context (default: view)"],
+      "description": "Request server-side rendering of a registered dynamic Gutenberg block",
+      "includes": ["UC2", "UC3", "UC4"],
+      "result": "JSON response: { rendered: '<html string>' }"
+    },
+    {
+      "id": "UC2",
+      "name": "Check Block Render Permission",
+      "actor": "WordPress Auth System",
+      "description": "Verify caller has sufficient capability before rendering. If post_id > 0: requires edit_post on that post. Otherwise: requires edit_posts globally.",
+      "controller_method": "get_item_permissions_check($request)",
+      "error_codes": ["block_cannot_read (403/401)"],
+      "branching": [
+        "post_id > 0 → get_post(post_id) + current_user_can('edit_post', post_id)",
+        "post_id == 0 → current_user_can('edit_posts')"
+      ]
+    },
+    {
+      "id": "UC3",
+      "name": "Validate Block Attributes",
+      "actor": "API Consumer",
+      "description": "Validate and sanitize incoming attributes against the block's registered JSON schema (block->get_attributes()). Uses rest_validate_value_from_schema / rest_sanitize_value_from_schema.",
+      "controller_method": "register_routes() — inline validate_callback & sanitize_callback",
+      "dependencies": ["WP_Block_Type_Registry::get_registered(name)", "WP_Block_Type::get_attributes()"]
+    },
+    {
+      "id": "UC4",
+      "name": "Execute Block Render",
+      "actor": "API Consumer",
+      "description": "Look up the registered block, verify it is dynamic (has render_callback), then call render_block() to produce HTML. Optionally sets up global $post context via setup_postdata(post_id).",
+      "controller_method": "get_item($request)",
+      "steps": [
+        "WP_Block_Type_Registry::get_instance()->get_registered(name)",
+        "Check registered->is_dynamic() — 404 if not dynamic",
+        "Optionally: get_post(post_id) + setup_postdata($post)",
+        "Build block array: {blockName, attrs, innerHTML:'', innerContent:[]}",
+        "render_block($block) — invokes block's render_callback with all filters",
+        "rest_ensure_response(['rendered' => html])"
+      ],
+      "error_codes": ["block_invalid (404) — unknown or non-dynamic block"]
+    },
+    {
+      "id": "UC5",
+      "name": "Retrieve Block Output Schema",
+      "actor": "API Consumer",
+      "description": "Return JSON Schema for the rendered-block response object. Schema defines 'rendered' (string, required, context:edit).",
+      "controller_method": "get_item_schema() / get_public_item_schema()",
+      "schema_title": "rendered-block"
+    },
+    {
+      "id": "UC6",
+      "name": "Register Block Renderer Route",
+      "actor": "WordPress Auth System",
+      "description": "On REST API init, register the route pattern for GET and POST methods. Performed once at boot.",
+      "controller_method": "register_routes()",
+      "route_pattern": "wp/v2/block-renderer/(?P<name>[a-z0-9-]+/[a-z0-9-]+)",
+      "methods": ["WP_REST_Server::READABLE (GET)", "WP_REST_Server::CREATABLE (POST)"]
+    }
+  ],
+
+  "key_classes": [
+    {
+      "name": "WP_REST_Block_Renderer_Controller",
+      "extends": "WP_REST_Controller",
+      "namespace_prop": "wp/v2",
+      "rest_base": "block-renderer",
+      "methods": [
+        "__construct() — sets namespace='wp/v2', rest_base='block-renderer'",
+        "register_routes() — registers GET+POST /wp/v2/block-renderer/{name}",
+        "get_item_permissions_check($request): true|WP_Error",
+        "get_item($request): WP_REST_Response|WP_Error",
+        "get_item_schema(): array — JSON Schema for rendered-block"
+      ]
+    },
+    {
+      "name": "WP_REST_Controller",
+      "type": "abstract class",
+      "since": "4.7.0",
+      "properties": ["$namespace (string)", "$rest_base (string)", "$schema (array, cached)"],
+      "abstract_methods": ["register_routes()", "get_item_permissions_check()", "get_item()", "get_item_schema()"],
+      "helper_methods": ["get_context_param()", "get_public_item_schema()"]
+    }
+  ],
+
+  "key_relationships": [
+    "WP_REST_Block_Renderer_Controller extends WP_REST_Controller",
+    "WP_REST_Block_Renderer_Controller depends_on WP_Block_Type_Registry (singleton, get_instance())",
+    "WP_REST_Block_Renderer_Controller depends_on WP_Block_Type (registered block, is_dynamic(), get_attributes())",
+    "WP_REST_Block_Renderer_Controller depends_on render_block() (WordPress global function)",
+    "WP_REST_Block_Renderer_Controller depends_on current_user_can() (WordPress capability function)",
+    "WP_REST_Block_Renderer_Controller depends_on rest_validate_value_from_schema() / rest_sanitize_value_from_schema()",
+    "WP_REST_Block_Renderer_Controller depends_on WP_REST_Server (READABLE, CREATABLE constants)"
+  ],
+
+  "business_rules": [
+    "Only dynamic blocks (those with a render_callback) can be rendered via this endpoint",
+    "Block name must match pattern: namespace/block-name (e.g., core/latest-posts)",
+    "Requires edit_posts capability at minimum; edit_post on specific post if post_id is provided",
+    "Attributes are validated AND sanitized against the block's own registered attribute schema",
+    "render_block() is used (not direct callback) to ensure all WordPress filters are applied",
+    "Response schema context is 'edit' only — rendered HTML is not exposed in public context"
+  ],
+
+  "important_notes": "Since WordPress 5.0.0. Supports GET (query params) and POST (body). post_id param sets global $post context for blocks that need it (e.g., dynamic blocks querying current post). Route: /wp/v2/block-renderer/{namespace}/{block-name}.",
+
+  "source_files_analyzed": [
+    "tests/Frameworks/WordPress/Version_6_1/wp-includes/rest-api/endpoints/class-wp-rest-block-renderer-controller.php",
+    "tests/Frameworks/WordPress/Version_6_1/wp-includes/rest-api/endpoints/class-wp-rest-controller.php",
+    "diagrams/use_case/ir_view_use_case.json"
+  ]
+}

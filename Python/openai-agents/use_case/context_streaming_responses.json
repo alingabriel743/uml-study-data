@@ -1,0 +1,169 @@
+{
+  "scope": "streaming_responses",
+  "title": "Streaming Responses and Event Handling",
+  "diagram_type": "use_case",
+  "system_boundary": "Agents SDK Streaming Subsystem",
+
+  "actors": [
+    "Caller (Developer/Application)",
+    "Runner",
+    "RunResultStreaming",
+    "ChatCmplStreamHandler",
+    "Background run_loop_task",
+    "GuardrailSystem"
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Start Streaming Run",
+      "actor": "Caller",
+      "entry_point": "Runner.run_streamed(agent, input) → RunResultStreaming",
+      "notes": "Returns RunResultStreaming immediately; background run_loop_task starts processing"
+    },
+    {
+      "id": "UC2",
+      "name": "Consume Stream Events",
+      "actor": "Caller",
+      "entry_point": "async for event in result.stream_events() → AsyncIterator[StreamEvent]",
+      "notes": "Reads from internal asyncio.Queue[StreamEvent | QueueCompleteSentinel]; blocks until events available; loop must be fully consumed for session persistence and cleanup to complete"
+    },
+    {
+      "id": "UC3",
+      "name": "Receive Raw LLM Token Deltas",
+      "actor": "Caller",
+      "entry_point": "event.type == 'raw_response_event' → RawResponsesStreamEvent(data: TResponseStreamEvent)",
+      "notes": "Passes OpenAI Responses API events directly: response.created, response.output_text.delta, etc. Useful for token-by-token output"
+    },
+    {
+      "id": "UC4",
+      "name": "Receive Run Item Updates",
+      "actor": "Caller",
+      "entry_point": "event.type == 'run_item_stream_event' → RunItemStreamEvent(name, item: RunItem)",
+      "notes": "Higher-level semantic events. Names: message_output_created, handoff_requested, handoff_occured, tool_called, tool_search_called, tool_search_output_created, tool_output, reasoning_item_created, mcp_approval_requested, mcp_approval_response, mcp_list_tools"
+    },
+    {
+      "id": "UC5",
+      "name": "Receive Agent Change Notification",
+      "actor": "Caller",
+      "entry_point": "event.type == 'agent_updated_stream_event' → AgentUpdatedStreamEvent(new_agent: Agent)",
+      "notes": "Emitted on agent handoff; new_agent reflects which agent is now active"
+    },
+    {
+      "id": "UC6",
+      "name": "Cancel Streaming Immediately",
+      "actor": "Caller",
+      "entry_point": "result.cancel(mode='immediate')",
+      "notes": "Calls _cleanup_tasks() cancelling run_loop_task, input/output guardrail tasks; sets is_complete=True; puts QueueCompleteSentinel to unblock stream_events"
+    },
+    {
+      "id": "UC7",
+      "name": "Cancel After Current Turn",
+      "actor": "Caller",
+      "entry_point": "result.cancel(mode='after_turn')",
+      "notes": "Sets _cancel_mode='after_turn'; run_loop checks flag and stops before next turn; LLM response finishes, tool calls execute, session state saved"
+    },
+    {
+      "id": "UC8",
+      "name": "Handle Streaming Interruptions (Tool Approval)",
+      "actor": "Caller",
+      "entry_point": "Consume stream_events() fully → inspect result.interruptions: list[ToolApprovalItem]",
+      "notes": "stream_events() finishes when tool requires approval; pending approvals in result.interruptions"
+    },
+    {
+      "id": "UC9",
+      "name": "Resume Streaming from State",
+      "actor": "Caller",
+      "entry_point": "state = result.to_state() → state.approve(interruption) → Runner.run_streamed(agent, state)",
+      "notes": "to_state() calls _populate_state_from_result(); returns RunState with current turn, processed response, tracker snapshot"
+    },
+    {
+      "id": "UC10",
+      "name": "Convert Stream Result to Input List",
+      "actor": "Caller",
+      "entry_point": "result.to_input_list(mode='preserve_all'|'normalized') → list[TResponseInputItem]",
+      "notes": "'normalized' returns canonical continuation input when handoff filtering rewrote history"
+    },
+    {
+      "id": "UC11",
+      "name": "Translate ChatCompletion Chunks to Response Events",
+      "actor": "ChatCmplStreamHandler",
+      "entry_point": "ChatCmplStreamHandler.handle_stream(response, AsyncStream[ChatCompletionChunk], model) → AsyncIterator[TResponseStreamEvent]",
+      "notes": "Stateful conversion: tracks StreamingState (text, refusal, reasoning, function_calls). Yields: ResponseCreatedEvent, ResponseOutputItemAddedEvent, ResponseContentPartAddedEvent, ResponseTextDeltaEvent, ResponseRefusalDeltaEvent, ResponseFunctionCallArgumentsDeltaEvent, ResponseOutputItemDoneEvent, ResponseContentPartDoneEvent, ResponseCompletedEvent. Also handles Anthropic thinking_blocks and reasoning_content, provider-specific data (Gemini thought_signature)"
+    },
+    {
+      "id": "UC12",
+      "name": "Handle MaxTurns Exceeded Error",
+      "actor": "RunResultStreaming",
+      "entry_point": "_check_errors() detects current_turn > max_turns → stores MaxTurnsExceeded in _stored_exception → raised after queue drained",
+      "notes": "stream_events() raises MaxTurnsExceeded after yielding remaining events"
+    },
+    {
+      "id": "UC13",
+      "name": "Handle Guardrail Tripwire",
+      "actor": "GuardrailSystem",
+      "entry_point": "InputGuardrailTripwireTriggered stored in _stored_exception via _input_guardrail_queue",
+      "notes": "Results pulled from _input_guardrail_queue in _check_errors(); exception raised from stream_events()"
+    }
+  ],
+
+  "key_relationships": [
+    "Caller initiates UC1 (start) and UC2 (consume events)",
+    "UC2 includes UC3, UC4, UC5 (event type dispatch)",
+    "UC8 extends UC2 (interruption on tool approval)",
+    "UC9 extends UC8 (resume after approval)",
+    "UC6 and UC7 extend UC2 (cancellation variants)",
+    "Runner delegates stream production to Background run_loop_task",
+    "Background run_loop_task writes StreamEvent to _event_queue; ChatCmplStreamHandler feeds raw events",
+    "UC11 is called by Background run_loop_task (model adapter layer)",
+    "GuardrailSystem writes to _input_guardrail_queue; RunResultStreaming checks it in UC12/UC13"
+  ],
+
+  "key_classes": {
+    "RunResultStreaming": {
+      "parent": "RunResultBase",
+      "key_fields": ["_event_queue: asyncio.Queue[StreamEvent|QueueCompleteSentinel]", "_input_guardrail_queue", "run_loop_task: asyncio.Task", "is_complete: bool", "interruptions: list[ToolApprovalItem]", "current_agent: Agent", "max_turns: int"],
+      "key_methods": ["stream_events() -> AsyncIterator[StreamEvent]", "cancel(mode)", "to_state() -> RunState", "to_input_list(mode) -> list[TResponseInputItem]", "_check_errors()", "_cleanup_tasks()", "_drain_event_queue()"]
+    },
+    "StreamEvent": {
+      "type": "TypeAlias",
+      "variants": ["RawResponsesStreamEvent(data: TResponseStreamEvent, type='raw_response_event')", "RunItemStreamEvent(name, item: RunItem, type='run_item_stream_event')", "AgentUpdatedStreamEvent(new_agent: Agent, type='agent_updated_stream_event')"]
+    },
+    "ChatCmplStreamHandler": {
+      "key_method": "handle_stream(response, stream, model) -> AsyncIterator[TResponseStreamEvent]",
+      "internal_state": "StreamingState (text_content, refusal_content, reasoning_content, function_calls, thinking_text/signature, provider_data)"
+    },
+    "StreamingState": {
+      "tracks": ["text_content_index_and_output", "refusal_content_index_and_output", "reasoning_content_index_and_output", "function_calls: dict[int, ResponseFunctionToolCall]", "function_call_streaming: dict[int, bool]", "thinking_text/thinking_signature (Anthropic)", "provider_data (model, response_id)"]
+    }
+  },
+
+  "event_sequence_in_chatcmpl_handler": [
+    "1. ResponseCreatedEvent (on first chunk)",
+    "2. ResponseOutputItemAddedEvent (reasoning/message/function_call start)",
+    "3. ResponseContentPartAddedEvent (text or refusal part start)",
+    "4a. ResponseTextDeltaEvent (per text token)",
+    "4b. ResponseRefusalDeltaEvent (per refusal token)",
+    "4c. ResponseReasoningSummaryTextDeltaEvent / ResponseReasoningTextDeltaEvent (reasoning delta)",
+    "4d. ResponseFunctionCallArgumentsDeltaEvent (function arg streaming)",
+    "5. ResponseContentPartDoneEvent (text/refusal part done)",
+    "6. ResponseOutputItemDoneEvent (reasoning/message/function_call done)",
+    "7. ResponseCompletedEvent (final, with full Response object including usage)"
+  ],
+
+  "important_notes": [
+    "stream_events() must be fully consumed — post-processing (session persistence, approval bookkeeping, history compaction) happens after last visible token",
+    "StreamEvent uses OpenAI Responses API event format throughout",
+    "ChatCmplStreamHandler bridges ChatCompletion API (chunks) to Responses API (events) for non-native model providers",
+    "Cancellation mode 'after_turn' allows graceful finish: LLM response, tool calls, session save complete before stopping",
+    "handoff_occured is intentionally misspelled for backward compatibility",
+    "RunResultStreaming inherits to_input_list() and final_output_as() from RunResultBase"
+  ],
+
+  "source_files_analyzed": [
+    "src/agents/models/chatcmpl_stream_handler.py",
+    "src/agents/result.py",
+    "src/agents/stream_events.py",
+    "docs/streaming.md"
+  ]
+}

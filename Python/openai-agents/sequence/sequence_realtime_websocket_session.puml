@@ -1,0 +1,236 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #DEE2E6
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Realtime WebSocket Session
+
+actor Application as app
+participant "RealtimeSession" as session
+participant "RealtimeAgent" as agent
+participant "OpenAIRealtimeWebSocketModel" as wsModel
+participant "_ResponseCreateSequencer" as sequencer
+participant "ModelAudioTracker" as audioTracker
+participant "WebSocketConnection" as wsConn
+participant "FunctionTool" as tool
+boundary "OpenAI Realtime API\n(wss://api.openai.com/v1/realtime)" as openai
+
+' ────────────────────────────────────────────
+' CONNECTION SETUP
+' ────────────────────────────────────────────
+box "Connection Setup" #EBF5FB
+  app -> session: __aenter__() / enter()
+  activate session
+
+  session -> wsModel: add_listener(self)
+  activate wsModel
+
+  session -> agent: _get_updated_model_settings_from_agent(starting_settings)
+  activate agent
+  agent -> agent: get_system_prompt(context_wrapper)
+  agent -> agent: get_all_tools(context_wrapper)
+  agent --> session: model_settings (instructions, tools, voice)
+  deactivate agent
+
+  session -> wsModel: connect(model_config)
+  wsModel -> wsModel: get_api_key(options.api_key)
+  wsModel -> wsConn: _create_websocket_connection(url, headers, transport_config)
+  activate wsConn
+  wsConn -> openai: websockets.connect(\nwss://.../v1/realtime?model=gpt-realtime-1.5)
+  openai --> wsConn: WebSocket handshake OK
+  wsConn --> wsModel: ClientConnection
+
+  wsModel -> wsModel: asyncio.create_task(_listen_for_messages())
+  note right of wsModel
+    Background task continuously
+    reads server events from the
+    WebSocket connection
+  end note
+
+  wsModel -> wsModel: _update_session_config(model_settings)
+  wsModel -> wsConn: _send_raw_message(SessionUpdateEvent)
+  wsConn -> openai: session.update\n(instructions, tools, voice: ash,\nturn_detection: semantic_vad)
+
+  wsModel --> session: connected
+  session --> app: RealtimeSession (context manager)\n+ put_event(RealtimeHistoryUpdated)
+end box
+
+' ────────────────────────────────────────────
+' SEND AUDIO
+' ────────────────────────────────────────────
+box "Send Audio (Application → OpenAI)" #EAF7EA
+  app -> session: send_audio(audio_bytes, commit=False)
+  session -> wsModel: send_event(RealtimeModelSendAudio(audio, commit))
+  wsModel -> wsModel: _send_audio(event)
+  wsModel -> wsModel: convert_audio_to_input_audio_buffer_append(event)
+  wsModel -> wsConn: _send_raw_message(InputAudioBufferAppendEvent)
+  wsConn -> openai: input_audio_buffer.append\n(base64 PCM16 chunk)
+
+  alt commit = True (manual VAD commit)
+    wsModel -> wsConn: _send_raw_message(InputAudioBufferCommitEvent)
+    wsConn -> openai: input_audio_buffer.commit
+  end
+end box
+
+' ────────────────────────────────────────────
+' RECEIVE AUDIO BACK (Audio Delta / Done)
+' ────────────────────────────────────────────
+box "Receive Audio (OpenAI → Application)" #FEF9E7
+  openai -> wsConn: response.output_audio.delta\n(audio bytes streamed)
+  wsConn -> wsModel: async for message in _websocket
+  wsModel -> wsModel: json.loads(message)\n_handle_ws_event(parsed_dict)
+
+  alt parsed.type == response.output_audio.delta
+    wsModel -> wsModel: _handle_audio_delta(parsed)
+    wsModel -> audioTracker: on_audio_delta(item_id, content_index, audio_bytes)
+    activate audioTracker
+    audioTracker --> wsModel: tracked
+    deactivate audioTracker
+    wsModel -> session: _emit_event(RealtimeModelAudioEvent\n(data, response_id, item_id))
+    session -> app: put_event(RealtimeAudio)
+  end
+
+  alt parsed.type == response.output_audio.done
+    wsModel -> session: _emit_event(RealtimeModelAudioDoneEvent)
+    session -> app: put_event(RealtimeAudioEnd)
+  end
+end box
+
+' ────────────────────────────────────────────
+' TURN STARTED / ENDED
+' ────────────────────────────────────────────
+box "Agent Turn Lifecycle" #F5EEF8
+  alt event.type == turn_started
+    wsModel -> session: _emit_event(RealtimeModelTurnStartedEvent)
+    session -> app: put_event(RealtimeAgentStartEvent(agent))
+  end
+
+  alt event.type == turn_ended
+    wsModel -> session: _emit_event(RealtimeModelTurnEndedEvent)
+    session -> app: put_event(RealtimeAgentEndEvent(agent))
+  end
+end box
+
+' ────────────────────────────────────────────
+' FUNCTION CALL / TOOL EXECUTION
+' ────────────────────────────────────────────
+box "Function Call / Tool Execution" #FDF2F8
+  alt event.type == function_call (RealtimeModelToolCallEvent)
+    wsModel -> session: _emit_event(RealtimeModelToolCallEvent)
+    session -> session: _handle_tool_call(event, agent_snapshot)\n[async task if async_tool_calls=True]
+    session -> agent: get_all_tools(context_wrapper)
+    activate agent
+    agent --> session: tools list
+    deactivate agent
+
+    session -> app: put_event(RealtimeToolStart\n(tool, agent, arguments))
+
+    session -> tool: invoke_function_tool(tool, context, arguments)
+    activate tool
+    tool --> session: result
+    deactivate tool
+
+    session -> wsModel: send_event(RealtimeModelSendToolOutput\n(output, start_response=True))
+    wsModel -> wsConn: _send_raw_message(ConversationItemCreateEvent)
+    wsConn -> openai: conversation.item.create\n(tool result)
+
+    wsModel -> sequencer: reserve_response_create_request()
+    activate sequencer
+    sequencer --> wsModel: slot reserved
+    deactivate sequencer
+
+    wsModel -> wsConn: _send_raw_message(ResponseCreateEvent)
+    wsConn -> openai: response.create
+
+    session -> app: put_event(RealtimeToolEnd\n(tool, output, agent, arguments))
+  end
+end box
+
+' ────────────────────────────────────────────
+' VAD SPEECH STARTED / BARGE-IN INTERRUPT
+' ────────────────────────────────────────────
+box "VAD Barge-In / Audio Interrupt" #FEF5E7
+  alt parsed.type == input_audio_buffer.speech_started
+    openai -> wsConn: input_audio_buffer.speech_started
+    wsConn -> wsModel: server event received
+    wsModel -> session: _emit_event(RealtimeModelAudioInterruptedEvent)
+    wsModel -> wsConn: _send_raw_message(ConversationItemTruncateEvent)
+    wsConn -> openai: conversation.item.truncate
+    wsModel -> wsModel: _cancel_response()
+    wsModel -> wsConn: _send_raw_message(ResponseCancelEvent)
+    wsConn -> openai: response.cancel
+    session -> app: put_event(RealtimeAudioInterrupted)
+  end
+end box
+
+' ────────────────────────────────────────────
+' TRANSCRIPT DELTA & GUARDRAILS
+' ────────────────────────────────────────────
+box "Transcript & Guardrails" #EAFAF1
+  alt event.type == transcript_delta
+    wsModel -> session: _emit_event(RealtimeModelTranscriptDeltaEvent)
+    session -> session: accumulate _item_transcripts[item_id]
+    note right of session
+      Guardrail check fires when accumulated
+      transcript length exceeds debounce_text_length
+      threshold (default: 100 chars)
+    end note
+    alt debounce threshold crossed
+      session -> session: _enqueue_guardrail_task(transcript, response_id)
+      session -> app: put_event(RealtimeGuardrailTripped)
+    end
+  end
+end box
+
+' ────────────────────────────────────────────
+' SESSION CLOSE
+' ────────────────────────────────────────────
+box "Session Close" #FDEDEC
+  app -> session: __aexit__() / close()
+  session -> session: _cleanup()\n— cancel guardrail tasks\n— cancel tool tasks\n— remove listener
+  session -> wsModel: close()
+  wsModel -> wsModel: _cancel_response_create_tasks()
+  wsModel -> wsConn: websocket.close()
+  wsConn -> openai: WebSocket close frame
+  wsModel -> wsModel: cancel _websocket_task\n_release_response_waiters()
+  deactivate wsConn
+  deactivate wsModel
+  deactivate session
+end box
+
+note over app, openai
+  Default config: model=gpt-realtime-1.5 | voice=ash | turn_detection=semantic_vad (interrupt_response=True)
+  Audio format: pcm16 (input & output) | Transcription: gpt-4o-mini-transcribe
+  Response sequencing via _ResponseCreateSequencer prevents concurrent model responses
+  Handoffs update session config (instructions/tools) before sending tool output to OpenAI
+end note
+
+@enduml

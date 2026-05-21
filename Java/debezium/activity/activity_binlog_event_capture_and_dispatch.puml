@@ -1,0 +1,163 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam swimlane {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleBackgroundColor #DEE2E6
+}
+skinparam ArrowColor #495057
+skinparam NoteBackgroundColor #FFF9C4
+skinparam NoteBorderColor #F0AD4E
+
+title Binlog Event Capture and Dispatch
+
+|Kafka Connect|
+start
+:BaseSourceTask.start(props);
+
+|BinlogSourceTask|
+:doStart()\n→ build ChangeEventSourceCoordinator;
+:validateBinlogConfiguration()\n• isBinlogFormatRow()?\n• isBinlogRowImageFull()?;
+if (binlog config valid?) then (no)
+    #FFCCCC:Throw configuration exception\n(unsupported format or image mode);
+    stop
+else (yes)
+endif
+:validateSnapshotFeasibility()\n→ check earliestBinlogFilename();
+
+|BinlogStreamingChangeEventSource|
+:Configure BinaryLogClient\n(SSL, serverId, keepalive interval,\nheartbeat period, netTimeout,\neventDeserializer);
+:Register EventType handlers:\nROTATE, TABLE_MAP, QUERY, GTID,\nWRITE_ROWS, UPDATE_ROWS, DELETE_ROWS,\nTRANSACTION_PAYLOAD, HEARTBEAT,\nSTOP, INCIDENT, XID;
+if (skippedOperations contains\nCREATE / UPDATE / DELETE?) then (yes)
+    :Skip registering corresponding\nDML event handlers;
+else (no)
+endif
+if (isSqlQueryIncluded?) then (yes)
+    :Register ROWS_QUERY /\nANNOTATE_ROWS handler\n→ handleRecordingQuery();
+else (no)
+endif
+if (bufferSizeForStreaming == 0?) then (direct)
+    :listener = direct handleEvent();
+else (buffered)
+    :listener = EventBuffer wrapping handleEvent();
+endif
+if (isGtidModeEnabled\n&& shouldRecoverUsingGtid()?) then (GTID mode)
+    :Register GTID event handler\nCompute filteredGtidSet from server\nclient.setGtidSet(filteredGtidSet);
+else (file+pos mode)
+    :client.setBinlogFilename(offsetContext)\nclient.setBinlogPosition(offsetContext);
+endif
+:initialEventsToSkip = eventsToSkipUponRestart()\nstartingRowNumber = rowsToSkipUponRestart();
+
+|BinaryLogClient|
+:client.connect(timeout)\n→ Start background binlog reader thread\n  (subscribes to MySQL binlog stream);
+note right
+  BinaryLogClient runs in a
+  background thread and calls
+  registered listeners for each
+  event received from MySQL
+end note
+
+|BinlogStreamingChangeEventSource|
+while (context.isRunning()?) is (true)
+    :Thread.sleep(100)\nwaitWhenStreamingPaused(context);
+    note right: Pauses if incremental snapshot interleaving
+endwhile (false)
+
+|BinaryLogClient|
+:Receive binlog event packet from MySQL;
+:Invoke registered event listener callback;
+
+|BinlogStreamingChangeEventSource|
+:handleEvent(partition, offsetContext, context, event);
+if (event type == ROTATE?) then (yes)
+    :offsetContext.setBinlogStartPoint\n(filename, position);
+else (no)
+    :offsetContext.setEventPosition(pos, len);
+endif
+:waitWhenStreamingPaused(context);
+:Route event:\neventHandlers.get(eventType).accept(event);
+
+if (eventType?) then (ROTATE)
+    :handleRotateLogsEvent()\n→ offsetContext.setBinlogStartPoint()\n→ clear tableMapCache;
+elseif (TABLE_MAP) then (TABLE_MAP)
+    :handleUpdateTableMetadata()\n→ schema.getTableId()\n→ update table metadata in schema;
+elseif (QUERY) then (QUERY)
+    if (SQL statement?) then (BEGIN)
+        :handleTransactionBegin()\n→ offsetContext.startNextTransaction()\n→ eventDispatcher\n   .dispatchTransactionStartedEvent();
+    elseif (COMMIT) then (COMMIT)
+        :handleTransactionCompletion()\n→ eventDispatcher\n   .dispatchTransactionCommittedEvent();
+    else (DDL)
+        :eventDispatcher\n.dispatchSchemaChangeEvent();
+    endif
+elseif (GTID) then (GTID)
+    :handleGtidEvent()\n→ update currentGtid in offsetContext\n→ apply gtidDmlSourceFilter\n→ set ignoreDmlEventByGtidSource flag;
+elseif (WRITE_ROWS /\nUPDATE_ROWS /\nDELETE_ROWS) then (DML)
+    :handleInsert() / handleUpdate() / handleDelete()\n→ handleChange(op, tableId, rowEventData);
+    if (skipEvent == true?) then (yes)
+        :Decrement initialEventsToSkip\nLog skip and return;
+    elseif (ignoreDmlEventByGtidSource == true?) then (yes)
+        :Log GTID-filtered skip and return;
+    elseif (tableId == null or\nschema.schemaFor(tableId) == null?) then (yes)
+        :informAboutUnknownTableIfRequired()\nreturn;
+    else (emit rows)
+        :For each row (from startingRowNumber):\n• Validate schema\n• offsetContext.setRowNumber(row)\n• offsetContext.event(tableId, timestamp);
+        |EventDispatcher|
+        :new BinlogChangeRecordEmitter(op, row)\n→ dispatchDataChangeEvent\n  (partition, tableId, emitter);
+        note right: Enqueues SourceRecord\ninto ChangeEventQueue
+        |BinlogStreamingChangeEventSource|
+        :offsetContext.changeEventCompleted()\nstartingRowNumber = 0;
+    endif
+elseif (TRANSACTION_PAYLOAD) then (COMPRESSED)
+    :handleTransactionPayload()\n→ Decompress compressed event payload\n→ Iterate uncompressed inner events\n→ Call handleEvent() recursively\n  for each inner event;
+elseif (XID) then (XID)
+    :handleTransactionCompletion()\n→ eventDispatcher\n   .dispatchTransactionCommittedEvent();
+elseif (HEARTBEAT) then (HEARTBEAT)
+    :handleServerHeartbeat()\n→ update connector metrics;
+else (STOP / INCIDENT)
+    if (STOP?) then (yes)
+        :handleServerStop()\n→ signal graceful stop;
+    else (INCIDENT)
+        :handleServerIncident()\n→ log error event;
+    endif
+endif
+
+|EventDispatcher|
+:dispatchHeartbeatEvent(partition, offsetContext);
+
+|BinlogStreamingChangeEventSource|
+:offsetContext.completeEvent()\nupdateLastOffset();
+if (initialEventsToSkip > 0?) then (yes)
+    :Decrement initialEventsToSkip\nskipEvent = (initialEventsToSkip > 0);
+else (no)
+endif
+
+if (RuntimeException raised?) then (yes)
+    |BinlogSourceTask / ErrorHandler|
+    #FFCCCC:logStreamingSourceState()\nerrorHandler.setProducerThrowable\n  (DebeziumException)\neventHandlers.clear();
+    stop
+elseif (InterruptedException raised?) then (yes)
+    |BinlogSourceTask / ErrorHandler|
+    #FFCCCC:Thread.interrupt()\neventHandlers.clear();
+    stop
+else (no error)
+endif
+
+|Kafka Connect|
+:BaseSourceTask.poll()\n→ startIfNeededAndPossible()\n→ doPoll()\n→ ChangeEventSourceCoordinator\n   drains ChangeEventQueue\n→ return List<SourceRecord>;
+
+|BinlogStreamingChangeEventSource|
+:context.isRunning() becomes false\n→ exit main monitoring loop\n→ client.disconnect();
+stop
+
+@enduml

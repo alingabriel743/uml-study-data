@@ -1,0 +1,246 @@
+{
+  "scope": "agent_identity_and_environment_fingerprinting",
+  "title": "Agent Identity & Environment Fingerprinting",
+  "diagram_type": "use_case",
+  "description": "Use cases for establishing stable device identity and fingerprinting the runtime environment for agent tracking and integrity checks.",
+
+  "actors": [
+    {
+      "name": "GEP Agent",
+      "type": "primary",
+      "description": "The running Evolver/GEP agent process. Initiates all identity and fingerprinting operations."
+    },
+    {
+      "name": "PrivacyClient",
+      "type": "primary",
+      "description": "Uses crypto primitives to encrypt/decrypt blobs for privacy-preserving hub compute."
+    },
+    {
+      "name": "PolicyCheck",
+      "type": "primary",
+      "description": "Consumes captureEnvFingerprint to enforce runtime execution policies."
+    },
+    {
+      "name": "File System",
+      "type": "secondary",
+      "description": "Provides and stores persistent device UUID (device_id file) and evolver package.json for version/client info."
+    },
+    {
+      "name": "OS / Node.js Runtime",
+      "type": "secondary",
+      "description": "Provides process.version, process.platform, process.arch, os.release(), os.hostname(), process.cwd()."
+    },
+    {
+      "name": "Node.js Crypto",
+      "type": "secondary",
+      "description": "Underlying cryptographic primitives: randomBytes, createHash (sha256), createHmac, createCipheriv/createDecipheriv (AES-256-GCM)."
+    }
+  ],
+
+  "subsystems": [
+    "DeviceId (src/gep/deviceId.js)",
+    "EnvFingerprint (src/gep/envFingerprint.js)",
+    "ContentHash (src/gep/contentHash.js)",
+    "Crypto (src/gep/crypto.js)"
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Get Stable Device ID",
+      "subsystem": "DeviceId",
+      "function": "getDeviceId(): string",
+      "actor": "GEP Agent",
+      "description": "Read or create a persistent UUID anchoring this machine's identity. Reads from disk cache; if absent, computes from system attributes and persists. Returns UUID string."
+    },
+    {
+      "id": "UC2",
+      "name": "Detect Container Environment",
+      "subsystem": "DeviceId",
+      "function": "isContainer(): boolean",
+      "actor": "GEP Agent",
+      "description": "Detect whether the agent is running inside a container (Docker/cgroup) by checking /.dockerenv, cgroup, and hostname patterns. Returns boolean."
+    },
+    {
+      "id": "UC3",
+      "name": "Capture Environment Snapshot",
+      "subsystem": "EnvFingerprint",
+      "function": "captureEnvFingerprint(): EnvFingerprintObject",
+      "actor": "GEP Agent",
+      "description": "Assemble a full runtime environment snapshot: calls getDeviceId(), isContainer(), reads evolver package.json for version/client, hashes hostname and cwd (12-char sha256 slice), captures node_version/platform/arch/os_release/region/captured_at.",
+      "returns_shape": {
+        "device_id": "string",
+        "node_version": "string (process.version, starts with 'v')",
+        "platform": "string",
+        "arch": "string",
+        "os_release": "string",
+        "hostname": "string (sha256-hashed, 12 chars)",
+        "cwd": "string (sha256-hashed, 12 chars)",
+        "evolver_version": "string | null",
+        "client": "string",
+        "client_version": "string | null",
+        "region": "string | undefined",
+        "container": "boolean",
+        "captured_at": "ISO timestamp"
+      },
+      "includes": ["UC1", "UC2"]
+    },
+    {
+      "id": "UC4",
+      "name": "Generate Environment Fingerprint Key",
+      "subsystem": "EnvFingerprint",
+      "function": "envFingerprintKey(fp): string",
+      "actor": "GEP Agent",
+      "description": "Produce a compact 16-char hex key from an EnvFingerprintObject by joining key identity fields (device_id, node_version, platform, arch, os_release, evolver_version, client_version) with '|' and computing a SHA-256 HMAC. Returns 'unknown' for null/non-object input."
+    },
+    {
+      "id": "UC5",
+      "name": "Check Same Environment Class",
+      "subsystem": "EnvFingerprint",
+      "function": "isSameEnvClass(fp1, fp2): boolean",
+      "actor": "GEP Agent",
+      "description": "Compare two environment fingerprints to determine if they represent the same execution class. Computes envFingerprintKey for each and compares. Note: cwd differences do not affect class equality; device_id differences do.",
+      "includes": ["UC4"]
+    },
+    {
+      "id": "UC6",
+      "name": "Canonicalize Asset Data",
+      "subsystem": "ContentHash",
+      "function": "canonicalize(value: any): string",
+      "actor": "GEP Agent",
+      "description": "Produce a deterministic JSON-like string from any value: null/undefined → 'null', booleans → 'true'/'false', non-finite numbers → 'null', strings → JSON-quoted, arrays → '[...]' preserving order, objects → '{...}' with sorted keys recursively."
+    },
+    {
+      "id": "UC7",
+      "name": "Compute Asset Content Hash",
+      "subsystem": "ContentHash",
+      "function": "computeAssetId(obj: object): string",
+      "actor": "GEP Agent",
+      "description": "Compute a stable 'sha256:' + 64-hex-char content hash of an asset object. Canonicalizes the object (excluding the asset_id field itself) before hashing. Used to assign stable IDs to Gene/Capsule/EvolutionEvent assets.",
+      "includes": ["UC6"],
+      "returns_format": "'sha256:' + 64 hex chars"
+    },
+    {
+      "id": "UC8",
+      "name": "Verify Asset Integrity",
+      "subsystem": "ContentHash",
+      "function": "verifyAssetId(obj: object): boolean",
+      "actor": "GEP Agent",
+      "description": "Verify that an asset object's asset_id field matches the computed content hash. Re-runs computeAssetId and compares to obj.asset_id. Detects tampering or corruption.",
+      "includes": ["UC7"]
+    },
+    {
+      "id": "UC9",
+      "name": "Generate Encryption Key",
+      "subsystem": "Crypto",
+      "function": "generateKey(): Buffer",
+      "actor": "GEP Agent",
+      "description": "Generate 32 cryptographically random bytes for use as an AES-256-GCM symmetric key."
+    },
+    {
+      "id": "UC10",
+      "name": "Encrypt Data",
+      "subsystem": "Crypto",
+      "function": "encrypt(plaintext: Buffer|string, key: Buffer): {ciphertext, iv, authTag}",
+      "actor": "GEP Agent",
+      "description": "Encrypt plaintext using AES-256-GCM. Validates key is exactly 32 bytes, generates random 12-byte IV, produces ciphertext + 16-byte authentication tag. Returns structured object with ciphertext, iv, and authTag Buffers."
+    },
+    {
+      "id": "UC11",
+      "name": "Decrypt Data",
+      "subsystem": "Crypto",
+      "function": "decrypt(ciphertext: Buffer, key: Buffer, iv: Buffer, authTag: Buffer): Buffer",
+      "actor": "GEP Agent",
+      "description": "Decrypt AES-256-GCM ciphertext. Validates key length (32 bytes), creates decipher with IV, sets authTag for authenticated decryption, returns plaintext Buffer."
+    },
+    {
+      "id": "UC12",
+      "name": "Pack Crypto Payload",
+      "subsystem": "Crypto",
+      "function": "pack({iv, authTag, ciphertext}): Buffer",
+      "actor": "GEP Agent",
+      "description": "Serialize AES-GCM parts into a single binary Buffer: Buffer.concat([iv(12B), authTag(16B), ciphertext(variable)]). Used before transport/storage."
+    },
+    {
+      "id": "UC13",
+      "name": "Unpack Crypto Payload",
+      "subsystem": "Crypto",
+      "function": "unpack(buf: Buffer): {iv, authTag, ciphertext}",
+      "actor": "GEP Agent",
+      "description": "Deserialize a packed crypto Buffer back into {iv: buf[0..12], authTag: buf[12..28], ciphertext: buf[28..]}. Throws on undersized input."
+    }
+  ],
+
+  "include_relationships": [
+    "UC3 (captureEnvFingerprint) <<include>> UC1 (getDeviceId)",
+    "UC3 (captureEnvFingerprint) <<include>> UC2 (isContainer)",
+    "UC5 (isSameEnvClass) <<include>> UC4 (envFingerprintKey) [applied to both fp1 and fp2]",
+    "UC7 (computeAssetId) <<include>> UC6 (canonicalize)",
+    "UC8 (verifyAssetId) <<include>> UC7 (computeAssetId)"
+  ],
+
+  "actor_to_usecase": [
+    "GEP Agent → UC1, UC2, UC3, UC4, UC5, UC6, UC7, UC8, UC9, UC10, UC11, UC12, UC13",
+    "PrivacyClient → UC9 (generateKey), UC10 (encrypt), UC11 (decrypt), UC12 (pack), UC13 (unpack)",
+    "PolicyCheck → UC3 (captureEnvFingerprint)",
+    "File System ← UC1 (reads/writes device UUID file), UC3 (reads package.json for evolver_version/client)",
+    "OS / Node.js Runtime ← UC3 (process.version, platform, arch, os.release, hostname, cwd)",
+    "Node.js Crypto ← UC4 (createHmac sha256), UC6 (createHash sha256), UC7 (createHash sha256), UC9 (randomBytes), UC10 (createCipheriv aes-256-gcm), UC11 (createDecipheriv aes-256-gcm)"
+  ],
+
+  "module_exports_summary": {
+    "deviceId.js": ["getDeviceId(): string", "isContainer(): boolean"],
+    "envFingerprint.js": [
+      "captureEnvFingerprint(): EnvFingerprintObject",
+      "envFingerprintKey(fp): string (16-char hex, 'unknown' on bad input)",
+      "isSameEnvClass(fp1, fp2): boolean"
+    ],
+    "contentHash.js": [
+      "SCHEMA_VERSION: string ('1.6.0')",
+      "canonicalize(value): string",
+      "computeAssetId(obj): string ('sha256:' + 64 hex)",
+      "verifyAssetId(obj): boolean"
+    ],
+    "crypto.js": [
+      "ALGORITHM: 'aes-256-gcm'",
+      "KEY_BYTES: 32",
+      "IV_BYTES: 12",
+      "AUTH_TAG_BYTES: 16",
+      "generateKey(): Buffer",
+      "encrypt(plaintext, key): {ciphertext, iv, authTag}",
+      "decrypt(ciphertext, key, iv, authTag): Buffer",
+      "pack({iv, authTag, ciphertext}): Buffer",
+      "unpack(buf): {iv, authTag, ciphertext}"
+    ]
+  },
+
+  "key_dependencies": [
+    "envFingerprint.js imports getDeviceId, isContainer from deviceId.js",
+    "envFingerprint.js imports getRepoRoot from ./paths",
+    "contentHash.js uses Node.js crypto (createHash sha256) and crypto.createHmac",
+    "crypto.js uses Node.js crypto (randomBytes, createCipheriv, createDecipheriv) exclusively",
+    "deviceId.js uses Node.js crypto, os, fs, path",
+    "PrivacyClient (privacyClient.js) imports generateKey, encrypt, decrypt, pack, unpack from crypto.js"
+  ],
+
+  "important_notes": [
+    "All four modules (deviceId.js, envFingerprint.js, contentHash.js, crypto.js) are heavily obfuscated with hex-encoded string literals and an RC4-like string rotation cipher — a software protection pattern.",
+    "deviceId.js provides the identity anchor: a persistent UUID that survives restarts, backed by a file on disk.",
+    "hostname and cwd in the EnvFingerprintObject are hashed to 12-char sha256 slices to avoid leaking local path information.",
+    "isSameEnvClass ignores cwd differences — it keys on device_id, node_version, platform, arch, os_release, and evolver/client version.",
+    "computeAssetId excludes the asset_id field itself from hashing (prevents circular dependency when the field is pre-populated).",
+    "crypto.js uses AES-256-GCM — authenticated encryption that combines confidentiality and integrity via the authTag.",
+    "The packed binary layout is deterministic: [IV(12)] + [authTag(16)] + [ciphertext(variable)]."
+  ],
+
+  "source_files_analyzed": [
+    "src/gep/deviceId.js (obfuscated — IR + class diagram context)",
+    "src/gep/envFingerprint.js (obfuscated — full source read)",
+    "src/gep/contentHash.js (obfuscated — full source read)",
+    "src/gep/crypto.js (obfuscated — full source read)",
+    "test/envFingerprint.test.js (plaintext — public API confirmed)",
+    "test/contentHash.test.js (plaintext — public API confirmed)",
+    "diagrams/class/context_gep_identity_and_security.json (prior class analysis)",
+    "ir_postprocessed.json (function entries for all four modules)"
+  ]
+}

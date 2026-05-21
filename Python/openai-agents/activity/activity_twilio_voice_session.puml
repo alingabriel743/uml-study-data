@@ -1,0 +1,176 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #212529
+    EndColor #DC3545
+    BarColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam noteFontSize 11
+skinparam noteBackgroundColor #E8F4FD
+skinparam noteBorderColor #5BA4CF
+
+title Twilio Voice Session Setup
+
+|Twilio Network|
+start
+:Incoming phone call arrives;
+:HTTP POST /incoming-call\n(or GET for initial handshake);
+
+|FastAPI / server.py|
+:Return TwiML Response:\n<Connect><Stream url='wss://{host}/media-stream'/>\n</Connect>;
+
+|Twilio Network|
+:Dial /media-stream WebSocket endpoint;
+
+|FastAPI / server.py|
+:@app.websocket('/media-stream')\nmedia_stream_endpoint(websocket) fires;
+:manager.new_session(websocket)\n[TwilioWebSocketManager];
+
+|TwilioHandler|
+:Instantiate TwilioHandler(websocket)\n- playback_tracker = RealtimePlaybackTracker()\n- audio_buffer = []\n- startup_buffer = []\n- _mark_data = {}\n- _mark_counter = 0\n- _stream_sid = None\n- _startup_warmed = False;
+note right
+  Env config:
+  STARTUP_BUFFER_CHUNKS (default=3)
+  STARTUP_DELAY_S (default=0.0)
+  Audio: g711_ulaw at 8kHz
+end note
+
+:handler.start();
+:Create RealtimeAgent\n(name='Twilio Assistant'\ntools=[get_weather, get_current_time]);
+:Create RealtimeRunner(agent);
+
+if (OPENAI_API_KEY present?) then (no)
+  #FFD6D6:Raise ValueError\n"API key not configured";
+  stop
+else (yes)
+endif
+
+:runner.run(\n  api_key=OPENAI_API_KEY,\n  model='gpt-realtime-1.5',\n  input_audio_format='g711_ulaw',\n  output_audio_format='g711_ulaw',\n  turn_detection=semantic_vad\n) → returns RealtimeSession;
+
+|OpenAI Realtime API|
+:Accept Realtime WebSocket connection\nfrom RealtimeRunner;
+:Activate session (session.id assigned);
+
+|TwilioHandler|
+:session.enter()\nActivate RealtimeSession\n(subscribe to events);
+:twilio_websocket.accept()\nComplete WebSocket handshake\nwith Twilio;
+
+if (STARTUP_DELAY_S > 0?) then (yes)
+  :asyncio.sleep(STARTUP_DELAY_S)\n[optional warm-up delay];
+else (no)
+endif
+
+note right
+  Three concurrent async tasks
+  are spawned simultaneously via
+  asyncio.gather() / create_task()
+end note
+
+fork
+  |#E8F5E9|TwilioHandler — Task A|
+  :_realtime_session_loop\n[OpenAI → Twilio];
+  repeat
+    :async for event in self.session;
+    if (event.type?) then (audio)
+      :Base64-encode audio bytes;
+      :Send 'media' JSON\nto Twilio WS (streamSid, payload);
+      :Increment _mark_counter;
+      :Send 'mark' JSON to Twilio WS\n(mark_id → item_id + byte_count);
+    elseif (audio_interrupted) then
+      :Send 'clear' JSON\nto Twilio WS (streamSid)\n[interrupt ongoing playback];
+    elseif (audio_end) then
+      :Log audio_end event;
+    else (other)
+      :No-op;
+    endif
+  repeat while (session active?)
+
+fork again
+  |#EAF2FF|TwilioHandler — Task B|
+  :_twilio_message_loop\n[Twilio → OpenAI];
+  repeat
+    :receive_text from Twilio WS;
+    :Parse JSON event;
+    if (event type?) then (connected)
+      :Log connected;
+    elseif (start) then
+      :Capture _stream_sid\nfrom start.streamSid;
+    elseif (media) then
+      :Decode base64 µ-law audio payload;
+      :Extend _audio_buffer;
+      if (len(_audio_buffer)\n>= BUFFER_SIZE_BYTES\n(~400 bytes / 50ms)?) then (yes)
+        :_flush_audio_buffer();
+      else (no)
+      endif
+    elseif (mark) then
+      :Lookup mark_id in _mark_data;
+      :playback_tracker.on_play_bytes(\n  item_id, content_index,\n  placeholder_bytes\n);
+      :Delete entry from _mark_data;
+    else (stop)
+      :Log stop;
+    endif
+  repeat while (connection active?)
+
+fork again
+  |#FFF8E1|TwilioHandler — Task C|
+  :_buffer_flush_loop\n[Periodic fallback, 50ms];
+  repeat
+    :asyncio.sleep(50ms);
+    if (buffer has data AND\ntime since last send > 100ms?) then (yes)
+      :_flush_audio_buffer();
+    else (no)
+    endif
+  repeat while (session active?)
+
+end fork
+
+note right
+  _flush_audio_buffer logic:
+  • If NOT warmed up → accumulate into startup_buffer
+    – If startup_buffer >= N_chunks × BUFFER_SIZE_BYTES
+      → session.send_audio(startup_buffer)
+        mark _startup_warmed = True
+    – Else keep buffering
+  • If already warmed up
+    → session.send_audio(buffer_data) immediately
+end note
+
+|FastAPI / server.py|
+:await handler.wait_until_done()\n(waits on _twilio_message_loop task);
+
+if (WebSocketDisconnect\nor Exception?) then (yes)
+  #FFD6D6:Log error / disconnection\nand exit gracefully;
+  stop
+else (no)
+  :Session completed normally;
+  stop
+endif
+
+@enduml

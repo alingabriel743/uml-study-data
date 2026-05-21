@@ -1,0 +1,242 @@
+{
+  "scope": "streaming_responses",
+  "title": "Streaming Responses",
+  "diagram_type": "use_case",
+  "description": "Developer consumes real-time streamed AI output, handling text chunks, tool-call deltas, and finish events via SSE/chunked responses.",
+
+  "actors": [
+    {
+      "name": "Developer",
+      "type": "primary",
+      "description": "Consumes the streaming API; iterates events, registers callbacks, returns HTTP responses"
+    },
+    {
+      "name": "AI Provider",
+      "type": "external",
+      "description": "Backend (OpenAI, Anthropic, Gemini, etc.) that generates the raw token stream via TextProvider::stream()"
+    },
+    {
+      "name": "Queue Worker",
+      "type": "external",
+      "description": "Executes BroadcastAgent jobs for async broadcast streaming"
+    },
+    {
+      "name": "Browser / SSE Client",
+      "type": "external",
+      "description": "Receives chunked SSE or Vercel-protocol data over HTTP"
+    },
+    {
+      "name": "WebSocket Channel",
+      "type": "external",
+      "description": "Receives broadcast StreamEvents via Laravel Echo/Reverb channels"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Stream Agent Response",
+      "actor": "Developer",
+      "entry_point": "Agent::stream(prompt, attachments?, provider?, model?): StreamableAgentResponse",
+      "description": "Invoke agent and receive a lazy StreamableAgentResponse backed by a generator closure. No I/O happens until iterated.",
+      "extends": []
+    },
+    {
+      "id": "UC2",
+      "name": "Iterate Stream Events",
+      "actor": "Developer",
+      "entry_point": "StreamableAgentResponse::getIterator() / foreach($response as $event)",
+      "description": "Lazily pulls events from the generator. On first iteration calls provider->stream(AgentPrompt). Events cached on Collection after first pass. Builds StreamedAgentResponse on completion.",
+      "extends": ["UC1"]
+    },
+    {
+      "id": "UC3",
+      "name": "Consume Text Delta Chunks",
+      "actor": "Developer",
+      "entry_point": "StreamableAgentResponse::each(fn(TextDelta $event) => ...)",
+      "description": "Receives TextDelta events (type='text_delta') carrying incremental text. TextDelta::combine() aggregates all deltas into full text.",
+      "event_type": "TextDelta",
+      "event_payload": "id, invocationId, messageId, delta, timestamp",
+      "extends": ["UC2"]
+    },
+    {
+      "id": "UC4",
+      "name": "Handle Tool Call Events",
+      "actor": "Developer",
+      "entry_point": "StreamableAgentResponse::each(fn(ToolCall $event) => ...)",
+      "description": "Receives ToolCall streaming events (type='tool_call') with tool id, name, arguments, optional reasoningId.",
+      "event_type": "ToolCall",
+      "event_payload": "id, invocationId, toolCall{id, name, arguments, reasoningId}, timestamp",
+      "extends": ["UC2"]
+    },
+    {
+      "id": "UC5",
+      "name": "Handle Tool Result Events",
+      "actor": "Developer",
+      "entry_point": "StreamableAgentResponse::each(fn(ToolResult $event) => ...)",
+      "description": "Receives ToolResult events (type='tool_result') with result, successful flag, and optional error.",
+      "event_type": "ToolResult",
+      "event_payload": "id, invocationId, toolResult{id, name, result}, successful, error, timestamp",
+      "extends": ["UC2"]
+    },
+    {
+      "id": "UC6",
+      "name": "Receive Stream Finish Event",
+      "actor": "Developer",
+      "entry_point": "StreamableAgentResponse::each(fn(StreamEnd $event) => ...)",
+      "description": "StreamEnd event (type='stream_end') signals completion; carries finish reason and token Usage. StreamEnd::combineUsage() aggregates across multi-step responses.",
+      "event_type": "StreamEnd",
+      "event_payload": "id, invocationId, reason, usage{inputTokens, outputTokens}, timestamp",
+      "extends": ["UC2"]
+    },
+    {
+      "id": "UC7",
+      "name": "Register Post-Stream Callback",
+      "actor": "Developer",
+      "entry_point": "StreamableAgentResponse::then(fn(StreamedAgentResponse $r) => ...)",
+      "description": "Registers a callback invoked after full iteration completes. If already streamed, callback fires immediately. Receives complete StreamedAgentResponse with text, usage, toolCalls, toolResults.",
+      "extends": ["UC2"]
+    },
+    {
+      "id": "UC8",
+      "name": "Return SSE HTTP Response",
+      "actor": "Developer",
+      "entry_point": "StreamableAgentResponse::toResponse($request) — default mode",
+      "description": "Wraps the iterator in Laravel response()->stream(). Yields 'data: {json}\\n\\n' per event then 'data: [DONE]\\n\\n'. Content-Type: text/event-stream.",
+      "extends": ["UC1"]
+    },
+    {
+      "id": "UC9",
+      "name": "Stream Using Vercel AI SDK Protocol",
+      "actor": "Developer",
+      "entry_point": "StreamableAgentResponse::usingVercelDataProtocol()->toResponse($request)",
+      "description": "Uses CanStreamUsingVercelProtocol trait. Sends start, text-delta, tool-input-available, tool-output-available, finish events. Defers StreamEnd to last. Sets x-vercel-ai-ui-message-stream: v1 header.",
+      "extends": ["UC8"]
+    },
+    {
+      "id": "UC10",
+      "name": "Broadcast Stream Events (Sync)",
+      "actor": "Developer",
+      "entry_point": "Agent::broadcast(prompt, channels, attachments?, now?, ...) or Agent::broadcastNow()",
+      "description": "Iterates stream; calls StreamEvent::broadcastNow(channels) per event using Laravel Broadcast. Sends immediately over WebSocket channels.",
+      "extends": ["UC2"]
+    },
+    {
+      "id": "UC11",
+      "name": "Broadcast Stream Events (Queued Job)",
+      "actor": "Developer",
+      "entry_point": "Agent::broadcastOnQueue() → dispatches BroadcastAgent job",
+      "description": "BroadcastAgent (ShouldQueue) queues stream+broadcast. handle() calls agent.stream().each(event→broadcastNow(channels)).then(response→withCallbacks()). DisplayName returns agent class.",
+      "extends": ["UC10"],
+      "actor_extends": "Queue Worker"
+    },
+    {
+      "id": "UC12",
+      "name": "Associate Stream with Conversation",
+      "actor": "Developer",
+      "entry_point": "StreamableAgentResponse::withinConversation(conversationId, conversationUser?)",
+      "description": "Sets conversationId and conversationUser on the response for conversation tracking.",
+      "extends": ["UC1"]
+    },
+    {
+      "id": "UC13",
+      "name": "Receive Reasoning Events",
+      "actor": "Developer",
+      "entry_point": "foreach yields ReasoningStart / ReasoningDelta / ReasoningEnd events",
+      "description": "Dedicated reasoning lifecycle events for chain-of-thought providers. Subtypes of StreamEvent.",
+      "event_types": ["ReasoningStart", "ReasoningDelta", "ReasoningEnd"],
+      "extends": ["UC2"]
+    }
+  ],
+
+  "key_classes": [
+    {
+      "name": "StreamableAgentResponse",
+      "namespace": "Laravel\\Ai\\Responses",
+      "implements": ["IteratorAggregate", "Responsable"],
+      "uses_trait": "CanStreamUsingVercelProtocol",
+      "key_methods": ["each(callable)", "then(callable)", "toResponse($request)", "getIterator()", "usingVercelDataProtocol()", "withinConversation()"],
+      "key_properties": "invocationId, generator(Closure), meta, events(Collection), text, usage, conversationId, usesVercelProtocol, thenCallbacks[], streamedResponse"
+    },
+    {
+      "name": "StreamedAgentResponse",
+      "namespace": "Laravel\\Ai\\Responses",
+      "extends": "AgentResponse",
+      "description": "Immutable aggregate built after full iteration; holds events, text, usage, toolCalls, toolResults."
+    },
+    {
+      "name": "StreamEvent",
+      "namespace": "Laravel\\Ai\\Streaming\\Events",
+      "type": "abstract class",
+      "key_methods": ["broadcast(channels, now)", "broadcastNow(channels)", "type()", "toArray()", "toVercelProtocolArray()", "__toString()"],
+      "subclasses": ["StreamStart", "TextDelta", "TextStart", "TextEnd", "ToolCall", "ToolResult", "StreamEnd", "ReasoningStart", "ReasoningDelta", "ReasoningEnd", "Error", "Citation", "ProviderToolEvent"]
+    },
+    {
+      "name": "BroadcastAgent",
+      "namespace": "Laravel\\Ai\\Jobs",
+      "implements": "ShouldQueue",
+      "key_methods": ["handle()", "displayName()"],
+      "constructor_params": "Agent $agent, string $prompt, Channel|array $channels, array $attachments, provider, model"
+    },
+    {
+      "name": "Agent",
+      "namespace": "Laravel\\Ai\\Contracts",
+      "type": "interface",
+      "streaming_methods": ["stream(...): StreamableAgentResponse", "broadcast(...): StreamableAgentResponse", "broadcastNow(...): StreamableAgentResponse", "broadcastOnQueue(...): QueuedAgentResponse"]
+    }
+  ],
+
+  "streaming_event_types": [
+    {"type": "stream_start", "class": "StreamStart", "vercel_type": "start", "payload": "id, provider, model, timestamp, metadata?"},
+    {"type": "text_delta",   "class": "TextDelta",   "vercel_type": "text-delta", "payload": "id, messageId, delta, timestamp"},
+    {"type": "tool_call",    "class": "ToolCall",    "vercel_type": "tool-input-available", "payload": "id, toolCall{id,name,arguments,reasoningId}, timestamp"},
+    {"type": "tool_result",  "class": "ToolResult",  "vercel_type": "tool-output-available", "payload": "id, toolResult{id,name,result}, successful, error, timestamp"},
+    {"type": "stream_end",   "class": "StreamEnd",   "vercel_type": "finish", "payload": "id, reason, usage{inputTokens,outputTokens}, timestamp"},
+    {"type": "text_start",   "class": "TextStart",   "vercel_type": null},
+    {"type": "text_end",     "class": "TextEnd",     "vercel_type": null},
+    {"type": "reasoning_start", "class": "ReasoningStart", "vercel_type": null},
+    {"type": "reasoning_delta", "class": "ReasoningDelta", "vercel_type": null},
+    {"type": "reasoning_end",   "class": "ReasoningEnd",   "vercel_type": null},
+    {"type": "error",        "class": "Error",        "vercel_type": null},
+    {"type": "citation",     "class": "Citation",     "vercel_type": null},
+    {"type": "provider_tool_event", "class": "ProviderToolEvent", "vercel_type": null}
+  ],
+
+  "delivery_modes": [
+    {"mode": "SSE (default)",          "method": "toResponse()", "content_type": "text/event-stream", "format": "data: {json}\\n\\n ... data: [DONE]\\n\\n"},
+    {"mode": "Vercel AI SDK Protocol", "method": "usingVercelDataProtocol()->toResponse()", "content_type": "text/event-stream", "extra_header": "x-vercel-ai-ui-message-stream: v1"},
+    {"mode": "Laravel Broadcasting",   "method": "StreamEvent::broadcast(channels) / broadcastNow()", "transport": "WebSocket via Broadcast facade"},
+    {"mode": "Queued Broadcast",       "method": "BroadcastAgent (ShouldQueue) job", "transport": "Queue + WebSocket"}
+  ],
+
+  "key_relationships": [
+    "StreamableAgentResponse implements IteratorAggregate (lazy generator-backed iteration)",
+    "StreamableAgentResponse implements Responsable (returns SSE HTTP response)",
+    "StreamableAgentResponse uses CanStreamUsingVercelProtocol trait",
+    "StreamableAgentResponse creates StreamedAgentResponse after first full iteration",
+    "StreamedAgentResponse extends AgentResponse",
+    "All streaming events extend abstract StreamEvent",
+    "BroadcastAgent depends_on Agent::stream() and StreamEvent::broadcastNow()",
+    "Agent interface defines stream(), broadcast(), broadcastNow(), broadcastOnQueue()",
+    "Promptable trait implements Agent interface stream/broadcast methods",
+    "Multiple AI gateways implement TextProvider::stream() → StreamableAgentResponse"
+  ],
+
+  "important_notes": "StreamableAgentResponse is lazy — no HTTP/AI call until iterated. Events are cached after first iteration for reuse. then() fires immediately if already streamed. Vercel protocol defers StreamEnd to end of stream and filters orphan ToolResults. BroadcastAgent uses InvokesQueuedResponseCallbacks concern for post-job callbacks.",
+
+  "source_files_analyzed": [
+    "src/Responses/StreamableAgentResponse.php",
+    "src/Responses/StreamedAgentResponse.php",
+    "src/Responses/Concerns/CanStreamUsingVercelProtocol.php",
+    "src/Jobs/BroadcastAgent.php",
+    "src/Contracts/Agent.php",
+    "src/Promptable.php (stream/broadcast methods)",
+    "src/Streaming/Events/StreamEvent.php",
+    "src/Streaming/Events/StreamStart.php",
+    "src/Streaming/Events/TextDelta.php",
+    "src/Streaming/Events/ToolCall.php",
+    "src/Streaming/Events/ToolResult.php",
+    "src/Streaming/Events/StreamEnd.php",
+    "src/Streaming/Events/ (Citation, Error, ProviderToolEvent, ReasoningDelta/End/Start, TextStart/End)"
+  ]
+}

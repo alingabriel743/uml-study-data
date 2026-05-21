@@ -1,0 +1,180 @@
+{
+  "scope": "datadog_config_management",
+  "title": "Datadog INI Configuration Management",
+  "diagram_type": "activity",
+  "entry_point": "main() → switch(cmd): CMD_CONFIG_LIST | CMD_CONFIG_GET | CMD_CONFIG_SET",
+
+  "activities": [
+    {
+      "name": "cmd_config_list",
+      "signature": "cmd_config_list(array $options): void",
+      "steps": [
+        "Call config_list($options) → returns array<string, IniRecord>",
+        "For each IniRecord: call $record->println()"
+      ]
+    },
+    {
+      "name": "cmd_config_get",
+      "signature": "cmd_config_get(array $options): void",
+      "steps": [
+        "[Guard] if !isset($options['d']) → print_help(), return",
+        "Call config_list($options) → group records by setting name (one setting may exist in multiple INI files)",
+        "For each requested setting in $options['d']:",
+        "  [Branch] if not in records → echo '; <setting> = undefined; is missing in INI files'",
+        "  [Branch] if found → for each IniRecord: $record->println()"
+      ]
+    },
+    {
+      "name": "cmd_config_set",
+      "signature": "cmd_config_set(array $options): void",
+      "steps": [
+        "[Guard] if !isset($options['d']) → print_help(), return",
+        "require_binaries_or_exit($options) → $selectedBinaries",
+        "For each PHP binary ($command => $fullPath):",
+        "  echo 'Setting configuration for binary: ...'",
+        "  ini_values($fullPath) → $phpProps",
+        "  For each CLI setting string in $options['d']:",
+        "    parse_ini_setting($cliIniSetting) → [Branch] false → echo skip warning, continue",
+        "    find_all_ini_files($phpProps) → $allIniFilePaths (98-ddtrace.ini sorted first)",
+        "    [PASS 1 — update active lines]",
+        "    For each $iniFile: update_ini_setting($setting, $iniFile, promoteComment=false)",
+        "      → count=0: skip | count=false: echo error | count>0: echo success, $matchCount++",
+        "    [Branch] $matchCount >= 1 → done (if >= 2: echo duplicate warning); continue next setting",
+        "    [PASS 2 — promote commented lines]",
+        "    For each $iniFile: update_ini_setting($setting, $iniFile, promoteComment=true)",
+        "      → count=0: skip | count=false: echo error | count>0: echo success, $matchCount++, break",
+        "    [Branch] $matchCount >= 1 → done; continue next setting",
+        "    [PASS 3 — create new entry in main INI file]",
+        "    find_main_ini_files($phpProps) → $mainIniFilePaths",
+        "    For each $iniFile:",
+        "      [Branch] file does not exist → attempt file_put_contents('') to create it; on failure echo error, continue",
+        "      Read existing content; if not ending with EOL → append EOL",
+        "      Append 'key = value' line; file_put_contents()",
+        "      [Branch] write fails → echo error | success → echo success, $set=true",
+        "    [Branch] !$set → echo unable, exit(1)"
+      ]
+    },
+    {
+      "name": "config_list",
+      "signature": "config_list(array $options): array<string, IniRecord>",
+      "steps": [
+        "get_ini_settings('','','') → full array of DD INI setting definitions",
+        "array_slice(..., CMD_CONFIG_NUM_SHIFT=3) → skip the 3 'extension=' entries",
+        "Build $indexByName keyed by setting 'name'",
+        "require_binaries_or_exit($options) → iterate binaries",
+        "For each binary: find_all_ini_files(ini_values($fullPath)) → $iniFilePaths",
+        "For each INI file: parse_ini_file($path, false, INI_SCANNER_RAW) → raw settings",
+        "array_intersect_key(raw, $indexByName) → only Datadog settings",
+        "For each matched setting: create IniRecord(setting, currentValue, defaultValue, iniFile, binary)",
+        "Return $return array indexed by setting name (later entries overwrite earlier ones)"
+      ]
+    },
+    {
+      "name": "parse_ini_setting",
+      "signature": "parse_ini_setting(string $setting): false|array{0:string, 1:string}",
+      "steps": [
+        "explode('=', $setting, 2) then trim each part → [$key, $value]",
+        "[Branch] count != 2 → return false",
+        "parse_ini_string('key=value', false, INI_SCANNER_RAW) → validate",
+        "[Branch] parse fails → return false",
+        "Return [$key, $value]"
+      ]
+    },
+    {
+      "name": "update_ini_setting",
+      "signature": "update_ini_setting(array $setting, string $iniFile, bool $promoteComment): false|int",
+      "steps": [
+        "file_get_contents($iniFile) → $iniFileContent",
+        "[Branch] $promoteComment=true → regex matches commented OR active lines (^[\\h;]*key\\h*=...)",
+        "[Branch] $promoteComment=false → regex matches only active lines (^\\h*key\\h*=...)",
+        "preg_replace(regex, 'key = value', content, limit=($promoteComment ? 1 : -1), $count)",
+        "[Branch] preg_replace returns null → return false (regex error)",
+        "[Branch] $count > 0 → file_put_contents($iniFile, newContent); if fails → return false",
+        "Return $count (0 = not found, >0 = replaced)"
+      ]
+    },
+    {
+      "name": "find_all_ini_files",
+      "signature": "find_all_ini_files(array $phpProperties): string[]",
+      "steps": [
+        "Scan $phpProperties[INI_SCANDIR] for *.ini files; put 98-ddtrace.ini first in array",
+        "[Branch] Debian-based (path contains /cli/conf.d) → also scan ../apache2/conf.d and ../fpm/conf.d",
+        "[Branch] INI_MAIN is set and is a file → use only that file as the list",
+        "filter_ssi_ini_paths() → remove paths containing 'datadog-apm-library-php'",
+        "Return sorted path list"
+      ]
+    },
+    {
+      "name": "find_main_ini_files",
+      "signature": "find_main_ini_files(array $phpProperties): string[]",
+      "steps": [
+        "[Branch] INI_SCANDIR set:",
+        "  Default filename: 98-ddtrace.ini",
+        "  Scan directory for any .ini file containing 'extension = ddtrace' → use that filename instead",
+        "  [Branch] Debian-based → also derive apache2/fpm SAPI paths",
+        "  Return [scanDir/filename, ...SAPIPaths]",
+        "[Branch] INI_SCANDIR not set, INI_MAIN set → return [INI_MAIN]",
+        "[Branch] Neither set → return []"
+      ]
+    },
+    {
+      "name": "ini_values",
+      "signature": "ini_values(string $binary): array",
+      "steps": [
+        "exec(binary + ' -d date.timezone=UTC -i') → $lines",
+        "Parse lines split by '=>' for keys: PHP_VER, INI_MAIN, INI_SCANDIR, EXTENSION_DIR, THREAD_SAFETY, PHP_API, IS_DEBUG",
+        "Skip values '(none)'",
+        "Return associative array of PHP environment properties"
+      ]
+    },
+    {
+      "name": "get_ini_settings",
+      "signature": "get_ini_settings(string $sourcesDir, string $appsecHelperPath, string $appsecRulesPath): array",
+      "steps": [
+        "Returns hardcoded array of all Datadog INI setting definitions",
+        "First 3 entries are 'extension' type (ddtrace, datadog-profiling, ddappsec) — skipped by config commands via CMD_CONFIG_NUM_SHIFT=3",
+        "Remaining entries are datadog.* settings with: name, default, commented, description"
+      ]
+    }
+  ],
+
+  "key_data_structures": [
+    "IniRecord: {setting: string, currentValue: string, defaultValue: string, iniFile: string, binary: string, println()}",
+    "INI setting definition: {name: string, default: string, commented: bool, description: string|string[]}",
+    "parsed setting: [0: string key, 1: string value]",
+    "phpProperties: assoc array keyed by PHP_VER, INI_MAIN, INI_SCANDIR, EXTENSION_DIR, THREAD_SAFETY, PHP_API, IS_DEBUG"
+  ],
+
+  "key_constants": [
+    "CMD_CONFIG_NUM_SHIFT = 3 (extension= entries to skip in get_ini_settings output)",
+    "CMD_CONFIG_GET, CMD_CONFIG_SET, CMD_CONFIG_LIST (command discriminators in main())",
+    "INI_SCANDIR, INI_MAIN, EXTENSION_DIR (keys in phpProperties)",
+    "OPT_PHP_BIN = '--php-bin' CLI option for selecting PHP binaries"
+  ],
+
+  "branching_conditions": [
+    "config set PASS 1: active match found in any INI file → update all, warn if duplicates",
+    "config set PASS 2: no active match → search commented lines, promote first occurrence only",
+    "config set PASS 3: no active or commented match → append to main INI file (create if missing)",
+    "config set: file creation fails → echo error, continue to next main file",
+    "config set: all main files fail → exit(1)",
+    "config get: setting name not in config_list results → print 'undefined; is missing in INI files'",
+    "Debian detection: INI_SCANDIR contains '/cli/conf.d' → also process apache2/fpm SAPI dirs",
+    "parse_ini_setting: not exactly 2 parts OR parse_ini_string fails → return false (skip setting)"
+  ],
+
+  "call_graph": [
+    "cmd_config_list → config_list → require_binaries_or_exit, get_ini_settings, ini_values, find_all_ini_files",
+    "cmd_config_get → config_list (same as above)",
+    "cmd_config_set → require_binaries_or_exit, ini_values, parse_ini_setting, find_all_ini_files, update_ini_setting (×2 passes), find_main_ini_files",
+    "require_binaries_or_exit → pick_binaries_interactive | search_php_binaries | resolve_command_full_path",
+    "find_all_ini_files → filter_ssi_ini_paths",
+    "find_main_ini_files → (reads INI files to detect extension=ddtrace line)"
+  ],
+
+  "important_notes": "config list/get share the config_list() helper which indexes DD settings by name. A setting can appear in multiple INI files; get groups them while list overwrites (last wins). The 3-pass strategy in config set ensures existing active > commented > new-entry precedence. 98-ddtrace.ini is always prioritized (sorted first) in find_all_ini_files. Debian-based distros get SAPI-split INI dirs handled transparently.",
+
+  "source_files_analyzed": [
+    "datadog-setup.php (functions: main, cmd_config_list, cmd_config_get, cmd_config_set, config_list, parse_ini_setting, update_ini_setting, find_all_ini_files, find_main_ini_files, ini_values, get_ini_settings, require_binaries_or_exit, filter_ssi_ini_paths, class IniRecord)"
+  ]
+}

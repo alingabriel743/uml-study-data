@@ -1,0 +1,90 @@
+{
+  "scope": "input_guardrails_execution",
+  "title": "Input Guardrails Execution",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Runner (run.py)",
+    "run_input_guardrails / run_input_guardrails_with_queue",
+    "run_single_input_guardrail",
+    "InputGuardrail",
+    "guardrail_function (user-defined)",
+    "GuardrailFunctionOutput",
+    "InputGuardrailResult",
+    "asyncio (task scheduler)",
+    "guardrail_span (tracing)",
+    "RunResultStreaming._input_guardrail_queue",
+    "InputGuardrailTripwireTriggered (exception)"
+  ],
+  "interaction_flow": [
+    "Runner → split guardrails: sequential_guardrails = [g for g if not g.run_in_parallel], parallel_guardrails = [g for g if g.run_in_parallel]",
+    "--- SEQUENTIAL (blocking) path ---",
+    "Runner → run_input_guardrails(agent, sequential_guardrails, input, context)",
+    "run_input_guardrails → asyncio.create_task(run_single_input_guardrail(...)) for each guardrail [parallel tasks]",
+    "run_input_guardrails → asyncio.as_completed(tasks): iterate results as they finish",
+    "run_input_guardrails → run_single_input_guardrail(agent, guardrail, input, context): InputGuardrailResult",
+    "run_single_input_guardrail → guardrail_span(guardrail.get_name()): open tracing span",
+    "run_single_input_guardrail → InputGuardrail.run(agent, input, context): InputGuardrailResult",
+    "InputGuardrail.run → guardrail_function(context, agent, input): GuardrailFunctionOutput (sync or async)",
+    "InputGuardrail.run → return InputGuardrailResult(guardrail=self, output=GuardrailFunctionOutput)",
+    "run_single_input_guardrail → span_guardrail.span_data.triggered = result.output.tripwire_triggered",
+    "run_single_input_guardrail → return InputGuardrailResult",
+    "run_input_guardrails → check result.output.tripwire_triggered:",
+    "  [tripwire=True] → cancel all remaining tasks, gather(return_exceptions=True), attach SpanError, raise InputGuardrailTripwireTriggered(result)",
+    "  [tripwire=False] → append to guardrail_results, continue loop",
+    "run_input_guardrails → return list[InputGuardrailResult] to Runner",
+    "Runner → proceed to model call (agent never started during sequential guardrail run)",
+    "--- PARALLEL path ---",
+    "Runner → asyncio.gather(run_input_guardrails(parallel_guardrails, ...), run_single_turn(...))",
+    "--- STREAMING path: run_input_guardrails_with_queue ---",
+    "Runner → asyncio.create_task(run_input_guardrails_with_queue(agent, guardrails, input, context, streamed_result, parent_span))",
+    "run_input_guardrails_with_queue → queue = streamed_result._input_guardrail_queue",
+    "run_input_guardrails_with_queue → asyncio.create_task(run_single_input_guardrail(...)) per guardrail",
+    "run_input_guardrails_with_queue → asyncio.as_completed: iterate results",
+    "  [tripwire=True] → streamed_result.input_guardrail_results += guardrail_results, streamed_result._triggered_input_guardrail_result = result, queue.put_nowait(result), cancel all tasks, attach SpanError to parent_span, break",
+    "  [tripwire=False] → guardrail_results.append(result), queue.put_nowait(result)",
+    "run_input_guardrails_with_queue → streamed_result.input_guardrail_results += remaining guardrail_results"
+  ],
+  "key_data_objects": [
+    "GuardrailFunctionOutput: {output_info: Any, tripwire_triggered: bool}",
+    "InputGuardrailResult: {guardrail: InputGuardrail[Any], output: GuardrailFunctionOutput}",
+    "InputGuardrail: {guardrail_function: Callable, name: str|None, run_in_parallel: bool=True}",
+    "InputGuardrailTripwireTriggered(AgentsException): {guardrail_result: InputGuardrailResult}",
+    "SpanError: {message: str, data: {guardrail: str, type: str}}"
+  ],
+  "key_relationships": [
+    "Runner depends_on run_input_guardrails (non-streaming)",
+    "Runner depends_on run_input_guardrails_with_queue (streaming)",
+    "run_input_guardrails delegates_to run_single_input_guardrail via asyncio tasks",
+    "run_single_input_guardrail delegates_to InputGuardrail.run",
+    "InputGuardrail.run invokes guardrail_function (user-provided, sync or async)",
+    "guardrail_function returns GuardrailFunctionOutput",
+    "InputGuardrail.run wraps result in InputGuardrailResult",
+    "run_single_input_guardrail opens guardrail_span for tracing",
+    "run_input_guardrails_with_queue writes to RunResultStreaming._input_guardrail_queue"
+  ],
+  "execution_modes": {
+    "sequential_blocking": "run_in_parallel=False; guardrail runs and completes BEFORE model call; tripwire prevents agent from ever starting; cost-safe",
+    "parallel_concurrent": "run_in_parallel=True (default); guardrail runs concurrently with model call; tripwire cancels agent mid-execution; best latency",
+    "streaming_queue": "run_input_guardrails_with_queue used in streaming mode; results pushed to asyncio queue for downstream consumption"
+  },
+  "tripwire_logic": [
+    "Each InputGuardrailResult.output.tripwire_triggered is checked as results complete (asyncio.as_completed)",
+    "First tripwire hit: cancel all remaining guardrail tasks immediately",
+    "Attach SpanError to tracing span (parent_span or current span)",
+    "Non-streaming: raise InputGuardrailTripwireTriggered(result)",
+    "Streaming: set streamed_result._triggered_input_guardrail_result, put result in queue, break loop",
+    "Guardrails only run for first agent in chain (turn==1)"
+  ],
+  "tracing": [
+    "guardrail_span(guardrail.get_name()) opened per guardrail in run_single_input_guardrail",
+    "span_data.triggered = result.output.tripwire_triggered recorded on span close",
+    "SpanError attached to parent_span or current_span on tripwire"
+  ],
+  "important_notes": "Input guardrails only run on turn 1 (first agent). run_in_parallel=True is default. Both sync and async guardrail functions are supported (inspect.isawaitable). Sequential guardrails must all pass before model starts. The streaming queue (put_nowait) enables real-time guardrail result consumption during streaming.",
+  "source_files_analyzed": [
+    "src/agents/run_internal/guardrails.py",
+    "src/agents/guardrail.py",
+    "src/agents/run.py",
+    "docs/guardrails.md"
+  ]
+}

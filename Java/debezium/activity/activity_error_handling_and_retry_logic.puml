@@ -1,0 +1,153 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activityBackgroundColor #F8F9FA
+skinparam activityBorderColor #495057
+skinparam activityArrowColor #495057
+skinparam activityFontColor #212529
+skinparam activityDiamondBackgroundColor #E9ECEF
+skinparam activityDiamondBorderColor #6C757D
+skinparam swimlaneBorderColor #6C757D
+skinparam swimlaneTitleBackgroundColor #DEE2E6
+skinparam swimlaneTitleFontColor #212529
+skinparam noteBackgroundColor #FFF9C4
+skinparam noteBorderColor #F0AD00
+
+title Error Handling and Retry Logic\n<size:11>Debezium CDC Connector — io.debezium.pipeline / io.debezium.connector.mysql</size>
+
+' ─────────────────────────────────────────────────────────────
+'  MAIN ERROR HANDLING FLOW
+' ─────────────────────────────────────────────────────────────
+
+|Producer|
+start
+:Encounter <b>Throwable</b>\nduring CDC event processing;
+
+|ErrorHandler|
+:setProducerThrowable(throwable)\n<i>Log error at ERROR level with stack trace</i>;
+
+:AtomicReference CAS:\nproducerThrowable.compareAndSet(null, throwable)\n→ capture boolean <b>first</b>;
+note right
+  Thread-safe guard ensures
+  only the <b>first</b> throwable
+  is ever processed
+end note
+
+if (first == false?\n(concurrent/duplicate error)) then (yes — discard)
+  :Silently discard throwable\nno further processing;
+  stop
+else (no — first error, proceed)
+endif
+
+' ── isRetriable evaluation ──
+:Invoke <b>isRetriable(throwable)</b>;
+
+|MySqlErrorHandler|
+:Walk throwable cause chain\nlooking for <b>SQLException</b>;
+
+if (SQLException found AND\nerror code in NON_RETRIABLE_CODES?\n<i>code 1236 = ER_MASTER_FATAL_ERROR\n_READING_BINLOG</i>) then (yes — fatal MySQL code)
+  :Return <b>false</b>\n<i>(MySQL override short-circuits\nbefore calling super)</i>;
+else (no — no fatal MySQL error code)
+  :Delegate to <b>super.isRetriable()</b>\nusing communicationExceptions:\n{IOException.class, SQLException.class};
+endif
+
+|ErrorHandler|
+if (throwable class or cause chain\nmatches communicationExceptions?) then (yes)
+  :<b>isRetriable = true</b>;
+else (no — no matching exception type)
+  :<b>isRetriable = false</b>;
+endif
+
+' ── custom retriable override ──
+if (isRetriable == false?) then (yes — check custom rule)
+  if (isCustomRetriable?\nmessage matches\nconnectorConfig.customRetriableException\nregex pattern) then (yes — custom match)
+    :<b>retriable = true</b>\n<i>(custom regex override)</i>;
+  else (no — no custom match)
+    :<b>retriable = false</b>\n<i>(confirmed non-retriable)</i>;
+  endif
+else (no — already retriable)
+  :<b>retriable = true</b>;
+endif
+
+' ── retry count check ──
+if (retriable == true?) then (yes — retriable error)
+  :Invoke <b>hasMoreRetries()</b>;
+
+  if (maxRetries == RETRIES_UNLIMITED\n(-1)?) then (yes — unlimited retries)
+    :retries++\nLog WARN "Retry N of unlimited";
+    :<b>doRetry = true</b>;
+  elseif (retries < maxRetries?) then (yes — within configured limit)
+    :retries++\nLog WARN "Retry N of M";
+    :<b>doRetry = true</b>;
+  else (no — limit exhausted)
+    :Log ERROR "Max retries reached"\n<b>doRetry = false</b>;
+  endif
+
+else (no — non-retriable error)
+  :<b>doRetry = false</b>;
+endif
+
+' ── queue propagation ──
+if (doRetry == true?) then (yes — attempt retry)
+  |ChangeEventQueue|
+  :queue.producerException(\nnew <b>RetriableException</b>(...));
+  note right
+    Kafka Connect receives
+    **RETRIABLE** signal
+    → Connector task restarted
+    → retries counter preserved
+       across ErrorHandler replacement
+  end note
+  stop
+else (no — stop connector)
+  |ChangeEventQueue|
+  :queue.producerException(\nnew <b>ConnectException</b>(...));
+  note right
+    Kafka Connect receives
+    **FATAL** signal
+    → Connector stopped permanently
+    → Manual intervention required
+  end note
+  stop
+endif
+
+' ─────────────────────────────────────────────────────────────
+'  HEARTBEAT ERROR HANDLING FLOW  (independent path)
+' ─────────────────────────────────────────────────────────────
+
+|BinlogHeartbeatErrorHandler|
+start
+:onError(SQLException e)\ninvoked during heartbeat execution;
+
+:sqlState = e.getSQLState();
+
+switch (sqlState value?)
+case ('42000'\n— ER_DBACCESS_DENIED_ERROR)
+  :throw <b>DebeziumException</b>\n<i>"Access denied for heartbeat schema"</i>;
+  note right
+    Non-retriable — terminates
+    connector via error handler
+  end note
+  stop
+case ('3D000'\n— ER_NO_DB_ERROR)
+  :throw <b>DebeziumException</b>\n<i>"Heartbeat schema not found"</i>;
+  note right
+    Non-retriable — terminates
+    connector via error handler
+  end note
+  stop
+case (default\n— other SQL state)
+  :No-op: silently swallow\nSQLException;
+  note right
+    Transient heartbeat issues
+    are intentionally ignored
+    (DEFAULT_NOOP_ERRORHANDLER
+    also always swallows)
+  end note
+  stop
+endswitch
+
+@enduml

@@ -1,0 +1,222 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    StartColor #343A40
+    EndColor #343A40
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #495057
+    DiamondFontColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam noteBackgroundColor #FFFDE7
+skinparam noteBorderColor #ADB5BD
+
+title Resource Transport & Distribution
+
+' ─────────────────────────────────────────────
+' GAME ENGINE — tick trigger
+' ─────────────────────────────────────────────
+|#DDEEFF| Game Engine |
+start
+:Game tick fires\n(updateTile() dispatched to each building);
+note right
+  Common item-passing protocol:
+  source → dest.acceptItem(src, item)
+  If accepted → dest.handleItem(src, item)
+end note
+
+' ─────────────────────────────────────────────
+' CONVEYOR — forward belt transport
+' ─────────────────────────────────────────────
+|#E8F5E9| Conveyor |
+if (len == 0 AND timeScale == 1?) then (empty)
+  :Set clogHeat = 0;
+  :sleep() — skip further processing;
+else (has items)
+  :Compute nextMax\n(aligned to downstream conveyor:\n1 - max(itemSpace - nextc.minitem, 0));
+  :FOR each item i from back to front;
+  :maxmove = clamp(nextpos - ys[i], 0, moved);
+  :ys[i] += maxmove (capped at nextMax);
+  :xs[i] approach 0 (center alignment);
+  if (ys[i] >= 1.0?) then (at exit)
+    if (next != null\nAND next.acceptItem(this, item)?) then (accepted)
+      :next.handleItem(this, item);
+      :Remove item from conveyor array;
+    else (blocked)
+      :Item waits at front position;
+    endif
+  else (still moving)
+    :Track minitem spacing;
+  endif
+  if (minitem < itemSpace threshold?) then (backed up)
+    :Increment clogHeat (max 1.0);
+  else (flowing freely)
+    :Reset clogHeat = 0;
+  endif
+endif
+
+' ─────────────────────────────────────────────
+' ROUTER — round-robin distribution
+' ─────────────────────────────────────────────
+|#FFF9C4| Router |
+if (lastItem == null AND items.any()?) then (yes)
+  :lastItem = items.first();
+endif
+if (lastItem != null?) then (item pending)
+  :time += 1/speed × delta();
+  :getTileTarget(lastItem, lastInput, flip=false)\n→ scan proximity[] from rotation offset;
+  note right
+    Skips overflowGate-sourced tiles
+    to prevent feedback loops.
+    Unit-controlled: uses aim angle
+    to compute quadrant for routing.
+  end note
+  if (target found\nAND (time >= 1 OR target not instantTransfer)?) then (ready to send)
+    :getTileTarget(lastItem, lastInput, flip=true)\n[advance rotation counter for round-robin];
+    :target.handleItem(this, lastItem);
+    :items.remove(lastItem);\nlastItem = null; time = 0;
+  else (not ready)
+    :Hold item — wait for timer or valid target;
+  endif
+else (no item)
+  :Idle — nothing to route;
+endif
+
+' ─────────────────────────────────────────────
+' JUNCTION — directional crossover buffer
+' ─────────────────────────────────────────────
+|#EDE7F6| Junction |
+:FOR each direction i in [0..3];
+if (buffer.indexes[i] > 0?) then (lane has items)
+  :Cap indexes[i] to capacity if overflowed;
+  :Read buffer[i][0];\nextract stored_time via BufferItem.time();
+  if (Time.time >= stored_time + speed/timeScale\nOR time counter wrapped?) then (transit complete)
+    :dest = nearby(i);
+    if (dest exists\nAND same team\nAND dest.acceptItem(this, item)?) then (accepted)
+      :dest.handleItem(this, item);
+      :Remove from directional buffer\n(arraycopy left-shift; indexes[i]--);
+    else (blocked)
+      :Item waits in directional lane i;
+    endif
+  else (in transit)
+    :Transit time not elapsed — keep waiting;
+  endif
+else (empty lane)
+  :Direction i empty — skip;
+endif
+note right
+  Junction uses DirectionalItemBuffer:
+  4 independent lanes (one per direction).
+  Items cross without merging; transit ≈ 26 frames.
+  handleItem: buffer.accept(relativeDir, item)
+  acceptItem: buffer.accepts(relativeDir) AND nearby(rel) exists
+end note
+
+' ─────────────────────────────────────────────
+' OVERFLOW GATE — forward-priority with side fallback
+' ─────────────────────────────────────────────
+|#FCE4EC| OverflowGate |
+note right: Instantaneous transfer — no tick; triggered synchronously on item arrival
+:Item arrives → handleItem(source, item) called;
+:from = relativeToEdge(source.tile);
+:to = nearby((from + 2) % 4)\n— compute forward output direction;
+:canForward = to exists\nAND NOT (instantTransfer → instantTransfer)\nAND to.acceptItem(this, item);
+:inv = (invert XOR enabled) — invert flag;
+if (canForward AND NOT inv?) then (forward path clear)
+  :Route item forward to 'to';
+else (forward blocked or inverted)
+  :a = nearby((from - 1) % 4)  [left side];
+  :b = nearby((from + 1) % 4)  [right side];
+  if (neither a nor b accepts?) then (both sides blocked)
+    if (inv AND canForward?) then (invert fallback)
+      :Route forward to 'to' as last resort;
+    else (fully blocked)
+      :Item cannot be placed — hold;
+    endif
+  elseif (only one side accepts?) then (single side open)
+    :Route to the accepting side;
+  else (both sides accept)
+    :Alternate between a and b\nvia rotation bitmask (round-robin);
+  endif
+endif
+
+' ─────────────────────────────────────────────
+' OVERFLOW DUCT — timed duct with overflow fallback
+' ─────────────────────────────────────────────
+|#E0F2F1| OverflowDuct |
+:updateTile() called;
+:progress += edelta() / speed × 2;
+if (current != null\nAND progress >= delivery threshold?) then (item ready to deliver)
+  :target = target();
+  note right
+    Normal mode: try front() first (forward dir);
+    if blocked: iterate sides via cdump round-robin
+    (dir = mod(rotation + offset + cdump, 4), skip rotation dir).
+    Invert mode: try left() and right() first;
+    if both accept → cdump alternates; front() is last resort.
+  end note
+  if (target found?) then (yes)
+    :target.handleItem(this, current);
+    :Toggle cdump (0 ↔ 2);
+    :items.remove(); current = null;
+    :progress %= threshold;
+  else (blocked)
+    :All outputs blocked — retain current item;
+  endif
+endif
+if (current == null AND items.total() > 0?) then (yes)
+  :current = items.first()\n— load next item for transit;
+endif
+
+' ─────────────────────────────────────────────
+' BUFFERED ITEM BRIDGE — cross-distance buffered transport
+' ─────────────────────────────────────────────
+|#FBE9E7| BufferedItemBridge |
+:updateTransport(other: Building)\ncalled by parent ItemBridge.updateTile();
+if (buffer.accepts() AND items.total() > 0?) then (yes)
+  :item = items.take();
+  :buffer.accept(item)\n— enqueue with timestamp (TimeItem packed long);
+endif
+:buffer.poll(speed / timeScale)\n→ dequeue head item if time elapsed (FIFO);
+note right
+  ItemBuffer packed format:
+  long = TimeItem(short data, short itemId, float time)
+  Capacity: 50 items; speed-gated FIFO dequeue.
+end note
+if (timerAccept fires (4 / timeScale)\nAND item != null\nAND other.acceptItem(this, item)?) then (transfer ready)
+  :other.handleItem(this, item);
+  :buffer.remove()\n— left-shift arraycopy; index--;
+else (not ready)
+  :Item remains buffered — wait next cycle;
+endif
+
+' ─────────────────────────────────────────────
+' GAME ENGINE — tick complete
+' ─────────────────────────────────────────────
+|#DDEEFF| Game Engine |
+:All transport buildings updated for this tick;
+stop
+
+@enduml

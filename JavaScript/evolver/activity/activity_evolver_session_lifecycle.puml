@@ -1,0 +1,151 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+    ArrowColor #495057
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+}
+skinparam swimlane {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleFontSize 11
+}
+skinparam noteBackgroundColor #D1ECF1
+skinparam noteBorderColor #0C5460
+
+title Evolver Session Lifecycle
+
+'─────────────────────────────────────────
+'  PHASE 1 — SESSION START
+'─────────────────────────────────────────
+
+|Hook Runner (Claude Code)|
+start
+:**Session Begin** — hook triggered\n(stdin JSON context);
+
+|evolver-session-start.js|
+note right
+  Synchronous script —
+  no stdin timeout guard
+end note
+:findEvolverRoot()\nenv EVOLVER_ROOT → relative ../../../package.json\n→ ~/skills/evolver;
+if (evolverRoot found?) then (no)
+  #FFD6D6:Output {} — no-op;
+  stop
+else (yes)
+  :findMemoryGraph(evolverRoot)\nenv MEMORY_GRAPH_PATH\n→ memory/evolution/memory_graph.jsonl;
+  if (graphPath exists?) then (no)
+    #FFD6D6:Output {} — no-op;
+    stop
+  else (yes)
+    :readLastN(graphPath, 5)\nParse last 5 JSONL lines;
+    if (entries.length === 0?) then (yes)
+      #FFD6D6:Output {} — no-op;
+      stop
+    else (no)
+      :Count successCount & failCount\nfrom outcome.status fields;
+      :formatOutcome() per entry\n[icon] date  score=N  signals=[...];
+      :Build evolution memory summary string\n"Evolution Memory: N outcomes (S success, F failed): ...";
+      |Hook Runner (Claude Code)|
+      #C3E6CB:**Inject into session**\nagent_message + additionalContext;
+    endif
+  endif
+endif
+
+'─────────────────────────────────────────
+'  PHASE 2 — SIGNAL DETECTION (per file edit)
+'─────────────────────────────────────────
+
+|Hook Runner (Claude Code)|
+note right
+  Repeats on every
+  file edit / save event
+end note
+:**File Edit Event** — hook triggered\n(stdin JSON: {content|diff, path|file_path});
+
+|evolver-signal-detect.js|
+:Read stdin — 1500 ms timeout guard;
+:Extract content field + filePath from input;
+:detectSignals(content)\nIterate SIGNAL_KEYWORDS map\nKeyword substring match (lowercase);
+if (signals.length === 0?) then (yes)
+  #FFD6D6:Output {} — no-op;
+else (no)
+  :Build context string\n"[Evolution Signal] Detected: [signals] in <filePath>";
+  |Hook Runner (Claude Code)|
+  #C3E6CB:**Inject into session**\nadditional_context + additionalContext;
+endif
+
+'─────────────────────────────────────────
+'  PHASE 3 — SESSION END
+'─────────────────────────────────────────
+
+|Hook Runner (Claude Code)|
+note right
+  Triggered once when
+  the Claude session ends
+end note
+:**Session End** — hook triggered\n(stdin JSON);
+
+|evolver-session-end.js|
+:Read stdin — 7000 ms timeout guard;
+:getGitDiffStats()\nexecSync "git diff --stat HEAD~1"\n+ "git diff HEAD~1 --no-color"\n(5 s exec timeout each);
+if (hasChanges?) then (no)
+  #FFD6D6:Output {} — no-op;
+  stop
+else (yes)
+  :detectSignals(diffSnippet)\n7 signal keyword categories;
+  if (signals.length === 0?) then (yes)
+    :Push "stable_success_plateau"\nto signals (default plateau signal);
+  else (no)
+  endif
+  if (log_error OR test_failure\nin signals?) then (yes)
+    #FDECEA:status = "failed"\nscore = 0.3;
+  else (no)
+    #EAF4EA:status = "success"\nscore = 0.8;
+  endif
+  :Build outcome object\n{ geneId="ad_hoc", signals[], status, score, summary };
+  :findEvolverRoot() + findMemoryGraph()\n(create directory if missing);
+  :recordToHub(outcome)\ncurl POST → $EVOMAP_HUB_URL/a2a/evolution/record\nBearer token auth — 8 s exec timeout;
+  if (Hub POST succeeded?) then (yes)
+    :target = "Hub";
+    |Hub API (remote)|
+    #C3E6CB:Evolution outcome recorded remotely\nvia A2A Hub endpoint;
+    |evolver-session-end.js|
+  else (no)
+    :recordToLocal(graphPath, outcome);
+    if (local write succeeded?) then (yes)
+      :target = "local memory";
+      |Memory Graph (JSONL)|
+      #C3E6CB:appendFileSync → memory_graph.jsonl\n{ timestamp, gene_id, signals[],\n  outcome: {status, score, note}, source };
+      |evolver-session-end.js|
+    else (no)
+      #FFD6D6:target = "nowhere"\n(silent failure);
+    endif
+  endif
+  :Build outcome message\n"[Evolution] Session outcome recorded to {target}: {summary}";
+  |Hook Runner (Claude Code)|
+  #C3E6CB:**Output to session**\nfollowup_message + stopMessage + additionalContext;
+endif
+
+stop
+
+@enduml

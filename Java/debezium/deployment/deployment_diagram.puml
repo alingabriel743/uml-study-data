@@ -1,0 +1,175 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam node {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam artifact {
+    BackgroundColor #DEE2E6
+    BorderColor #6C757D
+}
+skinparam database {
+    BackgroundColor #D0E8FF
+    BorderColor #3A7DC9
+}
+skinparam component {
+    BackgroundColor #FFF3CD
+    BorderColor #FFC107
+}
+skinparam ArrowColor #495057
+skinparam ArrowFontSize 10
+
+title Debezium CDC Platform — Deployment Diagram
+
+' ─────────────────────────────────────────
+' SOURCE DATABASES
+' ─────────────────────────────────────────
+package "Source Databases" {
+
+    database "MySQL Server\n:3306" as mysql {
+    }
+
+    database "MariaDB Server\n:3306" as mariadb {
+    }
+
+    database "PostgreSQL Server\n:5432" as postgres {
+    }
+
+    database "MongoDB Replica Set\n:27017" as mongodb {
+    }
+
+    database "IBM DB2 Server\n:50000" as db2 {
+    }
+}
+
+' ─────────────────────────────────────────
+' KAFKA CONNECT CLUSTER (Debezium)
+' ─────────────────────────────────────────
+node "Kafka Connect Cluster\n<<Docker / OpenShift>>" as kc_cluster {
+
+    artifact "Debezium MySQL Connector\n(debezium-connector-mysql)" as conn_mysql
+    artifact "Debezium Binlog Connector\n(debezium-connector-binlog)" as conn_binlog
+    artifact "Debezium PostgreSQL Connector\n(debezium-connector-postgres)" as conn_pg
+    artifact "Debezium MongoDB Connector\n(debezium-connector-mongodb)" as conn_mongo
+    artifact "Debezium DB2 Connector\n(debezium-connector-db2)" as conn_db2
+    artifact "Debezium Sink Connector\n(debezium-sink)" as conn_sink
+    artifact "OpenTelemetry Tracing Interceptor\n(debezium-interceptor)" as otel
+}
+
+' ─────────────────────────────────────────
+' APACHE KAFKA CLUSTER
+' ─────────────────────────────────────────
+node "Apache Kafka Cluster\n<<Docker / OpenShift>>" as kafka_cluster {
+
+    node "ZooKeeper\n:2181 / :2888 / :3888" as zookeeper {
+        artifact "ZooKeeper Service" as zk_svc
+    }
+
+    node "Kafka Broker\n:9092" as kafka_broker {
+        artifact "CDC Change Events Topic" as topic_cdc
+        artifact "Schema History Topic" as topic_schema
+        artifact "Offset Storage Topic" as topic_offset
+        artifact "Config Storage Topic" as topic_config
+        artifact "Signal Channel Topic" as topic_signal
+    }
+}
+
+' ─────────────────────────────────────────
+' STORAGE BACKENDS
+' ─────────────────────────────────────────
+node "Storage Layer" as storage_layer {
+
+    node "Redis Cluster\n:7001 / :7002 / :7003\n<<Docker>>" as redis_cluster {
+        artifact "redis-node-1 (primary)" as redis1
+        artifact "redis-node-2 (replica)" as redis2
+        artifact "redis-node-3 (replica)" as redis3
+    }
+
+    database "Kafka Schema History\n(KafkaSchemaHistory)" as kafka_history
+}
+
+' ─────────────────────────────────────────
+' OBSERVABILITY
+' ─────────────────────────────────────────
+node "Observability\n<<Optional>>" as observability {
+    artifact "OpenTelemetry Collector" as otel_collector
+}
+
+' ─────────────────────────────────────────
+' DOWNSTREAM CONSUMERS
+' ─────────────────────────────────────────
+node "Downstream Consumers" as consumers {
+    artifact "Kafka Consumer Applications" as consumer_apps
+    artifact "Debezium Embedded Engine\n(debezium-embedded)" as embedded
+}
+
+' ─────────────────────────────────────────
+' CI / CD
+' ─────────────────────────────────────────
+node "CI / CD Infrastructure\n<<Jenkins / Docker>>" as cicd {
+    artifact "Jenkins Job Runner\n(jenkins-jobs/docker)" as jenkins
+    artifact "Strimzi Operator Image\n(Dockerfile.Strimzi)" as strimzi
+    artifact "Artifact Server\n(artifact-server)" as artifact_server
+}
+
+' ─────────────────────────────────────────
+' CONNECTIONS
+' ─────────────────────────────────────────
+
+' Source DB → Kafka Connect (CDC pull via binlog / WAL / oplog)
+mysql      --> conn_mysql  : "binlog / JDBC\n:3306"
+mysql      --> conn_binlog : "binlog protocol\n:3306"
+mariadb    --> conn_binlog : "binlog protocol\n:3306"
+postgres   --> conn_pg     : "WAL / JDBC\n:5432"
+mongodb    --> conn_mongo  : "Change Streams\n:27017"
+db2        --> conn_db2    : "ASN CDC\n:50000"
+
+' Kafka Connect → Kafka Broker
+conn_mysql  --> kafka_broker : "publish change events"
+conn_binlog --> kafka_broker : "publish change events"
+conn_pg     --> kafka_broker : "publish change events"
+conn_mongo  --> kafka_broker : "publish change events"
+conn_db2    --> kafka_broker : "publish change events"
+
+' Kafka Connect reads signal channel
+kafka_broker --> conn_binlog : "signal channel\n(KafkaSignalChannel)"
+
+' Kafka Connect internal storage
+kafka_broker <--> kc_cluster : "offsets / configs / status\n(BOOTSTRAP_SERVERS :9092)"
+
+' Schema history storage options
+kafka_broker --> kafka_history : "schema history records"
+conn_binlog  --> redis_cluster : "offset / schema storage\n(debezium-storage-redis)"
+
+' ZooKeeper ↔ Kafka Broker coordination
+zookeeper <--> kafka_broker : "cluster coordination\n:2181"
+
+' Tracing
+otel --> otel_collector : "OTLP traces"
+
+' Downstream
+kafka_broker --> consumer_apps : "consume change events\n:9092"
+kafka_broker --> embedded      : "consume via embedded engine\n:9092"
+conn_sink    --> consumer_apps : "sink delivery"
+
+' CI/CD deploys connectors
+strimzi --> kc_cluster    : "deploy on OpenShift"
+jenkins --> kc_cluster    : "build & deploy"
+
+@enduml

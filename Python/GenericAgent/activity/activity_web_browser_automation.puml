@@ -1,0 +1,224 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #343A40
+    EndColor #343A40
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #DEE2E6
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title Web Browser Automation Flow (TMWebDriver)
+
+|ga.py (Agent Tools)|
+start
+:Invoke web_scan() or web_execute_js()\nvia GenericAgentHandler;
+
+if (driver is None?) then (yes)
+  |TMWebDriver|
+  :Instantiate TMWebDriver\n(host='127.0.0.1', port=18765);
+
+  if (remote server reachable?\nsocket.connect_ex(host, port+1) == 0) then (yes)
+    :Remote proxy mode:\nself.remote = 'http://host:18766/link';
+  else (no - local mode)
+    fork
+      :start_ws_server()\nSpawn JSExecutor as daemon thread\n(WebSocket on port 18765);
+    fork again
+      :start_http_server()\nSpawn Bottle HTTP server as daemon thread\n(HTTP on port 18766);
+    end fork
+  endif
+
+  :Poll for browser sessions\n(up to 20 seconds);
+
+  |Browser|
+  :Browser tab connects to WS server\nor sends HTTP long-poll request\nwith {type='ready'/'ext_ready', sessionId, url, title};
+
+  |TMWebDriver|
+  :JSExecutor.handle() parses JSON message;
+
+  if (message type?) then (ready)
+    :Extract sessionId, url, title;
+    if (new session?) then (yes)
+      :Create Session(id, info, ws_client)\nAdd to sessions dict;
+    else (existing)
+      :session.reconnect(client, info);
+    endif
+    :Update latest_session_id\nSet default_session_id if unset;
+  else (ext_ready / tabs_update)
+    :Iterate tabs list\nMark missing sessions disconnected\nRegister or update each tab entry;
+  endif
+
+  |ga.py (Agent Tools)|
+endif
+
+if (get_all_sessions() empty?) then (yes)
+  #FFCCCC:Return error: "No active browser sessions";
+  stop
+endif
+
+if (switch_tab_id specified?) then (yes)
+  :driver.default_session_id = switch_tab_id;
+endif
+
+if (which tool operation?) then (web_scan)
+
+  :Build tabs list from active sessions\n(id + url, truncated to 50 chars);
+
+  if (tabs_only = True?) then (yes)
+    :Return metadata only:\n{tabs_count, tabs list};
+    stop
+  endif
+
+  |simphtml|
+  :Reload simphtml module\nCall get_html(driver, cutlist=True, maxchars=35000);
+  :Execute JS findMainList() in browser\nDetect repeating list selectors for cutlist;
+  :get_main_block(driver)\nRun optHTML() JavaScript in browser\nReceive optimized DOM HTML string;
+  :optimize_html_for_tokens(html)\nBeautifulSoup cleanup:\nStrip styles, shorten src/href,\nRemove non-essential attributes;
+
+  if (cutlist enabled?) then (yes)
+    :Truncate long repeated list elements\nKeep first 3 items + "[FAKE ELEMENT] N more" hint;
+  endif
+
+  if (HTML exceeds maxchars?) then (yes)
+    :smart_truncate(soup, maxchars)\nRecursive proportional truncation\nof largest DOM subtrees;
+  endif
+
+  |ga.py (Agent Tools)|
+  :Return result:\n{status,\nmetadata: {tabs_count, tabs, active_tab},\ncontent: optimized_html_string};
+  stop
+
+else (web_execute_js)
+
+  |simphtml|
+  if (monitoring enabled?\n(not no_monitor)) then (yes)
+    :Capture baseline DOM:\nget_html(driver, extra_js=temp_monitor_js)\nStart window._tm interval text monitor;
+  endif
+  :Record before_sids =\ndriver.get_session_dict().keys();
+
+  |TMWebDriver|
+  :execute_js(script, timeout, session_id);
+
+  if (is_remote?) then (yes)
+    :POST {cmd: execute_js, code: script}\nto /link HTTP relay endpoint\nReceive and return response;
+  else (no - local)
+    :Resolve target session\n(default_session_id or given session_id);
+
+    if (session inactive?) then (yes)
+      :sleep(3) and retry;
+      if (still no active session?) then (yes)
+        :Scan all sessions\nAuto-switch to first alive session;
+        if (no alive sessions found?) then (yes)
+          #FFCCCC:Raise ValueError:\n"No active browser sessions";
+          stop
+        endif
+      endif
+    endif
+
+    :Generate exec_id = uuid4()\nBuild payload: {id: exec_id, code: script};
+
+    if (session.type?) then (ws or ext_ws)
+      :ws_client.send_message(payload)\nDeliver script via WebSocket;
+      |Browser|
+      :Receive script payload over WebSocket\nExecute JavaScript in browser tab\nSend back ack and result/error messages;
+      |TMWebDriver|
+    else (http)
+      :http_queue.put(payload)\nQueue script for long-poll delivery;
+      |Browser|
+      :POST /api/longpoll {sessionId, url, title}\nServer polls http_queue (200ms intervals, up to 5s);
+      :Receive script payload in HTTP response\nSend ACK; Execute JavaScript in browser tab;
+      :POST /api/result {id, result or error};
+      |TMWebDriver|
+      :/api/result handler stores\nresult in self.results[id];
+    endif
+
+    :clean_sessions()\nRemove sessions disconnected > 600s;
+
+    repeat
+      :sleep(0.2)\nCheck self.results for exec_id;
+      if (ACK received in self.acks?) then (yes)
+        :Reset timeout start_time\n(script confirmed delivered);
+      endif
+      if (session became inactive?) then (yes)
+        :hasjump = True;
+        if (session active again?) then (yes)
+          :Return "session reloaded" message;
+          stop
+        endif
+      endif
+      if (timeout exceeded?) then (yes)
+        if (hasjump?) then (yes)
+          #FFE0B2:Return: "reloaded and loading";
+        else (no)
+          if (acked but no result?) then (yes)
+            #FFE0B2:Return: "script running, no response";
+          else (no)
+            #FFE0B2:Return: "script not delivered" or\n"delivered but no result" (http);
+          endif
+        endif
+        stop
+      endif
+    repeat while (exec_id in self.results?) is (no)
+
+    :Pop result from self.results\nClean self.acks[exec_id];
+
+    if (result.success = False?) then (yes)
+      #FFCCCC:Raise Exception(result.data);
+      stop
+    endif
+
+    :Build response:\n{data: result.data, newTabs?: [new_session_ids]};
+  endif
+
+  |simphtml|
+  :Extract result from response\nDetect page reload: response.get('closed') == 1\nsleep(1) to allow DOM to settle;
+
+  if (execution raised exception?) then (yes)
+    :Capture and store error message;
+  endif
+
+  :Compare after session dict vs before_sids\nDetect newly opened browser tabs;
+
+  if (not no_monitor AND not reloaded?) then (yes)
+    :get_temp_texts(driver)\nCall JS stopStrMonitor()\nCollect transient DOM text changes\ncaptured during execution;
+  endif
+
+  if (not reloaded AND no new tabs?) then (yes)
+    :find_changed_elements(before_html, after_html)\nParse before/after HTML with BeautifulSoup\nBuild element signature maps (tag + attrs + text)\nIdentify boundary elements and top_change;
+  endif
+
+  :Assemble rich result:\n{status, js_return, tab_id,\ndiff: changed_elements,\ntransients: transient_texts,\nnewTabs, reloaded?, error?};
+
+  if (save_to_file = True?) then (yes)
+    :Write js_return to file\nTruncate in-memory copy for response;
+  endif
+
+  |ga.py (Agent Tools)|
+  :Return StepOutcome\n(JSON-formatted result to agent);
+  stop
+
+endif
+
+@enduml

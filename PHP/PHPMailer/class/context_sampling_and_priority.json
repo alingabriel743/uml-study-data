@@ -1,0 +1,180 @@
+{
+  "scope": "sampling_and_priority",
+  "title": "Sampling and Priority",
+  "diagram_type": "class",
+  "description": "Samplers, sampling rules, and priority management for trace sampling decisions. Note: dedicated 'src/Sampling/' directory does not exist as PHP files — sampling logic is split between a PHP constants/value class (PrioritySampling), Tracer interface methods, SpanContext propagation, TextMap header injection/extraction, and the C extension's native rule-matching engine.",
+
+  "classes": [
+    {
+      "name": "PrioritySampling",
+      "namespace": "DDTrace\\Sampling",
+      "file": "src/api/Sampling/PrioritySampling.php",
+      "type": "class (value object / constants)",
+      "constants": [
+        "USER_REJECT = -1  // Agent drops trace (user-instructed)",
+        "AUTO_REJECT = 0   // Agent drops trace (automatic sampler decision)",
+        "AUTO_KEEP = 1     // Agent keeps trace (automatic sampler decision)",
+        "USER_KEEP = 2     // Agent keeps trace (user-instructed); backend applies volume cap only",
+        "UNKNOWN = null    // Could not be parsed"
+      ],
+      "methods": [
+        "public static parse($value): int|null  // parses raw header value to priority constant"
+      ]
+    },
+    {
+      "name": "Tracer (interface)",
+      "namespace": "DDTrace\\Contracts",
+      "file": "src/api/Contracts/Tracer.php",
+      "type": "interface",
+      "sampling_methods": [
+        "setPrioritySampling($prioritySampling): void",
+        "getPrioritySampling(): int|null"
+      ],
+      "notes": "Tracer interface owns the canonical sampling API alongside span lifecycle methods"
+    },
+    {
+      "name": "Tracer",
+      "namespace": "DDTrace",
+      "file": "src/DDTrace/Tracer.php",
+      "type": "final class implements DDTrace\\Contracts\\Tracer",
+      "sampling_methods": [
+        "public setPrioritySampling($prioritySampling): void  // calls native set_priority_sampling($p) and set_priority_sampling($p, true) (user flag)",
+        "public getPrioritySampling(): int|null              // delegates to native get_priority_sampling()",
+        "private setPrioritySamplingFromSpan(SpanInterface $span): void  // reads propagated priority from root span context and calls set_priority_sampling()"
+      ],
+      "call_sites": [
+        "startRootSpan() calls setPrioritySamplingFromSpan() on new root span",
+        "TextMap::inject() calls getPrioritySampling() to write x-datadog-sampling-priority header"
+      ],
+      "dependencies": ["SpanContext (DDTrace)", "TextMap", "PrioritySampling", "Native C extension functions"]
+    },
+    {
+      "name": "NoopTracer",
+      "namespace": "DDTrace",
+      "file": "src/api/NoopTracer.php",
+      "type": "final class implements DDTrace\\Contracts\\Tracer",
+      "sampling_methods": [
+        "public getPrioritySampling(): null  // always returns null",
+        "public setPrioritySampling($prioritySampling): void  // no-op"
+      ]
+    },
+    {
+      "name": "SpanContext (interface)",
+      "namespace": "DDTrace\\Contracts",
+      "file": "src/api/Contracts/SpanContext.php",
+      "type": "interface extends IteratorAggregate",
+      "sampling_methods": [
+        "getPropagatedPrioritySampling(): int  // initial priority received from upstream",
+        "setPropagatedPrioritySampling($propagatedPrioritySampling): void"
+      ]
+    },
+    {
+      "name": "SpanContext (abstract data)",
+      "namespace": "DDTrace\\Data",
+      "file": "src/api/Data/SpanContext.php",
+      "type": "abstract class implements DDTrace\\Contracts\\SpanContext",
+      "sampling_fields": [
+        "public $propagatedPrioritySampling: int  // priority inherited from distributed tracing parent"
+      ],
+      "other_fields": ["$traceId", "$spanId", "$parentId", "$isDistributedTracingActivationContext", "$origin", "$parentContext", "$baggageItems"]
+    },
+    {
+      "name": "SpanContext",
+      "namespace": "DDTrace",
+      "file": "src/DDTrace/SpanContext.php",
+      "type": "final class extends DDTrace\\Data\\SpanContext",
+      "key_methods": [
+        "static createAsChild(SpanContextInterface $parentContext): self  // propagates $propagatedPrioritySampling via setPropagatedPrioritySampling()",
+        "static createAsRoot(array $baggageItems = []): self",
+        "getPropagatedPrioritySampling(): int",
+        "setPropagatedPrioritySampling($p): void"
+      ],
+      "notes": "createAsChild() calls $instance->setPropagatedPrioritySampling($parentContext->getPropagatedPrioritySampling()) — key priority propagation chain"
+    },
+    {
+      "name": "Propagator (interface)",
+      "namespace": "DDTrace",
+      "file": "src/DDTrace/Propagator.php",
+      "type": "interface",
+      "sampling_constants": [
+        "DEFAULT_SAMPLING_PRIORITY_HEADER = 'x-datadog-sampling-priority'"
+      ],
+      "methods": ["inject(SpanContextInterface, &$carrier): void", "extract($carrier): SpanContextInterface"]
+    },
+    {
+      "name": "TextMap",
+      "namespace": "DDTrace\\Propagators",
+      "file": "src/DDTrace/Propagators/TextMap.php",
+      "type": "final class implements DDTrace\\Propagator",
+      "dependencies": ["DDTrace\\Contracts\\Tracer", "DDTrace\\Sampling\\PrioritySampling", "DDTrace\\SpanContext"],
+      "sampling_methods": [
+        "inject(SpanContextInterface, &$carrier): void  // writes x-datadog-sampling-priority if priority != UNKNOWN",
+        "extract($carrier): SpanContextInterface|null   // calls extractPrioritySampling()",
+        "private extractPrioritySampling(SpanContextInterface, $carrier): void  // reads x-datadog-sampling-priority, calls PrioritySampling::parse(), calls setPropagatedPrioritySampling()"
+      ],
+      "inject_flow": "reads tracer->getPrioritySampling() → writes carrier[x-datadog-sampling-priority]",
+      "extract_flow": "reads carrier[x-datadog-sampling-priority] → PrioritySampling::parse() → spanContext->setPropagatedPrioritySampling()"
+    },
+    {
+      "name": "SamplingRuleMatchingBench",
+      "namespace": "Benchmarks\\API",
+      "file": "tests/Benchmarks/API/SamplingRuleMatchingBench.php",
+      "type": "benchmark class",
+      "notes": "Benchmarks native sampling rule matching. Configures datadog.trace.sampling_rules INI as JSON array [{name, service, resource, sample_rate}]. Calls \\DDTrace\\get_priority_sampling() which triggers C-extension rule evaluation. Pattern formats: 'glob' (wildcards) or 'regex'. Fallback rule has no constraints, only sample_rate."
+    }
+  ],
+
+  "native_extension_elements": {
+    "description": "Sampler, RuleBasedSampler, RateLimiter, and SamplingRule are implemented in the C extension — not as PHP classes. They are exposed via INI config and native functions.",
+    "native_functions": [
+      "\\DDTrace\\get_priority_sampling(): int|null  // retrieves current trace's priority",
+      "\\DDTrace\\set_priority_sampling(int $priority, bool $userFlag = false): void",
+      "\\DDTrace\\root_span(): SpanData  // used by benchmarks to set service/name/resource for rule matching"
+    ],
+    "ini_config": {
+      "datadog.trace.sampling_rules": "JSON array of rules: [{\"service\":\"...\",\"name\":\"...\",\"resource\":\"...\",\"sample_rate\":0.5}]",
+      "datadog.trace.sampling_rules_format": "glob (default) or regex"
+    },
+    "sampling_rule_fields": ["service (pattern)", "name (pattern)", "resource (pattern)", "sample_rate (float 0.0-1.0)"],
+    "rate_limiter": "Built into C extension; limits keep rate to configured max_per_second"
+  },
+
+  "relationships": [
+    "DDTrace\\Tracer implements DDTrace\\Contracts\\Tracer",
+    "DDTrace\\NoopTracer implements DDTrace\\Contracts\\Tracer",
+    "DDTrace\\SpanContext extends DDTrace\\Data\\SpanContext",
+    "DDTrace\\Data\\SpanContext implements DDTrace\\Contracts\\SpanContext",
+    "DDTrace\\Propagators\\TextMap implements DDTrace\\Propagator",
+    "DDTrace\\Propagators\\TextMap depends_on DDTrace\\Contracts\\Tracer (composition, getPrioritySampling)",
+    "DDTrace\\Propagators\\TextMap depends_on DDTrace\\Sampling\\PrioritySampling (parse/UNKNOWN check)",
+    "DDTrace\\Tracer depends_on DDTrace\\Sampling\\PrioritySampling (UNKNOWN constant in TextMap injection path)",
+    "DDTrace\\Tracer delegates_to C_extension native set_priority_sampling / get_priority_sampling",
+    "DDTrace\\SpanContext::createAsChild propagates_priority_from SpanContextInterface parent"
+  ],
+
+  "priority_sampling_flow": [
+    "1. Incoming HTTP request → TextMap::extract() reads x-datadog-sampling-priority header",
+    "2. PrioritySampling::parse(rawValue) validates and maps to constant",
+    "3. SpanContext::setPropagatedPrioritySampling(parsedValue) stores on context",
+    "4. Tracer::startRootSpan() → setPrioritySamplingFromSpan() → reads propagatedPrioritySampling from root context",
+    "5. Calls native set_priority_sampling(value) to set trace-level decision in C extension",
+    "6. C extension rule engine evaluates datadog.trace.sampling_rules against root span service/name/resource",
+    "7. On outgoing request → TextMap::inject() → tracer->getPrioritySampling() → native get_priority_sampling() → x-datadog-sampling-priority header",
+    "8. Agent receives trace with _sampling_priority_v1 tag and applies keep/drop decision"
+  ],
+
+  "important_notes": "The 'Sampler', 'SamplingRule', 'RuleBasedSampler', and 'RateLimiter' key elements named in the scope description do NOT exist as PHP classes — they are C extension constructs. The PHP layer provides only the PrioritySampling value class (constants + parse), Tracer get/set methods (delegating to native), and SpanContext propagation fields. Sampling rules are configured via INI JSON. Priority constants: USER_REJECT=-1, AUTO_REJECT=0, AUTO_KEEP=1, USER_KEEP=2.",
+
+  "source_files_analyzed": [
+    "src/api/Sampling/PrioritySampling.php",
+    "src/api/Contracts/SpanContext.php",
+    "src/api/Contracts/Tracer.php",
+    "src/api/Data/SpanContext.php",
+    "src/api/NoopTracer.php",
+    "src/DDTrace/SpanContext.php",
+    "src/DDTrace/Tracer.php",
+    "src/DDTrace/Propagator.php",
+    "src/DDTrace/Propagators/TextMap.php",
+    "tests/Benchmarks/API/SamplingRuleMatchingBench.php"
+  ]
+}

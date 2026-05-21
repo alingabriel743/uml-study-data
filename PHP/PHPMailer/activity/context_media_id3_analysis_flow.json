@@ -1,0 +1,144 @@
+{
+  "scope": "media_id3_analysis_flow",
+  "title": "Media File ID3 Tag Analysis Flow",
+  "diagram_type": "activity",
+  "domain": "WordPress ID3 media metadata analysis (getID3 v1.9.22)",
+
+  "key_classes": [
+    "getID3 — main orchestrator class (public API)",
+    "getid3_handler — abstract base for all format/tag modules",
+    "getid3_lib — static utility helpers",
+    "getid3_exception — extends Exception, wraps fatal errors"
+  ],
+
+  "activity_partitions": ["getID3", "getid3_handler (concrete module)", "Filesystem / PHP"],
+
+  "flow_construction": [
+    "START: caller instantiates getID3()",
+    "Check PHP version >= 5.3.0 → startup_error if fails",
+    "Parse ini memory_limit (M/G suffix) → startup_error if < 4MB, startup_warning if < 12MB",
+    "Check safe_mode, mbstring.func_overload bitmask 2 → startup_error if set",
+    "Check magic_quotes_runtime / magic_quotes_gpc (PHP < 7.4) → startup_error if on",
+    "include_once getid3.lib.php → startup_error if missing",
+    "Set option_max_2gb_check = (PHP_INT_MAX <= 2147483647) if null",
+    "[Windows only] Resolve GETID3_HELPERAPPSDIR with 8.3 path conversion",
+    "IF startup_error: throw getid3_exception → END",
+    "ELSE: handler ready for analysis calls"
+  ],
+
+  "flow_analyze": [
+    "ENTRY: getID3::analyze($filename, $filesize=null, $original_filename='', $fp=null)",
+    "Call openfile($filename, $filesize, $fp)",
+    "  openfile: check startup_error → throw getid3_exception",
+    "  openfile: emit each startup_warning via warning()",
+    "  openfile: init $this->info array (filesize, filepath, filename, filenamepath, avdataoffset=0, avdataend, error=[], warning=[], tags=[], comments=[], encoding)",
+    "  openfile: reject remote URLs (ht/ftp) → throw getid3_exception",
+    "  openfile: accept existing $fp resource OR fopen($filename,'rb') → throw if fails",
+    "  openfile: IF option_max_2gb_check → fseek SEEK_END + ftell to detect >2GB → warning or exception",
+    "  openfile: return true",
+    "IF openfile fails → return $this->info (with error)",
+    "FOR EACH tag type in [id3v2, id3v1, apetag, lyrics3]:",
+    "  IF option_tag_{name} enabled: include_module('tag.{name}') → new getid3_{name}($this) → tag->Analyze()",
+    "  Catch getid3_exception → rethrow",
+    "Set avdataoffset from id3v2 tag_offset_end (if present)",
+    "Set avdataend from id3v1/apetag/lyrics3 tag_offset_start (min)",
+    "IF !option_tag_id3v2: fseek(0) + fread(10) to detect ID3v2 header presence → update avdataoffset",
+    "fseek(avdataoffset) + fread(32774) → $formattest buffer",
+    "GetFileFormat($formattest, $filename) — pattern-match first bytes against GetFileFormatArray()",
+    "IF no format matched → fclose + error('unable to determine file format') → return info",
+    "Check fail_id3 constraint (ERROR/WARNING) for illegal ID3 tags on format",
+    "Check fail_ape constraint (ERROR/WARNING) for illegal APE tags on format",
+    "Set info['mime_type']",
+    "Check module file exists → error if missing",
+    "Check iconv/mb_convert_encoding required → error if absent",
+    "include_once module file (module.{group}.{module}.php)",
+    "Instantiate 'getid3_{module}'($this) — concrete getid3_handler subclass",
+    "Copy matching 'options_{group}_{module}_*' properties into module instance",
+    "$class->Analyze() — format-specific parsing",
+    "unset($class); fclose($this->fp)",
+    "IF option_tags_process: HandleAllTags() — copy/charset-convert tags to info['tags'] and info['tags_html']",
+    "IF option_extra_info: ChannelsBitratePlaytimeCalculations(), CalculateCompressionRatioVideo(), CalculateCompressionRatioAudio(), CalculateReplayGain(), ProcessAudioStreams()",
+    "IF option_md5_data AND NOT (option_md5_data_source AND md5_data_source set): getHashdata('md5')",
+    "IF option_sha1_data: getHashdata('sha1')",
+    "CleanUp() — remove empty keys, deduplicate error/warning arrays",
+    "Catch Exception → error('Caught exception: ...')",
+    "RETURN $this->info"
+  ],
+
+  "flow_analyze_string": [
+    "ENTRY: getid3_handler::AnalyzeString($string)",
+    "Call setStringMode($string): data_string_flag=true, data_string=$string, data_string_length=strlen($string)",
+    "Save: saved_avdataoffset, saved_avdataend, saved_filesize from getid3->info",
+    "Reset: info['avdataoffset']=0, info['avdataend']=info['filesize']=data_string_length",
+    "Call abstract Analyze() — operates on string via overridden fread/fseek/ftell/feof/fgets",
+    "Restore: info['avdataoffset'], info['avdataend'], info['filesize'] to saved values",
+    "data_string_flag = false (exit string mode)"
+  ],
+
+  "flow_save_attachment": [
+    "ENTRY: getid3_handler::saveAttachment($name, $offset, $length, $image_mime=null)",
+    "IF option_save_attachments === ATTACHMENTS_NONE (false): attachment = null (skip)",
+    "ELSE IF option_save_attachments === ATTACHMENTS_INLINE (true): fseek($offset) + fread($length) → attachment = raw binary string",
+    "ELSE (directory path string): build $dest = dir/name[.ext]; fopen($dest,'wb'); fseek($offset); loop fread(buffersize)+fwrite until bytesleft==0; fclose; attachment = $dest path",
+    "ON Exception: fclose+unlink $dest if created; attachment=null; warning('Failed to extract attachment...')",
+    "Finally: fseek($offset + $length) — advance past attachment",
+    "RETURN $attachment (binary|filepath|null)"
+  ],
+
+  "io_dispatch": [
+    "getid3_handler::fread($bytes): IF data_string_flag → substr(data_string, pos, bytes); pos+=bytes. ELSE → loop fread(fp) to handle partial reads",
+    "getid3_handler::fseek($bytes, $whence): IF data_string_flag → update data_string_position per SEEK_SET/CUR/END. ELSE → fseek(fp) + throw if non-zero return",
+    "getid3_handler::ftell(): IF data_string_flag → data_string_position. ELSE → ftell(fp)",
+    "getid3_handler::feof(): IF data_string_flag → position >= length. ELSE → feof(fp)",
+    "getid3_handler::fgets(): custom CR/LF/CRLF handler for string or fp"
+  ],
+
+  "error_warning_handling": [
+    "getID3::error($message): calls CleanUp(), appends to info['error'][], returns info array",
+    "getID3::warning($message): appends to info['warning'][], returns true",
+    "getid3_handler::error($text): appends to getid3->info['error'][], returns false",
+    "getid3_handler::warning($text): delegates to getid3->warning($text)",
+    "getid3_handler::notice($text): no-op currently",
+    "Fatal conditions throw getid3_exception (extends Exception) — caught at analyze() top level"
+  ],
+
+  "key_constants": [
+    "getID3::ATTACHMENTS_NONE = false",
+    "getID3::ATTACHMENTS_INLINE = true (default for option_save_attachments)",
+    "getID3::FREAD_BUFFER_SIZE = 32768",
+    "GETID3_INCLUDEPATH = dirname(getid3.php)/",
+    "GETID3_TEMP_DIR = resolved temp directory"
+  ],
+
+  "key_options": [
+    "option_tag_id3v1/id3v2/apetag/lyrics3 (bool) — enable tag parsing",
+    "option_tags_process (bool) — copy tags to info['tags'] with charset conversion",
+    "option_tags_html (bool) — copy tags to info['tags_html'] as HTML entities",
+    "option_extra_info (bool) — calculate bitrate, channels, playtime, compression, replaygain",
+    "option_save_attachments (false|true|dirpath) — none/inline/file",
+    "option_md5_data, option_sha1_data (bool) — hash audio/video portion",
+    "option_max_2gb_check (bool|null) — guard against 32-bit PHP file size limit",
+    "option_fread_buffer_size (int, default 32768)"
+  ],
+
+  "module_handler_subclasses": [
+    "getid3_id3v1, getid3_id3v2, getid3_apetag, getid3_lyrics3 (tag modules)",
+    "getid3_mp3, getid3_flac, getid3_ogg, getid3_ac3, getid3_dts, getid3_mpc, getid3_wavpack (audio)",
+    "getid3_asf, getid3_riff, getid3_quicktime, getid3_matroska, getid3_flv (audio-video)",
+    "All extend abstract getid3_handler and implement Analyze()"
+  ],
+
+  "key_decisions": [
+    "[startup] PHP version / memory / safe_mode / mbstring checks before any analysis",
+    "[analyze] Tag modules run BEFORE format detection to set avdataoffset/avdataend boundaries",
+    "[analyze] ID3v2 header optionally detected even when tag parsing disabled (for offset calc)",
+    "[analyze] Format identified by binary byte-pattern match (32KB read); fallback by filename extension for mp3/mpc/cue",
+    "[analyze] fail_id3/fail_ape per-format constraints raise ERROR (fatal) or WARNING",
+    "[saveAttachment] Three modes: discard / inline binary / write to disk directory",
+    "[fread/fseek] Dual-mode dispatch: string buffer vs file pointer, with 2GB boundary guard"
+  ],
+
+  "source_files_analyzed": [
+    "tests/Frameworks/WordPress/Version_6_1/wp-includes/ID3/getid3.php (lines 1-2480)"
+  ]
+}

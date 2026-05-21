@@ -1,0 +1,123 @@
+{
+  "scope": "node_heartbeat_and_upgrade",
+  "title": "Node Heartbeat & Upgrade Check",
+  "diagram_type": "activity",
+  "key_participants": ["LifecycleManager", "store", "hub (remote)", "logger"],
+
+  "constants": {
+    "DEFAULT_HEARTBEAT_INTERVAL": "360_000 ms (6 min)",
+    "HELLO_TIMEOUT": "15_000 ms",
+    "HEARTBEAT_TIMEOUT": "10_000 ms",
+    "MAX_REAUTH_ATTEMPTS": 2,
+    "min_backoff": "30_000 ms",
+    "max_backoff": "30 * 60_000 ms (30 min)"
+  },
+
+  "activity_flow": [
+    "START: startHeartbeatLoop(intervalMs) called",
+    "GUARD: if _running == true → return (loop already active)",
+    "ACTION: set _running=true, _startedAt=Date.now()",
+    "ACTION: interval = max(30_000, intervalMs || DEFAULT_HEARTBEAT_INTERVAL)",
+    "ACTION: invoke tick() immediately",
+
+    "--- tick() ---",
+    "GUARD: if !_running → return (loop stopped)",
+    "ACTION: await heartbeat()",
+
+    "--- heartbeat() ---",
+    "GUARD: if !hubUrl → return {ok:false, error:'no_hub_url'}",
+    "GUARD: if !nodeId → await hello(); if !ok return hello result",
+    "ACTION: build body (node_id, env_fingerprint, pending counts, taskMeta)",
+    "ACTION: POST /a2a/heartbeat with 10s timeout",
+
+    "BRANCH: HTTP 401/403?",
+    "  YES → increment _consecutiveFailures",
+    "       BRANCH: _skipReauth==false?",
+    "         YES → await reAuthenticate()",
+    "              reAuthenticate: loop up to MAX_REAUTH_ATTEMPTS:",
+    "                ACTION: hello({rotateSecret:true})",
+    "                GUARD: if hello fails → continue",
+    "                GUARD: if no new secret returned → continue",
+    "                ACTION: heartbeat({_skipReauth:true})",
+    "                BRANCH: heartbeat ok? YES → return true (auth restored)",
+    "              END LOOP → return false (exhausted)",
+    "         BRANCH: recovered?",
+    "           YES → reset _consecutiveFailures=0, return {ok:true, recovered:true}",
+    "           NO  → return {ok:false, error:'auth_failed_<status>'}",
+    "  NO (other HTTP error) → increment _consecutiveFailures, return {ok:false, error:'http_<status>'}",
+
+    "BRANCH: response ok?",
+    "  NO (network/timeout) → increment _consecutiveFailures, log, return {ok:false}",
+    "  YES →",
+    "    ACTION: reset _consecutiveFailures=0",
+    "    ACTION: store.setState('last_heartbeat_at', now)",
+
+    "    BRANCH: data.status == 'unknown_node'?",
+    "      YES → await hello()  [re-register node]",
+
+    "    BRANCH: data.events array non-empty?",
+    "      YES → store.writeInboundBatch(events mapped to {type, payload, channel:'evomap-hub'})",
+
+    "    BRANCH: data.min_proxy_version present AND _shouldUpgrade(min_proxy_version)?",
+    "      _shouldUpgrade: semver compare cur vs min, component by component",
+    "        RETURN true if any cur[i] < min[i], false if cur[i] > min[i], false if equal",
+    "      YES → store.writeInbound({type:'system', payload:{action:'proxy_upgrade_required', ...}, priority:'high'})",
+    "            logger.warn upgrade message",
+    "      NO  → no upgrade action",
+
+    "    ACTION: return {ok:true, response:data}",
+    "--- END heartbeat() ---",
+
+    "BACK IN tick(): BRANCH: _running still true?",
+    "  YES →",
+    "    BRANCH: _consecutiveFailures > 0?",
+    "      YES → backoff = min(interval * 2^failures, 30min)",
+    "      NO  → backoff = interval",
+    "    ACTION: _heartbeatTimer = setTimeout(tick, backoff)",
+    "    ACTION: timer.unref() if supported (non-blocking)",
+    "  NO → stop (no next tick scheduled)",
+
+    "--- stopHeartbeatLoop() ---",
+    "ACTION: set _running=false",
+    "ACTION: clearTimeout(_heartbeatTimer)",
+    "ACTION: _heartbeatTimer = null",
+    "END"
+  ],
+
+  "key_methods": [
+    "startHeartbeatLoop(intervalMs): entry point; sets _running; calls tick() immediately",
+    "tick() [inner async]: calls heartbeat(), schedules next tick with exponential backoff",
+    "heartbeat({_skipReauth=false}): POSTs to /a2a/heartbeat; handles 401/403 via reAuthenticate; processes hub response (events, upgrade, unknown_node)",
+    "reAuthenticate(): loops up to 2 attempts; calls hello({rotateSecret:true}) then heartbeat(_skipReauth:true)",
+    "hello({rotateSecret}): POSTs to /a2a/hello; stores node_id and node_secret",
+    "_shouldUpgrade(minVersion): semver compare PROXY_PROTOCOL_VERSION vs minVersion → boolean",
+    "stopHeartbeatLoop(): sets _running=false; clears timer"
+  ],
+
+  "key_relationships": [
+    "startHeartbeatLoop calls tick (inner closure)",
+    "tick calls heartbeat",
+    "heartbeat calls hello (if no nodeId)",
+    "heartbeat calls reAuthenticate (on 401/403, unless _skipReauth)",
+    "reAuthenticate calls hello({rotateSecret:true}) then heartbeat({_skipReauth:true})",
+    "heartbeat calls _shouldUpgrade(data.min_proxy_version)",
+    "heartbeat reads store.countPending, writes store.setState, store.writeInboundBatch, store.writeInbound",
+    "stopHeartbeatLoop terminates tick loop"
+  ],
+
+  "backoff_logic": "interval * 2^_consecutiveFailures, capped at 30 min; resets to normal interval on success",
+
+  "upgrade_logic": "_shouldUpgrade does semver (major.minor.patch) compare: returns true only if current < min",
+
+  "important_notes": [
+    "PROXY_PROTOCOL_VERSION imported from mailbox/store",
+    "env_fingerprint captured once and cached (_cachedFingerprint)",
+    "node_secret validated with /^[a-f0-9]{64}$/i before storing",
+    "Heartbeat body includes outbound_pending + inbound_pending queue depths from store",
+    "hub events written as inbound batch with channel='evomap-hub'",
+    "upgrade notification written as high-priority system inbound message",
+    "Timer uses .unref() to avoid blocking Node.js process exit"
+  ],
+
+  "source_files_analyzed": ["src/proxy/lifecycle/manager.js"]
+}

@@ -1,0 +1,175 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF9E6
+    BorderColor #E0C050
+}
+
+title Browser Extension Core (Service Worker & Content Script)
+
+' ─────────────────────────────────────────────
+' Data Models
+' ─────────────────────────────────────────────
+package "Data Models" {
+
+    class TabState <<dataclass>> {
+        +findings: Finding[]
+        +overlaysVisible: boolean
+        +injected: boolean
+        +csInjected: boolean
+    }
+
+    class Settings <<dataclass>> {
+        +disabledRules: string[]
+        +lineLengthMode: "strict" | "lax"
+        +spotlightBlur: boolean
+        +autoScan: "panel" | "devtools"
+    }
+
+    class ScanConfig <<dataclass>> {
+        +disabledRules?: string[]
+        +lineLengthMax: number
+        +spotlightBlur: boolean
+    }
+
+}
+
+' ─────────────────────────────────────────────
+' Service Worker (Background)
+' ─────────────────────────────────────────────
+package "Background (Service Worker)" {
+
+    class ServiceWorker <<module>> {
+        -tabState: Map<tabId, TabState>
+        -panelPorts: Map<tabId, Set<Port>>
+        -devtoolsTabs: Set<tabId>
+        --
+        +getState(tabId): TabState
+        +updateBadge(tabId): void
+        +notifyPanels(tabId, message): void
+        +getSettings(): Promise<Settings>
+        +buildScanConfig(): Promise<ScanConfig>
+        +ensureContentScriptInjected(tabId): Promise<boolean>
+        +sendScanToTab(tabId): Promise<void>
+        +tearDownTab(tabId): Promise<void>
+        ..Event Handlers..
+        ~onMessage(scan | findings | toggle-overlays\n  | get-state | overlays-toggled\n  | page-pointer-active | inject-fallback\n  | disabled-rules-changed)
+        ~onConnect(impeccable-devtools-*\n  | impeccable-panel-*\n  | impeccable-sidebar-*)
+        ~onWebNavigationCompleted()
+        ~onTabRemoved()
+    }
+
+}
+
+' ─────────────────────────────────────────────
+' Content Layer (Isolated World & Main World)
+' ─────────────────────────────────────────────
+package "Content Layer" {
+
+    class ContentScript <<module>> {
+        -injected: boolean
+        -pendingScan: boolean
+        -scanConfig: ScanConfig | null
+        -lastPageActive: number
+        -lastUrl: string
+        --
+        +injectAndScan(): void
+        +sendScanCommand(): void
+        +onPossibleNavigation(): void
+        ..Event Handlers..
+        ~onMessage(scan | toggle-overlays\n  | remove | highlight | unhighlight)
+        ~onWindowMessage(impeccable-results\n  | impeccable-overlays-toggled\n  | impeccable-ready)
+        ~onPointerMove()
+        ~onPopState() / onHashChange()
+    }
+
+    note right of ContentScript
+        IIFE with idempotency guard
+        (window.__IMPECCABLE_CS_LOADED__)
+        Runs in ISOLATED world;
+        bridges to MAIN world via
+        window.postMessage
+    end note
+
+    class Detector <<external module>> {
+        Runs in MAIN world
+        (needs getComputedStyle,
+        styleSheets.cssRules)
+        --
+        postMessage(impeccable-ready)
+        postMessage(impeccable-results)
+        postMessage(impeccable-overlays-toggled)
+    }
+
+}
+
+' ─────────────────────────────────────────────
+' Chrome Extension APIs (external actors)
+' ─────────────────────────────────────────────
+package "Chrome Extension APIs" {
+
+    class "chrome.action" as ChromeAction <<API>> {
+        +setBadgeText(options)
+        +setBadgeBackgroundColor(options)
+    }
+
+    class "chrome.storage.sync" as ChromeStorage <<API>> {
+        +get(keys): Promise
+    }
+
+    class "chrome.scripting" as ChromeScripting <<API>> {
+        +executeScript(injection): Promise
+    }
+
+    class "chrome.tabs" as ChromeTabs <<API>> {
+        +sendMessage(tabId, message)
+        +onRemoved: Event
+    }
+
+}
+
+' ─────────────────────────────────────────────
+' Relationships
+' ─────────────────────────────────────────────
+
+' ServiceWorker owns state maps (composition)
+ServiceWorker *-- TabState : "tabState\nMap<tabId, TabState>"
+
+' ServiceWorker uses data models
+ServiceWorker ..> Settings       : "reads via\ngetSettings()"
+ServiceWorker ..> ScanConfig     : "builds via\nbuildScanConfig()"
+
+' ServiceWorker <-> ContentScript bidirectional messaging
+ServiceWorker ..> ContentScript  : "injects &\nsendMessage(scan /\ntoggle-overlays)"
+ContentScript ..> ServiceWorker  : "sendMessage(findings /\noverlays-toggled /\npage-pointer-active /\ninject-fallback)"
+
+' ContentScript -> Detector
+ContentScript ..> Detector       : "injects <script>\nor chrome.scripting\n(CSP fallback)"
+ContentScript ..> Detector       : "postMessage(scan,\nconfig)"
+Detector       ..> ContentScript : "postMessage(results /\noverlays-toggled /\nready)"
+
+' ContentScript uses ScanConfig
+ContentScript ..> ScanConfig     : "carries scanConfig"
+
+' ServiceWorker -> Chrome APIs
+ServiceWorker ..> ChromeAction   : updateBadge()
+ServiceWorker ..> ChromeStorage  : getSettings()
+ServiceWorker ..> ChromeScripting : ensureContentScriptInjected()
+ServiceWorker ..> ChromeTabs     : sendMessage()
+
+@enduml

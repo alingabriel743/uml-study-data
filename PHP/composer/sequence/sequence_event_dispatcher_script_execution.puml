@@ -1,0 +1,189 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    GroupBackgroundColor #E9ECEF
+    GroupBorderColor #6C757D
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF3CD
+    BorderColor #856404
+    FontColor #212529
+}
+
+title Event Dispatcher: Script and Package Event Execution
+
+participant "Installer" as installer
+participant "EventDispatcher" as dispatcher
+participant "InstallationManager" as instMgr
+participant "PluginManager" as pluginMgr
+participant "CompletePackage" as pkg
+participant "AutoloadGenerator" as autoload
+participant "ProcessExecutor" as process
+
+== Plugin Subscription (startup) ==
+
+pluginMgr -> pluginMgr : addPlugin(plugin)
+activate pluginMgr
+pluginMgr -> dispatcher : addSubscriber(plugin)
+activate dispatcher
+dispatcher -> pluginMgr : plugin.getSubscribedEvents()
+pluginMgr --> dispatcher : [eventName => [method, priority]]
+dispatcher -> dispatcher : addListener(eventName, [plugin, method], priority)
+deactivate dispatcher
+deactivate pluginMgr
+
+== Installer::run() — Pre-Script Phase ==
+
+[-> installer : run()
+activate installer
+
+installer -> dispatcher : dispatchScript(PRE_INSTALL_CMD | PRE_UPDATE_CMD, devMode)
+activate dispatcher
+dispatcher -> dispatcher : doDispatch(new ScriptEvent(eventName, composer, io, devMode))
+activate dispatcher
+dispatcher -> dispatcher : getListeners(event)
+activate dispatcher
+dispatcher -> pkg : getScripts()
+activate pkg
+pkg --> dispatcher : scriptListeners[]
+deactivate pkg
+note right of dispatcher
+  Skips if COMPOSER_SKIP_SCRIPTS env set
+  or runScripts == false
+end note
+dispatcher -> dispatcher : merge $listeners[] + scriptListeners (priority=0)
+dispatcher --> dispatcher : listeners[]
+deactivate dispatcher
+dispatcher -> dispatcher : pushEvent(event)\n[circular dispatch guard]
+loop for each $callable in listeners
+    alt PHP callable (object method)
+        dispatcher -> autoload : makeAutoloader(event, callable)
+        activate autoload
+        autoload --> dispatcher : ClassLoader
+        deactivate autoload
+        dispatcher -> dispatcher : $callable($event)
+    else @scriptName (Composer script alias)
+        dispatcher -> dispatcher : new ScriptEvent(scriptName, ...)
+        dispatcher -> dispatcher : setOriginatingEvent(event)
+        dispatcher -> dispatcher : dispatch(scriptName, scriptEvent) [recursive]
+    else @composer command
+        dispatcher -> dispatcher : getPhpExecCommand()
+        dispatcher -> process : executeTty(phpBin + COMPOSER_BINARY + cmd)
+        activate process
+        process --> dispatcher : exitCode
+        deactivate process
+    else ClassName::methodName (PHP static script)
+        dispatcher -> autoload : makeAutoloader(event, callable)
+        activate autoload
+        autoload --> dispatcher : ClassLoader
+        deactivate autoload
+        dispatcher -> dispatcher : executeEventPhpScript(className, methodName, event)
+        note right : Calls ClassName::methodName($event) statically
+    else SomeCommand (Symfony Command class)
+        dispatcher -> dispatcher : new Application()\napp.add(new $className())\napp.run(StringInput(args), output)
+    else shell command
+        dispatcher -> process : executeTty(resolvedCmd)
+        activate process
+        process --> dispatcher : exitCode
+        deactivate process
+    end
+end
+dispatcher -> dispatcher : popEvent() [finally]
+deactivate dispatcher
+dispatcher --> installer : exitCode
+deactivate dispatcher
+deactivate dispatcher
+
+== Installer::doInstall() — Pre-Operations Installer Event ==
+
+installer -> dispatcher : dispatchInstallerEvent(\n  InstallerEvents::PRE_OPERATIONS_EXEC,\n  devMode, executeOperations, localRepoTransaction)
+activate dispatcher
+dispatcher -> dispatcher : doDispatch(new InstallerEvent(\n  eventName, composer, io,\n  devMode, executeOperations, transaction))
+activate dispatcher
+dispatcher -> dispatcher : getListeners(event) → listeners[]
+dispatcher -> dispatcher : pushEvent / dispatch listeners / popEvent
+deactivate dispatcher
+dispatcher --> installer : exitCode
+deactivate dispatcher
+
+== InstallationManager::execute() — Per-Package Events ==
+
+installer -> instMgr : execute(localRepo, operations, devMode, runScripts, downloadOnly)
+activate instMgr
+
+loop for each operation (install | update | uninstall)
+
+    instMgr -> dispatcher : dispatchPackageEvent(\n  PRE_PACKAGE_INSTALL | PRE_PACKAGE_UPDATE\n  | PRE_PACKAGE_UNINSTALL,\n  devMode, localRepo, allOperations, operation)
+    activate dispatcher
+    dispatcher -> dispatcher : doDispatch(new PackageEvent(\n  eventName, composer, io, devMode,\n  localRepo, operations, operation))
+    activate dispatcher
+    dispatcher -> dispatcher : getListeners / pushEvent / dispatch / popEvent
+    deactivate dispatcher
+    dispatcher --> instMgr : exitCode
+    deactivate dispatcher
+
+    instMgr -> instMgr : installer.prepare(opType, package, initialPackage)
+    instMgr -> instMgr : installer.install(repo, op)\n| installer.update(repo, op)\n| installer.uninstall(repo, op)
+    instMgr -> instMgr : localRepo.write(devMode, this)
+
+    note over instMgr
+      POST_PACKAGE_* events are deferred
+      to postExecCallbacks[] and executed
+      after all async promises resolve
+    end note
+
+    instMgr -> dispatcher : dispatchPackageEvent(\n  POST_PACKAGE_INSTALL | POST_PACKAGE_UPDATE\n  | POST_PACKAGE_UNINSTALL, ...) [deferred callback]
+    activate dispatcher
+    dispatcher -> dispatcher : doDispatch(new PackageEvent(...))
+    activate dispatcher
+    dispatcher -> dispatcher : getListeners / pushEvent / dispatch / popEvent
+    deactivate dispatcher
+    dispatcher --> instMgr : exitCode
+    deactivate dispatcher
+
+end
+
+instMgr --> installer : (operations complete)
+deactivate instMgr
+
+== Installer::run() — Post-Script Phase ==
+
+installer -> dispatcher : dispatchScript(POST_INSTALL_CMD | POST_UPDATE_CMD, devMode)
+activate dispatcher
+dispatcher -> dispatcher : doDispatch(new ScriptEvent(eventName, composer, io, devMode))
+activate dispatcher
+dispatcher -> dispatcher : getListeners / pushEvent / dispatch callables / popEvent
+deactivate dispatcher
+dispatcher --> installer : exitCode
+deactivate dispatcher
+
+[<-- installer : exitCode
+deactivate installer
+
+@enduml

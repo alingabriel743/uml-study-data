@@ -1,0 +1,220 @@
+{
+  "scope": "multiview_diffusion_model_training",
+  "title": "Multiview Diffusion Model Training",
+  "diagram_type": "use_case",
+  "description": "Training a base multiview diffusion model including loss computation and batch sampling across multiple camera views with context parallelism support.",
+
+  "actors": [
+    {
+      "name": "Trainer",
+      "type": "primary",
+      "description": "Orchestrates the training loop via cosmos_predict1.utils.trainer.Trainer; drives forward/loss/backward cycles"
+    },
+    {
+      "name": "DataLoader",
+      "type": "primary",
+      "description": "Supplies data_batch dicts with keys 'video' (input_data_key) and 'images_1024' (input_image_key)"
+    },
+    {
+      "name": "ConfigurationSystem",
+      "type": "primary",
+      "description": "Instantiates MultiviewModelConfig (n_views=6) and Config via make_config(); registers experiment groups"
+    },
+    {
+      "name": "ParallelStateManager",
+      "type": "supporting",
+      "description": "Megatron parallel_state; manages context-parallel (CP) and tensor-parallel (TP) groups"
+    },
+    {
+      "name": "VAE",
+      "type": "supporting",
+      "description": "Encodes/decodes latents; called as self.vae.encode() / self.vae.decode() per-view"
+    },
+    {
+      "name": "Conditioner",
+      "type": "supporting",
+      "description": "Produces condition/uncondition CosmosCondition objects via get_condition_uncondition() or get_condition_with_negative_prompt()"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Configure Multiview Model",
+      "actor": "ConfigurationSystem",
+      "description": "Instantiate MultiviewModelConfig(n_views=6) extending DefaultModelConfig; set VAE, conditioner, net (MultiviewGeneralDIT), EMA, EDMSDE, sigma_data=0.5, latent_shape=[16,24,44,80], loss_reduce='sum'",
+      "key_methods": ["make_config()", "MultiviewModelConfig.__init__()"]
+    },
+    {
+      "id": "UC2",
+      "name": "Initialize MultiviewDiffusionModel",
+      "actor": "Trainer",
+      "description": "Construct MultiviewDiffusionModel(config): calls super().__init__(config) [DiffusionModel], sets self.n_views from config.n_views",
+      "key_methods": ["MultiviewDiffusionModel.__init__(config)"],
+      "extends": []
+    },
+    {
+      "id": "UC3",
+      "name": "Initialize MultiviewGeneralDIT Network",
+      "actor": "Trainer",
+      "description": "Construct MultiviewGeneralDIT: extends GeneralDIT; reinitializes self.blocks as nn.ModuleDict with GeneralDITTransformerBlock(n_views=n_views); adds view_embeddings=nn.Embedding(n_views, view_condition_dim); optionally adds traj_embeddings, repeat_frame_embedding; calls build_patch_embed() and build_pos_embed()",
+      "key_methods": [
+        "MultiviewGeneralDIT.__init__(n_views, view_condition_dim, traj_condition_dim, concat_view_embedding, concat_traj_embedding)",
+        "build_patch_embed()",
+        "build_pos_embed()"
+      ],
+      "important_params": "n_views=3 (default), view_condition_dim=3, pos_emb_cls='rope3d' → MultiviewVideoRopePosition3DEmb + MultiviewSinCosPosEmbAxis"
+    },
+    {
+      "id": "UC4",
+      "name": "Encode Multiview State",
+      "actor": "Trainer",
+      "description": "Rearrange B C (V T) H W → (B V) C T H W, call VAE encode per-view batch, rescale by sigma_data, rearrange back to B C (V T) H W",
+      "key_methods": ["MultiviewDiffusionModel.encode(state: Tensor) → Tensor"],
+      "decorator": "@torch.no_grad()"
+    },
+    {
+      "id": "UC5",
+      "name": "Decode Multiview Latent",
+      "actor": "Trainer",
+      "description": "Rearrange latent to (B V) C T H W, call VAE decode(latent/sigma_data) per-view, rearrange back",
+      "key_methods": ["MultiviewDiffusionModel.decode(latent: Tensor) → Tensor"],
+      "decorator": "@torch.no_grad()"
+    },
+    {
+      "id": "UC6",
+      "name": "Compute Training Loss",
+      "actor": "Trainer",
+      "description": "For image batch: disable CP. For video batch with CP>1: enable CP, split x0/epsilon along temporal dim per view using split_inputs_cp(). Calls grandparent (VideoModel).compute_loss_with_epsilon_and_sigma(). For sum-loss with CP: scale kendall_loss by CP world size. Returns (output_batch, kendall_loss, pred_mse, edm_loss).",
+      "key_methods": [
+        "MultiviewDiffusionModel.compute_loss_with_epsilon_and_sigma(data_batch, x0_from_data_batch, x0, condition, epsilon, sigma)",
+        "self.net.disable_context_parallel()",
+        "self.net.enable_context_parallel(cp_group)",
+        "split_inputs_cp(x, seq_dim=2, cp_group)"
+      ],
+      "branching": "is_image_batch → CP off; video + CP world size > 1 → split x0/epsilon per view"
+    },
+    {
+      "id": "UC7",
+      "name": "Generate Training Samples",
+      "actor": "Trainer",
+      "description": "Normalize data, detect image vs video batch, build x0_fn, generate noise x_sigma_max (arch_invariant_rand * sde.sigma_max). If CP enabled: split x_sigma_max per view. Run sampler(x0_fn, x_sigma_max, num_steps, sigma_max, solver_option). If CP enabled: cat_outputs_cp per view. Return samples.",
+      "key_methods": [
+        "MultiviewDiffusionModel.generate_samples_from_batch(data_batch, guidance=1.5, seed, state_shape, n_sample, num_steps=35, solver_option='2ab')",
+        "get_x0_fn_from_batch(data_batch, guidance)",
+        "self.sampler(x0_fn, x_sigma_max, ...)",
+        "split_inputs_cp()", "cat_outputs_cp()"
+      ]
+    },
+    {
+      "id": "UC8",
+      "name": "Build Denoising Function (x0_fn)",
+      "actor": "Trainer",
+      "description": "Get condition/uncondition from conditioner. Broadcast to TP/CP groups. Return closure x0_fn(noise_x, sigma): computes cond_x0=denoise(noise_x,sigma,condition).x0, uncond_x0=denoise(...,uncondition).x0, applies classifier-free guidance: raw_x0 = cond_x0 + guidance*(cond_x0-uncond_x0). Optional inpainting via guided_image/guided_mask replacement trick.",
+      "key_methods": [
+        "MultiviewDiffusionModel.get_x0_fn_from_batch(data_batch, guidance, is_negative_prompt, guidance_other) → Callable",
+        "conditioner.get_condition_uncondition(data_batch)",
+        "conditioner.get_condition_with_negative_prompt(data_batch)",
+        "broadcast_condition(condition, to_tp, to_cp)",
+        "self.denoise(noise_x, sigma, condition)"
+      ],
+      "guidance_modes": "standard CFG; dual-guidance (guidance + guidance_other for trajectory); inpainting replacement"
+    },
+    {
+      "id": "UC9",
+      "name": "Prepare Embedded Sequence (Forward Pre-Block)",
+      "actor": "MultiviewGeneralDIT",
+      "description": "Concatenate optional padding mask. Generate view_embeddings (nn.Embedding) for [0..V-1]. Optionally add repeat_frame_embedding. Optionally concat traj_emb. Rearrange to B C V T H W, concat view embedding channel-wise, rearrange back. Apply x_embedder (PatchEmbed). Compute RoPE pos embedding via MultiviewVideoRopePosition3DEmb. Compute extra_pos_emb via MultiviewSinCosPosEmbAxis.",
+      "key_methods": [
+        "MultiviewGeneralDIT.prepare_embedded_sequence(x_B_C_T_H_W, fps, padding_mask, trajectory, frame_repeat)",
+        "self.view_embeddings(view_indices)",
+        "self.x_embedder(x_B_C_T_H_W)",
+        "self.pos_embedder(x_B_T_H_W_D, fps)",
+        "self.extra_pos_embedder(x_B_T_H_W_D, fps)"
+      ]
+    },
+    {
+      "id": "UC10",
+      "name": "Execute DIT Forward Pass",
+      "actor": "MultiviewGeneralDIT",
+      "description": "forward_before_blocks(): call prepare_embedded_sequence(), t_embedder(timesteps), prepare_additional_timestamp_embedder(), affline_norm(). Rearrange for THWBD or BTHWD format. Optionally scatter for sequence parallelism. Returns dict with x, affline_emb_B_D, crossattn_emb, crossattn_mask, rope_emb, adaln_lora, original_shape, extra_pos_emb.",
+      "key_methods": [
+        "MultiviewGeneralDIT.forward_before_blocks(x, timesteps, crossattn_emb, crossattn_mask, fps, image_size, padding_mask, data_type, ...)",
+        "self.t_embedder(timesteps)",
+        "self.affline_norm(affline_emb_B_D)"
+      ]
+    },
+    {
+      "id": "UC11",
+      "name": "FSDP-Wrapped Model Training",
+      "actor": "Trainer",
+      "description": "FSDPDiffusionModel(MultiviewDiffusionModel) decorated by @diffusion_fsdp_class_decorator; pass-through class enabling FSDP sharding. Config: FSDPConfig(policy='block', sharding_group_size=8, sharding_strategy='full').",
+      "key_methods": ["FSDPDiffusionModel (no new methods, inherits all from MultiviewDiffusionModel)"]
+    }
+  ],
+
+  "relationships": [
+    "MultiviewDiffusionModel extends DiffusionModel",
+    "FSDPDiffusionModel extends MultiviewDiffusionModel (decorated with diffusion_fsdp_class_decorator)",
+    "MultiviewGeneralDIT extends GeneralDIT",
+    "VideoExtendGeneralDIT extends MultiviewGeneralDIT",
+    "MultiviewModelConfig extends DefaultModelConfig",
+    "MultiviewDiffusionModel composes MultiviewGeneralDIT (as self.net)",
+    "MultiviewDiffusionModel composes VAE (as self.vae)",
+    "MultiviewDiffusionModel composes Conditioner (as self.conditioner)",
+    "MultiviewDiffusionModel composes EDMSDE (as self.sde)",
+    "MultiviewGeneralDIT composes GeneralDITTransformerBlock (nn.ModuleDict self.blocks)",
+    "MultiviewGeneralDIT composes nn.Embedding view_embeddings(n_views, view_condition_dim)",
+    "MultiviewGeneralDIT composes MultiviewVideoRopePosition3DEmb (self.pos_embedder)",
+    "MultiviewGeneralDIT composes MultiviewSinCosPosEmbAxis (self.extra_pos_embedder)",
+    "MultiviewGeneralDIT composes PatchEmbed (self.x_embedder)",
+    "UC3 includes UC9 (prepare_embedded_sequence called in forward_before_blocks)",
+    "UC7 includes UC8 (get_x0_fn_from_batch)",
+    "UC6 uses split_inputs_cp from context_parallel module",
+    "UC7 uses cat_outputs_cp from context_parallel module"
+  ],
+
+  "include_extend_relationships": [
+    {"type": "include", "from": "UC7", "to": "UC8", "label": "includes get_x0_fn_from_batch"},
+    {"type": "include", "from": "UC10", "to": "UC9", "label": "includes prepare_embedded_sequence"},
+    {"type": "extend", "from": "UC11", "to": "UC2", "label": "FSDP variant extends base init"},
+    {"type": "extend", "from": "UC6", "to": "UC7", "label": "loss uses same CP split logic"}
+  ],
+
+  "key_config_values": {
+    "n_views": 6,
+    "sigma_data": 0.5,
+    "sigma_max": 80,
+    "sigma_min": 0.0002,
+    "p_mean": 0.0,
+    "p_std": 1.0,
+    "loss_reduce": "sum",
+    "latent_shape": [16, 24, 44, 80],
+    "input_data_key": "video",
+    "input_image_key": "images_1024",
+    "precision": "bfloat16",
+    "fsdp_sharding_group_size": 8,
+    "default_guidance": 1.5,
+    "default_num_steps": 35,
+    "default_solver_option": "2ab"
+  },
+
+  "important_notes": [
+    "n_views in MultiviewDiffusionModel is used to rearrange B C (V T) H W ↔ (B V) C T H W for per-view VAE ops",
+    "Context parallelism (CP) splits the temporal dimension per view; only enabled for video batches, not image batches",
+    "MultiviewGeneralDIT reinitializes self.blocks as nn.ModuleDict (not list) with optional layer_mask to skip blocks",
+    "view_embeddings (learnable nn.Embedding) are concatenated channel-wise to the latent before PatchEmbed",
+    "pos_emb_cls must be 'rope3d' for multiview → uses MultiviewVideoRopePosition3DEmb + MultiviewSinCosPosEmbAxis",
+    "extra_per_block_abs_pos_emb must be True in MultiviewGeneralDIT; uses 'sincos' type",
+    "FSDPDiffusionModel is a pass-through class decorated at class definition time for FSDP wrapping",
+    "Dual guidance (guidance_other) supported for inference-time trajectory guidance; not usable with parallel_state",
+    "Inpainting supported via guided_image/guided_mask replacement trick in x0_fn"
+  ],
+
+  "source_files_analyzed": [
+    "Lyra-1/cosmos_predict1/diffusion/training/models/model_multiview.py",
+    "Lyra-1/cosmos_predict1/diffusion/training/networks/general_dit_multiview.py",
+    "Lyra-1/cosmos_predict1/diffusion/training/config/base/model.py",
+    "Lyra-1/cosmos_predict1/diffusion/training/config/config_multiview.py"
+  ]
+}

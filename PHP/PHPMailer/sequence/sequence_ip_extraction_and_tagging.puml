@@ -1,0 +1,216 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #F1F3F5
+    GroupBorderColor #868E96
+    GroupBackgroundColor #DEE2E6
+    DividerBorderColor #868E96
+    DividerBackgroundColor #E9ECEF
+    NoteBackgroundColor #FFF9DB
+    NoteBorderColor #F08C00
+}
+
+title IP Extraction and Header Tagging Flow
+
+box "PHP Layer" #EDF2FF
+    participant "Caller\n(PHP Integration /\nSwooleIntegration)" as Caller
+    participant "DDTrace\\\\extract_ip_from_headers\n(PHP stub)" as PHPStub
+    participant "DDTrace\\\\active_span() /\nroot_span()" as SpanAccessor
+end box
+
+box "C Extension Layer (ddtrace.so)" #E3FAFC
+    participant "ddtrace_extract_ip_from_headers\n(ip_extraction.c:214)" as ExtractHeaders
+    participant "ddtrace_ip_extraction_find\n(ip_extraction.c:133)" as IPFind
+    participant "priority_header_map\n(header parsers)" as HeaderMap
+    participant "SpanData::$meta\n(http.client_ip tag)" as SpanMeta
+    participant "DDTRACE_G\n(additional_global_tags)" as GlobalTags
+end box
+
+box "Auto / APM Path" #FFF0F6
+    participant "serializer.c\n(span serialization)" as Serializer
+end box
+
+box "AppSec Extension" #FFF4E6
+    participant "dd_tags_add_tags()\n(appsec/tags.c)" as AppSecTags
+end box
+
+== Manual / Integration Path ==
+
+Caller -> PHPStub : extract_ip_from_headers(array $headers)\n<i>[ext/ddtrace.stub.php:695]</i>
+activate PHPStub
+
+PHPStub -> ExtractHeaders : ddtrace_extract_ip_from_headers(zval *server, zend_array *meta)\n<i>[ip_extraction.c:214]</i>
+activate ExtractHeaders
+
+ExtractHeaders -> IPFind : ddtrace_ip_extraction_find(zval *server)\n<i>[ip_extraction.c:133]</i>
+activate IPFind
+
+note over IPFind
+  **DDTRACE_PUBLIC symbol** — also
+  exported for use by AppSec extension
+  (ddtrace.sym:12)
+end note
+
+alt DD_TRACE_CLIENT_IP_HEADER is set (custom override)
+    IPFind -> HeaderMap : dd_fetch_arr_str(server, custom_header)
+    activate HeaderMap
+    HeaderMap -> HeaderMap : dd_parse_forwarded() or\ndd_parse_multiple_maybe_port()
+    HeaderMap --> IPFind : extract_res { success, is_private }
+    deactivate HeaderMap
+
+else Scan priority header map (standard flow)
+    loop for each header in priority order
+        IPFind -> HeaderMap : parse_fn(header_value, &out)
+        activate HeaderMap
+        note right of HeaderMap
+          **Priority order:**
+          1. X-Forwarded-For
+          2. X-Real-IP
+          3. Forwarded (RFC 7239)
+          4. True-Client-IP
+          5. X-Client-IP
+          6. X-Forwarded
+          7. Forwarded-For
+          8. X-Cluster-Client-IP
+          9. Fastly-Client-IP
+          10. CF-Connecting-IP
+          11. CF-Connecting-IPv6
+        end note
+        HeaderMap --> IPFind : extract_res { success, is_private }
+        deactivate HeaderMap
+
+        opt Public IP found (is_private = false)
+            IPFind -> IPFind : select this IP as winner\n(first public IP wins — stop scan)
+        end
+
+        opt Private IP found, no public yet
+            IPFind -> IPFind : retain as fallback\n(private ranges: 10/8, 172.16/12,\n192.168/16, 127/8, 169.254/16, 100.64/10)
+        end
+    end
+
+    opt No public IP found in any header
+        IPFind -> HeaderMap : dd_parse_plain(REMOTE_ADDR)\n<i>(fallback)</i>
+        activate HeaderMap
+        HeaderMap --> IPFind : extract_res { success }
+        deactivate HeaderMap
+    end
+end
+
+IPFind -> IPFind : dd_ipaddr_to_zstr(&out)\nnormalize IPv4-mapped IPv6 (::ffff:x.x.x.x → IPv4)\nstrip port from IPv4:port / [IPv6]:port
+
+IPFind --> ExtractHeaders : zend_string* normalized_ip
+deactivate IPFind
+
+ExtractHeaders -> SpanMeta : zend_hash_str_update(meta,\n"http.client_ip", normalized_ip)\n<i>[ip_extraction.c — writes tag to meta array]</i>
+activate SpanMeta
+SpanMeta --> ExtractHeaders : ok
+deactivate SpanMeta
+
+ExtractHeaders --> PHPStub : (meta hash updated)
+deactivate ExtractHeaders
+
+PHPStub --> Caller : return array ["http.client_ip" => "<ip>"]
+deactivate PHPStub
+
+== Tag Active / Root Span (Manual Mode) ==
+
+alt Standard PHP integration (active span)
+    Caller -> SpanAccessor : DDTrace\\active_span()\n<i>[ddtrace.c:3229]</i>
+    activate SpanAccessor
+    SpanAccessor --> Caller : SpanData (top of SpanStack)
+    deactivate SpanAccessor
+
+    Caller -> SpanMeta : $span->meta["http.client_ip"] =\n$ipResult["http.client_ip"]\n<i>[direct property write on SpanData::$meta]</i>
+    activate SpanMeta
+    SpanMeta --> Caller : ok
+    deactivate SpanMeta
+
+else Swoole integration (root span merge)
+    Caller -> SpanAccessor : DDTrace\\root_span()\n<i>[ddtrace.c]</i>
+    activate SpanAccessor
+    SpanAccessor --> Caller : RootSpanData (base of SpanStack)
+    deactivate SpanAccessor
+
+    Caller -> SpanMeta : $rootSpan->meta += $res\n<i>[SwooleIntegration.php:64 — merges\nfull result array onto root span meta]</i>
+    activate SpanMeta
+    SpanMeta --> Caller : ok
+    deactivate SpanMeta
+end
+
+== Automatic Path (Serializer / DD_TRACE_CLIENT_IP_ENABLED) ==
+
+note over Serializer
+  **Triggered automatically** during web span
+  serialization when
+  **DD_TRACE_CLIENT_IP_ENABLED = true**
+end note
+
+Serializer -> ExtractHeaders : ddtrace_extract_ip_from_headers(&server_zv, meta)\n<i>[serializer.c:678]</i>
+activate ExtractHeaders
+ExtractHeaders -> IPFind : ddtrace_ip_extraction_find(zval *server)
+activate IPFind
+IPFind --> ExtractHeaders : normalized_ip
+deactivate IPFind
+ExtractHeaders -> SpanMeta : zend_hash_str_update(meta, "http.client_ip", val)
+activate SpanMeta
+SpanMeta --> ExtractHeaders : ok
+deactivate SpanMeta
+ExtractHeaders --> Serializer : (span meta updated automatically)
+deactivate ExtractHeaders
+
+== AppSec Path ==
+
+note over AppSecTags
+  AppSec uses same **DD_TAG_HTTP_CLIENT_IP**
+  constant ("http.client_ip") defined in
+  appsec/src/extension/tags.c
+end note
+
+AppSecTags -> IPFind : ddtrace_ip_extraction_find(server)\n<i>[DDTRACE_PUBLIC exported symbol]</i>
+activate IPFind
+IPFind --> AppSecTags : normalized_ip
+deactivate IPFind
+
+AppSecTags -> SpanMeta : dd_trace_span_add_tag(span,\nDD_TAG_HTTP_CLIENT_IP, ip)\n<i>[writes client IP to active span meta for AppSec]</i>
+activate SpanMeta
+SpanMeta --> AppSecTags : ok
+deactivate SpanMeta
+
+== Global Tag Propagation ==
+
+Caller -> GlobalTags : DDTrace\\add_global_tag("http.client_ip", ip)\n<i>[ddtrace.c:2064]</i>
+activate GlobalTags
+note right of GlobalTags
+  Writes to
+  **DDTRACE_G(additional_global_tags)** hash.
+  All **new spans** created after this call
+  automatically inherit this tag.
+end note
+GlobalTags --> Caller : void
+deactivate GlobalTags
+
+@enduml

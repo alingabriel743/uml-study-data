@@ -1,0 +1,185 @@
+{
+  "scope": "session_and_user_services",
+  "title": "Session & User Services",
+  "diagram_type": "class",
+  "classes": [
+    {
+      "name": "BaseService",
+      "type": "abstract",
+      "notes": "Base class for all services; provides this.services (service locator), this.db, this.log, this.errors, this.config, this.modules"
+    },
+    {
+      "name": "SessionService",
+      "extends": "BaseService",
+      "properties": [
+        "db: DatabaseAccessService (injected in _init)"
+      ],
+      "constants": [
+        "SESSION_CACHE_TTL_SECONDS = 300",
+        "SESSION_FLUSH_LOCK_TTL_SECONDS = 30",
+        "SESSION_FLUSH_INTERVAL_STEP_SECONDS = 5 (1-12 random steps)"
+      ],
+      "methods": [
+        "_init(): void — gets DB, starts flush loop",
+        "create_session(user, meta): Promise<Session> — INSERT into sessions, cacheSession()",
+        "getSession(uuid): Promise<Session|undefined> — #getSession + touch + cacheSession(pending) + #removeInternalValues",
+        "get_user_sessions(user): Promise<Session[]> — reads redis set by user_id, maps cached sessions",
+        "remove_session(uuid): Promise — invalidateCachedSession + DELETE from sessions",
+        "cacheSession(session, options): Promise<void> — SET in redis (EX 300s), SADD to user-set, manage flush-pending set",
+        "getCachedSession(uuid): Promise<Session|null> — GET from redis, parse JSON, validate uuid",
+        "invalidateCachedSession(uuid, userId?): Promise<void> — DEL from redis, SREM from sets",
+        "getSessionCacheKey(uuid): string",
+        "getSessionUserSetKey(userId): string",
+        "getSessionFlushLockKey(uuid): string",
+        "#getSession(uuid): Promise<Session|undefined> — cache-first, fallback to DB tryHardRead + get_user()",
+        "#updateSessions(): Promise<void> — periodic flush: UPDATE sessions + UPDATE user.last_activity_ts + update UserRedisCacheSpace",
+        "#scheduleSessionFlushLoop(): void — recursive setTimeout with random interval",
+        "#getRandomFlushIntervalMs(): number",
+        "#removeInternalValues(session): Session — strips last_touch, last_store, user_id, flushPending"
+      ],
+      "redis_keys": [
+        "session-cache:{uuid} — session JSON, TTL 300s",
+        "session-cache:user-sessions:{userId} — set of session UUIDs",
+        "session-cache:flush-pending — set of UUIDs pending DB flush",
+        "session-cache:flush-lock:{uuid} — distributed lock, TTL 30s"
+      ],
+      "db_tables": ["sessions (uuid, user_id, meta, last_activity, created_at)", "user (last_activity_ts)"]
+    },
+    {
+      "name": "UserService",
+      "extends": "BaseService",
+      "static": { "MODULES": "{ uuidv4: require('uuid').v4 }" },
+      "properties": [
+        "db: DatabaseAccessService (DB_WRITE)",
+        "dir_system: FSNode | null"
+      ],
+      "methods": [
+        "_init(): void — gets DB_WRITE connection",
+        "'__on_filesystem.ready'(): void — ensures system user home dir exists via GetUserService + generate_default_fsentries()",
+        "get_system_dir(): FSNode",
+        "generate_default_fsentries({ user }): Promise<void> — bulk INSERT 8 default dirs (Home/Trash/AppData/Desktop/Documents/Pictures/Videos/Public), UPDATE user folder UUIDs/IDs, invalidate_cached_user()",
+        "updateUserMetadata(userId, updatedMetadata): Promise<void> — SELECT metadata, merge, UPDATE user, GetUserService.get_user(force:true), invalidate_cached_user_by_id()"
+      ],
+      "db_tables": ["fsentries (uuid, parent_uid, user_id, name, path, is_dir, ...)", "user (metadata, trash_uuid, appdata_uuid, ...)"],
+      "events_handled": ["filesystem.ready"]
+    },
+    {
+      "name": "GetUserService",
+      "extends": "BaseService",
+      "properties": [
+        "id_properties: Set<string> — {username, uuid, id, email, referral_code}"
+      ],
+      "methods": [
+        "_construct(): void — initializes id_properties Set",
+        "_init(): void — registers PermissionImplicator 'user-set-own' with PermissionService",
+        "get_user(options): Promise<User|null> — cache-first via UserRedisCacheSpace, fallback get_user_(), then svc_whoami.get_details(), cache result",
+        "get_user_(options): Promise<User|null> — DB read (replica first, then primary) by any id_property; parses metadata JSON",
+        "refresh_actor(actor): Promise<Actor> — force-refreshes actor.type.user via get_user(force:true)",
+        "register_id_property(prop): void — adds custom identifying property to Set"
+      ],
+      "options_flags": "cached (default true), force (bypass replica, use primary)",
+      "db_tables": ["user"]
+    },
+    {
+      "name": "ReferralCodeService",
+      "extends": "BaseService",
+      "properties": [
+        "REFERRAL_INCREASE_LEFT = 1 GB",
+        "REFERRAL_INCREASE_RIGHT = 1 GB",
+        "STORAGE_INCREASE_STRING = '1 GB'",
+        "MAX_REFERRALS_PER_MONTH = 20",
+        "MONTHLY_REFERRAL_KEY_PREFIX = 'referral:monthly'"
+      ],
+      "methods": [
+        "_construct(): void — sets referral constants",
+        "_init(): void — subscribes to 'user.email-confirmed' event → on_verified()",
+        "gen_referral_code(user): Promise<string> — seeded RNG (seedrandom), up to 5 tries UPDATE user.referral_code, invalidate_cached_user_by_id()",
+        "on_verified(user): Promise<void> — checks referred_by, consumeMonthlyReferralSlot(), svc_size.add_storage() ×2, meteringService.updateAddonCredit() ×2, svc_email.send_email(), svc_notification.notify()",
+        "consumeMonthlyReferralSlot(referredByUserId): Promise<number> — sudo() → kvStore.incr() + kvStore.expireAt()",
+        "getMonthlyReferralKey(referredByUserId, nowMs?): string",
+        "getNextMonthTimestamp(nowMs?): number",
+        "getUser(query): Promise<User> — delegates to helpers.get_user()"
+      ],
+      "events_handled": ["user.email-confirmed"],
+      "external_calls": ["sizeService.add_storage()", "meteringService.updateAddonCredit()", "EmailService.send_email()", "NotificationService.notify()"]
+    },
+    {
+      "name": "Emailservice",
+      "note": "Exported as 'Emailservice' (lowercase s), registered as 'email' service",
+      "extends": "BaseService",
+      "static": { "MODULES": "{ nodemailer, handlebars, dedent }" },
+      "properties": [
+        "templates: Object — 12 named templates (new-referral, approved-for-listing, listing-rejected, email_change_request, email_verification_code, email_verification_link, email_password_recovery, enabled_2fa, disabled_2fa, share_by_username, share_by_email, password_change_notification)",
+        "template_fns: Object — compiled Handlebars template functions keyed by template name"
+      ],
+      "methods": [
+        "_construct(): void — compiles all templates with Handlebars + dedent, registers nl2br helper",
+        "_init(): void — no-op",
+        "get_transport_(): nodemailer.Transport — creates transport from this.config (SMTP)",
+        "send_email(user, template, values): Promise<void> — renders template, calls transporter.sendMail(from: no-reply@puter.com)",
+        "sendMail(params): void — raw passthrough to nodemailer transporter.sendMail()"
+      ]
+    },
+    {
+      "name": "UserRedisCacheSpace",
+      "type": "utility/namespace",
+      "notes": "Static helper — getByProperty(prop, val), setUser(user, opts), key(prop, val). Used by SessionService and GetUserService for user-level Redis caching."
+    }
+  ],
+  "relationships": [
+    "SessionService extends BaseService",
+    "UserService extends BaseService",
+    "GetUserService extends BaseService",
+    "ReferralCodeService extends BaseService",
+    "Emailservice extends BaseService",
+    "SessionService depends_on redisClient (direct import)",
+    "SessionService depends_on UserRedisCacheSpace (update user cache on flush)",
+    "SessionService depends_on database service (DB read/write)",
+    "SessionService depends_on helpers.get_user (inside #getSession)",
+    "UserService depends_on GetUserService (get-user service for system user lookup)",
+    "UserService depends_on database service (DB_WRITE)",
+    "UserService depends_on helpers.invalidate_cached_user / invalidate_cached_user_by_id",
+    "GetUserService depends_on UserRedisCacheSpace (cache reads/writes)",
+    "GetUserService depends_on database service (DB_READ, replica + primary)",
+    "GetUserService depends_on whoami service (enriches user object)",
+    "GetUserService depends_on permission service (registers implicator in _init)",
+    "ReferralCodeService depends_on GetUserService / helpers.get_user",
+    "ReferralCodeService depends_on Emailservice (send_email on referral verified)",
+    "ReferralCodeService depends_on NotificationService (notify referrer)",
+    "ReferralCodeService depends_on sizeService (add_storage ×2)",
+    "ReferralCodeService depends_on meteringService (updateAddonCredit ×2)",
+    "ReferralCodeService depends_on puter-kvstore (monthly referral counter)",
+    "ReferralCodeService depends_on event service (subscribes user.email-confirmed)",
+    "ReferralCodeService depends_on su service (sudo() for kvStore ops)",
+    "Emailservice depends_on nodemailer (SMTP transport)",
+    "Emailservice depends_on handlebars (template rendering)"
+  ],
+  "key_flows": [
+    "Session creation: create_session() → INSERT DB → cacheSession() → redis SET + SADD user-set",
+    "Session retrieval: getSession() → getCachedSession() [redis GET] or DB tryHardRead → touch + mark pending flush → #removeInternalValues",
+    "Session flush loop: #scheduleSessionFlushLoop() → #updateSessions() → for each pending UUID: acquire redis lock → getCachedSession() → UPDATE sessions DB → UPDATE user.last_activity_ts DB → update UserRedisCacheSpace",
+    "Session removal: remove_session() → getCachedSession() + DB SELECT user_id → invalidateCachedSession() → DELETE sessions DB",
+    "User lookup (GetUserService): get_user() → UserRedisCacheSpace.getByProperty() [cache hit] OR get_user_() [DB read replica→primary] → svc_whoami.get_details() → UserRedisCacheSpace.setUser()",
+    "User metadata update: UserService.updateUserMetadata() → DB SELECT metadata → merge → DB UPDATE → GetUserService.get_user(force:true) → invalidate_cached_user_by_id()",
+    "Default fs entries: UserService.generate_default_fsentries() → bulk INSERT 8 dirs into fsentries → UPDATE user table with folder UUIDs/IDs → invalidate cache",
+    "Referral code generation: gen_referral_code(user) → seedrandom → generate_random_code(8) → UPDATE user.referral_code (up to 5 retries) → invalidate cache",
+    "Referral verification: on 'user.email-confirmed' event → ReferralCodeService.on_verified() → consumeMonthlyReferralSlot() → svc_size.add_storage ×2 → meteringService.updateAddonCredit ×2 → EmailService.send_email(referred_by, 'new-referral') → NotificationService.notify()",
+    "Email delivery: EmailService.send_email(user, template, values) → template_fns[template](values) [Handlebars compile] → get_transport_() [nodemailer SMTP] → transporter.sendMail()"
+  ],
+  "important_notes": [
+    "EmailService class is named 'Emailservice' (lowercase s) in source code",
+    "SessionService uses distributed locking in Redis to prevent duplicate DB flushes across instances",
+    "GetUserService supports pluggable id_properties via register_id_property(); defaults: username, uuid, id, email, referral_code",
+    "UserService listens to 'filesystem.ready' event to bootstrap system user home directory",
+    "ReferralCodeService enforces MAX_REFERRALS_PER_MONTH=20 via Redis kvStore counter (monthly rolling)",
+    "Referral rewards: +1 GB storage + $0.25 credit to both referrer and referee",
+    "All services use service locator pattern via this.services.get('service-name')"
+  ],
+  "source_files_analyzed": [
+    "src/backend/src/services/SessionService.js",
+    "src/backend/src/services/UserService.js",
+    "src/backend/src/services/GetUserService.js",
+    "src/backend/src/services/ReferralCodeService.js",
+    "src/backend/src/services/EmailService.js"
+  ]
+}

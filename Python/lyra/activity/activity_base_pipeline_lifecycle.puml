@@ -1,0 +1,158 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam NoteBackgroundColor #FFF9C4
+skinparam NoteBorderColor #F0AD4E
+
+title Base World Generation Pipeline Lifecycle
+
+|Pipeline — __init__|
+
+start
+
+:Receive configuration parameters\n(checkpoint_dir, checkpoint_name,\nhas_text_input, offload_* flags,\ndisable_* flags);
+
+note right
+  <b>Key flags:</b>
+  offload_network, offload_tokenizer,
+  offload_text_encoder_model,
+  offload_guardrail_models,
+  disable_guardrail, disable_prompt_encoder
+end note
+
+:Initialise instance state:\nself.text_guardrail = None\nself.video_guardrail = None\nself.text_encoder = None\nself.model = None;
+
+|Component Loading|
+
+:**[Step 1 — Always]**\n_load_model(checkpoint_name)\n<i>[abstract · subclass must implement]</i>;
+
+note right
+  Only unconditionally-called
+  method in __init__.
+  Populates self.model.
+end note
+
+if (offload_text_encoder_model = True\nAND disable_prompt_encoder = False?) then (defer)
+  :Text encoder deferred;\nnote right: Loaded lazily by\n_run_text_embedding_on_prompt_with_offload()
+else (load now)
+  :**[Step 2]** _load_text_encoder_model();
+  if (disable_prompt_encoder = True?) then (yes)
+    :self.text_encoder =\nDummyT5TextEncoder(device='cuda');
+  else (no)
+    :self.text_encoder =\nCosmosT5TextEncoder\n(cache_dir = checkpoint_dir/\ngoogle-t5/t5-11b);
+  endif
+endif
+
+if (disable_guardrail = True\nOR offload_guardrail_models = True?) then (skip / defer)
+  :Guardrail models skipped or deferred;\nnote right: Loaded lazily by\n_run_guardrail_*_with_offload() methods
+else (load now)
+  :**[Step 3]** Load guardrail models;
+  if (has_text_input = True?) then (yes)
+    :_load_text_guardrail()\n→ create_text_guardrail_runner(checkpoint_dir);
+  else (no text input)
+  endif
+  :_load_video_guardrail()\n→ create_video_guardrail_runner(checkpoint_dir);
+endif
+
+if (offload_network = True?) then (defer)
+  :Network loading deferred;\nnote right: Loaded lazily by\n_run_model_with_offload()\n[subclass responsibility]
+else (load now)
+  :**[Step 4]** _load_network()\n<i>[no-op in base · subclass override]</i>;
+endif
+
+if (offload_tokenizer = True?) then (defer)
+  :Tokenizer loading deferred;\nnote right: Loaded lazily by\n_run_tokenizer_decoding()\n[subclass responsibility]
+else (load now)
+  :**[Step 5]** _load_tokenizer()\n<i>[no-op in base · subclass override]</i>;
+endif
+
+|Pipeline — __init__|
+
+:Pipeline Ready for Inference;
+
+note right
+  All non-offloaded components
+  are resident in GPU memory.
+  Deferred components will be
+  loaded on first use.
+end note
+
+detach
+
+|Runtime — Lazy Load / Offload Pattern|
+
+:Inference request;
+
+:**_run_text_embedding_on_prompt_with_offload**(prompts);
+if (offload_text_encoder_model?) then (yes)
+  :_load_text_encoder_model();
+endif
+:_run_text_embedding_on_prompt()\n→ text_encoder.encode_prompts([prompt])\n  for each prompt in prompts;
+if (offload_text_encoder_model?) then (yes)
+  |Memory Management|
+  :_offload_text_encoder_model()\ndel text_encoder\nself.text_encoder = None\ngc.collect()\ntorch.cuda.empty_cache();
+  |Runtime — Lazy Load / Offload Pattern|
+endif
+:return (embeddings, masks);
+
+:**_run_guardrail_on_prompt_with_offload**(prompt);
+if (offload_guardrail_models?) then (yes)
+  :_load_text_guardrail();
+endif
+:_run_guardrail_on_prompt()\n→ guardrail_presets.run_text_guardrail(prompt);
+if (offload_guardrail_models?) then (yes)
+  |Memory Management|
+  :_offload_guardrail_models()\ndel text_guardrail (if exists)\ndel video_guardrail (if exists)\ngc.collect()\ntorch.cuda.empty_cache();
+  |Runtime — Lazy Load / Offload Pattern|
+endif
+:return is_safe: bool;
+
+:**_run_guardrail_on_video_with_offload**(video);
+if (offload_guardrail_models?) then (yes)
+  :_load_video_guardrail();
+endif
+:_run_guardrail_on_video()\n→ guardrail_presets.run_video_guardrail(video);
+if (offload_guardrail_models?) then (yes)
+  |Memory Management|
+  :_offload_guardrail_models()\ndel text_guardrail (if exists)\ndel video_guardrail (if exists)\ngc.collect()\ntorch.cuda.empty_cache();
+  |Runtime — Lazy Load / Offload Pattern|
+endif
+:return video: np.ndarray | None;
+
+note right
+  <b>_run_model_with_offload()</b> is abstract;
+  subclass implements the
+  load → run → offload cycle
+  for the main generative model.
+end note
+
+stop
+
+@enduml

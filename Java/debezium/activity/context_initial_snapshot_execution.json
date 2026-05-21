@@ -1,0 +1,189 @@
+{
+  "scope": "initial_snapshot_execution",
+  "title": "Initial Snapshot Execution",
+  "diagram_type": "activity",
+  "key_participants": [
+    "SnapshotterServiceProvider",
+    "SnapshotterService",
+    "Snapshotter (SPI)",
+    "SnapshotLock (SPI)",
+    "SnapshotQuery (SPI)",
+    "RelationalSnapshotChangeEventSource",
+    "ThreadedSnapshotExecutor",
+    "JdbcConnection / ConnectionPool",
+    "EventDispatcher",
+    "OffsetContext",
+    "SnapshotReceiver"
+  ],
+
+  "phase_1_service_bootstrap": [
+    "SnapshotterServiceProvider.createService(configuration, serviceRegistry)",
+    "  → beanRegistry.lookupByName(CONNECTOR_CONFIG) → CommonConnectorConfig",
+    "  → resolve snapshotMode: if 'custom' && customName non-empty use customName else use configuredMode",
+    "  → ServiceLoader.load(Snapshotter.class) filter by name → exactly 1 match (throws if 0 or >1)",
+    "  → serviceRegistry.tryGetService(SnapshotQuery.class)",
+    "  → serviceRegistry.tryGetService(SnapshotLock.class)",
+    "  → if snapshotter instanceof BeanRegistryAware → injectBeanRegistry(beanRegistry)",
+    "  → snapshotter.configure(configuration.asMap())",
+    "  → return new SnapshotterService(snapshotter, snapshotQuery, snapshotLock)"
+  ],
+
+  "phase_2_task_determination": [
+    "RelationalSnapshotChangeEventSource.getSnapshottingTask(partition, previousOffset)",
+    "  → snapshotterService.getSnapshotter()",
+    "  → check offsetExists = (previousOffset != null)",
+    "  → check snapshotInProgress = previousOffset.isInitialSnapshotRunning()",
+    "  → snapshotter.shouldSnapshotSchema(offsetExists, snapshotInProgress) → boolean",
+    "  → snapshotter.shouldSnapshotData(offsetExists, snapshotInProgress) → boolean",
+    "  → return SnapshottingTask(snapshotSchema, snapshotData, dataCollections, selectOverrides, isOnDemand=false)"
+  ],
+
+  "phase_3_main_execute_flow": [
+    "doExecute(context, previousOffset, snapshotContext, snapshottingTask)",
+    "  STEP 1 – Preparing",
+    "    → getDataCollectionPattern(snapshottingTask.getDataCollections())",
+    "    → preSnapshot()",
+    "    → check previousOffset.isInitialSnapshotRunning() (log warning if incomplete prior run)",
+    "  STEP 2 – Determining captured tables",
+    "    → createSnapshotConnection() [jdbcConnection.reconnect() if invalid; setAutoCommit(false)]",
+    "    → connectionCreated(ctx) [subclass hook]",
+    "    → determineCapturedTables(ctx, dataCollectionsToBeSnapshotted, snapshottingTask)",
+    "      → getAllTableIds(ctx) [abstract, DB-specific]",
+    "      → determineDataCollectionsToBeSnapshotted(allTableIds, patterns)",
+    "      → filter by tableFilters.dataCollectionFilter().isIncluded(tableId)",
+    "      → addSignalingCollectionAndSort(capturedTables)",
+    "    → snapshotProgressListener.monitoredDataCollectionsDetermined(partition, capturedTables)",
+    "    → createConnectionPool(ctx) [builds ConcurrentLinkedQueue of JdbcConnections, 1..snapshotMaxThreads]",
+    "  STEP 3 – Locking tables",
+    "    → [if snapshottingTask.snapshotSchema()] lockTablesForSchemaSnapshot(context, ctx) [abstract]",
+    "  STEP 4 – Determining snapshot offset",
+    "    → [if !onDemand] determineSnapshotOffset(ctx, previousOffset) [abstract, e.g. binlog pos / SCN]",
+    "  STEP 5 – Reading table structure",
+    "    → readTableStructure(context, ctx, previousOffset, snapshottingTask) [abstract]",
+    "  STEP 6 – Persisting schema history",
+    "    → [if snapshotSchema] createSchemaChangeEventsForTables(context, ctx, snapshottingTask)",
+    "      → tryStartingSnapshot(ctx) → offset.preSnapshotStart(onDemand)",
+    "      → [if schema.isHistorized()] iterate capturedTables:",
+    "        → offset.event(tableId, currentTime)",
+    "        → getCreateTableEvent(ctx, table) [abstract]",
+    "        → dispatcher.dispatchSchemaChangeEvent(partition, offset, tableId, receiver)",
+    "      → releaseSchemaSnapshotLocks(ctx) [abstract]",
+    "  STEP 7 – Snapshotting data",
+    "    → [if snapshotData] createDataEvents(context, ctx, connectionPool, snapshotSelectOverrides)",
+    "    → [else] releaseDataSnapshotLocks(ctx); offset.preSnapshotCompletion(); offset.postSnapshotCompletion()",
+    "  POST",
+    "    → postSnapshot()",
+    "    → dispatcher.alwaysDispatchHeartbeatEvent(partition, offset)",
+    "    → return SnapshotResult.completed(offset)",
+    "  FINALLY",
+    "    → close extra pool connections (keep main jdbcConnection)",
+    "    → rollbackTransaction(connection)"
+  ],
+
+  "phase_4_data_events": [
+    "createDataEvents(sourceContext, snapshotContext, connectionPool, snapshotSelectOverrides)",
+    "  → tryStartingSnapshot(snapshotContext)",
+    "  → dispatcher.getSnapshotChangeEventReceiver() → SnapshotReceiver",
+    "  → createOffsetPool(snapshotContext, connectionPool.size()) → Queue<OffsetContext>",
+    "  → [if legacy/single-thread] createLegacyDataEvents(...)",
+    "    → prepareTables(snapshotContext, determineSnapshotSelect, rowCountForTable) → PreparedTables",
+    "    → try(ThreadedSnapshotExecutor executor = new ThreadedSnapshotExecutor(snapshotMaxThreads, 'snapshot'))",
+    "      → for each tableId: createDataEventsForTableCallable(...) → executor.submit(callable)",
+    "      → executor.awaitCompletion()",
+    "  → [else chunked] createChunkedDataEvents(...)",
+    "    → prepareTables(snapshotContext, determineSnapshotSelect, rowCountForTableChunked)",
+    "    → ChunkBoundaryCalculator.calculateBoundaries / calculateMaxKey / createChunks per table",
+    "    → try(ThreadedSnapshotExecutor executor = new ThreadedSnapshotExecutor(snapshotMaxThreads, 'chunked snapshot'))",
+    "      → for each SnapshotChunk: createDataEventsForChunkedTableCallable(...) → executor.submit(callable)",
+    "      → executor.awaitCompletion()",
+    "  → releaseDataSnapshotLocks(snapshotContext)",
+    "  → for each offset: offset.preSnapshotCompletion()",
+    "  → snapshotReceiver.completeSnapshot()",
+    "  → for each offset: offset.postSnapshotCompletion()  [OFFSET COMMIT POINT]"
+  ],
+
+  "phase_5_row_reading": [
+    "doCreateDataEventsForTable(..., table, selectStatement, rowCount, jdbcConnection)",
+    "  → getSnapshotSourceTimestamp(jdbcConnection, offset, tableId)",
+    "  → readTableStatement(jdbcConnection, rowCount) → Statement",
+    "  → resultSetForDataEvents(selectStatement, statement) → CancellableResultSet",
+    "  → while rs.next():",
+    "    → jdbcConnection.rowToArray(table, rs, columnArray) → Object[]",
+    "    → setSnapshotMarker(offset, firstTable, lastTable, firstRecord, lastRecord)",
+    "      → SnapshotMarkerResolver.resolve(...) → SnapshotRecord enum",
+    "      → offset.markSnapshotRecord(marker)",
+    "    → dispatcher.dispatchSnapshotEvent(partition, tableId, getChangeRecordEmitter(...), snapshotReceiver)",
+    "      → offset.event(tableId, timestamp)",
+    "      → new SnapshotChangeRecordEmitter(partition, offset, row, clock, connectorConfig)",
+    "  → snapshotProgressListener.dataCollectionSnapshotCompleted(partition, tableId, rows)",
+    "",
+    "doCreateDataEventsForChunk(..., chunk, progressMap, snapshotProgress, jdbcConnection)",
+    "  → SnapshotChunkQueryBuilder.buildChunkQuery(chunk, keyColumns, baseSelectStatement)",
+    "  → queryBuilder.prepareChunkStatement(...) → PreparedStatement",
+    "  → while rs.next():",
+    "    → jdbcConnection.rowToArray(table, rs, columnArray) → Object[]",
+    "    → emitRecordWithCoordination(ctx, offset, snapshotReceiver, chunk, progress, snapshotProgress, ...)",
+    "      → [first record of first chunk] dispatcher.dispatchSnapshotEvent + snapshotProgress.signalFirstRecordEmitted",
+    "      → [last record of last chunk] wait for other chunks/tables then dispatch",
+    "      → [regular record] progress.waitForFirstRecord() then dispatch",
+    "  → progress.markChunkComplete(rows); progress.signalChunkComplete()"
+  ],
+
+  "threaded_snapshot_executor": {
+    "class": "ThreadedSnapshotExecutor (private static inner class, AutoCloseable)",
+    "fields": ["ExecutorService executorService (fixed thread pool)", "CompletionService<Void> completionService", "int submittedTasks"],
+    "methods": [
+      "submit(Callable<Void>) → completionService.submit; submittedTasks++",
+      "awaitCompletion() → loop completionService.take().get() for each submitted task",
+      "close() → executorService.shutdownNow()"
+    ]
+  },
+
+  "key_relationships": [
+    "SnapshotterServiceProvider implements ServiceProvider<SnapshotterService>",
+    "SnapshotterService implements Service; holds Snapshotter + SnapshotQuery + SnapshotLock (all @Immutable)",
+    "RelationalSnapshotChangeEventSource extends AbstractSnapshotChangeEventSource",
+    "RelationalSnapshotChangeEventSource depends_on SnapshotterService (injected via constructor)",
+    "RelationalSnapshotChangeEventSource depends_on JdbcConnection / MainConnectionProvidingConnectionFactory",
+    "RelationalSnapshotChangeEventSource depends_on EventDispatcher (dispatches schema + snapshot events)",
+    "RelationalSnapshotChangeEventSource depends_on SnapshotProgressListener",
+    "RelationalSnapshotChangeEventSource contains ThreadedSnapshotExecutor (private inner class)",
+    "Snapshotter SPI controls shouldSnapshotSchema / shouldSnapshotData decision",
+    "SnapshotLock SPI controls lock acquisition strategy",
+    "SnapshotQuery SPI controls query generation"
+  ],
+
+  "decision_points": [
+    "snapshotMode == 'custom' && customName non-empty → use customName, else use configuredMode",
+    "snapshotter.shouldSnapshotSchema(offsetExists, snapshotInProgress) → true/false",
+    "snapshotter.shouldSnapshotData(offsetExists, snapshotInProgress) → true/false",
+    "snapshottingTask.isOnDemand() → skip determineSnapshotOffset if true",
+    "isUseNonChunkedSnapshots(snapshotMaxThreads) → legacy table-per-thread vs. chunked path",
+    "keyColumns.isEmpty() → single chunk for keyless table",
+    "snapshotSelect.selectOverride() → single chunk for override queries",
+    "chunk.isFirstChunk() + isFirstChunkOfSnapshot() → coordinates FIRST snapshot record emission",
+    "chunk.isLastChunk() + isLastChunkOfSnapshot() → coordinates LAST snapshot record emission"
+  ],
+
+  "offset_commit_sequence": [
+    "offset.markSnapshotRecord(marker) — per row during table scan",
+    "offset.preSnapshotCompletion() — after all data events emitted, before completeSnapshot",
+    "snapshotReceiver.completeSnapshot() — signals Kafka Connect that snapshot batch is done",
+    "offset.postSnapshotCompletion() — clears snapshot-in-progress flag"
+  ],
+
+  "important_notes": [
+    "Abstract methods (getAllTableIds, lockTablesForSchemaSnapshot, determineSnapshotOffset, readTableStructure, releaseSchemaSnapshotLocks, getCreateTableEvent, copyOffset) must be implemented per DB connector.",
+    "Connection pool size = snapshotMaxThreads; legacy mode caps at min(maxThreads, tableCount).",
+    "Chunked mode calculates chunk boundaries via ChunkBoundaryCalculator using primary keys; falls back to single chunk if no keys or select override.",
+    "Coordination latches (SnapshotProgress, TableChunkProgress) ensure correct FIRST/LAST snapshot markers in parallel execution.",
+    "Transaction is opened with autoCommit=false and rolled back in the finally block; subclasses must not commit/rollback the outer transaction.",
+    "SnapshotterServiceProvider uses Java ServiceLoader to discover Snapshotter implementations; expects exactly one match."
+  ],
+
+  "source_files_analyzed": [
+    "debezium-connector-common/src/main/java/io/debezium/snapshot/SnapshotterService.java",
+    "debezium-connector-common/src/main/java/io/debezium/snapshot/SnapshotterServiceProvider.java",
+    "debezium-connector-common/src/main/java/io/debezium/relational/RelationalSnapshotChangeEventSource.java"
+  ]
+}

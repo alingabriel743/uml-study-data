@@ -1,0 +1,227 @@
+{
+  "scope": "mysql_cdc_streaming",
+  "title": "MySQL CDC Streaming",
+  "diagram_type": "use_case",
+  "description": "Actor interactions for streaming MySQL binlog change events to Kafka",
+
+  "actors": [
+    {
+      "name": "DBA/Operator",
+      "type": "primary",
+      "description": "Configures and deploys the MySQL connector"
+    },
+    {
+      "name": "Kafka Connect Framework",
+      "type": "primary",
+      "description": "Deploys connector, manages task lifecycle, collects SourceRecords"
+    },
+    {
+      "name": "MySQL Database",
+      "type": "primary",
+      "description": "External source producing binlog events via BinaryLogClient"
+    },
+    {
+      "name": "Kafka Broker",
+      "type": "secondary",
+      "description": "Receives dispatched change events (INSERT/UPDATE/DELETE/DDL)"
+    }
+  ],
+
+  "system_boundary": "MySQL CDC Streaming Pipeline (Debezium)",
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Configure MySQL Connector",
+      "actor": "DBA/Operator",
+      "component": "MySqlConnector",
+      "description": "Provide connector config (MySqlConnectorConfig.ALL_FIELDS), validate all fields via validateAllFields()",
+      "key_methods": ["config()", "validateAllFields(Configuration)", "getConfigFields()"]
+    },
+    {
+      "id": "UC2",
+      "name": "Deploy Connector Task",
+      "actor": "Kafka Connect Framework",
+      "component": "MySqlConnector → MySqlConnectorTask",
+      "description": "Framework calls taskClass()=MySqlConnectorTask.class, then starts task lifecycle",
+      "key_methods": ["taskClass()", "version()"]
+    },
+    {
+      "id": "UC3",
+      "name": "Initialize Task & Validate Binlog",
+      "actor": "Kafka Connect Framework",
+      "component": "MySqlConnectorTask (extends BinlogSourceTask)",
+      "description": "preStart() creates MySqlTaskContext; start() builds connection, schema, validates binlog format (ROW) and row_image (FULL), validates snapshot feasibility",
+      "key_methods": [
+        "preStart(Configuration)",
+        "start(Configuration)",
+        "validateBinlogConfiguration(Snapshotter, BinlogConnectorConnection)",
+        "validateSnapshotFeasibility(Snapshotter, O, BinlogConnectorConnection)",
+        "validateSchemaHistory(...)"
+      ]
+    },
+    {
+      "id": "UC4",
+      "name": "Stream Binlog Change Events",
+      "actor": "MySQL Database",
+      "component": "BinlogStreamingChangeEventSource",
+      "description": "BinaryLogClient connects to MySQL, receives binlog events. execute() registers event handlers per EventType, then client starts streaming.",
+      "key_methods": [
+        "execute(ChangeEventSourceContext, P, O)",
+        "handleEvent(P, O, ChangeEventSourceContext, Event)"
+      ]
+    },
+    {
+      "id": "UC5",
+      "name": "Handle INSERT / WRITE_ROWS Event",
+      "actor": "MySQL Database",
+      "component": "BinlogStreamingChangeEventSource",
+      "description": "EventType.WRITE_ROWS / EXT_WRITE_ROWS dispatched to handleInsert(). Skipped if CREATE operation is in skippedOperations.",
+      "key_methods": ["handleInsert(P, O, Event)"]
+    },
+    {
+      "id": "UC6",
+      "name": "Handle UPDATE / UPDATE_ROWS Event",
+      "actor": "MySQL Database",
+      "component": "BinlogStreamingChangeEventSource",
+      "description": "EventType.UPDATE_ROWS / EXT_UPDATE_ROWS dispatched to handleUpdate(). Skipped if UPDATE operation is in skippedOperations.",
+      "key_methods": ["handleUpdate(P, O, Event)"]
+    },
+    {
+      "id": "UC7",
+      "name": "Handle DELETE / DELETE_ROWS Event",
+      "actor": "MySQL Database",
+      "component": "BinlogStreamingChangeEventSource",
+      "description": "EventType.DELETE_ROWS / EXT_DELETE_ROWS dispatched to handleDelete(). Skipped if DELETE operation is in skippedOperations.",
+      "key_methods": ["handleDelete(P, O, Event)"]
+    },
+    {
+      "id": "UC8",
+      "name": "Handle DDL / Schema Change Event",
+      "actor": "MySQL Database",
+      "component": "BinlogStreamingChangeEventSource",
+      "description": "EventType.QUERY dispatched to handleQueryEvent(). Distinguishes BEGIN/COMMIT from DDL. Handles TRUNCATE via TRUNCATE_STATEMENT_PATTERN.",
+      "key_methods": [
+        "handleQueryEvent(P, O, Event)",
+        "handleTransactionBegin(P, O, Event, Long)",
+        "handleTransactionCompletion(P, O, Event)"
+      ]
+    },
+    {
+      "id": "UC9",
+      "name": "Handle GTID Event",
+      "actor": "MySQL Database",
+      "component": "BinlogStreamingChangeEventSource",
+      "description": "When GTID mode enabled, handleGtidEvent() filters by gtidDmlSourceFilter. Abstract method overridden by MySQL-specific subclass.",
+      "key_methods": ["handleGtidEvent(P, O, Event, Predicate<String>)"]
+    },
+    {
+      "id": "UC10",
+      "name": "Handle Transaction Payload (Compressed)",
+      "actor": "MySQL Database",
+      "component": "BinlogStreamingChangeEventSource",
+      "description": "EventType.TRANSACTION_PAYLOAD dispatched to handleTransactionPayload() for compressed binlog event handling.",
+      "key_methods": ["handleTransactionPayload(P, O, ChangeEventSourceContext, Event)"]
+    },
+    {
+      "id": "UC11",
+      "name": "Rotate Binlog File",
+      "actor": "MySQL Database",
+      "component": "BinlogStreamingChangeEventSource + BinlogSourceInfo",
+      "description": "EventType.ROTATE dispatched to handleRotateLogsEvent(). Updates BinlogSourceInfo with new binlog filename/position.",
+      "key_methods": ["handleRotateLogsEvent(O, Event)", "BinlogSourceInfo.binlogFilename()", "BinlogSourceInfo.binlogPosition()"]
+    },
+    {
+      "id": "UC12",
+      "name": "Track Binlog Position / Source Metadata",
+      "actor": "MySQL Database",
+      "component": "BinlogSourceInfo",
+      "description": "Tracks server_id, ts_sec, gtid, binlog file+position, row, snapshot state, thread, db, table. Serialized into offset map for Kafka Connect.",
+      "key_methods": ["binlogFilename()", "binlogPosition()", "struct()"]
+    },
+    {
+      "id": "UC13",
+      "name": "Dispatch Change Event to Kafka",
+      "actor": "Kafka Broker",
+      "component": "EventDispatcher",
+      "description": "BinlogStreamingChangeEventSource calls eventDispatcher to enqueue DataChangeEvent into ChangeEventQueue. Kafka Connect polls and sends to Kafka.",
+      "key_methods": ["EventDispatcher.dispatchDataChangeEvent()", "ChangeEventQueue.poll()"]
+    },
+    {
+      "id": "UC14",
+      "name": "Handle Streaming Error",
+      "actor": "Kafka Connect Framework",
+      "component": "MySqlErrorHandler",
+      "description": "MySqlErrorHandler extends ErrorHandler. Classifies IOException/SQLException as communication exceptions. MySQL error 1236 (ER_MASTER_FATAL_ERROR_READING_BINLOG) is NON_RETRIABLE. Other SQLExceptions delegated to super.isRetriable().",
+      "key_methods": [
+        "MySqlErrorHandler(MySqlConnectorConfig, ChangeEventQueue, ErrorHandler)",
+        "communicationExceptions() → {IOException, SQLException}",
+        "isRetriable(Throwable) → false for error 1236"
+      ]
+    },
+    {
+      "id": "UC15",
+      "name": "Handle Heartbeat Error",
+      "actor": "Kafka Connect Framework",
+      "component": "BinlogSourceTask.BinlogHeartbeatErrorHandler",
+      "description": "Inner class BinlogHeartbeatErrorHandler implements HeartbeatErrorHandler. SQL states 42000 (DB access denied) and 3D000 (no DB) throw DebeziumException; others are silently ignored.",
+      "key_methods": ["onError(SQLException)"]
+    },
+    {
+      "id": "UC16",
+      "name": "Monitor Streaming Metrics",
+      "actor": "Kafka Connect Framework",
+      "component": "BinlogStreamingChangeEventSourceMetrics",
+      "description": "Tracks GTID mode status, total record counter, streaming lag. Updated via metrics.setIsGtidModeEnabled().",
+      "key_methods": ["setIsGtidModeEnabled(boolean)"]
+    },
+    {
+      "id": "UC17",
+      "name": "Handle BinaryLogClient Lifecycle Events",
+      "actor": "MySQL Database",
+      "component": "BinlogStreamingChangeEventSource.ReaderThreadLifecycleListener",
+      "description": "onConnect, onDisconnect, onCommunicationFailure, onEventDeserializationFailure callbacks wired to BinaryLogClient.",
+      "key_methods": [
+        "onConnect(BinaryLogClient)",
+        "onDisconnect(BinaryLogClient)",
+        "onCommunicationFailure(BinaryLogClient, Exception)",
+        "onEventDeserializationFailure(BinaryLogClient, Exception)"
+      ]
+    }
+  ],
+
+  "key_relationships": [
+    "MySqlConnector extends BinlogConnector<MySqlConnectorConfig>",
+    "MySqlConnectorTask extends BinlogSourceTask<MySqlPartition, MySqlOffsetContext>",
+    "MySqlErrorHandler extends ErrorHandler",
+    "BinlogStreamingChangeEventSource implements StreamingChangeEventSource<P, O>",
+    "BinlogSourceInfo extends BaseSourceInfo",
+    "MySqlConnector creates MySqlConnectorTask (via taskClass())",
+    "MySqlConnectorTask owns MySqlErrorHandler (composition)",
+    "MySqlConnectorTask owns BinlogStreamingChangeEventSource (via ChangeEventSourceCoordinator)",
+    "BinlogStreamingChangeEventSource uses BinaryLogClient (mysql-binlog-connector)",
+    "BinlogStreamingChangeEventSource uses EventDispatcher → ChangeEventQueue → Kafka Connect",
+    "BinlogStreamingChangeEventSource uses BinlogSourceInfo for offset/position tracking",
+    "MySqlErrorHandler uses ChangeEventQueue (to propagate fatal errors)"
+  ],
+
+  "include_extend_notes": [
+    "UC5/UC6/UC7 <<extend>> UC4 (streaming): DML event types are sub-cases of the main streaming use case",
+    "UC8 <<extend>> UC4: DDL/schema changes are a sub-case of streaming",
+    "UC9 <<extend>> UC4: GTID handling extends streaming when GTID mode is enabled",
+    "UC14 <<extend>> UC4: error handling is an extension of the streaming flow",
+    "UC12 <<include>> UC11: position tracking is included in binlog rotation",
+    "UC16 <<include>> UC4: metrics monitoring is included in streaming"
+  ],
+
+  "important_notes": "MySQL error 1236 (fatal binlog read error) is the only explicitly non-retriable error. Binlog must be configured with binlog_format=ROW and binlog_row_image=FULL. GTID support is optional but changes event routing. BinaryLogClient from mysql-binlog-connector library is the core transport. Buffer mode (EventBuffer) is available when bufferSizeForStreamingChangeEventSource > 0.",
+
+  "source_files_analyzed": [
+    "debezium-connector-mysql/src/main/java/io/debezium/connector/mysql/MySqlConnector.java",
+    "debezium-connector-mysql/src/main/java/io/debezium/connector/mysql/MySqlConnectorTask.java",
+    "debezium-connector-mysql/src/main/java/io/debezium/connector/mysql/MySqlErrorHandler.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogSourceTask.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogStreamingChangeEventSource.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogSourceInfo.java"
+  ]
+}

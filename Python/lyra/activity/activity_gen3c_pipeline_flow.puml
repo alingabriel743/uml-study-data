@@ -1,0 +1,190 @@
+@startuml gen3c_pipeline_flow
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    StartColor #212529
+    EndColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #495057
+}
+
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #DEE2E6
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title Gen3C Generation Pipeline
+
+|Gen3cPipeline|
+start
+
+:__init__(inference_type, checkpoint_dir,
+guidance, num_steps, height, width, fps,
+num_video_frames, seed,
+offload_network, offload_tokenizer,
+offload_text_encoder, offload_prompt_upsampler,
+enable_prompt_upsampler, disable_guardrail);
+
+:Call super().__init__() with
+num_input_frames=1;
+
+:_load_model()
+→ load_model_by_config(DiffusionGen3CModel)
+→ self.model;
+
+if (enable_prompt_upsampler\nAND NOT offload_prompt_upsampler?) then (yes)
+    :_load_prompt_upsampler_model();
+else (no)
+endif
+
+|Gen3cPipeline|
+:generate(prompt, image_path,
+rendered_warp_images: Tensor,
+rendered_warp_masks: Tensor,
+negative_prompt, return_latents);
+
+:Log: image_path, prompt,
+enable_prompt_upsampler;
+
+|Safety Guardrail|
+if (disable_guardrail?) then (no)
+    :_run_guardrail_on_prompt_with_offload(prompt);
+    if (Prompt safe?) then (no)
+        #FFB3B3:Log CRITICAL — unsafe prompt;
+        end
+    else (yes)
+        :Log: prompt guardrail passed;
+    endif
+else (yes)
+    :Log: guardrail disabled, skip;
+endif
+
+|Gen3cPipeline|
+:Build prompts list
+[prompt] or [prompt, negative_prompt];
+
+:_run_text_embedding_on_prompt_with_offload(prompts)
+→ prompt_embeddings;
+
+:Extract prompt_embedding = embeddings[0]
+Extract negative_prompt_embedding = embeddings[1]
+  (if negative_prompt provided, else None);
+
+|GPU Offload Manager|
+note right
+  _run_model_with_offload()
+  orchestrates GPU memory
+  load/unload around inference
+end note
+
+if (offload_tokenizer?) then (yes)
+    :_load_tokenizer()
+    → reload tokenizer onto GPU;
+else (no)
+endif
+
+:_run_tokenizer_encoding(image_path)
+→ condition_latent;
+
+if (offload_network?) then (yes)
+    :_load_network()
+    → reload diffusion transformer onto GPU;
+else (no)
+endif
+
+|Inference Core|
+note right
+  _run_model()
+  Core diffusion inference
+  via inference_utils
+end note
+
+:get_video_batch(model, prompt_embedding,
+negative_prompt_embedding,
+height, width, fps, num_video_frames)
+→ data_batch, state_shape;
+
+:Inject 3D warp conditioning:
+data_batch['condition_state'] = rendered_warp_images
+data_batch['condition_state_mask'] = rendered_warp_masks;
+
+:generate_world_from_video(
+  model, state_shape,
+  is_negative_prompt=True,
+  data_batch, guidance,
+  num_steps, seed,
+  condition_latent,
+  num_input_frames)
+→ sample (latent tensor);
+
+|GPU Offload Manager|
+if (return_latents?) then (yes)
+    :Save latents = sample
+    (raw latent before decoding);
+else (no)
+endif
+
+if (offload_network?) then (yes)
+    :_offload_network()
+    → move diffusion transformer off GPU;
+else (no)
+endif
+
+:_run_tokenizer_decoding(sample)
+→ decoded video frames (np.ndarray [T,H,W,C]);
+
+if (offload_tokenizer?) then (yes)
+    :_offload_tokenizer()
+    → move tokenizer off GPU;
+else (no)
+endif
+
+:Build gen_dict = {'video': decoded_frames}
+Add gen_dict['latents'] if return_latents;
+
+|Gen3cPipeline|
+:Extract video = gen_dict['video'];
+
+|Safety Guardrail|
+if (disable_guardrail?) then (no)
+    :_run_guardrail_on_video_with_offload(video);
+    if (Video safe?) then (no)
+        #FFB3B3:Log CRITICAL — unsafe video output;
+        end
+    else (yes)
+        :Log: video guardrail passed;
+    endif
+else (yes)
+endif
+
+|Gen3cPipeline|
+if (return_latents?) then (yes)
+    :Return (video, prompt, gen_dict['latents']);
+else (no)
+    :Return (video, prompt);
+endif
+
+stop
+
+@enduml

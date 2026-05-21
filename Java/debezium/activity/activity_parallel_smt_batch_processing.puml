@@ -1,0 +1,132 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #212529
+    EndColor #212529
+    BarColor #495057
+}
+
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title Parallel SMT Batch Processing
+
+|ParallelSmtBatchProcessor|
+start
+
+:Receive **processRecords**(List<SourceRecord> records);
+note right
+  Called by the embedded engine
+  with a full batch of raw
+  SourceRecords to process
+end note
+
+:Log DEBUG — submitting **N** records\nfor parallel processing;
+
+:Initialize empty **recordFutures** list\n(List<Future<SourceRecord>>);
+
+|ParallelSmtBatchProcessor|
+:Iterate records in order\n(**forEachOrdered** preserves submission order);
+
+fork
+    |Thread Pool (recordService)|
+    :Submit **TransformRecord** callable\nto ExecutorService → **Future<SourceRecord>**;
+
+    |ProcessingCallables.TransformRecord|
+    :Execute **transformations.transform(record)**\nvia SMT Chain;
+
+    if (transformedRecord != null?) then (yes — record passed SMTs)
+        :Return **transformedRecord**\n(SourceRecord);
+    else (no — filtered out by SMT)
+        :Return **null**;
+    endif
+
+    |Thread Pool (recordService)|
+    :Future<SourceRecord> ready;
+
+fork again
+    |Thread Pool (recordService)|
+    :Submit **TransformRecord** callable\nto ExecutorService → **Future<SourceRecord>**;
+
+    |ProcessingCallables.TransformRecord|
+    :Execute **transformations.transform(record)**\nvia SMT Chain;
+
+    if (transformedRecord != null?) then (yes — record passed SMTs)
+        :Return **transformedRecord**\n(SourceRecord);
+    else (no — filtered out by SMT)
+        :Return **null**;
+    endif
+
+    |Thread Pool (recordService)|
+    :Future<SourceRecord> ready;
+
+end fork
+note right
+  All SourceRecords are submitted
+  **in parallel** across thread pool workers.
+  Submission order is preserved via
+  forEachOrdered → futures collected
+  in the same order.
+end note
+
+|ParallelSmtBatchProcessor|
+:Collect all **Future<SourceRecord>**\ninto **recordFutures** list;
+
+:Initialize empty **transformedRecords** list\n(List<SourceRecord>);
+
+repeat
+    :Call **future.get()**\n(blocking wait — no timeout);
+    note right
+      Blocks indefinitely
+      until each worker thread
+      completes its transform
+    end note
+
+    if (record != null?) then (yes — valid record)
+        :Append record to\n**transformedRecords** list;
+    else (no — null / SMT filtered)
+        :Discard record silently\n(not added to batch);
+    endif
+repeat while (more futures?) is (yes)
+-> no;
+
+:Log TRACE — calling user handler;
+
+|DebeziumEngine.ChangeConsumer (userHandler)|
+:Call **userHandler.handleBatch**(\n    transformedRecords,\n    committer\n);
+note right
+  Offset commit responsibility
+  belongs to the user-provided
+  ChangeConsumer via committer
+end note
+
+|ParallelSmtBatchProcessor|
+stop
+
+@enduml

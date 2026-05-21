@@ -1,0 +1,220 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Geometry and Special Type Handling Flow
+
+participant "BinlogEventReader" as reader
+participant "BinlogValueConverters" as converters
+participant "BinlogGeometry" as geom
+participant "Geometry\n(debezium schema)" as geoSchema
+participant "Point\n(debezium schema)" as pointSchema
+participant "BinlogUnsignedIntegerConverter" as uintConv
+participant "TinyIntOneToBooleanConverter" as tinyConv
+participant "BinlogChangeRecordEmitter" as emitter
+participant "RelationalChangeRecordEmitter" as relEmitter
+participant "Receiver" as receiver
+
+== Geometry Schema Registration ==
+
+reader -> converters : schemaBuilder(column)\n[GEOMETRY / LINESTRING / POLYGON / MULTI* / GEOMETRYCOLLECTION]
+activate converters
+converters -> geoSchema : builder()
+activate geoSchema
+geoSchema --> converters : SchemaBuilder (logical: io.debezium.data.geometry.Geometry)
+deactivate geoSchema
+deactivate converters
+
+reader -> converters : schemaBuilder(column) [POINT]
+activate converters
+converters -> pointSchema : builder()
+activate pointSchema
+pointSchema --> converters : SchemaBuilder (logical: io.debezium.data.geometry.Point)
+deactivate pointSchema
+deactivate converters
+
+== Geometry Conversion — Generic Types ==
+
+reader -> converters : converter(column, fieldDefn, data)\n[GEOMETRY / LINESTRING / POLYGON / MULTI* types]
+activate converters
+converters -> converters : convertGeometry(column, fieldDefn, byte[])
+note right: MySQL format:\n4-byte SRID (little-endian)\n+ WKB remainder
+converters -> geom : fromBytes(byte[] mysqlBytes)
+activate geom
+note right: Strips 4-byte SRID prefix\nSRID==0 → null (unset/unknown)
+geom --> converters : BinlogGeometry { wkb: byte[], srid: Integer }
+deactivate geom
+converters -> geoSchema : createValue(schema, wkb, srid)
+activate geoSchema
+geoSchema --> converters : Struct { wkb: bytes, srid: int32? }
+deactivate geoSchema
+converters --> receiver : deliver(Struct)
+deactivate converters
+
+== Geometry Conversion — POINT Type ==
+
+reader -> converters : converter(column, fieldDefn, data) [POINT type]
+activate converters
+converters -> converters : convertPoint(column, fieldDefn, byte[])
+converters -> geom : fromBytes(byte[] mysqlBytes)
+activate geom
+geom --> converters : BinlogGeometry { wkb, srid }
+deactivate geom
+converters -> geom : isPoint()
+activate geom
+note right: Check: wkb.length == 21\n(1 byte order + 4 type\n+ 8 X + 8 Y)
+geom --> converters : boolean
+deactivate geom
+
+alt isPoint() == true
+    converters -> pointSchema : createValue(schema, wkb, srid)
+    activate pointSchema
+    pointSchema --> converters : Struct { wkb, srid, x, y }
+    deactivate pointSchema
+    converters --> receiver : deliver(Struct)
+else isPoint() == false
+    converters -> converters : throw ConnectException\n("Failed to parse POINT value from binlog data")
+end
+
+== NULL / Empty Geometry Fallback ==
+
+converters -> geom : createEmpty()
+activate geom
+note right: Returns BinlogGeometry\n{ WKB_EMPTY_GEOMETRYCOLLECTION\n  (9 bytes), srid: null }
+geom --> converters : BinlogGeometry (empty)
+deactivate geom
+converters -> geoSchema : createValue(schema, emptyWkb, null)
+activate geoSchema
+geoSchema --> converters : Struct (default empty geometry value)
+deactivate geoSchema
+
+== Unsigned Integer Promotion ==
+
+reader -> converters : converter(column) [TINYINT UNSIGNED]
+activate converters
+converters -> converters : convertUnsignedTinyint(column, fieldDefn, data)
+converters -> uintConv : convertUnsignedTinyint(short value)
+activate uintConv
+note right: if value < 0: value + 256
+uintConv --> converters : corrected short
+deactivate uintConv
+deactivate converters
+
+reader -> converters : converter(column) [SMALLINT UNSIGNED]
+activate converters
+converters -> uintConv : convertUnsignedSmallint(int value)
+activate uintConv
+note right: if value < 0: value + 65536
+uintConv --> converters : corrected int
+deactivate uintConv
+deactivate converters
+
+reader -> converters : converter(column) [MEDIUMINT UNSIGNED]
+activate converters
+converters -> uintConv : convertUnsignedMediumint(int value)
+activate uintConv
+note right: if value < 0: value + 16,777,216
+uintConv --> converters : corrected int
+deactivate uintConv
+deactivate converters
+
+reader -> converters : converter(column) [INT UNSIGNED]
+activate converters
+converters -> uintConv : convertUnsignedInteger(long value)
+activate uintConv
+note right: if value < 0: value + 4,294,967,296
+uintConv --> converters : corrected long
+deactivate uintConv
+deactivate converters
+
+reader -> converters : converter(column) [BIGINT UNSIGNED — PRECISE mode]
+activate converters
+converters -> uintConv : convertUnsignedBigint(BigDecimal value)
+activate uintConv
+note right: if value < 0:\nvalue + 18,446,744,073,709,551,616\n(LONG mode: no promotion, may lose precision)
+uintConv --> converters : corrected BigDecimal
+deactivate uintConv
+deactivate converters
+
+== TinyInt(1) → Boolean Custom Conversion ==
+
+participant "ConnectorStartup" as startup
+
+startup -> tinyConv : configure(Properties { selector, length.checker })
+activate tinyConv
+tinyConv -> tinyConv : Predicates.includes(selectorConfig)\n→ Predicate<RelationalColumn>
+note right: selector: regex matching\ntable.column format\nlength.checker: default true\n(restricts to TINYINT(1))
+tinyConv --> startup : configured
+deactivate tinyConv
+
+participant "SchemaRegistration" as schemaReg
+
+schemaReg -> tinyConv : converterFor(RelationalColumn, ConverterRegistration)
+activate tinyConv
+note right: Accepts if:\n• typeName in [TINYINT, TINYINT UNSIGNED]\n• AND (lengthChecker==false OR length==1)\n• AND selector.test(field)
+tinyConv -> tinyConv : register(SchemaBuilder.bool(), converter lambda)
+tinyConv --> schemaReg : registered
+deactivate tinyConv
+
+reader -> tinyConv : convert(value) [via registered lambda]
+activate tinyConv
+alt value == null
+    tinyConv --> reader : null / defaultValue / false
+else value instanceof Boolean
+    tinyConv --> reader : pass-through Boolean
+else value instanceof Number
+    tinyConv --> reader : intValue() > 0
+else value instanceof String
+    tinyConv --> reader : Integer.parseInt() or Boolean.parseBoolean()
+end
+deactivate tinyConv
+
+== Change Record Emission ==
+
+reader -> emitter : new BinlogChangeRecordEmitter\n(partition, offset, clock, operation, before[], after[], connectorConfig)
+activate emitter
+emitter -> relEmitter : super(partition, offset, clock, connectorConfig)
+activate relEmitter
+relEmitter -> emitter : getOldColumnValues()
+emitter --> relEmitter : before[]
+relEmitter -> emitter : getNewColumnValues()
+emitter --> relEmitter : after[]
+relEmitter -> receiver : changeRecord(partition, schema, operation, key, envelope, offset, headers)
+activate receiver
+receiver --> relEmitter : ack
+deactivate receiver
+deactivate relEmitter
+
+alt operation == TRUNCATE
+    emitter -> emitter : emitTruncateRecord(receiver, tableSchema)
+    note right: Calls schema.envelopeSchema.truncate\n(sourceInfo, timestamp) → Struct
+end
+deactivate emitter
+
+@enduml

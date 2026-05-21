@@ -1,0 +1,193 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceMessageAlign center
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipant underline
+skinparam sequenceBoxBackgroundColor #E9ECEF
+skinparam sequenceBoxBorderColor #6C757D
+skinparam sequenceLifeLineBorderColor #495057
+skinparam sequenceLifeLineBackgroundColor #F8F9FA
+skinparam sequenceActiveBorderColor #495057
+skinparam sequenceActiveBackgroundColor #DEE2E6
+skinparam noteBackgroundColor #FFF9C4
+skinparam noteBorderColor #F0C040
+
+title Embeddings Generation & Caching Flow
+
+actor       "Client"                        as client
+participant "Embeddings"                    as embeddings
+participant "PendingEmbeddingsGeneration"   as pending
+participant "Ai (Facade)"                   as ai
+participant "AiManager"                     as manager
+participant "EmbeddingProvider"             as provider
+participant "Cache (Laravel)"               as cache
+participant "EmbeddingsResponse"            as response
+
+' ─── Step 1: Factory creation ───────────────────────────────────────────────
+client -> embeddings : for(array $inputs)
+activate embeddings
+embeddings -> pending ** : new PendingEmbeddingsGeneration($inputs)
+embeddings --> client : PendingEmbeddingsGeneration
+deactivate embeddings
+
+' ─── Step 2: Optional builder configuration ─────────────────────────────────
+note over client, pending #FFF9C4
+  Optional fluent configuration
+  (any or all may be called)
+end note
+
+client -> pending : dimensions(int $dimensions)
+activate pending
+pending --> client : self
+deactivate pending
+
+client -> pending : cache(?int $seconds = null)
+activate pending
+pending --> client : self
+deactivate pending
+
+client -> pending : timeout(int $seconds = 30)
+activate pending
+pending --> client : self
+deactivate pending
+
+' ─── Step 3: generate() ─────────────────────────────────────────────────────
+client -> pending : generate($provider = null, $model = null)
+activate pending
+
+pending -> provider : formatProviderAndModelList(\n  $provider ?? config('ai.default_for_embeddings'),\n  $model\n)
+activate provider
+provider --> pending : [providerName, modelName]
+deactivate provider
+
+' ─── Step 4: Resolve EmbeddingProvider via Ai facade ────────────────────────
+pending -> ai : fakeableEmbeddingProvider(providerName)
+activate ai
+ai -> manager : fakeableEmbeddingProvider(providerName)
+activate manager
+
+manager -> manager : embeddingProvider(name)\n[validates EmbeddingProvider interface]
+activate manager
+manager --> manager
+deactivate manager
+
+alt Fake mode enabled
+    manager -> manager : embeddingsAreFaked() → true
+    activate manager
+    manager -> provider : clone provider
+    activate provider
+    provider --> manager : cloned provider
+    deactivate provider
+    manager -> provider : useEmbeddingGateway(FakeEmbeddingGateway)
+    activate provider
+    provider --> manager : provider (with fake gateway)
+    deactivate provider
+    manager --> manager
+    deactivate manager
+else Normal mode
+    manager -> manager : embeddingsAreFaked() → false
+    activate manager
+    manager --> manager : return provider as-is
+    deactivate manager
+end
+
+manager --> ai : EmbeddingProvider
+deactivate manager
+ai --> pending : EmbeddingProvider
+deactivate ai
+
+' ─── Step 5: Resolve default model & dimensions ─────────────────────────────
+opt model is null
+    pending -> provider : defaultEmbeddingsModel()
+    activate provider
+    provider --> pending : string $model
+    deactivate provider
+end
+
+opt dimensions is null
+    pending -> provider : defaultEmbeddingsDimensions()
+    activate provider
+    provider --> pending : int $dimensions
+    deactivate provider
+end
+
+' ─── Step 6: Cache check & generation ───────────────────────────────────────
+pending -> pending : generateFromCache(provider, model, dimensions)
+activate pending
+
+pending -> pending : shouldCache()\n[cacheSeconds set OR\nconfig('ai.caching.embeddings.cache')]
+activate pending
+pending --> pending
+deactivate pending
+
+alt Cache HIT (caching enabled & entry exists)
+    pending -> cache : store(config('ai.caching.embeddings.store'))\n  .get(cacheKey)
+    activate cache
+    note right of cache
+      cacheKey = sha256(
+        driver + '-' + model + '-' +
+        dimensions + '-' + inputs
+      )
+    end note
+    cache --> pending : JSON string (cached embeddings)
+    deactivate cache
+
+    pending -> response ** : new EmbeddingsResponse(\n  embeddings, tokens=0, Meta\n)
+    pending --> pending : return cached EmbeddingsResponse
+    deactivate pending
+
+else Cache MISS (or caching disabled)
+    pending -> provider : embeddings(\n  $inputs, $dimensions,\n  $model, $timeout\n)
+    activate provider
+
+    alt FailoverableException thrown
+        provider --> pending : FailoverableException
+        note over pending #FFD0D0
+          event(ProviderFailedOver) dispatched,
+          failover to next provider in list
+        end note
+    else Success
+        provider --> pending : EmbeddingsResponse
+        deactivate provider
+
+        opt shouldCache() is true
+            pending -> pending : cacheEmbeddings(\n  provider, model, dimensions, response\n)
+            activate pending
+
+            pending -> cache : store(config('ai.caching.embeddings.store'))\n  .put(\n    cacheKey,\n    json_encode(response),\n    TTL\n  )
+            activate cache
+            note right of cache
+              TTL = cacheSeconds ??
+              config('ai.caching.embeddings.seconds',
+                     default: 30 days)
+            end note
+            cache --> pending : void
+            deactivate cache
+            pending --> pending
+            deactivate pending
+        end
+    end
+
+    pending --> pending : return EmbeddingsResponse
+    deactivate pending
+end
+
+pending --> client : EmbeddingsResponse
+deactivate pending
+
+@enduml

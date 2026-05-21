@@ -1,0 +1,118 @@
+{
+  "scope": "binlog_change_event_emission",
+  "title": "Binlog Change Record Emission",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "BinlogEventHandler",
+    "BinlogChangeRecordEmitter",
+    "RelationalChangeRecordEmitter",
+    "BinlogOffsetContext",
+    "BinlogSourceInfo",
+    "BinlogSourceInfoStructMaker",
+    "TableSchema",
+    "EnvelopeSchema",
+    "BinlogUnsignedIntegerConverter",
+    "Receiver"
+  ],
+  "interaction_flow": [
+    "BinlogEventHandler → BinlogChangeRecordEmitter: new BinlogChangeRecordEmitter(partition, offsetContext, clock, operation, before[], after[], connectorConfig)",
+    "BinlogEventHandler → BinlogChangeRecordEmitter: emitChangeRecords(tableSchema, receiver)",
+    "BinlogChangeRecordEmitter → RelationalChangeRecordEmitter: [inherited] emitChangeRecords(schema, receiver)",
+    "RelationalChangeRecordEmitter → BinlogChangeRecordEmitter: getOperation() → returns stored Operation (CREATE/READ/UPDATE/DELETE/TRUNCATE)",
+    "RelationalChangeRecordEmitter → RelationalChangeRecordEmitter: switch(operation) dispatch to emitCreateRecord / emitReadRecord / emitUpdateRecord / emitDeleteRecord / emitTruncateRecord",
+
+    "-- CREATE/READ path --",
+    "RelationalChangeRecordEmitter → BinlogChangeRecordEmitter: getNewColumnValues() → returns after[]",
+    "RelationalChangeRecordEmitter → TableSchema: keyFromColumnData(newColumnValues) → Struct newKey",
+    "RelationalChangeRecordEmitter → TableSchema: valueFromColumnData(newColumnValues) → Struct newValue",
+    "RelationalChangeRecordEmitter → BinlogChangeRecordEmitter: getOffset() → BinlogOffsetContext",
+    "RelationalChangeRecordEmitter → BinlogOffsetContext: getSourceInfo() → Struct (via AbstractChangeRecordEmitter)",
+    "BinlogOffsetContext → BinlogSourceInfoStructMaker: [internally] struct(sourceInfo) during getSourceInfo()",
+    "BinlogSourceInfoStructMaker → BinlogSourceInfo: getServerId(), getCurrentGtid(), getCurrentBinlogFilename(), getCurrentBinlogPosition(), getCurrentRowNumber(), getThreadId(), table(), getQuery()",
+    "BinlogSourceInfoStructMaker → BinlogSourceInfoStructMaker: commonStruct(sourceInfo) [fills version, connector, name, ts_ms, snapshot, db]",
+    "BinlogSourceInfoStructMaker → BinlogSourceInfoStructMaker: result.put(SERVER_ID_KEY, ...) + binlogFile + pos + row + thread + table + query → Struct",
+    "RelationalChangeRecordEmitter → EnvelopeSchema: create(newValue, sourceInfoStruct, clock.currentTimeAsInstant()) → Struct envelope",
+    "RelationalChangeRecordEmitter → Receiver: changeRecord(partition, tableSchema, CREATE, newKey, envelope, offset, null)",
+
+    "-- UPDATE path (same PK) --",
+    "RelationalChangeRecordEmitter → BinlogChangeRecordEmitter: getOldColumnValues() → before[], getNewColumnValues() → after[]",
+    "RelationalChangeRecordEmitter → TableSchema: keyFromColumnData(old), keyFromColumnData(new), valueFromColumnData(old), valueFromColumnData(new)",
+    "RelationalChangeRecordEmitter → EnvelopeSchema: update(oldValue, newValue, sourceInfoStruct, ts) → Struct envelope",
+    "RelationalChangeRecordEmitter → Receiver: changeRecord(partition, tableSchema, UPDATE, newKey, envelope, offset, null)",
+
+    "-- UPDATE path (PK change) --",
+    "RelationalChangeRecordEmitter → RelationalChangeRecordEmitter: emitUpdateAsPrimaryKeyChangeRecord(...)",
+    "RelationalChangeRecordEmitter → EnvelopeSchema: delete(oldValue, sourceInfo, ts) → envelope1",
+    "RelationalChangeRecordEmitter → Receiver: changeRecord(partition, tableSchema, DELETE, oldKey, envelope1, offset, headers[newkey])",
+    "RelationalChangeRecordEmitter → EnvelopeSchema: create(newValue, sourceInfo, ts) → envelope2",
+    "RelationalChangeRecordEmitter → Receiver: changeRecord(partition, tableSchema, CREATE, newKey, envelope2, offset, headers[oldkey])",
+
+    "-- DELETE path --",
+    "RelationalChangeRecordEmitter → BinlogChangeRecordEmitter: getOldColumnValues() → before[]",
+    "RelationalChangeRecordEmitter → TableSchema: keyFromColumnData(old), valueFromColumnData(old)",
+    "RelationalChangeRecordEmitter → EnvelopeSchema: delete(oldValue, sourceInfoStruct, ts) → Struct envelope",
+    "RelationalChangeRecordEmitter → Receiver: changeRecord(partition, tableSchema, DELETE, oldKey, envelope, offset, null)",
+
+    "-- TRUNCATE path (BinlogChangeRecordEmitter override) --",
+    "BinlogChangeRecordEmitter → BinlogChangeRecordEmitter: emitTruncateRecord(receiver, schema) [overrides base which throws UnsupportedOperationException]",
+    "BinlogChangeRecordEmitter → BinlogOffsetContext: getOffset().getSourceInfo() → sourceInfoStruct",
+    "BinlogChangeRecordEmitter → EnvelopeSchema: schema.getEnvelopeSchema().truncate(sourceInfoStruct, clock.currentTimeAsInstant()) → Struct envelope",
+    "BinlogChangeRecordEmitter → Receiver: changeRecord(partition, schema, TRUNCATE, null, envelope, offset, null)",
+
+    "-- Unsigned integer type conversion (column value level) --",
+    "TableSchema/ValueConverter → BinlogUnsignedIntegerConverter: convertUnsignedTinyint(short) | convertUnsignedSmallint(int) | convertUnsignedMediumint(int) | convertUnsignedInteger(long) | convertUnsignedBigint(BigDecimal)"
+  ],
+  "key_relationships": [
+    "BinlogChangeRecordEmitter extends RelationalChangeRecordEmitter<BinlogPartition>",
+    "RelationalChangeRecordEmitter extends AbstractChangeRecordEmitter<P, TableSchema>",
+    "BinlogOffsetContext extends CommonOffsetContext<BinlogSourceInfo>",
+    "BinlogOffsetContext composes BinlogSourceInfo (sourceInfo field)",
+    "BinlogOffsetContext composes TransactionContext and IncrementalSnapshotContext",
+    "BinlogSourceInfoStructMaker extends AbstractSourceInfoStructMaker<BinlogSourceInfo>",
+    "BinlogSourceInfo extends BaseSourceInfo",
+    "BinlogUnsignedIntegerConverter is a static utility class (no instances)",
+    "BinlogChangeRecordEmitter depends_on BinlogOffsetContext (stored as OffsetContext)",
+    "RelationalChangeRecordEmitter depends_on TableSchema (for key/value struct building)",
+    "RelationalChangeRecordEmitter depends_on EnvelopeSchema (for envelope wrapping)"
+  ],
+  "class_key_attributes": {
+    "BinlogChangeRecordEmitter": {
+      "fields": ["Operation operation", "OffsetContext offset", "Object[] before", "Object[] after"],
+      "overrides": ["getOffset()", "getOperation()", "getOldColumnValues()", "getNewColumnValues()", "emitTruncateRecord()"]
+    },
+    "BinlogOffsetContext": {
+      "fields": ["Schema sourceInfoSchema", "TransactionContext transactionContext", "IncrementalSnapshotContext incrementalSnapshotContext", "String restartGtidSet", "String currentGtidSet", "String restartBinlogFilename", "long restartBinlogPosition", "int restartRowsToSkip", "long restartEventsToSkip", "boolean inTransaction", "String transactionId"],
+      "key_methods": ["getOffset()", "event(tableId, ts)", "setRowNumber(eventRowNumber, totalRows)", "setEventPosition(pos, sizeBytes)", "setBinlogStartPoint(file, pos)", "startGtid(gtid, gtidSet)", "startNextTransaction()", "commitTransaction()", "databaseEvent(db, ts)", "tableEvent(db, tableIds, ts)"]
+    },
+    "BinlogSourceInfo": {
+      "fields": ["String currentGtid", "String currentBinlogFilename", "long currentBinlogPosition", "int currentRowNumber", "long serverId", "Instant sourceTime", "long threadId", "String currentQuery", "Set<TableId> tableIds", "String databaseName"],
+      "key_methods": ["setBinlogPosition(file, pos)", "setEventPosition(pos)", "setRowNumber(row)", "startGtid(gtid)", "setBinlogServerId(id)", "setSourceTime(ts)", "setBinlogThread(threadId)", "tableEvent(TableId)", "tableEvent(Set<TableId>)", "databaseEvent(db)", "binlogFilename()", "binlogPosition()", "table()", "getQuery()"]
+    },
+    "BinlogSourceInfoStructMaker": {
+      "key_methods": ["init(connector, version, config): builds Schema with fields [version, connector, name, ts_ms, snapshot, db, sequence, table, server_id, gtid, file, pos, row, thread, query]", "schema() → Schema", "struct(T sourceInfo) → Struct"],
+      "abstract_method": "getConnectorName()"
+    },
+    "BinlogUnsignedIntegerConverter": {
+      "static_methods": ["convertUnsignedTinyint(short) → short", "convertUnsignedSmallint(int) → int", "convertUnsignedMediumint(int) → int", "convertUnsignedInteger(long) → long", "convertUnsignedBigint(BigDecimal) → BigDecimal"],
+      "logic": "If value < 0: add correction constant (type_max + 1) to recover unsigned representation"
+    }
+  },
+  "important_notes": [
+    "BinlogChangeRecordEmitter is constructed per-row: before[] and after[] are Serializable[] from the binlog row event",
+    "TRUNCATE is the only operation overridden in BinlogChangeRecordEmitter; base class throws UnsupportedOperationException for TRUNCATE",
+    "PK update (oldKey != newKey) emits two records: DELETE (old key, with __debezium.newkey header) + CREATE (new key, with __debezium.oldkey header)",
+    "BinlogOffsetContext.setRowNumber(eventRowNumber, totalRows) delegates to BinlogSourceInfo.setRowNumber() AND tracks restartRowsToSkip for fault tolerance",
+    "BinlogSourceInfoStructMaker.struct() reads GTID only if non-null; reads threadId only if >= 0; reads table/query only if non-null",
+    "BinlogUnsignedIntegerConverter is applied during column value extraction (inside TableSchema's value converter), not inside BinlogChangeRecordEmitter directly",
+    "The source info Struct schema name is: io.debezium.connector.<connectorName>.Source",
+    "Offset map keys: server_id, gtids (GTID set), file, pos, event (eventsToSkip), row (rowsToSkip), ts_sec"
+  ],
+  "source_files_analyzed": [
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogChangeRecordEmitter.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogSourceInfo.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogSourceInfoStructMaker.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogUnsignedIntegerConverter.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogOffsetContext.java",
+    "debezium-connector-common/src/main/java/io/debezium/relational/RelationalChangeRecordEmitter.java"
+  ]
+}

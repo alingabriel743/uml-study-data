@@ -1,0 +1,298 @@
+@startuml activity_player_input_building_placement
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    ArrowColor #495057
+}
+skinparam noteFontSize 11
+skinparam noteFontColor #495057
+skinparam noteBorderColor #ADB5BD
+skinparam noteBackgroundColor #F1F3F5
+
+title Player Input & Building Placement\n<size:11>(DesktopInput / MobileInput → InputHandler → Build Validator → PlayerUnit Build Queue)</size>
+
+|#E8F4FD| Player / UI |
+|#EAF7EA| Desktop Input |
+|#FFF8E8| Mobile Input |
+|#F4EAF7| InputHandler (Shared) |
+|#FDEAEA| Build Validator & Unit Queue |
+
+start
+
+|Player / UI|
+:Game frame tick;
+note right: Called every render frame
+
+|Desktop Input|
+:update() — pollInputPlayer()\nor pollInputNoPlayer();
+
+if (locked() or player.dead()?) then (yes)
+  :pollInputNoPlayer()\n[camera pan only];
+  note right: No block placement\nwhen locked/dead
+  |Player / UI|
+  :Await next frame;
+  stop
+else (no)
+endif
+
+:pollInputPlayer();
+
+' ─── BLOCK SELECTION ───
+if (Block selected from UI?) then (yes)
+  |Player / UI|
+  :User picks block from hotbar / menu;
+  |InputHandler (Shared)|
+  :Set InputHandler.block\nReset mode to none;
+  |Desktop Input|
+endif
+
+' ─── COMMAND / UI FOCUS GUARDS ───
+if (commandMode active\nor scene.hasMouse()?) then (yes)
+  :Skip world placement input;
+  |Player / UI|
+  :Await next frame;
+  stop
+else (no)
+endif
+
+' ─── DESKTOP PLACEMENT ───
+if (keyTap(select) && isPlacing()\n[block != null]?) then (yes)
+  :Set selectX/Y = cursorX/Y\nmode = placing;
+  |InputHandler (Shared)|
+  :updateLine(selectX, selectY)\n→ build linePlans;
+  note right: iterateLine() creates\nBuildPlan per tile;\ncheck blockreplace setting
+  |Desktop Input|
+
+  :Key held — cursor moves?;
+  while (select key held?) is (yes)
+    if (cursor moved?) then (yes)
+      |InputHandler (Shared)|
+      :updateLine() — clear linePlans,\nrecreate BuildPlan for each tile,\napply block replacement if enabled;
+      |Desktop Input|
+    endif
+    if (axisTap(rotate)?) then (yes)
+      :rotation = (rotation + delta) % 4;
+      |InputHandler (Shared)|
+      :updateLine() refreshed\nwith new rotation;
+      |Desktop Input|
+    endif
+  endwhile (key released)
+
+  :keyRelease(select)\nmode == placing;
+  if (keyDown(boost)?) then (yes — reversed)
+    |InputHandler (Shared)|
+    :flushPlansReverse(linePlans)\n[reverse tile order];
+  else (no)
+    |InputHandler (Shared)|
+    :flushPlans(linePlans);
+  endif
+
+  :For each BuildPlan in linePlans:;
+  note right: linePlans.clear()\nmode = none\nEvents.fire(LineConfirmEvent)
+
+' ─── DESKTOP BREAK MODE ───
+elseif (keyTap(breakBlock)?) then (yes)
+  :Set selectX/Y = cursorX/Y\nmode = breaking;
+  :keyRelease(breakBlock)\nwhile mode == breaking;
+  |InputHandler (Shared)|
+  :removeSelection(selectX, selectY,\ncursorX, cursorY, maxLength)\n→ normalizeArea(), iterate tiles;
+  :tryBreakBlock(x, y)\nper tile in selection;
+  note right: Produces break-type\nBuildPlans (no block field)
+  :breakBlock(x, y)\n→ new BuildPlan(tile.x, tile.y) [break];
+
+' ─── DESKTOP SCHEMATIC ───
+elseif (keyRelease(schematicSelect)?) then (yes)
+  |InputHandler (Shared)|
+  :schematics.create(schemX, schemY,\ncursorX, cursorY);
+  :useSchematic(lastSchematic)\n→ selectPlans.addAll(\nschematics.toPlans(schem, schX, schY));
+  :Next tap, selectPlans not empty\n→ flushPlans(selectPlans);
+  note right: Schematic placed\nimmediately on Desktop
+
+' ─── DESKTOP CANCEL ───
+elseif (keyTap(deselect)\nor keyTap(clearBuilding)?) then (yes)
+  |Desktop Input|
+  :block = null, mode = none;
+  :OR player.unit().clearBuilding();
+  |Player / UI|
+  :Await next frame;
+  stop
+else (no action)
+  |Player / UI|
+  :Await next frame;
+  stop
+endif
+
+' ─── JUMP TO VALIDATION ───
+|Build Validator & Unit Queue|
+
+:validPlace(x, y, block, rotation):;
+
+' ═══════════════════════════════════════
+' MOBILE FLOW — begins in its own section
+' ═══════════════════════════════════════
+
+|Mobile Input|
+
+note
+  **Mobile Input Flow** runs independently
+  on touch-screen devices via separate
+  event callbacks (tap / longPress / touchUp)
+end note
+
+:update() called each frame\n— mode sync;
+if (block != null && mode == none?) then (yes)
+  :mode = placing;
+elseif (block == null && mode == placing?) then (yes)
+  :mode = none;
+endif
+
+' ─── MOBILE BLOCK SELECTION ───
+if (Block tapped from UI?) then (yes)
+  |Player / UI|
+  :User taps block from hotbar;
+  |InputHandler (Shared)|
+  :InputHandler.block set;
+  |Mobile Input|
+  :update() → mode = placing;
+endif
+
+' ─── MOBILE SINGLE TAP ───
+:tap(x, y, count, button) received;
+|InputHandler (Shared)|
+:Get cursor tile\nCall.tileTap(player, cursor)\ncheckTargets(worldX, worldY);
+|Mobile Input|
+
+if (hasPlan(cursor)\n&& !commandMode?) then (yes — toggle off)
+  |InputHandler (Shared)|
+  :removePlan(getPlan(cursor));
+elseif (mode == placing\n&& isPlacing()\n&& !checkOverlapPlacement()?) then (yes)
+  |Build Validator & Unit Queue|
+  :validPlace(cursor.x, cursor.y,\nblock, rotation);
+  if (valid?) then (yes)
+    |Mobile Input|
+    :selectPlans.add(\nnew BuildPlan(cursor.x, cursor.y,\nrotation, block, block.nextConfig()));
+  else (no)
+    :Placement rejected;
+  endif
+elseif (mode == breaking\n&& validBreak(linked.x, linked.y)\n&& !hasPlan(linked)?) then (yes)
+  |Mobile Input|
+  :selectPlans.add(\nnew BuildPlan(linked.x, linked.y) [break]);
+endif
+
+' ─── MOBILE LONG PRESS / LINE MODE ───
+if (longPress(x, y)\n&& (mode==placing || mode==breaking)?) then (yes)
+  :lineMode = true\nSet lineStartX/Y;
+  |InputHandler (Shared)|
+  :updateLine(lineStartX, lineStartY,\ncursor.x, cursor.y);
+  |Mobile Input|
+
+  while (lineMode active?) is (yes)
+    if (cursor moved?) then (yes)
+      |InputHandler (Shared)|
+      :updateLine() → rebuild linePlans;
+      |Mobile Input|
+    endif
+    :autoPan() if near screen edge;
+  endwhile (touchUp received)
+
+  :touchUp();
+  if (mode == placing?) then (yes)
+    |InputHandler (Shared)|
+    :flushSelectPlans(linePlans)\n→ append valid plans to selectPlans;
+    :Events.fire(LineConfirmEvent);
+  else (breaking)
+    |InputHandler (Shared)|
+    :removeSelection(\nlineStartX, lineStartY, tileX, tileY)\n→ break plans added to selectPlans;
+  endif
+  |Mobile Input|
+  :lineMode = false;
+endif
+
+' ─── MOBILE SCHEMATIC ───
+if (schematicMode &&\ntouchDown()?) then (yes)
+  :mode = schematicSelect\n(or rebuildSelect);
+  :touchUp() with schematicSelect\n→ schematics.create()\n→ useSchematic() → selectPlans populated;
+  note right: UI shows flip / rotate\nbuttons for selectPlans
+endif
+
+' ─── MOBILE CONFIRM BUTTON ───
+if (Confirm button tapped\n&& !selectPlans.isEmpty()?) then (yes)
+  :Iterate selectPlans;
+  |Build Validator & Unit Queue|
+  :For each non-breaking plan:\nvalidPlace(plan.x, plan.y,\nplan.block, plan.rotation);
+  note right: Breaking plans go\nthrough tryBreakBlock()
+else (no / cancel)
+  |Mobile Input|
+  if (Cancel button?) then (yes)
+    :selectPlans.clear()\nmode = none, block = null;
+    :player.unit().clearBuilding();
+    stop
+  endif
+endif
+
+' ════════════════════════════════════════
+' SHARED VALIDATION & BUILD QUEUE
+' ════════════════════════════════════════
+
+|Build Validator & Unit Queue|
+
+:Build.validPlace(type, team, x, y, rotation)\n[Static: bounds, tile solid, team rules];
+
+if (Bounds / tile check passed?) then (no)
+  :Plan rejected — out of bounds\nor tile blocked;
+  stop
+else (yes)
+endif
+
+if (player.isBuilder()?) then (yes)
+  :Query playerPlanTree\nfor overlapping queued plans;
+  if (Overlap with non-replaceable plan?) then (yes)
+    :Plan rejected — overlap;
+    stop
+  else (no overlap)
+  endif
+endif
+
+:plan.copy();
+:plan.block.onNewPlan(copy)\n[block-specific callback];
+:playerPlanTree.insert(copy)\n[update spatial index];
+:player.unit().addBuild(copy)\n→ enqueue in unit's build queue;
+
+note right
+  Unit AI will process
+  queued BuildPlans and
+  physically construct /
+  deconstruct tiles
+end note
+
+|Player / UI|
+:Build plan committed\nto unit queue;
+
+stop
+
+@enduml

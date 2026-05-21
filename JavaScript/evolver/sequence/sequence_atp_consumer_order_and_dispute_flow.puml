@@ -1,0 +1,152 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title ATP Consumer Order Verification and Dispute Flow
+
+actor "Caller" as caller
+participant "consumerAgent" as consumer
+participant "a2aProtocol" as a2a
+participant "hubClient" as hub
+participant "Hub (HTTP)" as httpHub
+
+== Initialization Guard ==
+
+caller -> consumer : dispute(orderId, reason)
+activate consumer
+
+consumer -> consumer : ensureInitialized()
+activate consumer
+
+alt _initialized == false
+
+    consumer -> a2a : sendHelloToHub()
+    activate a2a
+    a2a -> httpHub : POST /a2a/hello
+    activate httpHub
+    httpHub --> a2a : {ok: true, ...} | {ok: false, error}
+    deactivate httpHub
+
+    alt hello response missing or !hello.ok
+        a2a --> consumer : falsy / error response
+        consumer --> caller : throw Error("Failed to register with Hub")
+    else hello.ok == true
+        a2a --> consumer : hello response {ok: true}
+        deactivate a2a
+        consumer -> consumer : _initialized = true
+    end
+
+end
+
+deactivate consumer
+
+== Dispute Order ==
+
+consumer -> hub : disputeOrder(orderId, reason)
+activate hub
+
+hub -> a2a : getNodeId()
+activate a2a
+a2a --> hub : nodeId
+deactivate a2a
+
+hub -> hub : _hubPost('/a2a/atp/dispute',\n{sender_id, order_id, reason})
+activate hub
+
+hub -> a2a : getHubUrl()
+activate a2a
+a2a --> hub : hubUrl
+deactivate a2a
+
+hub -> a2a : buildHubHeaders()
+activate a2a
+a2a --> hub : headers
+deactivate a2a
+
+alt hubUrl is null/empty
+    hub --> consumer : {ok: false, error: "no_hub_url"}
+else hubUrl available
+    hub -> httpHub : POST /a2a/atp/dispute\nbody: {sender_id, order_id, reason}
+    activate httpHub
+
+    alt HTTP 200
+        httpHub --> hub : {data}
+        deactivate httpHub
+        hub --> hub : return {ok: true, data}
+    else HTTP error (non-200)
+        httpHub --> hub : error status + text
+        hub --> hub : return {ok: false, status, error}
+    else Network failure
+        hub --> hub : catch → return {ok: false, error}
+    end
+end
+
+deactivate hub
+hub --> consumer : {ok: true, data} | {ok: false, error}
+deactivate hub
+
+consumer --> caller : {ok, data?, error?}
+deactivate consumer
+
+== Verify Delivery (Alternate Flow) ==
+
+caller -> consumer : confirmDelivery(orderId)\n  OR  requestAiJudge(orderId)
+activate consumer
+
+consumer -> consumer : ensureInitialized()
+note right : Same guard as above —\nskipped if _initialized=true
+
+consumer -> hub : verifyDelivery(orderId,\n'confirm' | 'ai_judge')
+activate hub
+
+hub -> a2a : getNodeId()
+activate a2a
+a2a --> hub : nodeId
+deactivate a2a
+
+hub -> hub : _hubPost('/a2a/atp/verify',\n{sender_id, order_id, action})
+activate hub
+
+hub -> httpHub : POST /a2a/atp/verify\nbody: {sender_id, order_id, action}
+activate httpHub
+httpHub --> hub : {ok: true, data} | error
+deactivate httpHub
+
+hub --> hub : return {ok, data} | {ok: false, error}
+deactivate hub
+
+hub --> consumer : {ok, data?, error?}
+deactivate hub
+
+consumer --> caller : {ok, data?, error?}
+deactivate consumer
+
+@enduml

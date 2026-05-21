@@ -1,0 +1,181 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #F1F3F5
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Token Pruning and Selection Flow
+
+participant "LatentRecon" as LR
+participant "forward_gaussians" as FG
+participant "subsample_x_and_rays\n[render.py]" as SAR
+participant "process_tensors\n[token_pruning.py]" as PT
+participant "global_selection" as GS
+participant "structured_selection" as SS
+participant "select_topk" as STK
+participant "sample_gumbel" as SG
+participant "apply_mask_and_select" as AMS
+participant "gaussian_pruning" as GP
+participant "GaussianRenderer" as GR
+
+== Encoding & Feature Extraction ==
+
+LR -> FG : forward_gaussians(images_input, plucker,\nrays_os, rays_ds, time_embeddings)
+activate FG
+
+FG -> FG : patch_embed(images_input)\n→ enc_blocks (Transformer)\n→ enc_norm → block_out
+FG -> FG : deconv(x) or decoder_cosmos(x)\n[upsample latent features → (B,C,T,H,W)]
+
+note over FG
+  If sub_sample_gaussians_type == 'learned':
+  output_dims += 1 (extra mask logit channel)
+  x_mask = x[:, [-1]]   # (B,1,T,H,W)
+  x      = x[:, :-1]    # (B,C,T,H,W)
+end note
+
+== Token Subsampling Entry ==
+
+FG -> SAR : subsample_x_and_rays_wrapper(\n  x, rays_os, rays_ds, x_mask,\n  factor, type, type_tokens,\n  temperature, training)
+activate SAR
+
+SAR -> SAR : compute target sizes:\nt_g_out, h_g_out, w_g_out\n= (x.shape[-3:] / factor).int()
+
+alt sub_sample_gaussians_type == 'random'
+    SAR -> SAR : subsample_pixels_spatio_temporal()\n→ query_z_with_indices(bthw_g, x/rays)
+    note over SAR : Random spatial sampling — no mask logits used
+else sub_sample_gaussians_type == 'learned'
+
+    alt type_tokens == 'local'  (structured)
+        SAR -> PT : process_tensors(\n  tokens=x, mask_logits=x_mask,\n  other_tensors=[rays_os, rays_ds],\n  k_t=t_g_out, k_hw=h_g_out*w_g_out,\n  temperature, training)
+    else type_tokens == 'global'  (flat joint)
+        SAR -> PT : process_tensors(\n  tokens=x, mask_logits=x_mask,\n  other_tensors=[rays_os, rays_ds],\n  total_k=t_g_out*h_g_out*w_g_out,\n  temperature, training)
+    end
+    activate PT
+
+    PT -> PT : squeeze mask_logits:\n(B,1,T,H,W) → (B,T,H,W)
+
+    note over PT
+      Method selection:
+      training=True OR soft_inference=True
+        → method='softmax', hard=True  (Gumbel-Softmax, differentiable)
+      else
+        → method='topk',    hard=False (non-differentiable)
+    end note
+
+    == Selection Branch ==
+
+    alt total_k provided  →  Global Selection
+        PT -> GS : global_selection(\n  mask_logits:(B,T,H,W),\n  total_k, method, temperature, hard, eps)
+        activate GS
+        GS -> GS : flatten: (B,T,H,W) → (B, N=T×H×W)
+        GS -> STK : select_topk(logits_flat:(B,N),\n  total_k, method, temperature, hard, eps)
+        activate STK
+
+        alt method == 'topk'
+            STK -> STK : torch.topk(logits, k)\n→ scatter indices to binary mask (B,N)
+        else method == 'softmax'  (Gumbel-Softmax)
+            STK -> SG : sample_gumbel(shape, eps, device, dtype)
+            activate SG
+            SG --> STK : gumbel_noise
+            deactivate SG
+            STK -> STK : y = softmax((logits + gumbel_noise) / temperature)
+            STK -> STK : straight-through:\nhard_mask = one_hot(argmax(y))\nmask = hard_mask - y.detach() + y
+        end
+
+        STK --> GS : mask:(B,N)
+        deactivate STK
+        GS -> GS : reshape mask: (B,N) → (B,T,H,W)
+        GS --> PT : mask:(B,T,H,W)
+        deactivate GS
+
+    else k_t + k_hw provided  →  Structured Selection
+        PT -> SS : structured_selection(\n  mask_logits:(B,T,H,W),\n  k_t, k_hw, method, temperature, hard, eps)
+        activate SS
+
+        note over SS : Step 1 — Temporal selection
+        SS -> SS : logits_t = mask_logits.mean(dim=[2,3])\n→ (B, T)
+        SS -> STK : select_topk(logits_t:(B,T),\n  k_t, method, temperature, hard, eps)
+        activate STK
+        STK --> SS : mask_t:(B, T)
+        deactivate STK
+
+        note over SS : Step 2 — Spatial selection per frame
+        loop for each batch b, each temporal slot t
+            SS -> SS : logits_hw = mask_logits[b,t].reshape(-1)\n→ (1, H×W)
+            SS -> STK : select_topk(logits_hw.unsqueeze(0):(1,H×W),\n  k_hw, method, temperature, hard, eps)
+            activate STK
+            STK --> SS : mask_hw:(1, H×W)
+            deactivate STK
+            SS -> SS : reshape mask_hw → (H, W)
+        end
+
+        note over SS : Step 3 — Combine: outer product
+        SS -> SS : mask = mask_spatial\n        * mask_t.unsqueeze(-1).unsqueeze(-1)\n→ (B, T, H, W)
+        SS --> PT : mask:(B,T,H,W)
+        deactivate SS
+    end
+
+    == Token Gathering ==
+
+    PT -> AMS : apply_mask_and_select(\n  tokens:(B,C,T,H,W),\n  other_tensors=[rays_os, rays_ds],\n  mask:(B,T,H,W))
+    activate AMS
+    AMS -> AMS : flatten tokens: (B,C,T,H,W) → (B,C,N)\nflatten mask:  (B,T,H,W)  → (B,N)
+    loop for each batch b
+        AMS -> AMS : idx = mask_flat[b].nonzero()\ngather tokens[:,idx]\ngather rays_os[:,idx], rays_ds[:,idx]
+    end
+    AMS --> PT : tokens_out:(B,C,k),\nothers_out:[rays_os:(B,3,k), rays_ds:(B,3,k)]
+    deactivate AMS
+
+    PT --> SAR : (tokens_out, others_out, mask)
+    deactivate PT
+end
+
+SAR --> FG : x_pruned:(B,C,k), rays_os_pruned, rays_ds_pruned
+deactivate SAR
+
+== Gaussian Assembly & Post-Processing ==
+
+FG -> FG : gaussian_processing(x_pruned, rays_os, rays_ds)\n→ split channels: distance, rgb, scaling,\n                  rotation, opacity\n→ apply activations\n→ cat gaussians:(B,N,14)
+
+FG -> GP : gaussian_pruning(gaussians:(B,N,14))
+activate GP
+GP -> GP : opacity-based top-k selection\n+ optional random keep (Long LRM style)
+GP --> FG : gaussians_pruned:(B,k,14)
+deactivate GP
+
+FG --> LR : gaussians:(B,k,14), x_mask
+deactivate FG
+
+== Rendering ==
+
+LR -> GR : gs.render(gaussians, cam_view,\n            bg_color, intrinsics)
+activate GR
+GR --> LR : images_pred, depths_pred
+deactivate GR
+
+@enduml

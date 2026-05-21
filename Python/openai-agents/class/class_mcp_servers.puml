@@ -1,0 +1,319 @@
+@startuml class_mcp_servers
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF8DC
+    BorderColor #B8860B
+}
+
+title MCP (Model Context Protocol) Servers
+
+' ─────────────────────────────────────────────
+' Package: agents.mcp.server
+' ─────────────────────────────────────────────
+package "agents.mcp.server" {
+
+    abstract class MCPServer {
+        +use_structured_content: bool
+        #_needs_approval_policy: bool | dict | Callable
+        #_failure_error_function: ToolErrorFunction | None
+        +tool_meta_resolver: MCPToolMetaResolver | None
+        --
+        +{abstract} name: str
+        +{abstract} connect(): None
+        +{abstract} cleanup(): None
+        +{abstract} list_tools(run_context, agent): list[MCPTool]
+        +{abstract} call_tool(tool_name, arguments, meta): CallToolResult
+        +{abstract} list_prompts(): ListPromptsResult
+        +{abstract} get_prompt(name, arguments): GetPromptResult
+        +cached_tools: list[MCPTool] | None
+        +list_resources(cursor): ListResourcesResult
+        +list_resource_templates(cursor): ListResourceTemplatesResult
+        +read_resource(uri): ReadResourceResult
+        #_normalize_needs_approval(require_approval): bool | dict | Callable
+        #_get_needs_approval_for_tool(tool, agent): bool | Callable
+        #_get_failure_error_function(agent_fn): ToolErrorFunction | None
+    }
+
+    abstract class _MCPServerWithClientSession {
+        +session: ClientSession | None
+        +exit_stack: AsyncExitStack
+        #_cleanup_lock: asyncio.Lock
+        #_request_lock: asyncio.Lock
+        +cache_tools_list: bool
+        +server_initialize_result: InitializeResult | None
+        +client_session_timeout_seconds: float | None
+        +max_retry_attempts: int
+        +retry_backoff_seconds_base: float
+        +message_handler: MessageHandlerFnT | None
+        #_cache_dirty: bool
+        #_tools_list: list[MCPTool] | None
+        +tool_filter: ToolFilter
+        #_serialize_session_requests: bool
+        #_get_session_id: GetSessionIdCallback | None
+        --
+        +{abstract} create_streams(): AbstractAsyncContextManager
+        +connect(): None
+        +cleanup(): None
+        +list_tools(run_context, agent): list[MCPTool]
+        +call_tool(tool_name, arguments, meta): CallToolResult
+        +list_prompts(): ListPromptsResult
+        +get_prompt(name, arguments): GetPromptResult
+        +invalidate_tools_cache(): None
+        +cached_tools: list[MCPTool] | None
+        #_apply_tool_filter(tools, run_context, agent): list[MCPTool]
+        #_apply_static_tool_filter(tools, static_filter): list[MCPTool]
+        #_apply_dynamic_tool_filter(tools, run_context, agent): list[MCPTool]
+        #_run_with_retries(func): T
+        #_maybe_serialize_request(func): T
+    }
+
+    class MCPServerStdio {
+        -_params: MCPServerStdioParams
+        -_name: str
+        --
+        +name: str
+        +create_streams(): AbstractAsyncContextManager
+    }
+
+    class MCPServerSse {
+        -_params: MCPServerSseParams
+        -_name: str
+        --
+        +name: str
+        +create_streams(): AbstractAsyncContextManager
+    }
+
+    class MCPServerStreamableHttp {
+        -_params: MCPServerStreamableHttpParams
+        -_name: str
+        --
+        +name: str
+        +session_id: str | None
+        +create_streams(): AbstractAsyncContextManager
+        +call_tool(tool_name, arguments, meta): CallToolResult
+        -_isolated_client_session(): AsyncContextManager
+        -_call_tool_with_session(session, tool_name, arguments, meta)
+        -_call_tool_with_shared_session(tool_name, arguments, meta)
+        -_call_tool_with_isolated_retry(tool_name, arguments, meta)
+        -_should_retry_in_isolated_session(exc): bool
+    }
+
+    note bottom of MCPServerSse
+        **Deprecated**: SSE transport is deprecated
+        by MCP project. Prefer StreamableHttp
+        or stdio for new integrations.
+    end note
+
+    note right of MCPServerStreamableHttp
+        Supports isolated session retry
+        logic for request-isolation failures.
+        Overrides call_tool() from parent.
+    end note
+}
+
+' ─────────────────────────────────────────────
+' Package: agents.mcp.manager
+' ─────────────────────────────────────────────
+package "agents.mcp.manager" {
+
+    class MCPServerManager {
+        -_all_servers: list[MCPServer]
+        -_active_servers: list[MCPServer]
+        +connect_timeout_seconds: float | None
+        +cleanup_timeout_seconds: float | None
+        +drop_failed_servers: bool
+        +strict: bool
+        +suppress_cancelled_error: bool
+        +connect_in_parallel: bool
+        -_workers: dict[MCPServer, _ServerWorker]
+        +failed_servers: list[MCPServer]
+        -_failed_server_set: set[MCPServer]
+        -_connected_servers: set[MCPServer]
+        +errors: dict[MCPServer, BaseException]
+        --
+        +active_servers: list[MCPServer]
+        +all_servers: list[MCPServer]
+        +__aenter__(): MCPServerManager
+        +__aexit__(): None
+        +connect_all(): list[MCPServer]
+        +cleanup_all(): None
+        +reconnect(failed_only: bool): list[MCPServer]
+        -_attempt_connect(server, raise_on_error): None
+        -_run_connect(server): None
+        -_cleanup_server(server): None
+        -_connect_all_parallel(servers): None
+        -_refresh_active_servers(): None
+        -_record_failure(server, exc, phase): None
+        -_get_worker(server): _ServerWorker
+        -_remove_failed_server(server): None
+    }
+
+    class _ServerWorker {
+        -_server: MCPServer
+        -_connect_timeout_seconds: float | None
+        -_cleanup_timeout_seconds: float | None
+        -_queue: asyncio.Queue[_ServerCommand]
+        -_task: asyncio.Task
+        --
+        +is_done: bool
+        +connect(): None
+        +cleanup(): None
+        -_submit(action, timeout_seconds): None
+        -_run(): None
+    }
+
+    class _ServerCommand <<dataclass>> {
+        +action: str
+        +timeout_seconds: float | None
+        +future: asyncio.Future[None]
+    }
+
+    note right of MCPServerManager
+        Keeps MCP connect/cleanup on the
+        same asyncio task — required by
+        AnyIO cancel scopes.
+        connect_in_parallel=True uses
+        one _ServerWorker task per server.
+    end note
+}
+
+' ─────────────────────────────────────────────
+' Package: agents.mcp.util
+' ─────────────────────────────────────────────
+package "agents.mcp.util" {
+
+    class MCPUtil <<utility>> {
+        +{static} get_all_function_tools(servers, convert_schemas_to_strict, run_context, agent, failure_error_fn): list[Tool]
+        +{static} get_function_tools(server, convert_schemas_to_strict, run_context, agent, failure_error_fn): list[Tool]
+        +{static} to_function_tool(tool, server, convert_schemas_to_strict, agent, failure_error_fn): FunctionTool
+        +{static} invoke_mcp_tool(server, tool, context, input_json, meta): ToolOutput
+        -{static} _resolve_meta(server, context, tool_name, arguments): dict | None
+        -{static} _merge_mcp_meta(resolved_meta, explicit_meta): dict | None
+        -{static} _extract_static_meta(tool): dict | None
+    }
+
+    class ToolFilterContext <<dataclass>> {
+        +run_context: RunContextWrapper[Any]
+        +agent: AgentBase
+        +server_name: str
+    }
+
+    class ToolFilterStatic <<TypedDict>> {
+        +allowed_tool_names: list[str]
+        +blocked_tool_names: list[str]
+    }
+
+    class MCPToolMetaContext <<dataclass>> {
+        +run_context: RunContextWrapper[Any]
+        +server_name: str
+        +tool_name: str
+        +arguments: dict[str, Any] | None
+    }
+
+    interface HttpClientFactory <<Protocol>> {
+        +__call__(headers, timeout, auth): httpx.AsyncClient
+    }
+}
+
+' ─────────────────────────────────────────────
+' Package: agents._mcp_tool_metadata
+' ─────────────────────────────────────────────
+package "agents._mcp_tool_metadata" {
+
+    class MCPToolMetadata <<frozen dataclass>> {
+        +description: str | None
+        +title: str | None
+    }
+
+    note right of MCPToolMetadata
+        Resolved display metadata for an MCP tool.
+        Title resolved from tool.title or
+        annotations.title; description from
+        tool.description.
+    end note
+}
+
+' ─────────────────────────────────────────────
+' Package: Params (TypedDicts)
+' ─────────────────────────────────────────────
+package "Params (TypedDicts)" {
+
+    class MCPServerStdioParams <<TypedDict>> {
+        +command: str
+        +args: list[str]
+        +env: dict[str, str]
+        +cwd: str | Path
+        +encoding: str
+        +encoding_error_handler: Literal
+    }
+
+    class MCPServerSseParams <<TypedDict>> {
+        +url: str
+        +headers: dict[str, str]
+        +timeout: float
+        +sse_read_timeout: float
+        +auth: httpx.Auth
+        +httpx_client_factory: HttpClientFactory
+    }
+
+    class MCPServerStreamableHttpParams <<TypedDict>> {
+        +url: str
+        +headers: dict[str, str]
+        +timeout: timedelta | float
+        +sse_read_timeout: timedelta | float
+        +terminate_on_close: bool
+        +httpx_client_factory: HttpClientFactory
+        +auth: httpx.Auth
+        +ignore_initialized_notification_failure: bool
+    }
+}
+
+' ─────────────────────────────────────────────
+' Inheritance
+' ─────────────────────────────────────────────
+MCPServer <|-- _MCPServerWithClientSession : extends
+_MCPServerWithClientSession <|-- MCPServerStdio : extends
+_MCPServerWithClientSession <|-- MCPServerSse : extends
+_MCPServerWithClientSession <|-- MCPServerStreamableHttp : extends
+
+' ─────────────────────────────────────────────
+' Composition & Aggregation
+' ─────────────────────────────────────────────
+MCPServerManager o-- MCPServer : aggregates\n0..*
+MCPServerManager *-- _ServerWorker : composes\n(parallel mode)
+_ServerWorker --> MCPServer : calls connect/cleanup
+_ServerWorker *-- _ServerCommand : queues commands
+
+' ─────────────────────────────────────────────
+' Dependencies
+' ─────────────────────────────────────────────
+MCPServerStdio ..> MCPServerStdioParams : uses params
+MCPServerSse ..> MCPServerSseParams : uses params
+MCPServerStreamableHttp ..> MCPServerStreamableHttpParams : uses params
+
+MCPServerSseParams ..> HttpClientFactory : references
+MCPServerStreamableHttpParams ..> HttpClientFactory : references
+
+MCPUtil ..> MCPServer : calls list_tools / call_tool
+MCPUtil ..> MCPToolMetadata : produces metadata
+MCPUtil ..> MCPToolMetaContext : creates for meta resolution
+
+_MCPServerWithClientSession ..> ToolFilterContext : uses for filtering
+_MCPServerWithClientSession ..> ToolFilterStatic : evaluates static filter
+
+@enduml

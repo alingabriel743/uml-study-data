@@ -1,0 +1,177 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #212529
+    EndColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam ArrowColor #495057
+
+title Autoload File Generation Flow
+
+|AutoloadGenerator|
+start
+:AutoloadGenerator::dump() invoked\n(Config, RootPackage, InstallationManager,\ntargetDir, suffix, Locker);
+
+|EventDispatcher|
+:dispatchScript(PRE_AUTOLOAD_DUMP);
+
+|AutoloadGenerator|
+if (classMapAuthoritative?) then (yes)
+    :Force scanPsrPackages = true;
+else (no)
+endif
+
+if (devMode?) then (yes)
+    :Read vendor/composer/installed.json\nSet devMode flag — skip dev-package filtering;
+else (no)
+    :Filter dev packages from packageMap;
+endif
+
+|Filesystem|
+:ensureDirectoryExists(vendorDir)\nensureDirectoryExists(targetDir);
+
+|AutoloadGenerator|
+:Compute path codes\n(vendorPathCode, appBaseDirCode,\nvendorPathToTargetDirCode);
+
+:buildPackageMap(InstallationManager,\nrootPackage, localRepo.getCanonicalPackages())\n→ packageMap[];
+
+:parseAutoloads(packageMap, rootPackage)\n→ autoloads{ psr-0, psr-4, classmap,\nfiles, exclude-from-classmap };
+
+:Build autoload_namespaces.php content\nfrom autoloads['psr-0'];
+
+:Build autoload_psr4.php content\nfrom autoloads['psr-4'];
+
+if (rootPackage has targetDir + psr-0?) then (yes)
+    :Build targetDirLoader snippet\nfor autoload_real.php;
+else (no)
+endif
+
+:Collect exclusion regexes\nfrom autoloads['exclude-from-classmap'];
+
+|ClassMapGenerator|
+:scanPaths() for each classmap dir\napplying exclusion regex\n→ accumulate class entries;
+
+|AutoloadGenerator|
+if (scanPsrPackages?) then (yes)
+    |ClassMapGenerator|
+    :scanPaths() for each psr-4 / psr-0\nnamespace+paths with exclusion regex;
+    |AutoloadGenerator|
+endif
+
+|ClassMapGenerator|
+:getClassMap() → ClassMap;
+
+|AutoloadGenerator|
+if (strictAmbiguous?) then (yes)
+    :getAmbiguousClasses(strict=false)\n→ IOInterface::writeError(warnings);
+else (no)
+    :getAmbiguousClasses()\n→ IOInterface::writeError(warnings);
+endif
+
+:clearPsrViolationsByPath(vendorPath)\n→ IOInterface::writeError(PSR warnings);
+
+:ClassMap::addClass('Composer\\InstalledVersions', ...);
+:ClassMap::sort();
+:Build autoload_classmap.php content\nfrom ClassMap::getMap();
+
+:Resolve suffix:\nconfig 'autoloader-suffix'\n→ hash from existing autoload.php\n→ locker content-hash\n→ random bytes;
+
+if (dryRun?) then (yes)
+    :Return ClassMap\n(skip all file writes);
+    stop
+else (no)
+endif
+
+|Filesystem|
+:filePutContentsIfModified\n(autoload_namespaces.php);
+:filePutContentsIfModified\n(autoload_psr4.php);
+:filePutContentsIfModified\n(autoload_classmap.php);
+
+|AutoloadGenerator|
+if (include_paths entries?) then (yes)
+    :getIncludePathsFile(packageMap, ...)\n→ build include_paths.php content;
+    |Filesystem|
+    :filePutContentsIfModified\n(include_paths.php);
+    |AutoloadGenerator|
+else (no)
+    |Filesystem|
+    :unlink(include_paths.php)\nif it exists;
+    |AutoloadGenerator|
+endif
+
+if (autoload 'files' entries?) then (yes)
+    :getIncludeFilesFile(autoloads['files'], ...)\n→ build autoload_files.php content;
+    |Filesystem|
+    :filePutContentsIfModified\n(autoload_files.php);
+    |AutoloadGenerator|
+else (no)
+    |Filesystem|
+    :unlink(autoload_files.php)\nif it exists;
+    |AutoloadGenerator|
+endif
+
+:getStaticFile(suffix, targetDir, ...)\n→ instantiate ClassLoader\n→ load namespaces + psr4 + classmap\n→ serialize to ComposerStaticInit{suffix}\n   with $prefixLengthsPsr4, $classMap,\n   $files + getInitializer() method;
+
+|Filesystem|
+:filePutContentsIfModified\n(autoload_static.php);
+
+|AutoloadGenerator|
+if (checkPlatform?) then (yes)
+    :getPlatformCheck()\n→ build platform_check.php content\n(PHP/extension version guards);
+    |Filesystem|
+    :filePutContentsIfModified\n(platform_check.php);
+    |AutoloadGenerator|
+else (no)
+    |Filesystem|
+    :unlink(platform_check.php)\nif it exists;
+    |AutoloadGenerator|
+endif
+
+:getAutoloadFile(vendorPathToTargetDirCode, suffix)\n→ emits vendor/autoload.php:\n   require_once autoload_real.php\n   ComposerAutoloaderInit{suffix}::getLoader();
+
+|Filesystem|
+:filePutContentsIfModified\n(vendor/autoload.php);
+
+|AutoloadGenerator|
+:getAutoloadRealFile(suffix, ...)\n→ emit ComposerAutoloaderInit{suffix} class:\n  • spl_autoload_register → new ClassLoader\n  • require autoload_static.php\n  • ComposerStaticInit{suffix}::getInitializer($loader)\n  • setClassMapAuthoritative / setApcuPrefix\n  • $loader->register(prepend)\n  • Closure-bound requireFile loop\n    (guards via $GLOBALS['__composer_autoload_files'])\n  • return $loader;
+
+|Filesystem|
+:filePutContentsIfModified\n(vendor/composer/autoload_real.php);
+
+:safeCopy(ClassLoader.php → composer/ClassLoader.php)\nsafeCopy(LICENSE → composer/LICENSE);
+
+|EventDispatcher|
+:dispatchScript(POST_AUTOLOAD_DUMP);
+
+|AutoloadGenerator|
+:Return ClassMap;
+stop
+
+@enduml

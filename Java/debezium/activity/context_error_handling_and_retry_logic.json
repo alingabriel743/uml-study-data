@@ -1,0 +1,104 @@
+{
+  "scope": "error_handling_and_retry_logic",
+  "title": "Error Handling and Retry Logic",
+  "diagram_type": "activity",
+  "key_participants": [
+    "ErrorHandler",
+    "MySqlErrorHandler",
+    "BinlogHeartbeatErrorHandler",
+    "HeartbeatErrorHandler",
+    "ChangeEventQueue",
+    "CommonConnectorConfig"
+  ],
+  "class_hierarchy": [
+    "ErrorHandler (base) — in io.debezium.pipeline",
+    "MySqlErrorHandler extends ErrorHandler — in io.debezium.connector.mysql",
+    "BinlogHeartbeatErrorHandler implements HeartbeatErrorHandler — inner class of BinlogSourceTask",
+    "HeartbeatErrorHandler (interface) — in io.debezium.heartbeat, has DEFAULT_NOOP_ERRORHANDLER lambda"
+  ],
+  "key_fields": [
+    "ErrorHandler.queue: ChangeEventQueue<?> — target for exception propagation",
+    "ErrorHandler.producerThrowable: AtomicReference<Throwable> — stores first producer error",
+    "ErrorHandler.maxRetries: int — set from connectorConfig.getMaxRetriesOnError(); RETRIES_UNLIMITED=-1, RETRIES_DISABLED=0",
+    "ErrorHandler.retries: int — current retry count, transferred from replacedErrorHandler on construction",
+    "MySqlErrorHandler.NON_RETRIABLE_ERROR_CODES: Set<Integer> = {1236} (ER_MASTER_FATAL_ERROR_READING_BINLOG)"
+  ],
+  "main_activity_flow": [
+    "START: Producer encounters Throwable",
+    "→ ErrorHandler.setProducerThrowable(throwable) called",
+    "→ Log error at ERROR level",
+    "→ CAS: producerThrowable.compareAndSet(null, throwable) → 'first' flag",
+    "→ [DECISION] isRetriable(throwable)?",
+    "  YES → retriable = true",
+    "  NO → isCustomRetriable(throwable)?",
+    "    YES (message matches connectorConfig.customRetriableException regex) → retriable = true",
+    "    NO → retriable = false",
+    "→ [DECISION] first == true (no prior error)?",
+    "  NO → silently discard (already handling an error)",
+    "  YES →",
+    "    [DECISION] retriable AND hasMoreRetries()?",
+    "      YES → queue.producerException(new RetriableException(...)) → connector restarts",
+    "      NO → queue.producerException(new ConnectException(...)) → connector stops"
+  ],
+  "isRetriable_flow": [
+    "ErrorHandler.isRetriable(throwable):",
+    "  → throwable == null? return false",
+    "  → for each e in communicationExceptions(): e.isAssignableFrom(throwable.class)? return true",
+    "  → recurse: return isRetriable(throwable.getCause())",
+    "MySqlErrorHandler.isRetriable(throwable) OVERRIDE:",
+    "  → walk cause chain: if SQLException AND errorCode in NON_RETRIABLE_ERROR_CODES (1236) → return false",
+    "  → fall through to super.isRetriable(throwable) [uses IOException + SQLException as communicationExceptions]"
+  ],
+  "hasMoreRetries_flow": [
+    "hasMoreRetries():",
+    "  → unlimitedRetries()? (maxRetries == -1) → doRetry = true",
+    "  → OR retries < maxRetries → doRetry = true",
+    "  → if doRetry: retries++; log WARN 'Retry N of M'",
+    "  → else: log ERROR 'Max retries reached'",
+    "  → return doRetry"
+  ],
+  "communicationExceptions_per_handler": [
+    "ErrorHandler (base): {IOException.class}",
+    "MySqlErrorHandler: {IOException.class, SQLException.class}"
+  ],
+  "heartbeat_error_flow": [
+    "BinlogHeartbeatErrorHandler.onError(SQLException):",
+    "  → read sqlErrorId = exception.getSQLState()",
+    "  → SWITCH:",
+    "    '42000' (ER_DBACCESS_DENIED_ERROR) → throw DebeziumException (non-retriable, stops connector)",
+    "    '3D000' (ER_NO_DB_ERROR) → throw DebeziumException (non-retriable, stops connector)",
+    "    default → no-op (swallow, transient heartbeat issue ignored)",
+    "HeartbeatErrorHandler.DEFAULT_NOOP_ERRORHANDLER: always swallows SQLException"
+  ],
+  "constructor_init_flow": [
+    "ErrorHandler(connectorType, connectorConfig, queue, replacedErrorHandler):",
+    "  → connectorConfig != null? maxRetries = connectorConfig.getMaxRetriesOnError()",
+    "  → else: maxRetries = RETRIES_UNLIMITED (-1)",
+    "  → replacedErrorHandler != null? retries = replacedErrorHandler.getRetries() [preserves retry count across replacements]"
+  ],
+  "retry_management_methods": [
+    "resetRetries(): retries = 0",
+    "getRetries(): returns current retries int",
+    "unlimitedRetries(): maxRetries == RETRIES_UNLIMITED (-1)"
+  ],
+  "binlog_validation_errors": [
+    "validateBinlogConfiguration(): if shouldStream() and not ROW binlog_format → throw DebeziumException",
+    "validateBinlogConfiguration(): if shouldStream() and not FULL binlog_row_image → throw DebeziumException",
+    "validateSnapshotFeasibility(): logs WARN if no binlog files or binlogs appear purged (non-throwing)"
+  ],
+  "key_decisions_for_diagram": [
+    "Is error retriable? (IOException/SQLException chain walk)",
+    "Is MySql error code in NON_RETRIABLE set (1236)?",
+    "Is error custom-retriable? (regex on message)",
+    "Is this the first producer throwable? (CAS guard)",
+    "Have max retries been exhausted? (unlimited or counter check)",
+    "Heartbeat SQL state: 42000 or 3D000 → fatal; else → ignored"
+  ],
+  "important_notes": "MySqlErrorHandler short-circuits isRetriable to false for error code 1236 BEFORE calling super — meaning even if IOException is in the cause chain, a wrapping SQLException(1236) makes it non-retriable. producerThrowable uses AtomicReference CAS to ensure only the first error is processed (thread-safe). RetriableException signals Kafka Connect to restart; ConnectException signals permanent stop.",
+  "source_files_analyzed": [
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/ErrorHandler.java",
+    "debezium-connector-mysql/src/main/java/io/debezium/connector/mysql/MySqlErrorHandler.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogSourceTask.java",
+    "debezium-connector-common/src/main/java/io/debezium/heartbeat/HeartbeatErrorHandler.java"
+  ]
+}

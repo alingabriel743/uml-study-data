@@ -1,0 +1,152 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam actor {
+    BackgroundColor #D0E8FF
+    BorderColor #3A7DC9
+    FontColor #1A3A5C
+}
+skinparam usecase {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+    ArrowColor #495057
+}
+skinparam note {
+    BackgroundColor #FFFDE7
+    BorderColor #F9A825
+    FontColor #333333
+}
+
+title Sandbox Session Lifecycle Management
+
+left to right direction
+
+' ── Actors ──────────────────────────────────────────────────────
+actor "Runner" as runner
+actor "SandboxAgent" as sandboxAgent
+actor "BaseSandboxClient\n(UnixLocal / Docker / E2B)" as sandboxClient
+actor "Developer /\nExternal Caller" as developer
+
+' ── System Boundary ─────────────────────────────────────────────
+rectangle "SandboxRuntimeSessionManager — Session Lifecycle" {
+
+    ' Phase 1: Acquisition
+    package "Acquisition & Keying" {
+        usecase "Acquire Sandbox Agent\n(threading.Lock guard)" as UC_Acquire
+        usecase "Assign Stable\nResume Key" as UC_ResumeKey
+    }
+
+    ' Phase 2: Session Provisioning
+    package "Session Provisioning" {
+        usecase "Ensure / Get\nActive Session" as UC_EnsureSession
+        usecase "Create Fresh\nSandbox Session" as UC_CreateFresh
+        usecase "Resume Suspended\nSession" as UC_Resume
+        usecase "Inject Live\nSession (pre-existing)" as UC_Inject
+    }
+
+    ' Phase 3: Workspace Materialization
+    package "Workspace Materialization" {
+        usecase "Materialize Workspace\n/ Apply Manifest" as UC_Materialize
+        usecase "Process Capabilities\ninto Manifest" as UC_Capabilities
+        usecase "Set Concurrency\nLimits" as UC_Concurrency
+    }
+
+    ' Phase 4: Serialization & Cleanup
+    package "Serialization & Cleanup" {
+        usecase "Serialize Resume State\n(sessions_by_agent dict)" as UC_Serialize
+        usecase "Clean Up Session\n(stop → shutdown → delete)" as UC_Cleanup
+        usecase "Release Acquired\nAgents" as UC_Release
+    }
+}
+
+' ── Actor → Use Case relationships ──────────────────────────────
+runner --> UC_Acquire
+runner --> UC_EnsureSession
+runner --> UC_Serialize
+runner --> UC_Cleanup
+
+sandboxAgent --> UC_Acquire
+sandboxAgent --> UC_Capabilities
+
+sandboxClient --> UC_CreateFresh
+sandboxClient --> UC_Resume
+sandboxClient --> UC_Cleanup
+
+developer --> UC_Inject
+developer --> UC_Concurrency
+
+' ── Use Case include / extend relationships ──────────────────────
+UC_Acquire ..> UC_ResumeKey : <<include>>
+
+UC_EnsureSession ..> UC_CreateFresh  : <<extend>>\nno prior state
+UC_EnsureSession ..> UC_Resume       : <<extend>>\nsession_state present
+UC_EnsureSession ..> UC_Inject       : <<extend>>\nRunConfig.session set
+
+UC_CreateFresh ..> UC_Materialize : <<include>>
+UC_Resume      ..> UC_Materialize : <<include>>
+UC_Inject      ..> UC_Materialize : <<extend>>\ndiff entries only
+
+UC_Materialize ..> UC_Capabilities : <<include>>
+UC_Materialize ..> UC_Concurrency  : <<include>>
+
+UC_Cleanup ..> UC_Serialize : <<include>>\ncapture before clear
+UC_Cleanup ..> UC_Release   : <<include>>
+
+' ── Notes ────────────────────────────────────────────────────────
+note right of UC_Acquire
+  SandboxAgent cannot run concurrently
+  across multiple Runner.run() calls.
+  Enforced by _SandboxConcurrencyGuard
+  (threading.Lock + active_runs counter).
+end note
+
+note right of UC_Inject
+  owns_session = False.
+  Cleanup does NOT stop or delete
+  the injected session.
+  Root, env, users & mounts cannot
+  be changed on a running session.
+end note
+
+note right of UC_Resume
+  Looks up session payload by agent
+  resume key in sessions_by_agent.
+  Deserializes via
+  client.deserialize_session_state().
+  owns_session = True.
+end note
+
+note bottom of UC_Serialize
+  Returns None when a live injected
+  session is used (RunConfig.session).
+  Produces: {backend_id,
+  current_agent_key, session_state,
+  sessions_by_agent}.
+end note
+
+note bottom of UC_Cleanup
+  Sequence (owns_session = True only):
+  1. run_pre_stop_hooks()
+  2. stop()  3. shutdown()
+  4. client.delete(session)
+  5. _aclose_dependencies()
+  Protected by asyncio.Lock to
+  prevent double-cleanup.
+end note
+
+@enduml

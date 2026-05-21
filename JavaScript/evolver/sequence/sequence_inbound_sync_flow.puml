@@ -1,0 +1,156 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #ADB5BD
+    NoteBackgroundColor #FFF9DB
+    NoteBorderColor #F59F00
+}
+
+title Inbound Message Sync Flow
+
+participant "SyncEngine" as engine
+participant "InboundSync" as inbound
+participant "MailboxStore" as store
+participant "Hub (HTTP API)" as hub
+participant "onInboundReceived\n(callback)" as callback
+
+== Initialisation ==
+
+[-> engine : start()
+activate engine
+engine -> engine : _scheduleInbound(delayMs=1000ms)
+note right of engine : Initial delay: 1 000 ms\nbefore first poll
+
+== Pull Cycle ==
+
+engine -> inbound : pull(channel="evomap-hub", limit=50)
+activate inbound
+
+inbound -> store : getCursor("evomap-hub:inbound_cursor")
+activate store
+store --> inbound : cursor (string | null)
+deactivate store
+
+inbound -> store : getState("node_id")
+activate store
+store --> inbound : sender_id
+deactivate store
+
+inbound -> hub : POST /a2a/mailbox/inbound\n{ sender_id, proxy_protocol_version="0.1.0",\n  cursor, limit=50 }  [timeout=35s]
+activate hub
+
+alt 200 OK
+    hub --> inbound : { messages: [...], next_cursor }
+    deactivate hub
+
+    alt messages.length > 0
+        inbound -> store : writeInboundBatch(messages[])
+        activate store
+        loop for each message
+            store -> store : writeInbound({ id, type, payload,\n  channel, priority, refId, expiresAt })
+            store -> store : _appendMessage(msg)\n[status="pending", direction="inbound"\npersisted → messages.jsonl]
+        end
+        store --> inbound : ids: string[]
+        deactivate store
+    end
+
+    alt next_cursor present
+        inbound -> store : setCursor("evomap-hub:inbound_cursor", next_cursor)
+        activate store
+        note right of store : Persisted → state.json
+        store --> inbound : void
+        deactivate store
+    end
+
+    inbound --> engine : { received: N, cursor }
+    deactivate inbound
+
+    == Post-Pull Notifications ==
+
+    alt received > 0
+        engine -> engine : update _lastActivity
+        engine -> callback : onInboundReceived(N)
+        activate callback
+        callback --> engine : void
+        deactivate callback
+    end
+
+    == Acknowledge Delivered Messages ==
+
+    engine -> inbound : ackDelivered(channel="evomap-hub")
+    activate inbound
+
+    inbound -> store : list({ direction:"inbound",\n  status:"delivered", limit:100 })
+    activate store
+    store --> inbound : delivered[] (filtered by channel)
+    deactivate store
+
+    alt delivered.length > 0
+        inbound -> store : getState("node_id")
+        activate store
+        store --> inbound : sender_id
+        deactivate store
+
+        inbound -> hub : POST /a2a/mailbox/ack\n{ sender_id, message_ids: [...] }  [timeout=10s]
+        activate hub
+        hub --> inbound : 200 OK { acked: N }
+        deactivate hub
+    end
+
+    inbound --> engine : { acked: N }
+    deactivate inbound
+
+    == Reschedule ==
+
+    engine -> engine : _isIdle()?
+    alt idle (no activity > 5 min)
+        engine -> engine : _scheduleInbound(delayMs=60 000ms)
+        note right of engine : Slow poll: 60 s
+    else active
+        engine -> engine : _scheduleInbound(delayMs=10 000ms)
+        note right of engine : Fast poll: 10 s
+    end
+
+else 401 / 403 AuthError
+    hub --> inbound : 401 or 403
+    deactivate hub
+    inbound -> inbound : throw AuthError
+    inbound --> engine : AuthError propagated
+    deactivate inbound
+
+    engine -> engine : _handleAuthError("inbound")
+    engine -> callback : onAuthError()
+    activate callback
+    note right of callback : Lifecycle re-authentication\ntriggered upstream
+    callback --> engine : void
+    deactivate callback
+end
+
+deactivate engine
+
+@enduml

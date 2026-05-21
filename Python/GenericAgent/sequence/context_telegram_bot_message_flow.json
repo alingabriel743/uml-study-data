@@ -1,0 +1,79 @@
+{
+  "scope": "telegram_bot_message_flow",
+  "title": "Telegram Bot Message Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "TelegramUser",
+    "TelegramAPI",
+    "tgapp (ApplicationBuilder/handlers)",
+    "handle_msg",
+    "GeneraticAgent",
+    "_stream (async task)",
+    "_to_html",
+    "_clean",
+    "agent_runner_loop",
+    "LLMClient"
+  ],
+  "interaction_flow": [
+    "TelegramAPI → tgapp: incoming Update (TEXT message)",
+    "tgapp → handle_msg: MessageHandler dispatches update, ctx",
+    "handle_msg → TelegramAPI: update.message.reply_text('thinking..') → msg",
+    "handle_msg: build prompt = '[FILE hint]\\n\\n' + update.message.text",
+    "handle_msg → GeneraticAgent: put_task(prompt, source='telegram') → dq (queue)",
+    "handle_msg → asyncio: create_task(_stream(dq, msg)) → task",
+    "handle_msg → ctx.user_data: store stream_task = task",
+    "_stream: loop every 3s → dq.get_nowait() → item",
+    "_stream → _clean(raw): strip <thinking>/<summary>/<tool_use>/<file_content> tags, collapse newlines",
+    "_stream: if len(show)>4000 → msg.reply_text('(continued...)') → new msg",
+    "_stream → _to_html(display): convert markdown to HTML (bold/italic/code/pre blocks)",
+    "_stream → TelegramAPI: msg.edit_text(html, parse_mode='HTML')",
+    "_stream: on done=True → scan for [FILE:path] tokens → msg.reply_photo or msg.reply_document",
+    "_stream: final edit_text with clean text, break loop",
+    "GeneraticAgent (background thread) → agent_runner_loop: LLM turn loop",
+    "agent_runner_loop → LLMClient: client.chat(messages, tools_schema) → response (streaming)",
+    "agent_runner_loop → BaseHandler: handler.dispatch(tool_name, args, response)",
+    "agent_runner_loop → dq (queue): yield interim/done chunks visible to _stream"
+  ],
+  "command_flows": [
+    "/stop (cmd_abort): agent.abort() + task.cancel() → reply 'Aborted'",
+    "/llm <n> (cmd_llm): agent.next_llm(n) → reply switched LLM name; no arg → list all LLMs"
+  ],
+  "key_relationships": [
+    "tgapp imports GeneraticAgent from agentmain",
+    "handle_msg depends_on GeneraticAgent.put_task (returns queue dq)",
+    "_stream consumes dq (queue) produced by GeneraticAgent background thread",
+    "_stream calls _clean() then _to_html() before every Telegram edit",
+    "cmd_abort calls GeneraticAgent.abort() and cancels the asyncio stream_task",
+    "cmd_llm calls agent.next_llm(n) / agent.list_llms()",
+    "agent_runner_loop is the core LLM loop called inside GeneraticAgent.run()",
+    "BaseHandler.dispatch routes tool_name → do_<tool_name> methods",
+    "agent_runner_loop yields text chunks to the queue consumed by _stream"
+  ],
+  "key_functions": {
+    "_clean(t)": "Strips XML-style tags (thinking/summary/tool_use/file_content) via regex; collapses 3+ newlines; returns '...' if empty",
+    "_to_html(t)": "Converts markdown to Telegram HTML: fenced code blocks → <pre><code>, **bold** → <b>, *italic* → <i>, `inline` → <code>; HTML-escapes non-code segments",
+    "_stream(dq, msg)": "Async loop, polls queue every 3s; edits Telegram message with latest chunk + ⏳ spinner; splits at 4000 chars; on done sends FILE attachments and final edit",
+    "handle_msg(update, ctx)": "Auth check → reply 'thinking...' → build prompt → agent.put_task → create _stream task",
+    "cmd_abort(update, ctx)": "Calls agent.abort(), cancels stream_task, replies 'Aborted'",
+    "cmd_llm(update, ctx)": "Switches or lists LLM models via agent.next_llm(n) / agent.list_llms()",
+    "agent_runner_loop(...)": "Multi-turn LLM loop: build messages → client.chat → parse tool_calls → handler.dispatch → accumulate results → turn_end_callback; yields streamed output"
+  },
+  "data_flow": {
+    "queue (dq)": "put_task returns a queue; GeneraticAgent pushes {next: str} chunks and final {done: str} item; _stream polls it",
+    "msg object": "Initial Telegram message placeholder; continuously edited in-place by _stream; replaced by new message when text exceeds 4000 chars",
+    "prompt": "Prefixed with [FILE:filepath] instruction + user text",
+    "FILE tokens": "[FILE:filepath] in agent response triggers reply_photo or reply_document attachments"
+  },
+  "startup_sequence": [
+    "socket lock on port 19527 (single-instance guard)",
+    "agent.run() started in daemon thread",
+    "ApplicationBuilder → app with HTTPXRequest proxy",
+    "Handlers registered: /stop → cmd_abort, /llm → cmd_llm, TEXT → handle_msg",
+    "app.run_polling(drop_pending_updates=True) in outer restart loop"
+  ],
+  "important_notes": "Auth via ALLOWED set from mykeys['tg_allowed_users']; proxy from mykeys['proxy']. Bot restarts automatically on polling crash (sleep 10s + new event loop). agent_runner_loop max_turns=40 default. Non-verbose mode used in tgapp (agent.verbose=False) — yields cleaned content lines to queue.",
+  "source_files_analyzed": [
+    "frontends/tgapp.py",
+    "agent_loop.py"
+  ]
+}

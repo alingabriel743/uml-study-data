@@ -1,0 +1,251 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 2
+skinparam sequenceParticipantBackgroundColor #F8F9FA
+skinparam sequenceParticipantBorderColor #495057
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceBoxBackgroundColor #E9ECEF
+skinparam sequenceBoxBorderColor #6C757D
+skinparam noteBorderColor #ADB5BD
+skinparam noteBackgroundColor #FFF3CD
+
+title Span Creation and Lifecycle
+
+actor Caller as caller
+participant "DDTrace\n(ext functions)" as ddtrace
+participant "SpanStack" as stack
+participant "SpanData /\nRootSpanData" as spandata
+participant "Span\n(OT Wrapper)" as otspan
+
+' ─────────────────────────────────────────────
+' 1. New Trace — create root span
+' ─────────────────────────────────────────────
+== New Trace ==
+
+caller -> ddtrace : start_trace_span(float $startTime = 0)
+activate ddtrace
+ddtrace -> stack : create new root SpanStack\n& switch active stack
+activate stack
+stack --> ddtrace : rootStack
+deactivate stack
+ddtrace -> spandata : instantiate RootSpanData\n(id, parent=null, stack ref)
+activate spandata
+spandata --> ddtrace : rootSpanData
+deactivate spandata
+ddtrace --> caller : RootSpanData
+deactivate ddtrace
+
+note over spandata
+  RootSpanData extends SpanData.
+  Adds: origin, samplingPriority,
+  propagatedTags, parentId,
+  gitMetadata, inferredSpan
+end note
+
+' ─────────────────────────────────────────────
+' 2. Child Span
+' ─────────────────────────────────────────────
+== Child Span ==
+
+caller -> ddtrace : start_span(float $startTime = 0)
+activate ddtrace
+
+note right of ddtrace
+  If no active span exists,
+  start_span behaves like
+  start_trace_span (creates
+  new root stack with distributed
+  tracing headers applied)
+end note
+
+ddtrace -> stack : push new SpanData onto active stack\n(inherits service / env / version from parent)
+activate stack
+stack --> ddtrace : childSpanData
+deactivate stack
+ddtrace -> spandata : instantiate SpanData\n(id, parent=active_span, stack ref)
+activate spandata
+spandata --> ddtrace : spanData
+deactivate spandata
+ddtrace --> caller : SpanData
+deactivate ddtrace
+
+' ─────────────────────────────────────────────
+' 3. Attach Metadata (direct property access)
+' ─────────────────────────────────────────────
+== Attach Metadata (Direct) ==
+
+caller -> spandata : $span->name = 'operation'
+caller -> spandata : $span->resource = 'resource_name'
+caller -> spandata : $span->service = 'service_name'
+caller -> spandata : $span->type = 'web|db|cache|custom'
+caller -> spandata : $span->meta['key'] = 'value'
+caller -> spandata : $span->metrics['key'] = 1.0
+caller -> spandata : $span->links[] = SpanLink\n(distributed trace link)
+caller -> spandata : $span->events[] = SpanEvent
+
+' ─────────────────────────────────────────────
+' 4. Attach Metadata via OT Span Wrapper
+' ─────────────────────────────────────────────
+== Attach Metadata (via OT Wrapper) ==
+
+caller -> otspan : setTag(key, value)
+activate otspan
+note right of otspan
+  Routes special tags to
+  internalSpan fields:
+  ERROR, SERVICE_NAME,
+  RESOURCE_NAME, SPAN_TYPE,
+  HTTP_URL, HTTP_STATUS_CODE
+end note
+otspan -> spandata : set internalSpan field / meta[]
+deactivate otspan
+
+caller -> otspan : setError(Throwable|bool|null)
+activate otspan
+otspan -> spandata : set meta[error.msg / error.type /\nerror.stack] + hasError flag
+deactivate otspan
+
+caller -> otspan : setMetric(key, float)
+activate otspan
+otspan -> spandata : internalSpan->metrics[key] = value
+deactivate otspan
+
+' ─────────────────────────────────────────────
+' 5. Query Active Span
+' ─────────────────────────────────────────────
+== Query Active Span ==
+
+caller -> ddtrace : active_span()
+activate ddtrace
+ddtrace -> stack : return SpanStack->active
+activate stack
+stack --> ddtrace : SpanData|null
+deactivate stack
+ddtrace --> caller : SpanData|null
+deactivate ddtrace
+
+caller -> ddtrace : root_span()
+activate ddtrace
+ddtrace --> caller : RootSpanData|null
+deactivate ddtrace
+
+' ─────────────────────────────────────────────
+' 6. Close Span (normal path)
+' ─────────────────────────────────────────────
+== Close Span (Normal) ==
+
+caller -> ddtrace : close_span(float $finishTime = 0)
+activate ddtrace
+ddtrace -> stack : pop top user-span\nrecord finish time\ncompute duration (nanoseconds)
+activate stack
+stack --> ddtrace : ok
+deactivate stack
+ddtrace -> spandata : invoke onClose[] handlers\n(in reverse order)
+activate spandata
+note right of spandata
+  onClose handlers are cleared
+  after invocation (also cleared
+  on drop). Times stored internally
+  in nanoseconds; API input is float seconds.
+end note
+spandata --> ddtrace : handlers complete
+deactivate spandata
+ddtrace --> caller : false|null
+deactivate ddtrace
+
+' ─────────────────────────────────────────────
+' 7. Close Span via OT Wrapper (in-order & out-of-order)
+' ─────────────────────────────────────────────
+== Close Span (via OT Wrapper) ==
+
+caller -> otspan : finish(finishTime = null)
+activate otspan
+otspan -> ddtrace : active_span()
+activate ddtrace
+ddtrace --> otspan : currentTopSpan
+deactivate ddtrace
+
+alt span is on top (in-order finish)
+    otspan -> ddtrace : close_span(finishTime ?: 0)
+    activate ddtrace
+    ddtrace --> otspan : ok
+    deactivate ddtrace
+else span NOT on top (out-of-order finish)
+    otspan -> ddtrace : close_spans_until(internalSpan)
+    activate ddtrace
+    note right of ddtrace
+      Closes all spans above the target span
+      on the active stack (not including the
+      target itself). Returns count closed or
+      false if span not found.
+      Logs a warning when multiple spans
+      are closed at once.
+    end note
+    ddtrace -> stack : close all spans above target
+    activate stack
+    stack --> ddtrace : count closed
+    deactivate stack
+    ddtrace --> otspan : false|int
+    deactivate ddtrace
+    otspan -> ddtrace : close_span(finishTime ?: 0)
+    activate ddtrace
+    ddtrace --> otspan : ok
+    deactivate ddtrace
+end
+
+otspan --> caller : void
+deactivate otspan
+
+' ─────────────────────────────────────────────
+' 8. Update Duration Post-Close
+' ─────────────────────────────────────────────
+== Update Duration Post-Close ==
+
+caller -> ddtrace : update_span_duration(SpanData $span,\nfloat $finishTime = 0)
+activate ddtrace
+note right of ddtrace
+  Only effective if span has not yet
+  been flushed. Unreliable on root spans
+  when auto_flush_enabled is active.
+end note
+ddtrace --> caller : false|null
+deactivate ddtrace
+
+' ─────────────────────────────────────────────
+' 9. Stack Context Switching
+' ─────────────────────────────────────────────
+== Stack Context Switching ==
+
+caller -> ddtrace : switch_stack(SpanData|SpanStack|null)
+activate ddtrace
+ddtrace -> stack : change active span context
+activate stack
+stack --> ddtrace : null|false|SpanStack
+deactivate stack
+ddtrace --> caller : null|false|SpanStack
+deactivate ddtrace
+
+note over stack
+  SpanStack has:
+  • active: SpanData|null
+  • parent: SpanStack|null (nested stacks)
+  DDTrace ext functions operate on
+  a thread-local SpanStack.
+end note
+
+@enduml

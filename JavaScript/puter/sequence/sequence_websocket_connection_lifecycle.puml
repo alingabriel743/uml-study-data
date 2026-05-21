@@ -1,0 +1,207 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    DividerBackgroundColor #DEE2E6
+    GroupBackgroundColor #E3F2FD
+    GroupBorderColor #90CAF9
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title WebSocket / Socket.IO Connection Lifecycle\n(Socket.IO v4.7.2 / engine.io client)
+
+actor "Client App" as app
+participant "io() / lookup()" as io
+participant "Manager" as mgr
+participant "Socket\n(SIO Namespace)" as sio
+participant "EngineSocket\n(Socket\$1)" as eng
+participant "Polling\n(Transport)" as poll
+participant "WS\n(WebSocket Transport)" as ws
+participant "Server" as srv
+
+== Initial Connection ==
+
+app -> io : io(url, opts)
+activate app
+activate io
+
+io -> mgr : new Manager(uri, opts)\n[cached by URL unless forceNew]
+activate mgr
+note right of mgr : _autoConnect = true\nreadyState = 'closed'
+
+mgr -> mgr : open()
+mgr -> eng : new Socket\$1(uri, opts)\n[transports: polling, websocket, webtransport]
+activate eng
+
+eng -> eng : open()\nreadyState = 'opening'
+eng -> poll : createTransport('polling')\ntransport.open()
+activate poll
+
+== Engine.IO Handshake (over Polling) ==
+
+poll -> srv : HTTP GET /engine.io/?EIO=4&transport=polling
+activate srv
+srv --> poll : HTTP 200\n{type:'open', data:{sid, upgrades,\npingInterval, pingTimeout}}
+deactivate srv
+
+poll -> eng : onData(data) → decodePacket()\n→ onPacket({type:'open'})
+eng -> eng : onHandshake({sid, upgrades,\npingInterval, pingTimeout})\nstores session data
+eng -> eng : onOpen()\nreadyState = 'open', flush()
+eng -> mgr : emits 'open' event
+note right of eng : Starts upgrade probes\nfor each transport in upgrades[]
+
+== WebSocket Upgrade Probe ==
+
+eng -> ws : createTransport('websocket')\n→ wsTransport.open()
+activate ws
+
+ws -> srv : new WebSocket(wss://host/engine.io/\n?transport=websocket&sid=X)\nHTTP 101 Upgrade
+activate srv
+srv --> ws : WS connection established
+deactivate srv
+
+ws -> ws : addEventListeners()\nws.onopen / ws.onmessage\nws.onclose / ws.onerror
+
+ws -> eng : probe: transport open\n→ send [{type:'ping', data:'probe'}]
+ws -> srv : WS frame: {type:'ping', data:'probe'}
+activate srv
+srv --> ws : WS frame: {type:'pong', data:'probe'}
+deactivate srv
+
+ws -> eng : probe pong received\nupdating = true\npause Polling transport
+deactivate poll
+
+eng -> eng : setTransport(ws)\nswitch to WS transport
+eng -> srv : send [{type:'upgrade'}]
+activate srv
+srv --> eng : upgrade acknowledged
+deactivate srv
+
+eng -> mgr : emitReserved('upgrade', wsTransport)
+note right of eng : Now on WebSocket transport
+
+== Socket.IO Namespace Connect ==
+
+mgr -> mgr : onopen()\nreadyState = 'open'\nsubscribe [ping, data, error, close, decoded]
+
+io -> sio : io.socket(nsp, opts)\n→ new Socket(manager, '/', opts)
+activate sio
+
+sio -> sio : connect()\nsubEvents()\n[listens: manager open/packet/error/close]
+
+sio -> sio : onopen()\n_sendConnectPacket({auth})
+sio -> mgr : _packet({type: CONNECT(0), data:{auth}})
+mgr -> eng : encoder.encode() → engine.write()
+eng -> ws : Transport.send(packets)\nws.send(encodedData)
+ws -> srv : WS frame: CONNECT packet (type=0)
+activate srv
+srv --> ws : WS frame: CONNECT {type:0,\ndata:{sid, pid?}}
+deactivate srv
+
+ws -> eng : onData() → onPacket()
+eng -> mgr : emits 'packet' event
+mgr -> mgr : ondata() → Decoder.add()\n→ ondecoded() → emits 'packet'
+mgr -> sio : onpacket({type: CONNECT})
+sio -> sio : onconnect(sid, pid)\nconnected = true\nemitBuffered()\n_drainQueue(true)
+sio --> app : emits 'connect' event\n[connection established]
+
+== Ping / Pong Heartbeat ==
+
+srv -> ws : WS frame: {type:'ping'}\n(every pingInterval ms)
+activate srv
+ws -> eng : onData() → onPacket({type:'ping'})
+deactivate srv
+eng -> eng : resetPingTimeout()\nsetTimeout(pingInterval + pingTimeout)
+eng -> ws : sendPacket('pong')
+ws -> srv : WS frame: {type:'pong'}
+eng -> mgr : emits 'ping'
+note right of eng : If no ping received within\npingInterval + pingTimeout ms\n→ onClose('ping timeout')
+
+== Event Emission ==
+
+app -> sio : socket.emit('eventName', data)
+activate app
+sio -> sio : notifyOutgoingListeners()\npacket({type: EVENT(2),\ndata: ['eventName', ...args]})
+sio -> mgr : _packet(packet)
+mgr -> eng : Encoder.encode() → engine.write()
+eng -> ws : Transport.send(packets)
+ws -> srv : WS frame: EVENT packet (type=2)
+activate srv
+srv --> ws : WS frame: EVENT packet\n(incoming event)
+deactivate srv
+ws -> eng : onData() → onPacket()
+eng -> mgr : emits 'packet'
+mgr -> mgr : Decoder.add() → ondecoded()\n→ emits 'packet'
+mgr -> sio : onpacket({type: EVENT})
+sio -> sio : onevent()\nemitEvent(args)
+sio --> app : Emitter.emit('eventName', ...args)
+deactivate app
+
+== Disconnection & Reconnection ==
+
+srv -> ws : WS close / network error
+ws -> eng : onClose(reason)
+eng -> eng : readyState = 'closed'\nclearPingTimeout()\ntransport.close()
+deactivate ws
+eng -> mgr : emits 'close'
+mgr -> mgr : onclose(reason)\ncleanup()\nbackoff.reset()\nreadyState = 'closed'
+mgr -> sio : onclose(reason)
+sio --> app : emits 'disconnect'
+deactivate sio
+
+alt reconnection enabled && !skipReconnect
+    loop until success or max attempts exceeded
+        mgr -> mgr : reconnect()\nattempts++\ndelay = backoff.duration()\n[min:1000ms, max:5000ms, factor:2, jitter:0.5]
+        mgr --> app : emits 'reconnect_attempt'
+        note right of mgr : Waits exponential backoff delay
+
+        mgr -> mgr : open(fn)\n[re-creates EngineSocket]
+        activate eng
+
+        alt open success
+            mgr -> mgr : onreconnect()\n_reconnecting = false\nbackoff.reset()
+            mgr --> app : emits 'reconnect'
+            note right of mgr : Re-runs full handshake +\nSIO namespace connect flow
+        else open failed
+            mgr --> app : emits 'reconnect_error'
+            note right of mgr : Retries with increased delay
+        end
+    end
+
+    opt max attempts reached
+        mgr -> mgr : backoff.reset()
+        mgr --> app : emits 'reconnect_failed'
+    end
+end
+
+deactivate eng
+deactivate mgr
+deactivate io
+deactivate app
+
+@enduml

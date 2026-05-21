@@ -1,0 +1,185 @@
+{
+  "scope": "streaming_and_broadcast",
+  "title": "Streaming & Broadcast Response",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Client",
+    "Promptable",
+    "AiManager",
+    "TextProvider",
+    "StreamsText",
+    "TextGateway",
+    "AgentPrompt",
+    "StreamableAgentResponse",
+    "StreamEvent",
+    "BroadcastAgent",
+    "LaravelBroadcast"
+  ],
+  "interaction_flow_stream": [
+    "Client → Promptable: stream(prompt, attachments, provider, model, timeout)",
+    "Promptable → Promptable: withModelFailover(callback, provider, model)",
+    "Promptable → AiManager: textProviderFor(agent, providerName)",
+    "AiManager → TextProvider: instance(name) [resolves concrete provider]",
+    "AiManager → TextProvider: useTextGateway(fakeGateway) [if faked]",
+    "Promptable → TextProvider: stream(new AgentPrompt(agent, prompt, attachments, provider, model, timeout))",
+    "TextProvider (StreamsText) → StreamsText: stream(AgentPrompt)",
+    "StreamsText → EventDispatcher: dispatch(new StreamingAgent(invocationId, prompt))",
+    "StreamsText → StreamableAgentResponse: new StreamableAgentResponse(invocationId, generatorClosure, meta)",
+    "StreamsText → Promptable: return StreamableAgentResponse",
+    "Promptable → Client: return StreamableAgentResponse",
+    "Client → StreamableAgentResponse: iterate (foreach / each())",
+    "StreamableAgentResponse → StreamsText (generator): call_user_func(generator)",
+    "StreamsText → TextGateway: streamText(invocationId, provider, model, instructions, messages, tools, options, timeout)",
+    "TextGateway → AI API: HTTP streaming request",
+    "AI API → TextGateway: yield raw SSE chunks",
+    "TextGateway → StreamsText: yield StreamEvent (TextDelta | StreamEnd | StreamStart)",
+    "StreamsText → StreamableAgentResponse: yield StreamEvent",
+    "StreamableAgentResponse → Client: yield StreamEvent per chunk",
+    "StreamableAgentResponse → StreamableAgentResponse: collect events, build text & usage (after all chunks)",
+    "StreamableAgentResponse → StreamedAgentResponse: new StreamedAgentResponse(invocationId, events, meta)",
+    "StreamableAgentResponse → thenCallbacks[]: call_user_func(callback, streamedResponse)",
+    "StreamsText (then) → EventDispatcher: dispatch(new AgentStreamed(invocationId, prompt, response))"
+  ],
+  "interaction_flow_broadcast": [
+    "Client → Promptable: broadcast(prompt, channels, attachments, now=false)",
+    "Promptable → Promptable: stream(prompt, attachments, provider, model) [same as stream flow]",
+    "Promptable → StreamableAgentResponse: each(callback)",
+    "StreamableAgentResponse → StreamEvent: [per chunk] callback(event)",
+    "Promptable (callback) → StreamEvent: broadcast(channels) OR broadcastNow(channels) [based on 'now' flag]",
+    "StreamEvent → LaravelBroadcast: Broadcast::on(channels)->as(type)->with(toArray())->send() / sendNow()",
+    "LaravelBroadcast → WebSocket/Channel: push event payload to subscribers",
+    "Promptable → Client: return StreamableAgentResponse"
+  ],
+  "interaction_flow_broadcast_now": [
+    "Client → Promptable: broadcastNow(prompt, channels, attachments)",
+    "Promptable → Promptable: broadcast(prompt, channels, attachments, now=true)"
+  ],
+  "interaction_flow_broadcast_on_queue": [
+    "Client → Promptable: broadcastOnQueue(prompt, channels, attachments, provider, model)",
+    "Promptable → BroadcastAgent: BroadcastAgent::dispatch(agent, prompt, channels, attachments, provider, model)",
+    "BroadcastAgent (queue worker) → Agent: stream(prompt, attachments, provider, model)",
+    "BroadcastAgent → StreamableAgentResponse: each(event → event.broadcastNow(channels))",
+    "StreamEvent → LaravelBroadcast: Broadcast::on(channels)->sendNow()",
+    "BroadcastAgent → StreamableAgentResponse: then(response → store streamedResponse)",
+    "BroadcastAgent → InvokesQueuedResponseCallbacks: withCallbacks(() => streamedResponse)",
+    "Promptable → Client: return QueuedAgentResponse(PendingDispatch)"
+  ],
+  "interaction_flow_http_response": [
+    "Client → StreamableAgentResponse: toResponse(request)",
+    "StreamableAgentResponse → StreamableAgentResponse: [if usesVercelProtocol] toVercelProtocolResponse()",
+    "StreamableAgentResponse → HttpResponse: response()->stream(fn: foreach events → yield 'data: {json}\\n\\n')",
+    "StreamableAgentResponse → HttpResponse: headers=['Content-Type: text/event-stream']"
+  ],
+  "key_classes_and_signatures": {
+    "Promptable": {
+      "type": "trait",
+      "namespace": "Laravel\\Ai",
+      "methods": [
+        "stream(string $prompt, array $attachments, $provider, ?string $model, ?int $timeout): StreamableAgentResponse",
+        "broadcast(string $prompt, Channel|array $channels, array $attachments, bool $now, $provider, ?string $model): StreamableAgentResponse",
+        "broadcastNow(string $prompt, Channel|array $channels, array $attachments, $provider, ?string $model): StreamableAgentResponse",
+        "broadcastOnQueue(string $prompt, Channel|array $channels, array $attachments, $provider, ?string $model): QueuedAgentResponse",
+        "withModelFailover(Closure $callback, $provider, ?string $model): mixed",
+        "getProvidersAndModels($provider, ?string $model): array"
+      ]
+    },
+    "AiManager": {
+      "type": "class",
+      "extends": "MultipleInstanceManager",
+      "methods": [
+        "textProvider(?string $name): TextProvider",
+        "textProviderFor(Agent $agent, ?string $name): TextProvider [injects fake gateway if faked]"
+      ]
+    },
+    "TextProvider": {
+      "type": "interface",
+      "namespace": "Laravel\\Ai\\Contracts\\Providers",
+      "methods": [
+        "stream(AgentPrompt $prompt): StreamableAgentResponse",
+        "prompt(AgentPrompt $prompt): AgentResponse",
+        "textGateway(): TextGateway",
+        "useTextGateway(TextGateway $gateway): self"
+      ]
+    },
+    "StreamsText": {
+      "type": "trait (Provider concern)",
+      "namespace": "Laravel\\Ai\\Providers\\Concerns",
+      "methods": [
+        "stream(AgentPrompt $prompt): StreamableAgentResponse [generates invocationId, runs pipeline, dispatches events, wraps TextGateway::streamText in generator closure]"
+      ]
+    },
+    "StreamableAgentResponse": {
+      "type": "class",
+      "implements": ["IteratorAggregate", "Responsable"],
+      "constructor": "StreamableAgentResponse(string $invocationId, Closure $generator, ?Meta $meta)",
+      "methods": [
+        "each(callable $callback): self",
+        "then(callable $callback): self [called with StreamedAgentResponse after full stream]",
+        "toResponse(Request $request): Response [SSE or Vercel protocol]",
+        "getIterator(): Traversable [calls generator, yields StreamEvents, builds text/usage]",
+        "usingVercelDataProtocol(bool $value): self",
+        "withinConversation(?string $conversationId, ?object $user): self"
+      ],
+      "properties": ["text: ?string", "usage: ?Usage", "events: Collection", "conversationId: ?string"]
+    },
+    "StreamEvent": {
+      "type": "abstract class",
+      "namespace": "Laravel\\Ai\\Streaming\\Events",
+      "methods": [
+        "broadcast(Channel|array $channels, bool $now): void [uses Broadcast facade]",
+        "broadcastNow(Channel|array $channels): void",
+        "type(): string",
+        "toArray(): array",
+        "toVercelProtocolArray(): ?array",
+        "__toString(): string [json_encode(toArray())]"
+      ],
+      "subtypes": ["StreamStart", "TextDelta", "StreamEnd"]
+    },
+    "StreamEnd": {
+      "type": "class extends StreamEvent",
+      "properties": ["id: string", "reason: string", "usage: Usage", "timestamp: int"],
+      "array_type_value": "stream_end"
+    },
+    "BroadcastAgent": {
+      "type": "class implements ShouldQueue",
+      "constructor": "BroadcastAgent(Agent $agent, string $prompt, Channel|array $channels, array $attachments, $provider, ?string $model)",
+      "methods": [
+        "handle(): void [calls agent->stream()->each(event->broadcastNow)->then(store response)->withCallbacks()]"
+      ]
+    }
+  },
+  "key_relationships": [
+    "Promptable (trait) uses AiManager::textProviderFor() to resolve TextProvider per agent",
+    "Promptable::broadcast() delegates to stream() then calls each() on StreamableAgentResponse",
+    "Promptable::broadcastOnQueue() dispatches BroadcastAgent job (async)",
+    "BroadcastAgent::handle() calls agent.stream() then broadcastNow per event (synchronous within queue)",
+    "TextProvider (concrete class) uses StreamsText trait which implements stream()",
+    "StreamsText::stream() wraps TextGateway::streamText() in a lazy generator closure",
+    "StreamableAgentResponse::getIterator() materializes the generator on first iteration",
+    "StreamEvent::broadcast() delegates to Laravel Broadcast facade (queued or immediate)",
+    "AiManager extends MultipleInstanceManager; resolves concrete providers by driver name from config"
+  ],
+  "important_notes": [
+    "Stream is LAZY: TextGateway::streamText() is not called until StreamableAgentResponse is iterated",
+    "broadcast() is SYNCHRONOUS streaming: iterates SSE chunks inline and broadcasts each one",
+    "broadcastOnQueue() is ASYNC: pushes job to queue; job then streams and broadcasts synchronously within worker",
+    "Failover: withModelFailover() retries with next provider/model on FailoverableException, fires AgentFailedOver event",
+    "Provider/model resolution: checks $provider param → agent->provider() method → @Provider attribute → config('ai.default')",
+    "Model resolution: checks $model param → agent->model() method → @Model attribute → UseSmartestModel/UseCheapestModel attributes → provider->defaultTextModel()",
+    "Timeout: checks $timeout param → agent->timeout() method → @Timeout attribute → default 60s",
+    "Events fired: StreamingAgent (before stream starts), AgentStreamed (after full stream completes)",
+    "StreamableAgentResponse implements Responsable: toResponse() returns SSE text/event-stream response or Vercel AI SDK protocol",
+    "Vercel protocol support: usingVercelDataProtocol() switches serialization format for Vercel AI SDK compatibility",
+    "then() callbacks receive a StreamedAgentResponse with full events collection, combined text, and usage"
+  ],
+  "source_files_analyzed": [
+    "src/Promptable.php",
+    "src/AiManager.php",
+    "src/Responses/StreamableAgentResponse.php",
+    "src/Streaming/Events/StreamEvent.php",
+    "src/Streaming/Events/StreamEnd.php",
+    "src/Providers/Concerns/StreamsText.php",
+    "src/Jobs/BroadcastAgent.php",
+    "src/Contracts/Providers/TextProvider.php"
+  ]
+}

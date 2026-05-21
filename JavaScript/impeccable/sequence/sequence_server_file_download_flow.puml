@@ -1,0 +1,197 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #F1F3F5
+    GroupBorderColor #868E96
+    GroupBackgroundColor #F8F9FA
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #868E96
+}
+skinparam noteBackgroundColor #FFF9DB
+skinparam noteBorderColor #F08C00
+
+title Server File Download Flow
+
+actor Client
+
+box "Bun Dev Server" #E8F4FD
+    participant "BunServer\n(server/index.js)" as BunServer
+    participant "handleFileDownload\n(server/lib/api-handlers.js)" as Handler
+    participant "validation\n(server/lib/validation.js)" as Validation
+    participant "getFilePath\n(server/lib/api-handlers.js)" as GetFilePath
+    participant "FileSystem\n(fs/promises)" as FileSystem
+end box
+
+box "Cloudflare Workers (Edge)" #EDF7ED
+    participant "onRequestGet\n(functions/api/download/\n[type]/[provider]/[id].js)" as CFWorker
+    participant "CF_ASSETS\n(context.env.ASSETS)" as CFAssets
+end box
+
+participant "DownloadProviders\n(lib/download-providers.js)" as DownloadProviders
+
+== Bun Dev Server Path ==
+
+Client -> BunServer : GET /api/download/:type/:provider/:id
+activate BunServer
+
+BunServer -> Handler : handleFileDownload(type, provider, id)
+activate Handler
+
+Handler -> Validation : isAllowedType(type)
+activate Validation
+Validation --> Handler : valid / invalid
+deactivate Validation
+
+alt invalid type
+    Handler --> Client : 400 "Invalid type"
+else valid type
+
+    Handler -> Validation : isAllowedFileProvider(provider)
+    activate Validation
+    Validation --> Handler : valid / invalid
+    deactivate Validation
+
+    alt invalid provider
+        Handler --> Client : 400 "Invalid provider"
+    else valid provider
+
+        Handler -> Validation : isValidId(id)\n[regex /^[a-zA-Z0-9_-]+$/]
+        activate Validation
+        Validation --> Handler : valid / invalid
+        deactivate Validation
+
+        alt invalid id
+            Handler --> Client : 400 "Invalid file ID"
+        else valid id
+
+            Handler -> GetFilePath : getFilePath(type, provider, id)
+            activate GetFilePath
+            GetFilePath -> DownloadProviders : FILE_DOWNLOAD_PROVIDER_CONFIG_DIRS[provider]
+            activate DownloadProviders
+            DownloadProviders --> GetFilePath : configDir (e.g. ".cursor", ".claude")
+            deactivate DownloadProviders
+            GetFilePath --> Handler : dist/{provider}/{configDir}/skills/{id}/SKILL.md\nor null if unknown provider
+            deactivate GetFilePath
+
+            alt path is null (unknown provider)
+                Handler --> Client : 400 "Invalid provider"
+            else path resolved
+
+                Handler -> FileSystem : existsSync(filePath)
+                activate FileSystem
+                FileSystem --> Handler : exists / not found
+                deactivate FileSystem
+
+                alt file not found
+                    Handler --> Client : 404 "File not found"
+                else file exists
+
+                    Handler -> FileSystem : readFile(filePath)
+                    activate FileSystem
+                    FileSystem --> Handler : binary content
+                    deactivate FileSystem
+
+                    Handler -> Validation : sanitizeFilename(basename(filePath))
+                    activate Validation
+                    note right : strips chars outside\n[a-zA-Z0-9._-] from\n"SKILL.md"
+                    Validation --> Handler : safe filename
+                    deactivate Validation
+
+                    alt readFile exception
+                        Handler --> Client : 500 "Error downloading file"
+                    else success
+                        Handler --> Client : 200 OK\nContent-Type: application/octet-stream\nContent-Disposition: attachment; filename="SKILL.md"
+                    end
+                end
+            end
+        end
+    end
+end
+
+deactivate Handler
+deactivate BunServer
+
+== Cloudflare Workers (Edge) Path ==
+
+Client -> CFWorker : GET /api/download/:type/:provider/:id
+activate CFWorker
+
+note over CFWorker : Destructures {type, provider, id}\nfrom context.params
+
+alt invalid type (not 'skill' or 'command')
+    CFWorker --> Client : 400 {error: "Invalid type"}
+else type valid
+
+    CFWorker -> DownloadProviders : FILE_DOWNLOAD_PROVIDERS.includes(provider)
+    activate DownloadProviders
+    DownloadProviders --> CFWorker : true / false
+    deactivate DownloadProviders
+
+    alt provider not in FILE_DOWNLOAD_PROVIDERS
+        CFWorker --> Client : 400 {error: "Invalid provider"}
+    else provider valid
+
+        note over CFWorker : Inline VALID_ID regex check\n/^[a-zA-Z0-9_-]+$/
+
+        alt invalid id format
+            CFWorker --> Client : 400 {error: "Invalid file ID"}
+        else id valid
+
+            CFWorker -> DownloadProviders : FILE_DOWNLOAD_PROVIDER_CONFIG_DIRS[provider]
+            activate DownloadProviders
+            DownloadProviders --> CFWorker : configDir
+            deactivate DownloadProviders
+
+            alt configDir is null
+                CFWorker --> Client : 400 {error: "Invalid provider"}
+            else configDir resolved
+
+                note over CFWorker : Builds asset URL:\n/_data/dist/{provider}/{configDir}/skills/{id}/SKILL.md
+
+                CFWorker -> CFAssets : fetch(assetURL)
+                activate CFAssets
+                CFAssets --> CFWorker : Response (ok / not ok)
+                deactivate CFAssets
+
+                alt !response.ok
+                    CFWorker --> Client : 404 {error: "File not found"}
+                else response ok
+                    CFWorker -> CFAssets : response.arrayBuffer()
+                    activate CFAssets
+                    CFAssets --> CFWorker : binary content
+                    deactivate CFAssets
+
+                    CFWorker --> Client : 200 OK\nContent-Type: application/octet-stream\nContent-Disposition: attachment; filename="SKILL.md"\nCache-Control: public, s-maxage=86400, stale-while-revalidate=3600
+                end
+            end
+        end
+    end
+end
+
+deactivate CFWorker
+
+@enduml

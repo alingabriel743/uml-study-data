@@ -1,0 +1,209 @@
+{
+  "scope": "multiview_world_generation",
+  "title": "Multiview World Generation",
+  "diagram_type": "use_case",
+  "description": "System generates synchronized multi-camera viewpoint video outputs from a single text prompt or conditioning video/image.",
+
+  "actors": [
+    "User/Developer",
+    "TextEncoder (T5)",
+    "GuardrailSystem",
+    "Tokenizer/VAE",
+    "DiffusionScheduler",
+    "ContextParallelRuntime"
+  ],
+
+  "systems": [
+    {
+      "name": "MultiviewGenerationSystem",
+      "components": [
+        "DiffusionText2WorldMultiviewGenerationPipeline",
+        "DiffusionVideo2WorldMultiviewGenerationPipeline",
+        "DiffusionMultiviewT2WModel",
+        "DiffusionMultiviewV2WModel",
+        "MultiviewGeneralDIT"
+      ]
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Generate Multi-View World from Text Prompt",
+      "actor": "User/Developer",
+      "system": "DiffusionText2WorldMultiviewGenerationPipeline",
+      "description": "User provides per-view text prompts (front, left, right, back, back-left, back-right). Pipeline generates a synchronized 6-camera video output.",
+      "entry_point": "pipeline.generate(prompt_dict)",
+      "steps": [
+        "Parse per-view prompts (prompt, prompt_left, prompt_right, prompt_back, prompt_back_left, prompt_back_right)",
+        "_run_text_embedding_on_prompt_with_offload(prompts) → prompt_embeddings via T5 TextEncoder",
+        "_run_model_with_offload(prompt_embeddings) → calls _run_model()",
+        "get_video_batch_for_multiview_model() → data_batch, state_shape",
+        "generate_world_from_text(model, state_shape, data_batch, guidance, num_steps, seed) → latent sample",
+        "_run_tokenizer_decoding(sample) → [grid_video, video] numpy arrays",
+        "save_video() × 2 (individual + 2×3 grid layout)"
+      ],
+      "output": "[video_grid (H*2 x W*3), video (H x W)], prompt"
+    },
+    {
+      "id": "UC2",
+      "name": "Generate Multi-View World from Video/Image Input",
+      "actor": "User/Developer",
+      "system": "DiffusionVideo2WorldMultiviewGenerationPipeline",
+      "description": "User provides a conditioning image or video plus per-view prompts. Pipeline extends the visual input into synchronized 6-camera video.",
+      "entry_point": "pipeline.generate(prompt_dict, image_or_video_path)",
+      "steps": [
+        "check_input_frames(image_or_video_path, num_input_frames)",
+        "Parse per-view prompts + visual_input path",
+        "_run_tokenizer_encoding(image_or_video_path) → condition_latent via get_condition_latent_multiview()",
+        "_run_text_embedding_on_prompt_with_offload(prompts) → prompt_embeddings",
+        "_run_model_with_offload(prompt_embeddings, condition_latent) → calls _run_model()",
+        "generate_world_from_video(model, condition_latent, num_input_frames, ...) → latent sample",
+        "_run_tokenizer_decoding(sample) → [grid_video, video]",
+        "save_video() × 2"
+      ],
+      "output": "[video_grid, video], prompt"
+    },
+    {
+      "id": "UC3",
+      "name": "Encode Multi-View Latent State",
+      "actor": "Tokenizer/VAE",
+      "system": "DiffusionMultiviewT2WModel / DiffusionMultiviewV2WModel",
+      "description": "Encodes multi-view video tensor into latent space by splitting views, encoding per-view, and recombining.",
+      "entry_point": "model.encode(state: Tensor[B,C,(V*T),H,W])",
+      "steps": [
+        "rearrange B C (V T) H W → (B V) C T H W",
+        "tokenizer.encode(state) per view",
+        "rearrange (B V) C T H W → B C (V T) H W",
+        "scale by sigma_data"
+      ]
+    },
+    {
+      "id": "UC4",
+      "name": "Decode Multi-View Latent State",
+      "actor": "Tokenizer/VAE",
+      "system": "DiffusionMultiviewT2WModel / DiffusionMultiviewV2WModel",
+      "description": "Decodes multi-view latents back to pixel space.",
+      "entry_point": "model.decode(latent: Tensor[B,C,(V*T),H,W])",
+      "steps": [
+        "rearrange B C (V T) H W → (B V) C T H W",
+        "tokenizer.decode(latent / sigma_data)",
+        "rearrange (B V) C T H W → B C (V T) H W"
+      ]
+    },
+    {
+      "id": "UC5",
+      "name": "Run Multi-View Diffusion Sampling (CFG)",
+      "actor": "DiffusionScheduler",
+      "system": "DiffusionMultiviewT2WModel / DiffusionMultiviewV2WModel",
+      "description": "Iterative denoising loop with classifier-free guidance across all views simultaneously.",
+      "entry_point": "model.generate_samples_from_batch(data_batch, guidance, seed, state_shape, num_steps)",
+      "steps": [
+        "_get_conditions(data_batch) → condition, uncondition",
+        "scheduler.set_timesteps(num_steps)",
+        "Initialize xt from randn × init_noise_sigma",
+        "For each timestep t: scale_model_input(xt, t)",
+        "net(x=xt_scaled, timesteps=t, **condition) → net_output_cond",
+        "net(x=xt_scaled, timesteps=t, **uncondition) → net_output_uncond",
+        "CFG: net_output = cond + guidance × (cond - uncond)",
+        "scheduler.step(net_output, t, xt) → xt (prev_sample)"
+      ],
+      "note": "V2W variant additionally applies _augment_noise_with_latent() for conditioning frames and replaces indicated regions with ground-truth latent."
+    },
+    {
+      "id": "UC6",
+      "name": "Apply View Embeddings in DiT",
+      "actor": "MultiviewGeneralDIT",
+      "system": "MultiviewGeneralDIT",
+      "description": "Injects per-camera view identity embeddings into the input sequence before transformer blocks.",
+      "entry_point": "MultiviewGeneralDIT.prepare_embedded_sequence(x_B_C_T_H_W, ...)",
+      "steps": [
+        "view_indices = arange(n_views)",
+        "view_embedding = self.view_embeddings(view_indices) → [V, D]",
+        "Optionally add repeat_frame_embedding via self.repeat_frame_embedding(frame_repeat)",
+        "rearrange x → B C V T H W",
+        "Concatenate view_embedding along channel dim",
+        "Optionally concatenate traj_embedding via self.traj_embeddings(trajectory)",
+        "rearrange back → B C (V T) H W",
+        "x_embedder(x) → patch tokens",
+        "Apply MultiviewVideoRopePosition3DEmb or MultiviewSinCosPosEmbAxis"
+      ]
+    },
+    {
+      "id": "UC7",
+      "name": "Enable Context Parallel Inference",
+      "actor": "ContextParallelRuntime",
+      "system": "DiffusionMultiviewT2WModel / DiffusionMultiviewV2WModel",
+      "description": "Splits view-time dimension across GPU context parallel groups for multi-GPU inference.",
+      "entry_point": "pipeline.model.net.enable_context_parallel(process_group)",
+      "steps": [
+        "Detect net.is_context_parallel_enabled",
+        "rearrange xt: B C (V T) H W → (B V) C T H W",
+        "split_inputs_cp(xt, seq_dim=2, cp_group)",
+        "rearrange back to B C (V T) H W for forward pass",
+        "After sampling: cat_outputs_cp(samples, seq_dim=2, cp_group)",
+        "rearrange (B V) C T H W → B C (V T) H W"
+      ]
+    },
+    {
+      "id": "UC8",
+      "name": "Safety Guardrail Check",
+      "actor": "GuardrailSystem",
+      "system": "DiffusionText2WorldMultiviewGenerationPipeline",
+      "description": "Optionally validates generated content before saving; blocks unsafe outputs.",
+      "steps": [
+        "disable_guardrail flag checked at pipeline init",
+        "If guardrail blocks: log.critical('Guardrail blocked ...'), return None",
+        "If passed: return [video_grid, video], prompt"
+      ]
+    },
+    {
+      "id": "UC9",
+      "name": "Condition on Input Frames (V2W)",
+      "actor": "DiffusionMultiviewV2WModel",
+      "system": "DiffusionMultiviewV2WModel",
+      "description": "Sets up conditioning mask and augments conditioning frames with noise for video-to-world prediction.",
+      "entry_point": "model.add_condition_video_indicator_and_video_input_mask(latent_state, condition, num_condition_t)",
+      "steps": [
+        "Create condition_video_indicator (binary, 1 for conditioned frames)",
+        "Set indicator[:, :, :num_condition_t] = 1.0 (first_n strategy)",
+        "Set condition.gt_latent = latent_state",
+        "If video_cond_bool: condition_video_input_mask = indicator × ones else zeros",
+        "_augment_noise_with_latent(): blend augmented GT latent with noise in condition region",
+        "new_xt = indicator × augment_latent + (1 - indicator) × noise"
+      ]
+    }
+  ],
+
+  "key_relationships": [
+    "DiffusionMultiviewT2WModel extends DiffusionT2WModel (adds n_views, overrides encode/decode/generate_samples_from_batch)",
+    "DiffusionMultiviewV2WModel extends DiffusionV2WModel (adds n_views, view-aware conditioning, context parallel support)",
+    "DiffusionVideo2WorldMultiviewGenerationPipeline extends DiffusionText2WorldMultiviewGenerationPipeline",
+    "DiffusionText2WorldMultiviewGenerationPipeline extends DiffusionText2WorldGenerationPipeline",
+    "MultiviewGeneralDIT extends GeneralDIT (overrides build_patch_embed, build_pos_embed, prepare_embedded_sequence, forward_before_blocks)",
+    "MultiviewGeneralDIT uses MultiviewVideoRopePosition3DEmb (pos_emb_cls='rope3d') and MultiviewSinCosPosEmbAxis",
+    "MultiviewGeneralDIT uses GeneralDITTransformerBlock with n_views parameter in each block",
+    "MultiviewModelConfig extends DefaultModelConfig with n_views field",
+    "Pipeline._load_model creates DiffusionMultiviewT2WModel or DiffusionMultiviewV2WModel via load_model_by_config"
+  ],
+
+  "config_highlights": [
+    "MultiviewModelConfig.n_views = 6 (training), 4 (inference config)",
+    "Default views: front, left, right, back, back-left, back-right (6 automotive cameras)",
+    "Default resolution: 480×848, 57 frames per camera",
+    "Default guidance=7.0, num_steps=35",
+    "frame_repeat_negative_condition=10.0 (used as negative CFG condition)",
+    "num_input_frames: 1 or 9 (for V2W conditioning)",
+    "Context parallel: supports multi-GPU via megatron parallel_state"
+  ],
+
+  "source_files_analyzed": [
+    "Lyra-1/cosmos_predict1/diffusion/model/model_v2w_multiview.py",
+    "Lyra-1/cosmos_predict1/diffusion/model/model_t2w_multiview.py",
+    "Lyra-1/cosmos_predict1/diffusion/networks/general_dit_multiview.py",
+    "Lyra-1/cosmos_predict1/diffusion/inference/text2world_multiview.py",
+    "Lyra-1/cosmos_predict1/diffusion/inference/video2world_multiview.py",
+    "Lyra-1/cosmos_predict1/diffusion/inference/world_generation_pipeline.py (lines 694-1015)",
+    "Lyra-1/cosmos_predict1/diffusion/training/config/config_multiview.py"
+  ]
+}

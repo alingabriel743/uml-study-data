@@ -1,0 +1,127 @@
+{
+  "scope": "research_bot_workflow",
+  "title": "Research Bot Workflow",
+  "diagram_type": "activity",
+  "description": "Automated multi-agent research pipeline: plan searches, fan out parallel web searches, aggregate results, synthesize and stream final report",
+
+  "entry_point": "main() → ResearchManager().run(query: str)",
+
+  "activity_steps": [
+    "START: User provides research query (e.g. 'Impact of electric vehicles on the grid.')",
+    "Initialize: gen_trace_id(), open trace('Research trace', trace_id)",
+    "Print: 'Starting research...' via Printer",
+    "ACTIVITY: _plan_searches(query) → Runner.run(planner_agent, 'Query: {query}')",
+    "  planner_agent (gpt-5.4, reasoning=medium) produces WebSearchPlan with 5-20 WebSearchItems",
+    "  Print: 'Will perform N searches'",
+    "ACTIVITY: _perform_searches(search_plan: WebSearchPlan) — opens custom_span('Search the web')",
+    "  FORK: asyncio.create_task(_search(item)) for each WebSearchItem in search_plan.searches",
+    "  PARALLEL BRANCH (per item): _search(item: WebSearchItem)",
+    "    Build input: 'Search term: {item.query}\\nReason for searching: {item.reason}'",
+    "    Runner.run(search_agent, input) — search_agent uses WebSearchTool, gpt-5.4",
+    "    DECISION: exception raised?",
+    "      YES → return None (num_failed++)",
+    "      NO  → return str(result.final_output) (num_succeeded++)",
+    "  JOIN: asyncio.as_completed(tasks) — collect non-None results into list[str]",
+    "  Update status after each completed task: '{n}/{total} finished (N succeeded, N failed)'",
+    "  Print final summary: 'Searches finished: N/total succeeded'",
+    "ACTIVITY: _write_report(query, search_results: list[str])",
+    "  Build input: 'Original query: {query}\\nSummarized search results: {search_results}'",
+    "  Runner.run_streamed(writer_agent, input) — writer_agent gpt-5-mini, reasoning=medium",
+    "  LOOP: async for event in result.stream_events()",
+    "    DECISION: time since last update > 5s AND more messages remain?",
+    "      YES → printer.update_item('writing', next_message); advance pointer",
+    "    Progress messages cycle: 'Thinking…', 'Planning structure…', 'Writing outline…', 'Creating sections…', 'Cleaning up…', 'Finalizing…', 'Finishing…'",
+    "  END LOOP: printer.mark_item_done('writing')",
+    "  Return result.final_output_as(ReportData)",
+    "Print final_report: 'Report summary\\n\\n{report.short_summary}'",
+    "Print full markdown_report to stdout",
+    "Print follow_up_questions (newline-joined list)",
+    "printer.end()",
+    "END"
+  ],
+
+  "decision_points": [
+    {
+      "location": "_search()",
+      "condition": "Runner.run raises Exception",
+      "true_branch": "return None → search counted as failed",
+      "false_branch": "return str(result.final_output) → search counted as succeeded"
+    },
+    {
+      "location": "_perform_searches() loop",
+      "condition": "result is not None",
+      "true_branch": "append to results list, num_succeeded++",
+      "false_branch": "num_failed++"
+    },
+    {
+      "location": "_write_report() stream loop",
+      "condition": "time.time() - last_update > 5 AND next_message < len(update_messages)",
+      "true_branch": "update printer with next status message",
+      "false_branch": "continue streaming without UI update"
+    }
+  ],
+
+  "parallel_region": {
+    "name": "Fan-out web searches",
+    "mechanism": "asyncio.create_task + asyncio.as_completed",
+    "input": "WebSearchPlan.searches: list[WebSearchItem]",
+    "output": "list[str] — non-None summaries",
+    "each_task": "_search(item) → Runner.run(search_agent) → 2-3 paragraph web summary"
+  },
+
+  "agents": [
+    {
+      "name": "PlannerAgent",
+      "model": "gpt-5.4",
+      "reasoning": "medium",
+      "output_type": "WebSearchPlan",
+      "role": "Generates 5-20 WebSearchItems from the user query"
+    },
+    {
+      "name": "SearchAgent",
+      "model": "gpt-5.4",
+      "tools": ["WebSearchTool"],
+      "output_type": "str (free-form summary)",
+      "role": "Executes a single web search and returns a concise 2-3 paragraph summary (<300 words)"
+    },
+    {
+      "name": "WriterAgent",
+      "model": "gpt-5-mini",
+      "reasoning": "medium",
+      "output_type": "ReportData",
+      "role": "Synthesizes all search summaries into a structured, detailed markdown report (1000+ words)"
+    }
+  ],
+
+  "data_models": [
+    "WebSearchItem: { reason: str, query: str }",
+    "WebSearchPlan: { searches: list[WebSearchItem] }",
+    "ReportData: { short_summary: str, markdown_report: str, follow_up_questions: list[str] }"
+  ],
+
+  "key_relationships": [
+    "ResearchManager orchestrates PlannerAgent → SearchAgent(s) → WriterAgent sequentially",
+    "ResearchManager depends_on Runner (sync run + streamed run)",
+    "ResearchManager depends_on Printer for live status updates",
+    "ResearchManager uses trace/custom_span for observability",
+    "_perform_searches fans out N parallel _search() calls (asyncio tasks)",
+    "planner_agent output (WebSearchPlan) feeds into _perform_searches fan-out",
+    "search_results (list[str]) feeds into _write_report synthesis step"
+  ],
+
+  "observability": {
+    "trace": "trace('Research trace', trace_id=gen_trace_id())",
+    "custom_span": "custom_span('Search the web') wraps _perform_searches",
+    "trace_url": "https://platform.openai.com/traces/trace?trace_id={trace_id}"
+  },
+
+  "important_notes": "Pure async pipeline (asyncio). No human-in-the-loop. Failures in individual searches are silently counted/skipped — pipeline continues. WriterAgent uses streaming (run_streamed) with time-based UI progress messages every 5s. Final output printed directly to stdout after pipeline completes.",
+
+  "source_files_analyzed": [
+    "examples/research_bot/manager.py",
+    "examples/research_bot/agents/planner_agent.py",
+    "examples/research_bot/agents/search_agent.py",
+    "examples/research_bot/agents/writer_agent.py",
+    "examples/research_bot/main.py"
+  ]
+}

@@ -1,0 +1,144 @@
+{
+  "scope": "order_processing_and_payment",
+  "title": "Order Processing & Payment",
+  "diagram_type": "activity",
+  "key_participants": [
+    "User (Browser)",
+    "OrderServlet (@WebServlet /OrderServlet)",
+    "ShipmentServlet (@WebServlet /ShipmentServlet)",
+    "OrderServiceImpl",
+    "TransServiceImpl",
+    "CartServiceImpl",
+    "ProductServiceImpl",
+    "UserServiceImpl",
+    "MailMessage",
+    "DBUtil (Database)"
+  ],
+  "activity_flows": [
+    {
+      "flow": "Payment & Order Placement (paymentSuccess)",
+      "trigger": "OrderServlet.doGet() — GET/POST /OrderServlet?amount=<paidAmount>",
+      "steps": [
+        "START: Validate session (userName, password) — if null → redirect to login.jsp",
+        "Parse paidAmount from request param",
+        "OrderServiceImpl.paymentSuccess(userName, paidAmount)",
+        "  → CartServiceImpl.getAllCartItems(userName) → DB: select cart items",
+        "  [DECISION] cartItems.size() == 0 → return 'Order Placement Failed!'",
+        "  → Create TransactionBean(userName, paidAmount) — generates transactionId + timestamp",
+        "  [LOOP] for each CartBean item in cartItems:",
+        "    → ProductServiceImpl.getProductPrice(prodId) → DB: get unit price",
+        "    → Compute amount = price * quantity",
+        "    → Create OrderBean(transactionId, prodId, quantity, amount)",
+        "    → addOrder(order) → DB: INSERT INTO orders(transid, prodid, qty, amount, shipped=0)",
+        "    [DECISION] addOrder failed → break loop, ordered=false",
+        "    → CartServiceImpl.removeAProduct(userId, prodId) → DB: delete cart item",
+        "    [DECISION] removeAProduct failed → break loop, ordered=false",
+        "    → ProductServiceImpl.sellNProduct(prodId, quantity) → DB: decrement stock",
+        "    [DECISION] sellNProduct failed → break loop, ordered=false",
+        "  [END LOOP]",
+        "  [DECISION] ordered == true:",
+        "    → addTransaction(transaction) → DB: INSERT INTO transactions(transid, username, time, amount)",
+        "    [DECISION] addTransaction success:",
+        "      → MailMessage.transactionSuccess(userName, firstName, transId, amount) → send email",
+        "      → status = 'Order Placed Successfully!'",
+        "    [DECISION] addTransaction failed → status = 'Order Placement Failed!'",
+        "  [DECISION] ordered == false → status = 'Order Placement Failed!'",
+        "Return status string to OrderServlet",
+        "OrderServlet forwards to orderDetails.jsp, injects status message via JS",
+        "END"
+      ]
+    },
+    {
+      "flow": "Shipment Processing (shipNow)",
+      "trigger": "ShipmentServlet.doGet() — GET/POST /ShipmentServlet?orderid=&prodid=&userid=&amount=",
+      "steps": [
+        "START: Validate session (usertype) — if null → redirect to login.jsp with 'Access Denied'",
+        "Parse orderId, prodId, userName, amount from request params",
+        "OrderServiceImpl.shipNow(orderId, prodId)",
+        "  → DB: UPDATE orders SET shipped=1 WHERE orderid=? AND prodid=? AND shipped=0",
+        "  [DECISION] rows updated > 0 → status = 'Order Has been shipped successfully!!'",
+        "  [DECISION] rows updated == 0 or SQLException → status = 'FAILURE'",
+        "[DECISION] status == 'FAILURE':",
+        "  → pagename = 'unshippedItems.jsp'",
+        "[DECISION] status != 'FAILURE':",
+        "  → UserServiceImpl.getFName(userName) → DB: get first name",
+        "  → MailMessage.orderShipped(userName, firstName, orderId, amount) → send email",
+        "  → pagename = 'shippedItems.jsp'",
+        "Forward to pagename JSP, inject status message via JS",
+        "END"
+      ]
+    },
+    {
+      "flow": "addOrder(OrderBean) — helper",
+      "steps": [
+        "DBUtil.provideConnection()",
+        "INSERT INTO orders VALUES(transactionId, prodId, quantity, amount, 0)",
+        "[DECISION] k > 0 → return true | SQLException → return false"
+      ]
+    },
+    {
+      "flow": "addTransaction(TransactionBean) — helper",
+      "steps": [
+        "DBUtil.provideConnection()",
+        "INSERT INTO transactions VALUES(transId, userName, transDateTime, transAmount)",
+        "[DECISION] k > 0 → return true | SQLException → return false"
+      ]
+    },
+    {
+      "flow": "TransServiceImpl.getUserId(transId)",
+      "steps": [
+        "DBUtil.provideConnection()",
+        "SELECT username FROM transactions WHERE transid=?",
+        "Return userId string (used externally for lookup)"
+      ]
+    }
+  ],
+  "key_decisions": [
+    "Session valid? → proceed or redirect to login",
+    "Cart is empty? → abort with failure status",
+    "Each cart item: addOrder success? → continue or break",
+    "Each cart item: removeAProduct success? → continue or break",
+    "Each cart item: sellNProduct success? → continue or break",
+    "All items processed (ordered==true)? → addTransaction or fail",
+    "addTransaction success? → send email + success status or fail",
+    "shipNow rows updated > 0? → success + send email or FAILURE"
+  ],
+  "key_relationships": [
+    "OrderServlet depends_on OrderServiceImpl (paymentSuccess, shipNow — via ShipmentServlet)",
+    "ShipmentServlet depends_on OrderServiceImpl (shipNow)",
+    "ShipmentServlet depends_on UserServiceImpl (getFName)",
+    "OrderServiceImpl depends_on CartServiceImpl (getAllCartItems, removeAProduct)",
+    "OrderServiceImpl depends_on ProductServiceImpl (getProductPrice, sellNProduct)",
+    "OrderServiceImpl depends_on UserServiceImpl (getFName for email)",
+    "OrderServiceImpl depends_on MailMessage (transactionSuccess, orderShipped)",
+    "OrderServiceImpl depends_on DBUtil (provideConnection, closeConnection)",
+    "TransServiceImpl depends_on DBUtil (provideConnection)",
+    "OrderServiceImpl implements OrderService",
+    "TransServiceImpl implements TransService"
+  ],
+  "data_objects": [
+    "TransactionBean: transactionId (auto-generated), userName, transDateTime (Timestamp), transAmount",
+    "OrderBean: transactionId, productId, quantity, amount, shipped (0=pending, 1=shipped)",
+    "CartBean: userId, prodId, quantity",
+    "OrderDetails: orderId, prodImage, prodName, qty, amount, time, productId, shipped"
+  ],
+  "db_tables": [
+    "orders (orderid, prodid, quantity, amount, shipped)",
+    "transactions (transid, username, time, amount)",
+    "cart (userId, prodId, quantity)",
+    "product (pid, pname, image, price, quantity)"
+  ],
+  "important_notes": [
+    "paymentSuccess is transactional in intent but NOT wrapped in a DB transaction — partial failures can leave orphaned orders",
+    "shipped column uses 0/1 int flag; shipNow only updates if shipped=0 (idempotent guard)",
+    "TransactionBean auto-generates transactionId (likely via IDUtil) at construction time",
+    "MailMessage sends email on both payment success and shipment — relies on JavaMailUtil",
+    "TransServiceImpl.getUserId is a lightweight lookup used externally (e.g., admin views)"
+  ],
+  "source_files_analyzed": [
+    "src/com/shashi/service/impl/OrderServiceImpl.java",
+    "src/com/shashi/service/impl/TransServiceImpl.java",
+    "src/com/shashi/srv/OrderServlet.java",
+    "src/com/shashi/srv/ShipmentServlet.java"
+  ]
+}

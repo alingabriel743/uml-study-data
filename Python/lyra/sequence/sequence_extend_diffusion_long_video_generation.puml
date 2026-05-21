@@ -1,0 +1,214 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceMessageAlign center
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequenceActorBackgroundColor #E9ECEF
+skinparam sequenceActorBorderColor #495057
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceGroupBackgroundColor #E9ECEF
+skinparam sequenceGroupBorderColor #6C757D
+skinparam noteBorderColor #6C757D
+skinparam noteBackgroundColor #FFF9C4
+
+title Extended Diffusion Long Video Generation\n(Sliding-Window Autoregressive Loop with ExtendDiffusionModel)
+
+actor Caller as caller
+
+participant "get_condition_latent" as gcl
+participant "read_video_or_image\n_into_frames_BCTHW" as rvif
+participant "compute_num_frames\n_condition" as cnfc
+participant "create_condition_latent\n_from_input_frames" as cclif
+participant "VAE\n(model.tokenizer/vae)" as vae
+participant "switch_config\n_for_inference" as sci
+participant "generate_video_from\n_batch_with_loop" as gvfbwl
+participant "ExtendDiffusionModel\n.generate_samples_from_batch" as gsfb
+participant "get_x0_fn_from_batch\n_with_condition_latent" as gx0fn
+participant "Conditioner" as cond
+participant "augment_conditional\n_latent_frames" as aclf
+participant "Sampler\n(self.sampler)" as sampler
+participant "BaseModel\n.denoise" as base_denoise
+
+== Phase 1: Prepare Initial Condition Latent ==
+
+caller -> gcl : get_condition_latent(model, video_path,\nnum_of_latent_condition, state_shape)
+activate gcl
+
+gcl -> rvif : read_video_or_image_into_frames_BCTHW(path, H, W)
+activate rvif
+rvif --> gcl : input_frames [B,C,T,H,W]
+deactivate rvif
+
+gcl -> cnfc : compute_num_frames_condition(model, num_of_latent_condition)
+activate cnfc
+cnfc --> gcl : num_frames_condition : int
+deactivate cnfc
+
+gcl -> cclif : create_condition_latent_from_input_frames(model,\ninput_frames, num_frames_condition)
+activate cclif
+cclif -> vae : encode(encode_input_frames)
+activate vae
+vae --> cclif : latent BCTHW
+deactivate vae
+cclif --> gcl : (condition_latent BCTHW [bfloat16], encode_input_frames)
+deactivate cclif
+
+gcl --> caller : (condition_latent, input_frames)
+deactivate gcl
+
+== Phase 2: Configure Model for Inference ==
+
+caller -> sci : switch_config_for_inference(model)
+activate sci
+note right of sci
+  Sets:
+  • condition_location = 'first_n'
+  • apply_corruption = 'noise_with_sigma_fixed'
+end note
+sci --> caller : context manager active
+deactivate sci
+
+== Phase 3: Sliding-Window Generation Loop ==
+
+caller -> gvfbwl : generate_video_from_batch_with_loop(\n  model, state_shape, data_batch,\n  condition_latent, num_of_loops,\n  num_of_latent_overlap_list,\n  guidance, num_steps, seed, ...)
+activate gvfbwl
+
+loop i = 0 .. num_of_loops - 1
+
+    note over gvfbwl
+      Pad condition_latent → state_shape (if needed)
+      Append to condition_latent_list
+      Select augment_sigma = augment_sigma_list[i]
+    end note
+
+    gvfbwl -> gsfb : generate_samples_from_batch(\n  data_batch, guidance, state_shape,\n  num_steps, seed+i, condition_latent,\n  num_condition_t=overlap_i,\n  condition_video_augment_sigma_in_inference)
+    activate gsfb
+
+    gsfb -> gsfb : _normalize_video_databatch_inplace(data_batch)
+    gsfb -> gsfb : _augment_image_dim_inplace(data_batch)
+
+    gsfb -> gx0fn : get_x0_fn_from_batch_with_condition_latent(\n  data_batch, guidance, condition_latent,\n  num_condition_t, augment_sigma, seed)
+    activate gx0fn
+
+    gx0fn -> cond : get_condition_uncondition(data_batch)
+    activate cond
+    cond --> gx0fn : (condition, uncondition)
+    deactivate cond
+
+    gx0fn -> gx0fn : add_condition_video_indicator_and_video_input_mask(\n  condition_latent, condition, num_condition_t)\n→ gt_latent, condition_video_indicator [B,1,T,1,1],\n  condition_video_input_mask [B,1,T,H,W]
+
+    gx0fn -> gx0fn : add_condition_video_indicator_and_video_input_mask(\n  condition_latent, uncondition, num_condition_t)
+
+    gx0fn -> gx0fn : broadcast_condition(condition/uncondition,\n  to_tp, to_cp)  [tensor/context parallel]
+
+    gx0fn --> gsfb : x0_fn closure
+    deactivate gx0fn
+
+    gsfb -> gsfb : arch_invariant_rand(...) * sde.sigma_max\n→ x_sigma_max (initial noise)
+
+    gsfb -> sampler : sampler(x0_fn, x_sigma_max, num_steps, sigma_max)
+    activate sampler
+
+    loop each diffusion step (noise_x, sigma)
+
+        sampler -> gx0fn : x0_fn(noise_x, sigma)
+        activate gx0fn
+
+        note over gx0fn
+          Called twice: conditional + unconditional
+          Then: CFG = cond_x0 + guidance * (cond_x0 − uncond_x0)
+        end note
+
+        gx0fn -> aclf : augment_conditional_latent_frames(\n  condition, cfg, gt_latent,\n  augment_sigma, sigma, seed)
+        activate aclf
+        note right of aclf
+          if sigma < augment_sigma:
+            zero out condition_video_indicator
+            → joint denoising of all frames
+          augment_latent = gt_latent + noise * augment_sigma
+          Sets condition_video_augment_sigma
+        end note
+        aclf --> gx0fn : (condition, augment_latent_cin)
+        deactivate aclf
+
+        gx0fn -> gx0fn : new_noise_xt =\n  indicator * augment_latent\n+ (1−indicator) * noise_x
+
+        gx0fn -> base_denoise : super().denoise(\n  new_noise_xt, sigma, condition)
+        activate base_denoise
+        base_denoise --> gx0fn : denoise_pred (net forward pass)
+        deactivate base_denoise
+
+        gx0fn -> gx0fn : x0_pred_replaced =\n  indicator * gt_latent\n+ (1−indicator) * denoise_pred.x0
+
+        gx0fn --> sampler : VideoDenoisePrediction\n{x0, eps, logvar, net_in,\n net_x0_pred, xt, x0_pred_replaced}
+        deactivate gx0fn
+
+    end
+
+    sampler --> gsfb : samples BCTHW
+    deactivate sampler
+
+    gsfb --> gvfbwl : samples BCTHW
+    deactivate gsfb
+
+    alt skip_reencode = False (default)
+        gvfbwl -> cnfc : compute_num_frames_condition(model, overlap_i + 1)
+        activate cnfc
+        cnfc --> gvfbwl : num_cond_frames
+        deactivate cnfc
+
+        gvfbwl -> vae : decode(sample)
+        activate vae
+        vae --> gvfbwl : pixel frames [B,3,T,H,W] ∈ [0,1]
+        deactivate vae
+
+        note over gvfbwl
+          Trim leading conditional frames from
+          grid_np for output (except loop 0)
+          Append trimmed frames to grid_list
+        end note
+
+        gvfbwl -> cclif : create_condition_latent_from_input_frames(\n  model, condition_frame_input, num_cond_frames)
+        activate cclif
+        cclif -> vae : encode(condition_frame_input)
+        activate vae
+        vae --> cclif : re-encoded latent
+        deactivate vae
+        cclif --> gvfbwl : condition_latent (for next loop)
+        deactivate cclif
+
+    else skip_reencode = True
+        gvfbwl -> gvfbwl : condition_latent =\nsample[:, :, -num_of_latent_overlap_i_plus_1:]\n(reuse tail of latent directly — no re-encode)
+    end
+
+end
+
+note over gvfbwl
+  Concatenate grid_list across loops:
+  video_THWC = np.concatenate(grid_list)
+  (or decode all latents together)
+end note
+
+gvfbwl --> caller : (video_THWC [np.array THWC uint8 0–255],\ncondition_latent_list, sample_latent [, noise])
+deactivate gvfbwl
+
+@enduml

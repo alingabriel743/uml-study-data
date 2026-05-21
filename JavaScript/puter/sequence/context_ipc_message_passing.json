@@ -1,0 +1,116 @@
+{
+  "scope": "ipc_message_passing",
+  "title": "IPC Message Passing Between Processes",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "CallerApp (iframe)",
+    "ExecService",
+    "IPCService",
+    "InternalConnection",
+    "ProcessService",
+    "launch_app (helper)",
+    "ChildProcess (iframe)",
+    "BroadcastService (GUI)"
+  ],
+  "interaction_flow": [
+    "--- launchApp IPC flow ---",
+    "CallerApp → ExecService: IPC call 'launchApp'({app_name, args, pseudonym, file_paths, items}, ipc_context)",
+    "ExecService → ExecService: extract caller process from ipc_context.caller.process",
+    "ExecService → ExecService: generate child_instance_id = uuidv4()",
+    "ExecService → IPCService: add_connection({source: process.uuid, target: child_instance_id})",
+    "IPCService → IPCService: create forward conn (uuid) + backward conn (r_uuid) in connections_ map",
+    "IPCService → ExecService: return {forward, backward}",
+    "ExecService → launch_app: launch_app({name, uuid:child_instance_id, parent_instance_id, parent_pseudo_id: connection.backward.uuid, args, ...})",
+    "launch_app → ExecService: return child_launch_outcome {launchResult, references: {iframe, el_win}}",
+    "--- child IPC attachment detection ---",
+    "ChildProcess → ExecService: ipc_status changes to PROCESS_IPC_ATTACHED (onchange listener)",
+    "ExecService → ExecService: send_child_launched_msg({uses_sdk: true})",
+    "ExecService → CallerApp (iframe): postMessage({msg:'childAppLaunched', original_msg_id, child_instance_id, uses_sdk:true}, '*')",
+    "ExecService → BroadcastService (GUI): sendSavedBroadcastsTo(child_instance_id)",
+    "BroadcastService (GUI) → ChildProcess (iframe): postMessage({msg:'broadcast', name, data}, '*') [for each saved broadcast]",
+    "--- child window close ---",
+    "ChildProcess → ExecService: el_win 'remove' jQuery event",
+    "ExecService → CallerApp (iframe): postMessage({msg:'appClosed', appInstanceID: connection.forward.uuid, statusCode:0}, '*')",
+    "ExecService → ExecService: report_app_closed(child_process.uuid) [if not sdk app]",
+    "--- launchApp return ---",
+    "ExecService → CallerApp: return {appInstanceID: connection.forward.uuid, usesSDK:true, response?}",
+    "",
+    "--- connectToInstance IPC flow ---",
+    "CallerApp → ExecService: IPC call 'connectToInstance'({app_name, args}, ipc_context)",
+    "ExecService → ExecService: verify caller (must be 'phoenix'), verify target (must be 'puter-linux')",
+    "ExecService → ProcessService: select_by_name(app_name)",
+    "ProcessService → ExecService: return existing process",
+    "ExecService → IPCService: add_connection({source: caller_process.uuid, target: process.uuid})",
+    "IPCService → ExecService: return {forward, backward}",
+    "ExecService → ChildProcess: handle_connection(connection.backward, args)",
+    "ChildProcess → ExecService: return response",
+    "ExecService → CallerApp: return {appInstanceID: connection.forward.uuid, usesSDK:true, response}",
+    "",
+    "--- InternalConnection.send flow ---",
+    "Sender → InternalConnection: send(data)",
+    "InternalConnection → ProcessService: get_by_uuid(target)",
+    "ProcessService → InternalConnection: return target process",
+    "InternalConnection → TargetProcess: process.send({returnAddress: reverse_uuid}, data)"
+  ],
+  "key_relationships": [
+    "ExecService depends_on IPCService (registers ipc handlers 'launchApp', 'connectToInstance' at _init)",
+    "ExecService depends_on BroadcastService (GUI) (calls sendSavedBroadcastsTo on child IPC attach)",
+    "ExecService depends_on ProcessService (gets processes by uuid/name)",
+    "ExecService depends_on launch_app helper (actual app launching logic)",
+    "IPCService creates InternalConnection (lazy via get_connection)",
+    "InternalConnection depends_on ProcessService (to resolve target process by uuid)",
+    "IPCService stores bidirectional connections: forward (caller→child) + backward (child→caller)",
+    "BroadcastService (GUI) stores saved broadcasts in #broadcastsToSendToNewAppInstances Map",
+    "Backend BroadcastService listens to outer.* events, forwards to peers via webhook + Redis pub/sub"
+  ],
+  "method_signatures": {
+    "IPCService": [
+      "_init(): void — initializes connections_ = {}",
+      "add_connection({source, target}): {forward, backward} — creates UUID pair, stores both directions",
+      "get_connection(uuid): InternalConnection — lazy-instantiates from stored entry",
+      "register_ipc_handler(name, spec): void — sets window.ipc_handlers[name] = spec"
+    ],
+    "InternalConnection": [
+      "constructor({source, target, uuid, reverse}, {services})",
+      "send(data): void — resolves target process, calls process.send({returnAddress: reverse}, data)"
+    ],
+    "ExecService": [
+      "_init({services}): void — registers 'launchApp' and 'connectToInstance' IPC handlers",
+      "register_param_provider(param_provider): void",
+      "launchApp({app_name, args, pseudonym, file_paths, items}, {ipc_context, msg_id}): {appInstanceID, usesSDK, response?}",
+      "connectToInstance({app_name, args}, {ipc_context, msg_id}): {appInstanceID, usesSDK, response}"
+    ],
+    "BroadcastService_GUI": [
+      "sendBroadcast(name, data, {sendToNewAppInstances?}): void — postMessage to all SDK iframes",
+      "sendSavedBroadcastsTo(appInstanceID): void — replay saved broadcasts to new app via postMessage"
+    ],
+    "BroadcastService_Backend": [
+      "outBroadcastEventHandler(key, data, meta): void — queues outer.* events for outbound flush",
+      "#flushOutboundEvents(): Promise — sends batched events to all webhook peers",
+      "#sendWebhookToPeer(peer_config, events): Promise — HMAC-signed POST to peer webhook_url",
+      "#handleWebhookRequest(req, res): Promise — validates HMAC sig, nonce, timestamp; emits events locally",
+      "#handleRedisPubSubMessage(channel, message): Promise — fan-out from Redis to local event emitter"
+    ]
+  },
+  "connection_model": {
+    "forward_conn": "source(caller) → target(child), uuid=A, reverse=B",
+    "backward_conn": "source(child) → target(caller), uuid=B, reverse=A",
+    "parent_pseudo_id": "connection.backward.uuid — passed to child at launch so child can address parent",
+    "appInstanceID_returned": "connection.forward.uuid — returned to caller as handle to child"
+  },
+  "ipc_attachment_trigger": "PROCESS_IPC_ATTACHED constant; child signals readiness by changing ipc_status; ExecService.onchange listener fires send_child_launched_msg and BroadcastService.sendSavedBroadcastsTo",
+  "important_notes": [
+    "send_child_launched_msg is a closure inside launchApp — it captures process, msg_id, child_instance_id",
+    "postMessage uses '*' as targetOrigin (all origins)",
+    "connectToInstance has hardcoded permission check: only 'phoenix' → 'puter-linux' allowed",
+    "Backend BroadcastService is separate from GUI BroadcastService — backend handles cross-node via Redis/webhooks",
+    "Backend webhook uses HMAC-SHA256 with timestamp+nonce replay protection and 300s window",
+    "GUI BroadcastService stores saved broadcasts in a Map (name → data); later replaced by same-name updates"
+  ],
+  "source_files_analyzed": [
+    "src/gui/src/services/IPCService.js",
+    "src/gui/src/services/ExecService.js",
+    "src/gui/src/services/BroadcastService.js",
+    "src/backend/src/modules/broadcast/BroadcastService.js"
+  ]
+}

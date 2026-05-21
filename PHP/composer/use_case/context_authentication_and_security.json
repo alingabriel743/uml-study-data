@@ -1,0 +1,197 @@
+{
+  "scope": "authentication_and_security",
+  "title": "Authentication and Security",
+  "diagram_type": "use_case",
+  "description": "Managing credentials for repositories and auditing packages for vulnerabilities",
+
+  "actors": [
+    {
+      "name": "Developer",
+      "type": "primary",
+      "description": "Runs CLI commands, responds to interactive auth prompts"
+    },
+    {
+      "name": "RepositoryServer",
+      "type": "secondary",
+      "description": "GitHub, GitLab, Bitbucket, or generic HTTP repository returning 401/403"
+    },
+    {
+      "name": "SystemEnvironment",
+      "type": "secondary",
+      "description": "Provides proxy env vars (http_proxy, https_proxy, no_proxy) read by ProxyManager"
+    },
+    {
+      "name": "SecurityAdvisorySource",
+      "type": "secondary",
+      "description": "Remote advisory repositories queried during package audit"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Audit Packages for Vulnerabilities",
+      "actor": "Developer",
+      "class": "AuditCommand",
+      "entry_point": "execute(InputInterface, OutputInterface): int",
+      "description": "Developer runs `composer audit` to check installed/locked packages against security advisories",
+      "steps": [
+        "Developer invokes audit command (with optional flags)",
+        "AuditCommand::getPackages() resolves package list (installed or from lock file)",
+        "AuditConfig::fromConfig() loads audit configuration (ignoreList, severities, abandoned policy)",
+        "FilterListConfig::fromConfig() loads filter list configuration",
+        "Auditor::audit() queries RepositorySet for advisories and reports results"
+      ],
+      "options": [
+        "--no-dev: exclude dev packages",
+        "--locked: use composer.lock instead of installed packages",
+        "--format: table|plain|json|summary",
+        "--abandoned: ignore|report|fail",
+        "--ignore-severity: low|medium|high|critical",
+        "--ignore-unreachable: skip repos returning non-200",
+        "--filtered: ignore|report|fail for filtered packages"
+      ],
+      "returns": "exit code (min 255), non-zero on vulnerabilities found"
+    },
+    {
+      "id": "UC2",
+      "name": "Authenticate with Repository",
+      "actor": "Developer",
+      "class": "AuthHelper",
+      "entry_point": "promptAuthIfNeeded(url, origin, statusCode, reason, headers, retryCount, responseBody): array{retry, storeAuth}",
+      "description": "When an HTTP 401/403 occurs, AuthHelper prompts for or retrieves credentials and retries the request",
+      "sub_flows": [
+        "GitHub: authorizeOAuth() or authorizeOAuthInteractively(); handles rate-limit and SSO headers",
+        "GitLab: authorizeOAuth() or authorizeOAuthInteractively(); rejects invalid private/ci tokens",
+        "Bitbucket: requestToken() to exchange credentials for OAuth token; authorizeOAuthInteractively() if needed",
+        "Generic HTTP: asks username/password interactively; throws TransportException if non-interactive"
+      ],
+      "result": "returns {retry: true, storeAuth: bool|'prompt'} or throws TransportException"
+    },
+    {
+      "id": "UC3",
+      "name": "Store Credentials",
+      "actor": "Developer",
+      "class": "AuthHelper",
+      "entry_point": "storeAuth(origin, storeAuth): void",
+      "description": "After a successful authenticated request, optionally persist credentials to auth.json",
+      "steps": [
+        "If storeAuth===true: immediately write to auth config source",
+        "If storeAuth==='prompt': ask user 'Do you want to store credentials for X?'",
+        "Calls configSource->addConfigSetting('http-basic.<origin>', io->getAuthentication(origin))"
+      ]
+    },
+    {
+      "id": "UC4",
+      "name": "Add Authentication Headers to Request",
+      "actor": "RepositoryServer",
+      "class": "AuthHelper",
+      "entry_point": "addAuthenticationOptions(options, origin, url): array",
+      "description": "Inject the correct auth header type into outgoing HTTP request options",
+      "auth_strategies": [
+        "Bearer token: Authorization: Bearer <username>",
+        "GitHub OAuth: Authorization: token <username> (api.github.com only)",
+        "GitLab OAuth2: Authorization: Bearer <username>",
+        "GitLab private-token/ci-token: PRIVATE-TOKEN: <username>",
+        "Bitbucket OAuth: Authorization: Bearer <password>",
+        "SSL client certificate: sets ssl options from auth.json",
+        "Custom headers: injects arbitrary headers from auth.json",
+        "HTTP Basic: Authorization: Basic base64(username:password)"
+      ],
+      "note": "api.bitbucket.org and api.github.com are recursively redirected to their root origins"
+    },
+    {
+      "id": "UC5",
+      "name": "Configure Proxy for HTTP Requests",
+      "actor": "SystemEnvironment",
+      "class": "ProxyManager",
+      "entry_point": "getInstance(): ProxyManager (singleton)",
+      "description": "ProxyManager reads proxy environment variables and returns the appropriate proxy for each request URL",
+      "steps": [
+        "Reads http_proxy / HTTP_PROXY (CLI-only for security)",
+        "Reads cgi_http_proxy / CGI_HTTP_PROXY as fallback",
+        "Reads https_proxy / HTTPS_PROXY",
+        "Reads no_proxy / NO_PROXY → creates NoProxyPattern",
+        "getProxyForRequest(url): returns RequestProxy.none(), RequestProxy.noProxy(), or proxy.toRequestProxy(scheme)"
+      ],
+      "security_note": "http_proxy from $_SERVER is only read in CLI (PHP_SAPI=cli|phpdbg) to prevent header injection in CGI"
+    },
+    {
+      "id": "UC6",
+      "name": "Throw Security Exception on Invalid Signature",
+      "actor": "RepositoryServer",
+      "class": "RepositorySecurityException",
+      "entry_point": "new RepositorySecurityException(message)",
+      "description": "Thrown by repository code when a package signature is broken or missing",
+      "note": "Extends \\Exception directly. Caught by callers to abort insecure downloads."
+    }
+  ],
+
+  "relationships": [
+    "Developer <<include>> UC1 (runs audit)",
+    "UC1 <<include>> UC5 (HTTP requests through proxy during advisory fetch)",
+    "UC1 <<extend>> UC2 (advisory fetch may trigger 401 → auth flow)",
+    "Developer <<include>> UC2 (interactive credential prompt)",
+    "UC2 <<include>> UC3 (store credentials after success)",
+    "UC2 <<include>> UC4 (inject auth headers on retry)",
+    "RepositoryServer <<extend>> UC6 (throws on bad signature)",
+    "SystemEnvironment <<include>> UC5 (provides proxy env vars)"
+  ],
+
+  "key_classes": [
+    {
+      "class": "AuditCommand",
+      "namespace": "Composer\\Command",
+      "extends": "BaseCommand",
+      "key_methods": ["configure()", "execute(InputInterface, OutputInterface): int", "getPackages(Composer, InputInterface): PackageInterface[]"],
+      "depends_on": ["Auditor", "AuditConfig", "RepositorySet", "FilterListConfig", "FilterListProviderSet"]
+    },
+    {
+      "class": "AuthHelper",
+      "namespace": "Composer\\Util",
+      "key_methods": [
+        "storeAuth(origin, storeAuth): void",
+        "promptAuthIfNeeded(url, origin, statusCode, ...): array{retry, storeAuth}",
+        "addAuthenticationOptions(options, origin, url): array",
+        "addAuthenticationHeader(headers, origin, url): string[] [deprecated]",
+        "isPublicBitBucketDownload(url): bool"
+      ],
+      "depends_on": ["IOInterface", "Config", "GitHub", "GitLab", "Bitbucket", "TransportException"]
+    },
+    {
+      "class": "ProxyManager",
+      "namespace": "Composer\\Util\\Http",
+      "pattern": "Singleton",
+      "key_methods": [
+        "getInstance(): ProxyManager",
+        "reset(): void",
+        "hasProxy(): bool",
+        "getProxyForRequest(url): RequestProxy"
+      ],
+      "private_methods": ["getProxyData()", "getProxyForScheme(scheme): ?ProxyItem", "getProxyEnv(name): array", "noProxy(url): bool"],
+      "depends_on": ["ProxyItem", "RequestProxy", "NoProxyPattern", "TransportException"]
+    },
+    {
+      "class": "RepositorySecurityException",
+      "namespace": "Composer\\Repository",
+      "extends": "\\Exception",
+      "description": "Marker exception for broken/missing package signatures"
+    }
+  ],
+
+  "important_notes": [
+    "AuditCommand supports exit codes for CI use: non-zero = vulnerabilities found",
+    "AuthHelper supports 6 auth strategies: Bearer, GitHub OAuth, GitLab OAuth/private-token, Bitbucket OAuth, SSL cert, HTTP Basic",
+    "ProxyManager is a singleton; reset() is provided for tests",
+    "ProxyManager restricts http_proxy to CLI SAPI only (security: CGI could allow header injection)",
+    "RepositorySecurityException is a thin marker class — logic lives in repository implementations",
+    "AuthHelper::addAuthenticationHeader() is deprecated since Composer 2.9; use addAuthenticationOptions()"
+  ],
+
+  "source_files_analyzed": [
+    "src/Composer/Command/AuditCommand.php",
+    "src/Composer/Util/AuthHelper.php",
+    "src/Composer/Util/Http/ProxyManager.php",
+    "src/Composer/Repository/RepositorySecurityException.php"
+  ]
+}

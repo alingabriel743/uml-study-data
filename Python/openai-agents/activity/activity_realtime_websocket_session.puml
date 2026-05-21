@@ -1,0 +1,190 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 11
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #DEE2E6
+    DiamondBorderColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleBackgroundColor #E9ECEF
+}
+skinparam ArrowColor #495057
+skinparam NoteBackgroundColor #FFF9C4
+skinparam NoteBorderColor #CCA800
+
+title Realtime WebSocket Session
+
+|Client (Browser / App)|
+|Server — FastAPI / WebSocketManager|
+|RealtimeSession|
+|RealtimeModel|
+
+' ─────────────────────────────────────────
+'  CONNECTION SETUP
+' ─────────────────────────────────────────
+|Client (Browser / App)|
+start
+:Open WebSocket\n**GET /ws/{session_id}**;
+
+|Server — FastAPI / WebSocketManager|
+:websocket.accept();
+:get_starting_agent() → **RealtimeAgent**;
+:Create **RealtimeRunner**(agent, RealtimeRunConfig);
+:runner.run(model_config)\n→ async session context manager;
+note right
+  Default model config:
+  • model: gpt-realtime-1.5
+  • turn_detection: server_vad
+  • silence_duration_ms: 500
+  • interrupt_response: true
+end note
+
+|RealtimeSession|
+:**RealtimeSession** created\n(session_context.__aenter__());
+
+|Server — FastAPI / WebSocketManager|
+:Store in active_sessions, session_contexts,\nwebsockets[session_id];
+
+' ─────────────────────────────────────────
+'  TWO CONCURRENT TASKS
+' ─────────────────────────────────────────
+fork
+  ' ── BACKGROUND: event forwarding loop ──
+  note: **Background Task** — asyncio.create_task(_process_events)
+
+  |RealtimeSession|
+  repeat
+    :Yield next **RealtimeSessionEvent**\nfrom _event_queue;
+
+    |Server — FastAPI / WebSocketManager|
+    :_serialize_event(event) → dict;
+    :websocket.send_text(JSON event);
+    note right
+      Events forwarded to client:
+      • **agent_start** / **agent_end**
+      • **handoff** {from, to}
+      • **tool_start** / **tool_end** {output}
+      • **tool_approval_required** {call_id, args}
+      • **audio** {base64} / **audio_interrupted** / **audio_end**
+      • **history_updated** / **history_added**
+      • **guardrail_tripped** {guardrail_results}
+      • **error** / **input_audio_timeout_triggered**
+      • **raw_model_event**
+    end note
+
+    |RealtimeSession|
+  repeat while (Session active?) is (yes)
+  -> session closed;
+
+fork again
+  ' ── MAIN: client receive loop ──
+  |Server — FastAPI / WebSocketManager|
+  repeat
+    :await websocket.receive_text();
+    :json.loads(data) → message dict;
+
+    if (type == **'audio'**?) then (yes)
+      :Pack int16 PCM16 array\n→ audio_bytes (struct.pack);
+      |RealtimeSession|
+      :session.send_audio(audio_bytes);
+      |RealtimeModel|
+      :send_event(**RealtimeModelSendAudio**\naudio_bytes, commit=False);
+      |Server — FastAPI / WebSocketManager|
+
+    elseif (type == **'commit_audio'**?) then (yes)
+      |RealtimeModel|
+      :send_event(**RealtimeModelSendRawMessage**\n{type: input_audio_buffer.commit});
+      |Server — FastAPI / WebSocketManager|
+
+    elseif (type == **'image'** (single-shot)?) then (yes)
+      :Extract data_url + prompt_text;
+      :Build **RealtimeUserInputMessage**\n(input_image + input_text);
+      |RealtimeSession|
+      :session.send_message(user_msg);
+      |RealtimeModel|
+      :send_event(**RealtimeModelSendUserInput**);
+      |Server — FastAPI / WebSocketManager|
+      :send_text({type: client_info,\ninfo: image_enqueued});
+
+    elseif (type == **'image_start'**?) then (yes)
+      :Init image_buffers[img_id]\n= {text, chunks: []};
+      :send_text(image_start_ack);
+
+    elseif (type == **'image_chunk'**?) then (yes)
+      :Append chunk to image_buffers[img_id];
+      if (chunk_count % 10 == 0?) then (yes)
+        :send_text(image_chunk_ack);
+      endif
+      note right: Max frame size:\n16 MB (ws_max_size)
+
+    elseif (type == **'image_end'**?) then (yes)
+      :Pop image_buffers[img_id];
+      :Join chunks → complete data_url;
+      :Build **RealtimeUserInputMessage**;
+      |RealtimeSession|
+      :session.send_message(user_msg);
+      |RealtimeModel|
+      :send_event(**RealtimeModelSendUserInput**);
+      |Server — FastAPI / WebSocketManager|
+      :send_text({type: client_info,\ninfo: image_enqueued});
+
+    elseif (type == **'tool_approval_decision'**?) then (yes)
+      :Extract call_id, approve, always flags;
+      if (call_id present?) then (no)
+        :Send error response to client;
+      else (yes)
+        if (approve == True?) then (approve)
+          |RealtimeSession|
+          :Pop from _pending_tool_calls;
+          :context_wrapper.approve_tool\n(approval_item, always_approve=always);
+          note right: always=True permanently\nallows this tool for session
+          if (async_tool_calls?) then (yes)
+            :_enqueue_tool_call_task();
+          else (no)
+            :await _handle_tool_call();
+          endif
+          |Server — FastAPI / WebSocketManager|
+        else (reject)
+          |RealtimeSession|
+          :Pop from _pending_tool_calls;
+          :Send **REJECTION_MESSAGE**\nas tool output to model;
+          note right: always=True permanently\nblocks this tool for session
+          |Server — FastAPI / WebSocketManager|
+        endif
+      endif
+
+    elseif (type == **'interrupt'**?) then (yes)
+      |RealtimeSession|
+      :session.interrupt();
+      |RealtimeModel|
+      :send_event(**RealtimeModelSendInterrupt**());
+      |Server — FastAPI / WebSocketManager|
+    endif
+
+  repeat while (WebSocket connected?) is (yes)
+  -> WebSocketDisconnect;
+
+end fork
+
+' ─────────────────────────────────────────
+'  CLEANUP
+' ─────────────────────────────────────────
+|Server — FastAPI / WebSocketManager|
+:manager.disconnect(session_id);
+:session_context.__aexit__(None, None, None);
+:Delete from active_sessions,\nsession_contexts, websockets;
+
+|Client (Browser / App)|
+stop
+
+@enduml

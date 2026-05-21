@@ -1,0 +1,170 @@
+{
+  "scope": "custom_converters",
+  "title": "Custom Type Converters",
+  "diagram_type": "use_case",
+  "description": "Developer registers custom converters to transform column values during CDC. Pluggable column value converter framework.",
+
+  "actors": [
+    "Developer (external user)",
+    "ConnectorTask (system actor)",
+    "CustomConverterServiceProvider",
+    "DefaultServiceRegistry",
+    "CustomConverterRegistry",
+    "CustomConverter (interface)",
+    "CustomConverterFactory (SPI)"
+  ],
+
+  "use_cases": [
+    "Register custom converter via connector config (converters=<name>)",
+    "Configure converter with prefix-scoped properties (<name>.<prop>)",
+    "Register converter via SPI/ServiceLoader (CustomConverterFactory)",
+    "Lookup converter for a specific column (converterFor)",
+    "Transform column value during CDC event processing",
+    "Register schema override for converted column",
+    "Skip conversion (no matching converter returns empty)"
+  ],
+
+  "key_classes": [
+    {
+      "name": "CustomConverter<S, F>",
+      "package": "io.debezium.spi.converter",
+      "type": "interface",
+      "methods": [
+        "void configure(Properties props)",
+        "void converterFor(F field, ConverterRegistration<S> registration)"
+      ],
+      "inner_types": [
+        "interface Converter { Object convert(Object input); }",
+        "interface ConverterRegistration<S> { void register(S fieldSchema, Converter converter); }"
+      ],
+      "notes": "@Incubating; generic on S=SchemaBuilder, F=ConvertedField"
+    },
+    {
+      "name": "CustomConverterServiceProvider",
+      "package": "io.debezium.converters.custom",
+      "type": "class",
+      "implements": "ServiceProvider<CustomConverterRegistry>",
+      "methods": [
+        "CustomConverterRegistry createService(Configuration configuration, ServiceRegistry serviceRegistry)",
+        "Class<CustomConverterRegistry> getServiceClass()",
+        "private CustomConverter createConverter(Configuration configuration, String name)"
+      ],
+      "behavior": [
+        "Reads 'converters' config key (CUSTOM_CONVERTERS field) as comma-separated names",
+        "For each name: instantiates class at '<name>.type', calls configure(subset props)",
+        "Also loads additional converters via ServiceLoader<CustomConverterFactory>",
+        "Returns new CustomConverterRegistry(combinedList)"
+      ]
+    },
+    {
+      "name": "CustomConverterFactory",
+      "package": "io.debezium.converters.custom",
+      "type": "interface",
+      "methods": ["CustomConverter<SchemaBuilder, ConvertedField> get()"],
+      "notes": "@Incubating; loaded via java.util.ServiceLoader"
+    },
+    {
+      "name": "CustomConverterRegistry",
+      "package": "io.debezium.relational",
+      "type": "class",
+      "implements": "Service",
+      "annotations": ["@ThreadSafe"],
+      "fields": [
+        "List<CustomConverter<SchemaBuilder, ConvertedField>> converters (immutable)",
+        "Map<String, ConverterDefinition<SchemaBuilder>> conversionFunctionMap"
+      ],
+      "methods": [
+        "Optional<SchemaBuilder> registerConverterFor(TableId table, Column column, Object defaultValue)",
+        "Optional<ValueConverter> getValueConverter(TableId table, Column column)",
+        "boolean isEmpty()"
+      ],
+      "notes": "Key: 'tableId.columnName'. Iterates all converters; first match wins. Removes stale entries on schema change."
+    },
+    {
+      "name": "DefaultServiceRegistry",
+      "package": "io.debezium.service",
+      "type": "class",
+      "implements": "ServiceRegistry",
+      "annotations": ["@ThreadSafe", "@Incubating"],
+      "methods": [
+        "void registerServiceProvider(ServiceProvider<T> serviceProvider)",
+        "<T extends Service> T getService(Class<T> serviceClass)",
+        "void close()"
+      ],
+      "behavior": "Lazy initialization: on getService(), calls serviceProvider.createService(config, registry), then injectDependencies → configure → start"
+    },
+    {
+      "name": "BinlogUnsignedIntegerConverter",
+      "package": "io.debezium.connector.binlog",
+      "type": "class (utility, not CustomConverter)",
+      "methods": [
+        "static short convertUnsignedTinyint(short)",
+        "static int convertUnsignedSmallint(int)",
+        "static int convertUnsignedMediumint(int)",
+        "static long convertUnsignedInteger(long)",
+        "static BigDecimal convertUnsignedBigint(BigDecimal)"
+      ],
+      "notes": "Used internally by BinlogValueConverters; corrects signed binlog representation of unsigned MySQL integer types. Not a CustomConverter implementor."
+    },
+    {
+      "name": "TinyIntOneToBooleanConverter",
+      "package": "io.debezium.connector.binlog.converters",
+      "type": "class",
+      "implements": ["CustomConverter<SchemaBuilder, RelationalColumn>", "ConfigDescriptor"],
+      "config_props": ["selector (regex for table.column)", "length.checker (bool, default true)"],
+      "behavior": "Registers SchemaBuilder.bool() for TINYINT(1) columns matching selector; converts Number/Boolean/String to Boolean"
+    }
+  ],
+
+  "interaction_flow": [
+    "Developer sets 'converters=myconv' and 'myconv.type=com.example.MyConverter' in connector config",
+    "BaseSourceTask.registerServiceProviders() → serviceRegistry.registerServiceProvider(new CustomConverterServiceProvider())",
+    "ConnectorTask calls serviceRegistry.getService(CustomConverterRegistry.class)",
+    "DefaultServiceRegistry.getService() → lazy-init → CustomConverterServiceProvider.createService(config, registry)",
+    "CustomConverterServiceProvider reads 'converters' list, instantiates each via config.getInstance('<name>.type')",
+    "Each converter's configure(props) called with '<name>.*' scoped properties",
+    "ServiceLoader<CustomConverterFactory> checked for additional programmatic converters",
+    "Returns new CustomConverterRegistry(allConverters)",
+    "ConnectorTask passes CustomConverterRegistry to DatabaseSchema constructor",
+    "At schema build time: CustomConverterRegistry.registerConverterFor(table, column, defaultValue)",
+    "  → iterates converters, calls converter.converterFor(RelationalColumn, registration)",
+    "  → first converter that calls registration.register(schema, converter) wins",
+    "  → stores ConverterDefinition(fieldSchema, converter) in conversionFunctionMap",
+    "During CDC row processing: CustomConverterRegistry.getValueConverter(table, column)",
+    "  → returns ValueConverter wrapping ConverterDefinition.converter.convert(x)"
+  ],
+
+  "key_relationships": [
+    "BaseSourceTask registers CustomConverterServiceProvider into DefaultServiceRegistry",
+    "CustomConverterServiceProvider implements ServiceProvider<CustomConverterRegistry>",
+    "CustomConverterServiceProvider creates CustomConverterRegistry",
+    "CustomConverterRegistry holds List<CustomConverter>",
+    "CustomConverter (interface) implemented by: TinyIntOneToBooleanConverter, JdbcSinkDataTypesConverter, RawToStringConverter, NumberOneToBooleanConverter, NumberToZeroScaleConverter, user-defined converters",
+    "CustomConverterFactory (SPI) alternative registration path via ServiceLoader",
+    "BinlogUnsignedIntegerConverter is NOT a CustomConverter; it is an internal utility used by BinlogValueConverters"
+  ],
+
+  "config_keys": [
+    "converters — comma-separated list of converter name prefixes (CommonConnectorConfig.CUSTOM_CONVERTERS)",
+    "<name>.type — fully-qualified class implementing CustomConverter",
+    "<name>.<prop> — converter-specific configuration (passed as Properties to configure())"
+  ],
+
+  "extension_points": [
+    "Implement CustomConverter<SchemaBuilder, RelationalColumn> and declare class in connector config",
+    "Implement CustomConverterFactory and register via META-INF/services/io.debezium.converters.custom.CustomConverterFactory (SPI)"
+  ],
+
+  "important_notes": "BinlogUnsignedIntegerConverter is a static utility class (not pluggable). The pluggable framework is CustomConverter SPI. CustomConverterRegistry is thread-safe. First converter match wins per column.",
+
+  "source_files_analyzed": [
+    "debezium-connector-common/src/main/java/io/debezium/converters/custom/CustomConverterServiceProvider.java",
+    "debezium-connector-common/src/main/java/io/debezium/converters/custom/CustomConverterFactory.java",
+    "debezium-api/src/main/java/io/debezium/spi/converter/CustomConverter.java",
+    "debezium-connector-common/src/main/java/io/debezium/relational/CustomConverterRegistry.java",
+    "debezium-connector-common/src/main/java/io/debezium/service/DefaultServiceRegistry.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogUnsignedIntegerConverter.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/converters/TinyIntOneToBooleanConverter.java",
+    "debezium-connector-common/src/main/java/io/debezium/connector/common/BaseSourceTask.java (grep)"
+  ]
+}

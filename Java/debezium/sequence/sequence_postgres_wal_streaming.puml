@@ -1,0 +1,232 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+}
+
+title PostgreSQL WAL Streaming Flow
+
+actor "Kafka Connect" as kc
+participant "PostgresStreamingChangeEventSource" as psces
+participant "PostgresReplicationConnection" as prc
+participant "WalPositionLocator" as wpl
+participant "ReplicationStream\n(PgReplicationStream)" as rs
+participant "MessageDecoder\n(PgOutputMessageDecoder)" as md
+participant "PostgresOffsetContext" as poc
+participant "PostgresEventDispatcher" as ped
+participant "PostgresChangeRecordEmitter" as pcre
+participant "PostgreSQL Server\n(WAL)" as pg
+
+== Initialization ==
+
+kc -> psces: execute(context, partition, offsetContext)
+activate psces
+
+psces -> poc: hasCompletelyProcessedPosition()?
+activate poc
+poc --> psces: lastCompletelyProcessedLsn / lsn
+deactivate poc
+
+psces -> wpl: new WalPositionLocator(lastCommitLsn, lsn, lastOpType)
+activate wpl
+wpl --> psces: walPosition
+deactivate wpl
+
+== Replication Slot & Streaming Setup ==
+
+psces -> prc: startStreaming(lsn, walPosition)
+activate prc
+
+prc -> pg: SELECT * FROM pg_replication_slots WHERE slot_name = ?
+activate pg
+pg --> prc: slot info (or not found)
+deactivate pg
+
+alt Slot does not exist
+    prc -> pg: CREATE_REPLICATION_SLOT <slotName> LOGICAL <plugin>
+    activate pg
+    pg --> prc: SlotCreationResult (confirmedLsn, snapshotName)
+    deactivate pg
+else Slot exists
+    prc -> pg: READ_REPLICATION_SLOT info
+    activate pg
+    pg --> prc: confirmedFlushLsn
+    deactivate pg
+end
+
+note over prc: Init publication (pgoutput only)
+prc -> pg: SELECT puballtables FROM pg_publication WHERE pubname = ?
+activate pg
+pg --> prc: exists / not found
+deactivate pg
+
+alt Publication does not exist
+    prc -> pg: CREATE PUBLICATION <name> FOR ALL TABLES
+    activate pg
+    pg --> prc: ok
+    deactivate pg
+end
+
+prc -> pg: START_REPLICATION SLOT <slotName> LOGICAL <lsn> (plugin_params)
+activate pg
+pg --> prc: PGReplicationStream
+deactivate pg
+
+prc --> psces: ReplicationStream
+deactivate prc
+
+psces -> rs: startKeepAlive(executorService)
+activate rs
+rs --> psces: keep-alive thread started
+deactivate rs
+
+== Main WAL Streaming Loop ==
+
+loop context.isRunning() && !commitOffsetFailure
+
+    psces -> rs: readPending(messageProcessor)
+    activate rs
+    rs -> pg: poll WAL bytes (non-blocking)
+    activate pg
+    pg --> rs: ByteBuffer (WAL record) or null
+    deactivate pg
+
+    alt WAL message received
+        rs -> md: processMessage(walBuffer, processor)
+        activate md
+        md -> md: decode binary WAL record\n(relation, operation, columns)
+        md --> rs: ReplicationMessage (operation, table, columns, LSN)
+        deactivate md
+
+        rs --> psces: true (message received)
+        deactivate rs
+
+        psces -> psces: processReplicationMessages(partition, offsetContext, stream, message)
+
+        psces -> rs: lastReceivedLsn()
+        activate rs
+        rs --> psces: Lsn
+        deactivate rs
+
+        alt BEGIN message
+            psces -> poc: clearOrigin()
+            activate poc
+            deactivate poc
+            psces -> poc: updateWalPosition(lsn, lastProcessedLsn, commitTime, txId, xmin, BEGIN)
+            activate poc
+            deactivate poc
+            psces -> ped: dispatchTransactionStartedEvent(partition, txId, offsetContext, commitTime)
+            activate ped
+            ped --> psces: ok
+            deactivate ped
+
+        else COMMIT message
+            psces -> poc: updateWalPosition(lsn, lastProcessedLsn, commitTime, txId, xmin, COMMIT)
+            activate poc
+            deactivate poc
+            psces -> poc: updateCommitPosition(lsn, lastProcessedLsn)
+            activate poc
+            deactivate poc
+            psces -> ped: dispatchHeartbeatEvent(partition, offsetContext)
+            activate ped
+            ped --> psces: ok
+            deactivate ped
+            psces -> ped: dispatchTransactionCommittedEvent(partition, offsetContext, commitTime)
+            activate ped
+            ped --> psces: ok
+            deactivate ped
+
+        else DML (INSERT / UPDATE / DELETE)
+            psces -> poc: updateWalPosition(lsn, lastProcessedLsn, commitTime, txId, xmin, tableId, op)
+            activate poc
+            deactivate poc
+            psces -> pcre: new PostgresChangeRecordEmitter(partition, offsetContext, clock, config, schema, connection, tableId, message)
+            activate pcre
+            psces -> ped: dispatchDataChangeEvent(partition, tableId, emitter)
+            activate ped
+            ped -> pcre: emitChangeRecords(table, receiver)
+            activate pcre
+            pcre --> ped: SourceRecord(s)
+            deactivate pcre
+            deactivate pcre
+            ped --> psces: dispatched = true
+            deactivate ped
+
+        else LOGICAL DECODING MESSAGE
+            psces -> poc: updateWalPosition(lsn, ..., MESSAGE)
+            activate poc
+            deactivate poc
+            psces -> ped: dispatchLogicalDecodingMessage(partition, offsetContext, ts, message)
+            activate ped
+            ped --> psces: ok
+            deactivate ped
+        end
+
+    else No message available
+        rs --> psces: false (no message)
+        psces -> ped: dispatchHeartbeatEvent(partition, offsetContext)
+        activate ped
+        ped --> psces: ok
+        deactivate ped
+    end
+
+end
+
+== LSN Commit / WAL Acknowledgement ==
+
+kc -> psces: commitOffset(partition, offset)
+activate psces
+note right of psces: Called asynchronously\nafter Kafka offset commit
+
+psces -> rs: flushLsn(lsn)
+activate rs
+rs -> pg: Standby Status Update\n(writeLsn, flushLsn, applyLsn)
+activate pg
+pg --> rs: ok (WAL segments before lsn can be recycled)
+deactivate pg
+rs --> psces: ok
+deactivate rs
+deactivate psces
+
+== Shutdown ==
+
+psces -> rs: stopKeepAlive()
+activate rs
+rs --> psces: ok
+deactivate rs
+
+psces -> prc: close()
+activate prc
+prc -> pg: close replication connection
+activate pg
+pg --> prc: ok
+deactivate pg
+prc --> psces: ok
+deactivate prc
+
+deactivate psces
+
+@enduml

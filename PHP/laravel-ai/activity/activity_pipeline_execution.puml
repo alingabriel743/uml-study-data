@@ -1,0 +1,148 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam ArrowColor #495057
+skinparam NoteBackgroundColor #FFF9C4
+skinparam NoteBorderColor #F0C000
+
+title Pipeline Execution\n<size:11><color:#6C757D>pipeline() helper orchestrating sequential processing stages via GeneratesText trait</color></size>
+
+|GeneratesText|
+start
+:Caller invokes **TextProvider::prompt(AgentPrompt $prompt)**;
+:Generate UUID invocation ID\n<size:10>Str::uuid7()</size>;
+:Create **pipeline()** instance\n<size:10>Illuminate\\Pipeline\\Pipeline(Container::getInstance())\n.send($prompt).through($middleware).then($callback)</size>;
+
+|Middleware Assembly|
+:Initialize empty middleware stack;
+
+if (Agent is faked?\n<size:10>Ai::hasFakeGatewayFor(agent)</size>) then (yes)
+  :Prepend **fake-recording middleware**\n<size:10>Ai::recordPrompt()</size>;
+else (no)
+endif
+
+if (Agent uses **RemembersConversations** trait\n+ hasConversationParticipant()?) then (yes)
+  :Append **RememberConversation** middleware;
+else (no)
+endif
+
+if (Agent implements **HasMiddleware**?) then (yes)
+  :Append agent's own **middleware()** array;
+else (no)
+endif
+
+|GeneratesText|
+note right
+  Assembled middleware stack
+  is passed to .through()
+end note
+
+:Pipeline executes middleware chain **sequentially**;
+
+repeat
+  :Middleware receives **AgentPrompt**\n<size:10>can read / transform prompt, attachments, model</size>;
+  :Middleware calls **$next($prompt)**\nto pass control to next stage;
+repeat while (More middleware?) is (yes)
+-> no, all middleware passed;
+
+note right
+  RememberConversation wraps
+  $next() — stores conversation
+  data **after** the response returns
+end note
+
+:**Terminal callback** invoked;
+:Store **processedPrompt** reference;
+:Dispatch **PromptingAgent** event\n<size:10>(invocationId, prompt)</size>;
+
+if (Agent implements **Conversational**?) then (yes)
+  :Load **agent->messages()** as\nconversation history base;
+else (no)
+  :Use **empty []** as messages base;
+endif
+
+:Append **UserMessage**(prompt text, attachments)\nto messages array;
+:Register tool event listeners\n<size:10>listenForToolInvocations(invocationId, agent)</size>;
+
+if (Agent implements **HasStructuredOutput**?) then (yes)
+  :Build **JSON schema**\n<size:10>agent->schema(JsonSchemaTypeFactory)</size>;
+else (no)
+  :Set **$schema = null**;
+endif
+
+|TextGateway|
+:Call **textGateway()->generateText(**\n  provider, model, instructions,\n  messages, tools, schema,\n  TextGenerationOptions::forAgent(agent), timeout\n**)**;
+
+:Send request to **LLM API**;
+
+repeat
+  :Receive LLM response chunk / message;
+  :Accumulate into **Step** or **StructuredStep**\n<size:10>text, finishReason, usage, meta</size>;
+  if (Response contains **tool call**?) then (yes)
+    :Dispatch **InvokingTool** event\n<size:10>assign currentToolInvocationId</size>;
+    :Execute tool, capture result;
+    :Dispatch **ToolInvoked** event\n<size:10>with tool result</size>;
+    :Append tool result to messages\nand re-submit to LLM;
+  else (no)
+  endif
+repeat while (LLM requests more tool calls?) is (yes)
+-> no, final text response received;
+
+:Return **GatewayResponse**\n<size:10>text, structured?, toolCalls[], toolResults[],\nsteps[], usage, meta, messages[]</size>;
+
+|GeneratesText|
+if (**$schema** is not null?\n<size:10>structured output requested</size>) then (yes)
+  :Build **StructuredAgentResponse**\n<size:10>new StructuredAgentResponse(\n  invocationId, structured, text, usage, meta)\n  .withToolCallsAndResults(...)\n  .withSteps(steps)</size>;
+else (no)
+  :Build **AgentResponse**\n<size:10>new AgentResponse(\n  invocationId, text, usage, meta)\n  .withMessages(messages)\n  .withToolCallsAndResults(...)\n  .withSteps(steps)</size>;
+endif
+
+|ConversationStore|
+if (Agent uses **RemembersConversations**?) then (yes)
+  if (Agent has **no** currentConversation()?) then (yes)
+    :Generate **conversation title**\n<size:10>textGateway()->generateText(cheapestTextModel)\n→ 3–5 word summary of prompt</size>;
+    :**store->storeConversation**(participantId, title)\n→ get conversationId;
+    :agent->**continue**(conversationId, participant);
+  else (no — reuse existing conversation)
+  endif
+  :store->**storeUserMessage**\n<size:10>(conversation, participantId, prompt)</size>;
+  :store->**storeAssistantMessage**\n<size:10>(conversation, participantId, prompt, response)</size>;
+  :response->**withinConversation**\n<size:10>(conversation, participant)</size>;
+else (no)
+endif
+
+|GeneratesText|
+:Dispatch **AgentPrompted** event\n<size:10>(invocationId, processedPrompt, response)</size>;
+
+:Return **AgentResponse** | **StructuredAgentResponse**;
+stop
+
+@enduml

@@ -1,0 +1,126 @@
+{
+  "scope": "embedding_generation_flow",
+  "title": "Embedding Generation Flow",
+  "diagram_type": "activity",
+  "key_participants": [
+    "Embeddings (facade)",
+    "PendingEmbeddingsGeneration",
+    "Provider (EmbeddingProvider)",
+    "GeneratesEmbeddings (trait)",
+    "HasEmbeddingGateway (trait)",
+    "EmbeddingGateway (interface)",
+    "FakeEmbeddingGateway",
+    "EmbeddingsPrompt",
+    "EmbeddingsResponse",
+    "GeneratingEmbeddings (event)",
+    "EmbeddingsGenerated (event)",
+    "Ai (manager)",
+    "InteractsWithFakeEmbeddings (trait)",
+    "Cache"
+  ],
+
+  "activity_flow": [
+    "START: Caller invokes Embeddings::for(string[] inputs): PendingEmbeddingsGeneration",
+    "ACTIVITY: PendingEmbeddingsGeneration constructed with $inputs; optional fluent config via ->dimensions(int), ->timeout(int), ->cache(?int)",
+    "ACTIVITY: Caller calls ->generate(?provider, ?model) OR ->queue(?provider, ?model)",
+
+    "FORK [generate path]:",
+    "  ACTIVITY: Provider::formatProviderAndModelList() resolves provider+model list (from arg or ai.default_for_embeddings config)",
+    "  LOOP: foreach resolved providers (failover list):",
+    "    ACTIVITY: Ai::fakeableEmbeddingProvider($provider) — if faked, wraps provider with FakeEmbeddingGateway",
+    "    ACTIVITY: resolve $model (default if null), resolve $dimensions (default if null)",
+    "    DECISION: caching enabled?",
+    "      YES: Cache::store()->get(sha256 cache key) → hit? return EmbeddingsResponse from cache",
+    "      NO / cache miss: continue",
+    "    ACTIVITY: $provider->embeddings($inputs, $dimensions, $model, $timeout)  [GeneratesEmbeddings trait]",
+    "      ACTIVITY: Generate UUID7 invocationId",
+    "      ACTIVITY: new EmbeddingsPrompt($inputs, $dimensions, $provider, $model, $timeout)",
+    "      DECISION: Ai::embeddingsAreFaked()?",
+    "        YES: Ai::recordEmbeddingsGeneration($prompt) — appends to recordedEmbeddingsGenerations[]",
+    "      ACTIVITY: events->dispatch(new GeneratingEmbeddings(invocationId, provider, model, prompt))",
+    "      ACTIVITY: $this->embeddingGateway()->generateEmbeddings(provider, model, inputs, dimensions, timeout)",
+    "        DECISION: real gateway OR FakeEmbeddingGateway?",
+    "          [Real] ACTIVITY: HTTP call to provider API → parse response → EmbeddingsResponse(embeddings[][], tokens, Meta)",
+    "          [Fake] ACTIVITY: FakeEmbeddingGateway::generateEmbeddings() → nextResponse()",
+    "            DECISION: responses is array or Closure?",
+    "              Array: pick responses[$currentResponseIndex]",
+    "              Closure: call_user_func($responses, $prompt)",
+    "            DECISION: response is null?",
+    "              YES + preventStrayGenerations: throw RuntimeException",
+    "              YES: generateFakeEmbeddings(count, dimensions) → Embeddings::fakeEmbedding(dimensions) × N",
+    "            DECISION: response is array<array<float>>?",
+    "              YES: new EmbeddingsResponse(response, 0, Meta(provider, model))",
+    "              NO: return response as-is",
+    "            ACTIVITY: increment currentResponseIndex++",
+    "      ACTIVITY: events->dispatch(new EmbeddingsGenerated(invocationId, provider, model, prompt, response))",
+    "      RETURN: EmbeddingsResponse",
+    "    DECISION: FailoverableException thrown?",
+    "      YES: event(ProviderFailedOver), continue to next provider",
+    "      NO: optionally cache response → cacheStore()->put(cacheKey, json_encode(response), TTL)",
+    "    RETURN: EmbeddingsResponse to caller",
+    "  END LOOP — if all providers failed: throw $lastException",
+
+    "FORK [queue path]:",
+    "  DECISION: Ai::embeddingsAreFaked()?",
+    "    YES: Ai::recordEmbeddingsGeneration(new QueuedEmbeddingsPrompt(...)) → return QueuedEmbeddingsResponse(FakePendingDispatch)",
+    "    NO: GenerateEmbeddings::dispatch($this, $provider, $model) → return QueuedEmbeddingsResponse(PendingDispatch)",
+    "END"
+  ],
+
+  "key_relationships": [
+    "Embeddings::for() creates PendingEmbeddingsGeneration",
+    "Embeddings::fake() delegates to Ai::fakeEmbeddings() → creates FakeEmbeddingGateway",
+    "Embeddings assert methods delegate to Ai manager (InteractsWithFakeEmbeddings trait)",
+    "PendingEmbeddingsGeneration calls Provider->embeddings() (EmbeddingProvider interface)",
+    "Provider uses GeneratesEmbeddings trait which implements embeddings()",
+    "GeneratesEmbeddings uses HasEmbeddingGateway trait to get EmbeddingGateway",
+    "HasEmbeddingGateway falls back to provider->gateway if embeddingGateway not set",
+    "EmbeddingGateway::generateEmbeddings() is the actual HTTP dispatch point",
+    "FakeEmbeddingGateway implements EmbeddingGateway for testing",
+    "FakeEmbeddingGateway generates normalized random unit vectors via Embeddings::fakeEmbedding()",
+    "Cache layer wraps provider->embeddings() in PendingEmbeddingsGeneration::generate()",
+    "GeneratingEmbeddings event fired before gateway call; EmbeddingsGenerated event fired after"
+  ],
+
+  "interfaces_and_contracts": [
+    "EmbeddingProvider: embeddings(inputs, ?dimensions, ?model, timeout): EmbeddingsResponse; embeddingGateway(): EmbeddingGateway; useEmbeddingGateway(gateway): self; defaultEmbeddingsModel(): string; defaultEmbeddingsDimensions(): int",
+    "EmbeddingGateway: generateEmbeddings(provider, model, inputs, dimensions, timeout): EmbeddingsResponse"
+  ],
+
+  "data_objects": [
+    "EmbeddingsPrompt: inputs[], dimensions, provider, model, timeout — passed to events and fake gateway",
+    "QueuedEmbeddingsPrompt: inputs[], dimensions, provider, model, timeout — for queue path",
+    "EmbeddingsResponse: embeddings[][], tokens, Meta(provider, model) — implements Arrayable, Countable, IteratorAggregate, JsonSerializable",
+    "QueuedEmbeddingsResponse: wraps PendingDispatch or FakePendingDispatch",
+    "GeneratingEmbeddings event: invocationId, provider, model, prompt",
+    "EmbeddingsGenerated event: invocationId, provider, model, prompt, response"
+  ],
+
+  "fake_and_testing_support": [
+    "Embeddings::fake(Closure|array $responses): registers FakeEmbeddingGateway in Ai manager",
+    "Ai::fakeableEmbeddingProvider() injects FakeEmbeddingGateway onto real provider via useEmbeddingGateway()",
+    "FakeEmbeddingGateway cycles through responses array or invokes Closure per request",
+    "If no response found and !preventStrayGenerations: auto-generates random normalized float[] vectors",
+    "preventStrayEmbeddings(true) causes RuntimeException on unfaked generation",
+    "Ai::recordEmbeddingsGeneration() stores prompts in recordedEmbeddingsGenerations[] or recordedQueuedEmbeddingsGenerations[]",
+    "Assert methods: assertEmbeddingsGenerated(cb), assertEmbeddingsNotGenerated(cb), assertNoEmbeddingsGenerated(), assertEmbeddingsQueued(cb), assertEmbeddingsNotQueued(cb), assertNoEmbeddingsQueued()"
+  ],
+
+  "important_notes": "Cache key is sha256(driver-model-dimensions-inputs). Default cache TTL is 30 days. Failover iterates provider list on FailoverableException. VoyageAi test shows: POST to https://api.voyageai.com/v1/embeddings with {model, input, output_dimension}, Bearer token auth, response parsed as {data[].embedding, usage.total_tokens}. Default VoyageAi dimensions = 1024.",
+
+  "source_files_analyzed": [
+    "src/Embeddings.php",
+    "src/PendingResponses/PendingEmbeddingsGeneration.php",
+    "src/Contracts/Providers/EmbeddingProvider.php",
+    "src/Contracts/Gateway/EmbeddingGateway.php",
+    "src/Providers/Concerns/GeneratesEmbeddings.php",
+    "src/Providers/Concerns/HasEmbeddingGateway.php",
+    "src/Events/GeneratingEmbeddings.php",
+    "src/Events/EmbeddingsGenerated.php",
+    "src/Gateway/FakeEmbeddingGateway.php",
+    "src/Concerns/InteractsWithFakeEmbeddings.php",
+    "src/Prompts/EmbeddingsPrompt.php",
+    "src/Responses/EmbeddingsResponse.php",
+    "tests/Feature/Providers/VoyageAi/EmbeddingTest.php"
+  ]
+}

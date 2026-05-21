@@ -1,0 +1,91 @@
+{
+  "scope": "sandbox_memory_generation",
+  "title": "Sandbox Memory Generation and Persistence",
+  "diagram_type": "use_case",
+  "description": "Async pipeline that serializes sandbox run rollouts, extracts per-rollout memories (phase 1), and consolidates them into long-term agent memory (phase 2) when the session closes.",
+
+  "actors": [
+    "SandboxRuntime (initiates enqueue after each run)",
+    "BaseSandboxSession (pre-stop hook triggers flush)",
+    "MemoryWorker (background asyncio.Task, processes queue)",
+    "PhaseOneModel (gpt-5.4-mini, extracts per-rollout summary/memory)",
+    "PhaseTwoModel (gpt-5.4 + reasoning=medium, consolidates memories)",
+    "SandboxMemoryStorage (filesystem I/O on sandbox workspace)"
+  ],
+
+  "use_cases": [
+    "Enqueue Run Result — caller provides RunResultBase + rollout_id; manager serializes via build_rollout_payload_from_result() and appends to per-rollout JSONL file in sessions_dir",
+    "Enqueue Rollout Payload — low-level enqueue; validates rollout_id (file-safe regex), orders fields, writes JSONL via write_rollout()",
+    "Process Rollout File (Phase 1) — MemoryWorker reads JSONL, renders phase-1 prompt, runs gpt-5.4-mini via Runner.run(), validates RolloutExtractionArtifacts, writes raw_memories/<rollout_id>.md and rollout_summaries/<slug>.md",
+    "Flush & Finalize — pre-stop hook; drains queue, waits for worker, triggers phase-2 consolidation, unregisters manager",
+    "Phase 2 Consolidation — builds PhaseTwoInputSelection (capped at max_raw_memories_for_consolidation, default 256, max 4096), rebuilds raw_memories.md, runs gpt-5.4 SandboxAgent via Runner.run() with consolidation prompt, writes phase_two_selection.json",
+    "Ensure Memory Layout — creates directory tree: sessions_dir, memories_dir, raw_memories/, rollout_summaries/, skills/; ensures MEMORY.md and memory_summary.md exist",
+    "Get or Create Manager — factory keyed by (memories_dir, sessions_dir) layout tuple per session; raises UserError on conflicting configs or overlapping layout dirs"
+  ],
+
+  "key_classes": [
+    "SandboxMemoryGenerationManager: orchestrates full pipeline; holds asyncio.Queue + worker Task + flush lock; registers pre_stop_hook on session",
+    "SandboxMemoryStorage: all sandbox filesystem I/O; reads/writes JSONL rollouts, raw memory .md files, rollout summaries, phase_two_selection.json",
+    "MemoryGenerateConfig (@dataclass): phase_one_model=gpt-5.4-mini, phase_two_model=gpt-5.4, phase_two_model_settings=reasoning(medium), max_raw_memories_for_consolidation=256",
+    "RolloutTerminalMetadata (Pydantic): terminal_state in {completed|interrupted|cancelled|failed|max_turns_exceeded|guardrail_tripped}, exception_type, exception_message, has_final_output",
+    "RolloutExtractionArtifacts (Pydantic): rollout_slug, rollout_summary, raw_memory",
+    "PhaseTwoSelectionItem (frozen dataclass): rollout_id, updated_at, rollout_path, rollout_summary_file, terminal_state",
+    "PhaseTwoInputSelection (frozen dataclass): selected list, retained_rollout_ids set, removed list"
+  ],
+
+  "interaction_flow": [
+    "1. SandboxRuntime → Manager.enqueue_result(result, rollout_id) after each sandbox run",
+    "2. Manager calls build_rollout_payload_from_result() → RolloutPayload dict",
+    "3. Manager.enqueue_rollout_payload() validates rollout_id, calls SandboxMemoryStorage.ensure_layout(), appends JSONL via write_rollout() to sessions_dir/<rollout_id>.jsonl",
+    "4. BaseSandboxSession pre-stop hook fires → Manager.flush()",
+    "5. flush() sorts unique rollout files, starts MemoryWorker task, enqueues file paths, awaits queue.join()",
+    "6. MemoryWorker._process_rollout_file() per file: reads JSONL → render_phase_one_prompt() → run_phase_one(config, prompt, RunConfig(sandbox=session)) via gpt-5.4-mini",
+    "7. Phase 1 output validated as RolloutExtractionArtifacts; writes raw_memories/<id>.md and rollout_summaries/<id>_<slug>.md in parallel (asyncio.gather)",
+    "8. flush() sends _STOP sentinel, awaits worker task",
+    "9. Manager._run_phase_two(): storage.build_phase_two_input_selection() → PhaseTwoInputSelection (sorted by updated_at desc, capped)",
+    "10. storage.rebuild_raw_memories() concatenates selected raw_memories/*.md → raw_memories.md",
+    "11. run_phase_two(): creates SandboxAgent(sandbox-memory-phase-two), renders consolidation prompt, Runner.run(agent, prompt) via gpt-5.4",
+    "12. storage.write_phase_two_selection() persists phase_two_selection.json",
+    "13. _unregister_memory_generation_manager() removes manager from WeakKeyDictionary keyed by session"
+  ],
+
+  "key_relationships": [
+    "SandboxMemoryGenerationManager composes SandboxMemoryStorage",
+    "SandboxMemoryGenerationManager depends_on MemoryGenerateConfig (from Memory.generate)",
+    "SandboxMemoryGenerationManager depends_on BaseSandboxSession (registers pre_stop_hook)",
+    "SandboxMemoryGenerationManager creates asyncio.Task (_worker) for background processing",
+    "run_phase_one depends_on Runner.run (gpt-5.4-mini SandboxAgent)",
+    "run_phase_two depends_on Runner.run (gpt-5.4 SandboxAgent)",
+    "get_or_create_memory_generation_manager uses WeakKeyDictionary[BaseSandboxSession, dict[layout_key, Manager]]",
+    "Layout key is tuple(memories_dir, sessions_dir) — enforces isolation between different memory layouts"
+  ],
+
+  "file_layout": {
+    "sessions_dir": "<rollout_id>.jsonl — one JSONL per rollout, appended during session",
+    "memories_dir/raw_memories/<rollout_id>.md": "phase-1 raw memory with frontmatter metadata",
+    "memories_dir/rollout_summaries/<rollout_id>_<slug>.md": "phase-1 rollout summary",
+    "memories_dir/raw_memories.md": "concatenated selected raw memories for phase-2 input",
+    "memories_dir/MEMORY.md": "consolidated agent memory (written by phase-2 SandboxAgent)",
+    "memories_dir/memory_summary.md": "summary file (written by phase-2 SandboxAgent)",
+    "memories_dir/phase_two_selection.json": "persisted selection of rollouts processed by phase 2"
+  },
+
+  "business_rules": [
+    "rollout_id must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ (file-safe)",
+    "Excluded item types from memory: compaction, image_generation_call, reasoning",
+    "max_raw_memories_for_consolidation: 1–4096, default 256",
+    "Phase-2 selection sorted by updated_at descending; older rollouts pruned when limit exceeded",
+    "Multiple Memory capabilities per session allowed only if they use distinct (memories_dir, sessions_dir) pairs",
+    "flush() is idempotent via _stopped flag; safe to call multiple times"
+  ],
+
+  "important_notes": "MemoryRunConfig referenced in scope name maps to RunConfig(sandbox=SandboxRunConfig(session=self._session)) — no separate class. PhaseTwo is run_phase_two() function (not a class). Memory items filtered: only tool calls/outputs included (apply_patch, shell, mcp, function calls etc).",
+
+  "source_files_analyzed": [
+    "src/agents/sandbox/memory/manager.py",
+    "src/agents/sandbox/memory/storage.py",
+    "src/agents/sandbox/memory/phase_two.py",
+    "src/agents/sandbox/memory/rollouts.py",
+    "src/agents/sandbox/config.py (MemoryGenerateConfig)"
+  ]
+}

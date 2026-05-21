@@ -1,0 +1,147 @@
+{
+  "scope": "broadcast_and_event_system",
+  "title": "Broadcast and Event System",
+  "diagram_type": "use_case",
+  "description": "Sending broadcasts to clients, replaying saved broadcasts, and inter-service messaging",
+
+  "actors": [
+    "GUI Client (App/Window)",
+    "Backend Service (BroadcastService)",
+    "Remote Peer (Webhook Consumer)",
+    "Redis Pub/Sub",
+    "EventService",
+    "ServiceManager"
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Send Broadcast to All Open Apps",
+      "actor": "GUI Client / Internal Caller",
+      "description": "Call sendBroadcast(name, data) to postMessage to all .window-app-iframe[data-appUsesSDK=true] iframes",
+      "component": "GUI BroadcastService",
+      "method": "sendBroadcast(name, data, { sendToNewAppInstances })"
+    },
+    {
+      "id": "UC2",
+      "name": "Save Broadcast for Future App Instances",
+      "actor": "Internal Caller",
+      "description": "When sendToNewAppInstances=true, store broadcast in #broadcastsToSendToNewAppInstances Map for later replay",
+      "component": "GUI BroadcastService",
+      "method": "sendBroadcast(..., { sendToNewAppInstances: true })"
+    },
+    {
+      "id": "UC3",
+      "name": "Replay Saved Broadcasts to New App",
+      "actor": "App Launch System",
+      "description": "On new app launch, sendSavedBroadcastsTo(appInstanceID) locates the iframe by UUID and replays all stored broadcasts via postMessage",
+      "component": "GUI BroadcastService",
+      "method": "sendSavedBroadcastsTo(appInstanceID)"
+    },
+    {
+      "id": "UC4",
+      "name": "Receive and Emit Inbound Webhook Event",
+      "actor": "Remote Peer",
+      "description": "POST /broadcast/webhook with HMAC-signed payload; backend validates timestamp, nonce, signature, then emits events via EventService",
+      "component": "Backend BroadcastService",
+      "method": "#handleWebhookRequest(req, res) → #emitIncomingEventsSequentially(events)"
+    },
+    {
+      "id": "UC5",
+      "name": "Forward Outbound Event to Peer via Webhook",
+      "actor": "EventService (outer.* events)",
+      "description": "Backend listens to outer.* events; enqueues them, flushes batched events to webhook peers via HMAC-signed POST requests",
+      "component": "Backend BroadcastService",
+      "method": "outBroadcastEventHandler → #enqueueOutboundEvent → #flushOutboundEvents → #sendWebhookToPeer"
+    },
+    {
+      "id": "UC6",
+      "name": "Publish Events to Redis Pub/Sub",
+      "actor": "Backend BroadcastService",
+      "description": "Mirror outer.pub events to Redis channel 'broadcast.webhook.events' so same-cluster replicas receive them",
+      "component": "Backend BroadcastService",
+      "method": "#publishWebhookEventsToRedis(events)"
+    },
+    {
+      "id": "UC7",
+      "name": "Consume Redis Pub/Sub Events",
+      "actor": "Redis Pub/Sub",
+      "description": "Subscribe to Redis channel; on message from other instances (different sourceId), filter and emit events locally via EventService",
+      "component": "Backend BroadcastService",
+      "method": "#handleRedisPubSubMessage → #emitIncomingEventsSequentially"
+    },
+    {
+      "id": "UC8",
+      "name": "Register and Initialize Service",
+      "actor": "Application Bootstrap",
+      "description": "ServiceManager.register(name, factory) creates service instance, resolves dependencies, then calls init(). Services await deps via wait_for_init()",
+      "component": "ServiceManager",
+      "method": "register(name, factory, options) → maybe_init_ → init_service_"
+    },
+    {
+      "id": "UC9",
+      "name": "Retrieve Running Service",
+      "actor": "Any Service",
+      "description": "services.get(name) returns service instance only if status=Running; services.aget(name) waits for init before returning",
+      "component": "ServiceManager",
+      "method": "get(name) / aget(name)"
+    },
+    {
+      "id": "UC10",
+      "name": "Subscribe to Event",
+      "actor": "Service / Component",
+      "description": "EmitterFeature installs .on(selector, callback) and .emit(key, data, meta) on any class instance. Supports wildcard selectors (e.g. outer.*)",
+      "component": "EmitterFeature",
+      "method": "instance.on(selector, callback) → returns { detach() }"
+    },
+    {
+      "id": "UC11",
+      "name": "Emit Event to Listeners",
+      "actor": "Service / Component",
+      "description": "instance.emit(key, data, meta) resolves wildcard + exact-match listeners, invokes concurrently, awaits all promises",
+      "component": "EmitterFeature",
+      "method": "instance.emit(key, data, meta)"
+    },
+    {
+      "id": "UC12",
+      "name": "Install BroadcastService via Module",
+      "actor": "Application Bootstrap",
+      "description": "BroadcastModule.install(context) retrieves services container and registers 'broadcast' service",
+      "component": "BroadcastModule",
+      "method": "install(context) → services.registerService('broadcast', BroadcastService)"
+    }
+  ],
+
+  "key_relationships": [
+    "GUI BroadcastService extends Service (from definitions.js)",
+    "Backend BroadcastService extends BaseService",
+    "Backend BroadcastService depends_on EventService (svc_event = services.get('event'))",
+    "Backend BroadcastService depends_on WebServer (services.get('web-server'))",
+    "Backend BroadcastService depends_on Redis (redisClient singleton)",
+    "BroadcastModule registers BroadcastService with ServiceManager",
+    "ServiceManager depends_on TService concept (get_depends(), init())",
+    "EmitterFeature is a mixin installed on any AdvancedBase instance",
+    "ChannelFeature provides Channel (EventEmitter-like) objects named in CHANNELS static array"
+  ],
+
+  "key_data_flows": [
+    "outer.* event fired → outBroadcastEventHandler → Redis publish + webhook queue",
+    "Webhook POST received → HMAC validate → Redis mirror + EventService.emit(key, data, {from_outside:true})",
+    "Redis message received → filter outer.pub → EventService.emit(key, data, {from_outside:true})",
+    "New app launch → sendSavedBroadcastsTo(appInstanceID) → iframe.postMessage per saved broadcast",
+    "ServiceManager.register → factory.create → maybe_init_ → init_service_ → status=Running → notify listeners"
+  ],
+
+  "security_notes": "Webhook validation uses HMAC-SHA256 signature over 'timestamp.nonce.rawBody', replay window 300s, per-peer nonce tracking to prevent replay attacks",
+
+  "important_notes": "Backend BroadcastService deduplicates outbound events by JSON key before flushing (configurable flush interval, default 5000ms). GUI BroadcastService uses jQuery selectors for iframe targeting. EmitterFeature supports concurrent async listeners with wildcard matching.",
+
+  "source_files_analyzed": [
+    "src/gui/src/services/BroadcastService.js",
+    "src/backend/src/modules/broadcast/BroadcastService.js",
+    "src/backend/src/modules/broadcast/BroadcastModule.js",
+    "src/putility/src/system/ServiceManager.js",
+    "src/putility/src/features/EmitterFeature.js",
+    "src/backend/src/traits/ChannelFeature.js"
+  ]
+}

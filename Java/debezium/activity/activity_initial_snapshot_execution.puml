@@ -1,0 +1,183 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleFontSize 13
+    TitleFontStyle bold
+}
+skinparam ArrowColor #495057
+skinparam NoteBackgroundColor #FFF9C4
+skinparam NoteBorderColor #F9A825
+
+title Initial Snapshot Execution\n<size:11>//Lock acquisition, table scanning, row reading, and offset commit//</size>
+
+|SnapshotterServiceProvider|
+start
+
+:Load CommonConnectorConfig from BeanRegistry;
+if (snapshotMode == 'custom'\n&& customName non-empty?) then (yes)
+    :Use customName as Snapshotter key;
+else (no)
+    :Use configuredMode as Snapshotter key;
+endif
+
+:ServiceLoader.load(Snapshotter.class)\nfilter by name — expect exactly 1 match;
+note right
+  Throws if 0 or >1
+  implementations found
+end note
+
+:Resolve SnapshotQuery and SnapshotLock\nfrom ServiceRegistry;
+
+if (snapshotter instanceof\nBeanRegistryAware?) then (yes)
+    :snapshotter.injectBeanRegistry(beanRegistry);
+else (no)
+endif
+
+:snapshotter.configure(config.asMap());
+:Return new SnapshotterService\n(snapshotter + snapshotQuery + snapshotLock);
+
+|RelationalSnapshotChangeEventSource|
+
+:getSnapshottingTask(partition, previousOffset);
+:Evaluate offsetExists = (previousOffset != null)\nEvaluate snapshotInProgress =\npreviousOffset.isInitialSnapshotRunning();
+
+if (shouldSnapshotSchema\n(offsetExists, snapshotInProgress)?) then (yes)
+    :snapshotSchema = true;
+else (no)
+    :snapshotSchema = false;
+endif
+
+if (shouldSnapshotData\n(offsetExists, snapshotInProgress)?) then (yes)
+    :snapshotData = true;
+else (no)
+    :snapshotData = false;
+endif
+
+:Return SnapshottingTask\n(snapshotSchema, snapshotData, dataCollections);
+
+note right: **doExecute** begins
+
+' ─── STEP 1 ───────────────────────────────────────────
+:STEP 1 — Prepare\ngetDataCollectionPattern(snapshottingTask)\npreSnapshot()\nWarn if prior run was incomplete;
+
+' ─── STEP 2 ───────────────────────────────────────────
+:STEP 2 — Determine Captured Tables\ncreatSnapshotConnection() [autoCommit=false]\ngetAllTableIds() [DB-specific abstract]\ndetermineDataCollectionsToBeSnapshotted()\nfilter by tableFilters.dataCollectionFilter().isIncluded()\naddSignalingCollectionAndSort(capturedTables)\nsnapshotProgressListener.monitoredDataCollectionsDetermined()\ncreatConnectionPool(1..snapshotMaxThreads);
+
+' ─── STEP 3 ───────────────────────────────────────────
+if (snapshotSchema?) then (yes)
+    :STEP 3 — Lock Tables\nlockTablesForSchemaSnapshot(context, ctx)\n[DB-specific abstract];
+else (no)
+    note right: Skip table locking
+endif
+
+' ─── STEP 4 ───────────────────────────────────────────
+if (isOnDemand snapshot?) then (yes)
+    note right: Skip offset determination\nfor on-demand snapshots
+else (no)
+    :STEP 4 — Determine Snapshot Offset\ndetermineSnapshotOffset(ctx, previousOffset)\n[DB-specific — e.g. binlog position / SCN];
+endif
+
+' ─── STEP 5 ───────────────────────────────────────────
+:STEP 5 — Read Table Structure\nreadTableStructure(context, ctx, previousOffset)\n[DB-specific abstract];
+
+' ─── STEP 6 ───────────────────────────────────────────
+if (snapshotSchema?) then (yes)
+    :STEP 6 — Persist Schema History\ntryStartingSnapshot() → offset.preSnapshotStart(onDemand)\nFor each capturedTable:\n  offset.event(tableId, currentTime)\n  getCreateTableEvent(ctx, table) [abstract]\n  dispatcher.dispatchSchemaChangeEvent()\nreleaseSchemaSnapshotLocks(ctx) [abstract];
+else (no)
+    note right: Skip schema change events
+endif
+
+' ─── STEP 7 ───────────────────────────────────────────
+if (snapshotData?) then (yes)
+    :STEP 7 — Begin Data Events\ntryStartingSnapshot(snapshotContext)\ndispatcher.getSnapshotChangeEventReceiver() → SnapshotReceiver\ncreateOffsetPool(snapshotContext, connectionPool.size());
+
+    if (isUseNonChunkedSnapshots\n(snapshotMaxThreads)?) then (yes / legacy)
+        :prepareTables(snapshotContext,\ndetermineSnapshotSelect, rowCountForTable)\n→ PreparedTables;
+
+        |ThreadedSnapshotExecutor|
+        :new ThreadedSnapshotExecutor\n(snapshotMaxThreads, "snapshot");
+        fork
+            :createDataEventsForTableCallable(table 1)\nexecutor.submit(callable);
+            :doCreateDataEventsForTable()\ngetSnapshotSourceTimestamp()\nreadTableStatement() → Statement\nresultSetForDataEvents() → CancellableResultSet;
+            while (rs.next()?) is (true)
+                :jdbcConnection.rowToArray(table, rs) → Object[];
+                :setSnapshotMarker(offset, firstTable,\nlastTable, firstRecord, lastRecord)\n→ SnapshotMarkerResolver.resolve() → SnapshotRecord\n→ offset.markSnapshotRecord(marker);
+                |EventDispatcher|
+                :dispatcher.dispatchSnapshotEvent\n(partition, tableId, emitter, snapshotReceiver)\nnew SnapshotChangeRecordEmitter\n(partition, offset, row, clock, connectorConfig);
+                |ThreadedSnapshotExecutor|
+            endwhile (false)
+            :snapshotProgressListener\n.dataCollectionSnapshotCompleted\n(partition, tableId, rowCount);
+        fork again
+            :createDataEventsForTableCallable(table N)\nexecutor.submit(callable);
+            :doCreateDataEventsForTable() [parallel];
+        end fork
+        :executor.awaitCompletion();
+
+    else (no / chunked)
+        :prepareTables(snapshotContext,\ndetermineSnapshotSelect, rowCountForTableChunked)\n→ PreparedTables;
+        :ChunkBoundaryCalculator.calculateBoundaries()\ncalculateMaxKey() / createChunks per table;
+
+        |ThreadedSnapshotExecutor|
+        :new ThreadedSnapshotExecutor\n(snapshotMaxThreads, "chunked snapshot");
+        fork
+            :createDataEventsForChunkedTableCallable\n(chunk 1) → executor.submit(callable);
+            :doCreateDataEventsForChunk()\nSnapshotChunkQueryBuilder.buildChunkQuery\n(chunk, keyColumns, baseSelectStatement)\nprepareChunkStatement() → PreparedStatement;
+            while (rs.next()?) is (true)
+                :jdbcConnection.rowToArray(table, rs) → Object[];
+                if (first record of\nfirst chunk?) then (yes)
+                    |EventDispatcher|
+                    :dispatchSnapshotEvent +\nsnapshotProgress.signalFirstRecordEmitted;
+                    |ThreadedSnapshotExecutor|
+                elseif (last record of\nlast chunk?) then (yes)
+                    :Wait for other chunks/tables\nthen dispatch last record;
+                else (no)
+                    :progress.waitForFirstRecord()\nthen dispatchSnapshotEvent;
+                endif
+            endwhile (false)
+            :progress.markChunkComplete(rowCount)\nprogress.signalChunkComplete();
+        fork again
+            :createDataEventsForChunkedTableCallable\n(chunk N) → executor.submit(callable);
+            :doCreateDataEventsForChunk() [parallel];
+        end fork
+        :executor.awaitCompletion();
+    endif
+
+    |RelationalSnapshotChangeEventSource|
+    :releaseDataSnapshotLocks(snapshotContext);
+
+    |OffsetContext|
+    :offset.preSnapshotCompletion()\n[for each offset in pool];
+
+    |EventDispatcher|
+    :snapshotReceiver.completeSnapshot()\n<i>signals Kafka Connect that snapshot batch is done</i>;
+
+    |OffsetContext|
+    :offset.postSnapshotCompletion()\n<b>OFFSET COMMIT POINT</b>\n[clears snapshot-in-progress flag\nfor each offset in pool];
+
+    |RelationalSnapshotChangeEventSource|
+else (no)
+    :Skip data events path\nreleaseDataSnapshotLocks(ctx)\noffset.preSnapshotCompletion()\noffset.postSnapshotCompletion();
+endif
+
+' ─── POST & FINALLY ────────────────────────────────────
+:POST\npostSnapshot()\ndispatcher.alwaysDispatchHeartbeatEvent\n(partition, offset)\nReturn SnapshotResult.completed(offset);
+
+:FINALLY\nClose extra pool connections\n(keep main jdbcConnection)\nrollbackTransaction(connection);
+
+stop
+
+@enduml

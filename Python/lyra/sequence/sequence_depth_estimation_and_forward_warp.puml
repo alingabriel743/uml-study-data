@@ -1,0 +1,198 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #6C757D
+    GroupBackgroundColor #F1F3F5
+    GroupBorderColor #6C757D
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Depth Estimation and Forward Warp
+
+actor "lyra2_ar_inference\n(Caller)" as Caller
+participant "depth_utils" as DepthUtils
+participant "torch" as Torch
+participant "DepthAnything3\n(DA3 Model)" as DA3
+participant "_predict_da3\n_depth_window" as PredWindow
+participant "forward_warp" as FW
+participant "compute_transformed\n_points" as CTP
+participant "bilinear_splatting" as BS
+participant "forward_warp\n_multiframes" as FWM
+participant "unproject_points" as UPP
+participant "project_points" as PP
+
+' ============================================================
+== Phase 1: DA3 Model Loading ==
+' ============================================================
+
+Caller -> DepthUtils: load_da3_model(da3_model_name, da3_model_path_custom, device)
+activate DepthUtils
+
+DepthUtils -> DepthUtils: load_da3_from_custom_checkpoint\n(ckpt_path, pretrained_path, device, strict)
+activate DepthUtils
+
+DepthUtils -> DepthUtils: _import_da3_api()\n[lazy import via sys.path, clears stale sys.modules keys]
+
+DepthUtils -> DepthUtils: _resolve_da3_local_model_name(pretrained_path)\n[checks MODEL_REGISTRY → local config name]
+
+DepthUtils -> DA3: DepthAnything3(model_name=local_model_name)
+activate DA3
+DA3 --> DepthUtils: model (architecture instantiated)
+deactivate DA3
+
+DepthUtils -> Torch: torch.load(ckpt_path, map_location='cpu')
+activate Torch
+Torch --> DepthUtils: checkpoint dict
+deactivate Torch
+
+DepthUtils -> DepthUtils: extract state_dict\n[handles 'module'/'model' keys, strips 'model.' prefix]
+
+DepthUtils -> DA3: model.model.load_state_dict(converted_state_dict, strict=strict)
+activate DA3
+DA3 --> DepthUtils: weights loaded
+deactivate DA3
+
+DepthUtils -> DA3: model.to(device); model.eval()
+activate DA3
+DA3 --> DepthUtils: da3_model (ready)
+deactivate DA3
+
+deactivate DepthUtils
+
+DepthUtils --> Caller: return da3_model
+deactivate DepthUtils
+
+' ============================================================
+== Phase 2: DA3 Depth Prediction (Temporal Window) ==
+' ============================================================
+
+Caller -> PredWindow: _predict_da3_depth_window(\n  da3_model, history_frames[B,C,T,H,W],\n  start_index, abs_last_idx,\n  cam_w2c, intrinsics,\n  frame_interval, max_history_frames)
+activate PredWindow
+
+PredWindow -> PredWindow: build selected_frames list\n[abs_last_idx stepping back by frame_interval,\n up to max_history_frames, clamped ≥ 0]
+
+PredWindow -> PredWindow: for each frame f: extract frame_chw =\n  history_frames[0,:,start_index+f]\n  convert [-1,1] → uint8\n  collect extrinsics (w2c[N,4,4]) & intrinsics (K[N,3,3])
+
+PredWindow -> DA3: da3_model.inference(\n  images=List[np(H,W,3) uint8],\n  extrinsics=np[N,4,4], intrinsics=np[N,3,3],\n  align_to_input_extrinsics=True, infer_gs=False)
+activate DA3
+DA3 --> PredWindow: prediction_dict (metric depth maps)
+deactivate DA3
+
+PredWindow --> Caller: return {frame_indices, prediction: prediction_dict}
+deactivate PredWindow
+
+' ============================================================
+== Phase 3: Single-Frame Forward Warp (Lyra-1 path) ==
+' ============================================================
+
+Caller -> FW: forward_warp(\n  frame1[b,3,h,w], mask1[b,1,h,w],\n  depth1[b,1,h,w],\n  transformation1[b,4,4], transformation2[b,4,4],\n  intrinsic1[b,3,3], intrinsic2[b,3,3])
+activate FW
+
+FW -> FW: nan_to_num + clamp depth1 to [0, 1e4]
+
+FW -> CTP: compute_transformed_points(\n  depth1, transformation1, transformation2,\n  intrinsic1, is_depth=True, intrinsic2)
+activate CTP
+
+CTP -> CTP: relative_transform = transformation2 @ inv(transformation1)
+CTP -> CTP: build pixel grid [x2d, y2d, 1]\n→ pos_vectors_homo[1,h,w,3,1]
+CTP -> CTP: unnormalized_pos = K1_inv @ pos_vectors_homo\n[backproject to camera rays]
+CTP -> CTP: world_points = depth1 * unnormalized_pos\n[is_depth=True: scale along z-axis]
+CTP -> CTP: world_points_homo = [world_points; 1]\ntrans_world = relative_transform @ world_points_homo
+CTP -> CTP: trans_norm_points = K2 @ trans_world[...,:3]\n[project to target image plane]
+
+CTP --> FW: return trans_norm_points[b,h,w,3,1]
+deactivate CTP
+
+FW -> FW: mask out pixels with Z ≤ 0\ntrans_coordinates = trans_norm_points[...,:2] / Z
+FW -> FW: flow12 = trans_coordinates.permute(0,3,1,2)\n  - create_grid(b,h,w)
+
+note right of FW
+  Optional: compute camera_ray filtering
+  (rotate normals → target space,
+  dot product with camera rays → binary mask)
+end note
+
+FW -> BS: bilinear_splatting(\n  frame1, mask1, trans_depth1,\n  flow12, flow12_mask=None, is_image=True)
+activate BS
+
+BS -> BS: trans_pos = flow12 + grid\ncompute floor/ceil neighbour positions (NW/NE/SW/SE)
+BS -> BS: compute proximity weights\n[bilinear interpolation coefficients]
+BS -> BS: depth_weights = exp(log1p(depth)/max * scale)\n[closer pixels → higher weight; foreground wins]
+BS -> BS: scatter via index_put_(accumulate=True)\nweighted frame values → padded output[b, h+2, w+2, c]
+BS -> BS: normalize by accumulated weights\nclip to [-1,1] if is_image; mask = weights > 0
+
+BS --> FW: return (warped_frame2[b,c,h,w], mask2[b,1,h,w])
+deactivate BS
+
+note right of FW
+  Optional paths:
+  • render_depth: bilinear_splatting(trans_depth1) → warped_depth2
+  • foreground_masking: points_to_mesh +
+    ray_triangle_intersection (NVIDIA Warp)
+    → occlusion mask update
+end note
+
+FW --> Caller: return (warped_frame2, mask2, warped_depth2, flow12)
+deactivate FW
+
+' ============================================================
+== Phase 4: Multi-Frame Forward Warp (Lyra-2 path) ==
+' ============================================================
+
+Caller -> FWM: forward_warp_multiframes(\n  frame1[b,v,3,h,w], mask1,\n  depth1[b,v,1,h,w],\n  transformation1[b,v,4,4], transformation2[b,4,4],\n  intrinsic1[b,v,3,3], intrinsic2[b,3,3])
+activate FWM
+
+FWM -> FWM: nan_to_num + clamp depth\n[optional: reliable_depth_mask_range_batch continuity cleaning]
+
+FWM -> UPP: unproject_points(\n  depth_flat[(b*v),1,h,w],\n  w2c_flat[(b*v),4,4], K_flat[(b*v),3,3],\n  is_ftheta=False/True)
+activate UPP
+UPP --> FWM: world_pts_flat[(b*v),h,w,3]
+deactivate UPP
+
+FWM -> PP: project_points(\n  world_points1[(b*v),h,w,3],\n  transformation2_tiled, intrinsic2_tiled)
+activate PP
+PP --> FWM: trans_points1 (projected coordinates in target view)
+deactivate PP
+
+FWM -> FWM: compute flow12 = trans_coordinates - grid\n[optical flow to target view]
+
+FWM -> BS: bilinear_splatting(\n  frame1_flat, mask1_flat, trans_depth1,\n  flow12, n_views=v)
+activate BS
+note right of BS
+  n_views > 1: sums contributions
+  across all source views before
+  normalization (einops rearrange)
+end note
+BS --> FWM: (warped_frame2[b,c,h,w], mask2[b,1,h,w])
+deactivate BS
+
+FWM --> Caller: return (warped_frame2, mask2, warped_depth2, flow12)
+deactivate FWM
+
+@enduml

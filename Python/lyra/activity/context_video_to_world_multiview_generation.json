@@ -1,0 +1,118 @@
+{
+  "scope": "video_to_world_multiview_generation",
+  "title": "Video-to-World Multiview Generation",
+  "diagram_type": "activity",
+  "pipeline_class": "DiffusionVideo2WorldMultiviewGenerationPipeline",
+  "source_files_analyzed": [
+    "Lyra-1/cosmos_predict1/diffusion/inference/world_generation_pipeline.py",
+    "Lyra-1/cosmos_predict1/utils/base_world_generation_pipeline.py"
+  ],
+
+  "class_hierarchy": [
+    "BaseWorldGenerationPipeline (ABC)",
+    "  └── DiffusionText2WorldGenerationPipeline",
+    "        └── DiffusionText2WorldMultiviewGenerationPipeline",
+    "              └── DiffusionVideo2WorldMultiviewGenerationPipeline"
+  ],
+
+  "key_participants": [
+    "DiffusionVideo2WorldMultiviewGenerationPipeline",
+    "DiffusionMultiviewV2WModel",
+    "T5TextEncoder (CosmosT5TextEncoder)",
+    "inference_utils (get_video_batch_for_multiview_model, get_condition_latent_multiview, generate_world_from_video)",
+    "Tokenizer (encode/decode latents)"
+  ],
+
+  "init_flow": [
+    "START: __init__(inference_type, checkpoint_dir, checkpoint_name, n_views=6, num_input_frames=1, offload_network, offload_tokenizer, ...)",
+    "Set self.num_input_frames, self.n_views, self.frame_repeat_negative_condition",
+    "super().__init__() → DiffusionText2WorldMultiviewGenerationPipeline.__init__()",
+    "  → super().__init__() → DiffusionText2WorldGenerationPipeline.__init__()",
+    "    Set model_name = MODEL_NAME_DICT[checkpoint_name], guidance, num_steps, height, width, fps, num_video_frames, seed",
+    "    → super().__init__() → BaseWorldGenerationPipeline.__init__()",
+    "      Calls self._load_model() [abstract, loads DiffusionMultiviewV2WModel]",
+    "      if not offload_text_encoder_model: _load_text_encoder_model() [CosmosT5TextEncoder]",
+    "      if not disable_guardrail and not offload_guardrail_models: _load_text_guardrail(), _load_video_guardrail()",
+    "      if not offload_network: _load_network() [loads model.pt weights]",
+    "      if not offload_tokenizer: _load_tokenizer() [loads Cosmos-Tokenize1-CV8x8x8-720p]",
+    "  Back in T2W: if enable_prompt_upsampler and not offload: _load_prompt_upsampler_model()"
+  ],
+
+  "generate_activity_flow": [
+    "START: generate(prompt: dict, image_or_video_path: str)",
+    "STEP 1 — Extract 6-view prompts from dict:",
+    "  prompts = [prompt['prompt'], prompt['prompt_left'], prompt['prompt_right'],",
+    "             prompt['prompt_back'], prompt['prompt_back_left'], prompt['prompt_back_right']]",
+    "STEP 2 — Text embedding (with optional offload):",
+    "  _run_text_embedding_on_prompt_with_offload(prompts)",
+    "    [if offload_text_encoder_model] → _load_text_encoder_model()",
+    "    → text_encoder.encode_prompts([p]) for each prompt → embeddings list, masks list",
+    "    [if offload_text_encoder_model] → _offload_text_encoder_model()",
+    "  Returns: prompt_embeddings (list of 6 tensors), _ (masks)",
+    "STEP 3 — World generation with offload:",
+    "  _run_model_with_offload(prompt_embeddings, image_or_video_path)",
+    "    STEP 3a — [if offload_tokenizer] _load_tokenizer()",
+    "    STEP 3b — Build video batch:",
+    "      get_video_batch_for_multiview_model(model, prompt_embedding, height, width, fps,",
+    "        num_video_frames = self.num_video_frames * len(prompt_embedding),  // total frames = frames * n_views",
+    "        frame_repeat_negative_condition)",
+    "      Returns: data_batch (dict), state_shape (list)",
+    "    STEP 3c — Tokenizer encoding (condition latent from input video):",
+    "      _run_tokenizer_encoding(image_or_video_path, state_shape)",
+    "        → get_condition_latent_multiview(model, image_or_video_path, num_input_frames, state_shape)",
+    "        Returns: condition_latent (torch.Tensor), condition_frames",
+    "    STEP 3d — [if offload_network] _load_network()",
+    "    STEP 3e — Diffusion model inference:",
+    "      _run_model(embedding, condition_latent, negative_prompt_embedding, data_batch, state_shape)",
+    "        → generate_world_from_video(model, state_shape, is_negative_prompt=False, data_batch,",
+    "             guidance, num_steps, seed, condition_latent, num_input_frames)",
+    "        Returns: sample (torch.Tensor latents)",
+    "    STEP 3f — [if offload_network] _offload_network()",
+    "    STEP 3g — Tokenizer decoding:",
+    "      _run_tokenizer_decoding(sample)",
+    "        → model.decode(sample) → raw video [B, 3, T, H, W]",
+    "        → rearrange: 'b c (v t) h w -> b c v t h w' with v = n_views",
+    "        → reorder views: [1, 0, 2, 4, 3, 5] (front, left, right, back, back_left, back_right → grid order)",
+    "        → rearrange grid: 'b c (h w) t h1 w1 -> b c t (h h1) (w w1)' with h=2, w=3 (2x3 grid)",
+    "        → convert to uint8 numpy: shape [T, H*2, W*3, C]",
+    "        Returns: [grid_video, video] (both uint8 numpy arrays)",
+    "    STEP 3h — [if offload_tokenizer] _offload_tokenizer()",
+    "STEP 4 — Return: (video_list, prompt_dict)",
+    "END"
+  ],
+
+  "offload_branching": {
+    "offload_tokenizer": "Load tokenizer before encoding/decoding, delete + gc after",
+    "offload_network": "Load diffusion network just before _run_model, delete + gc after",
+    "offload_text_encoder_model": "Load T5 encoder before embedding, delete + gc after",
+    "offload_guardrail_models": "Load guardrail models on demand, delete + gc after each check",
+    "note": "Multiview generate() does NOT run guardrail checks (unlike parent DiffusionVideo2WorldGenerationPipeline)"
+  },
+
+  "key_differences_from_parent_v2w": [
+    "Loads DiffusionMultiviewV2WModel instead of DiffusionV2WModel",
+    "generate() accepts prompt as dict with 6 keys (front, left, right, back, back_left, back_right)",
+    "_run_model_with_offload() builds data_batch internally with get_video_batch_for_multiview_model",
+    "_run_tokenizer_encoding() calls get_condition_latent_multiview() vs get_condition_latent()",
+    "_run_tokenizer_decoding() produces [grid_video, video] list — 2x3 view grid + individual views",
+    "No guardrail checks on prompt or output video in generate()"
+  ],
+
+  "method_signatures": {
+    "_load_model": "() → sets self.model = load_model_by_config(model_name, config, DiffusionMultiviewV2WModel)",
+    "_run_tokenizer_encoding": "(image_or_video_path: str, state_shape: list) → tuple[torch.Tensor, frames]",
+    "_run_model": "(embedding, condition_latent, negative_prompt_embedding=None, data_batch=None, state_shape=None) → torch.Tensor",
+    "_run_model_with_offload": "(prompt_embedding: torch.Tensor, image_or_video_path: str, negative_prompt_embedding=None) → list[np.ndarray]",
+    "generate": "(prompt: dict, image_or_video_path: str) → tuple[list[np.ndarray], dict] | None"
+  },
+
+  "important_notes": [
+    "n_views=6 (front, front_left, front_right, back, back_left, back_right)",
+    "Output is 2x3 grid video + per-view video tensor",
+    "num_video_frames is multiplied by n_views for total frame count: num_video_frames * 6",
+    "condition_latent from tokenizer encoding conditions the diffusion model on input video frames",
+    "T5 encoder processes each of the 6 view prompts independently",
+    "Video decoding: normalizes (1+x)/2, rearranges spatiotemporal dims for grid layout",
+    "Tokenizer: Cosmos-Tokenize1-CV8x8x8-720p (8x spatial, 8x temporal compression)"
+  ]
+}

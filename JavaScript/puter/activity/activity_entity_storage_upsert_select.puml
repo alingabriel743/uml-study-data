@@ -1,0 +1,229 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam ActivityBackgroundColor #F8F9FA
+skinparam ActivityBorderColor #495057
+skinparam ActivityArrowColor #495057
+skinparam ActivityFontColor #212529
+skinparam ActivityDiamondBackgroundColor #E9ECEF
+skinparam ActivityDiamondBorderColor #6C757D
+skinparam SwimlaneBorderColor #6C757D
+skinparam SwimlaneTitleFontStyle bold
+
+title Entity Storage Upsert and Select Pipeline
+
+'==============================================================
+' UPSERT PIPELINE
+'==============================================================
+
+|Caller|
+start
+:Call **EntityStoreService.upsert**(entity, id, options);
+
+|EntityStoreService|
+:upstream.read(uid)
+— lookup existing entity by primary identifier;
+
+if (old_entity found?) then (no)
+    :IdentifierUtil.detect_identifier(entity)
+    — look for alternate identifier;
+    if (alternate identifier found?) then (yes)
+        :upstream.select({ predicate, limit:1 })
+        — find entity via alternate key;
+        :Set old_entity from result;
+    else (no)
+        :Treat as INSERT
+        old_entity = null;
+    endif
+else (yes)
+endif
+
+:upstream.upsert(entity, { old_entity, options })
+— delegate to SubdomainES;
+
+|SubdomainES|
+if (old_entity is null?\n(new record)) then (yes — INSERT)
+    :**_check_max_subdomains()**;
+
+    |Database|
+    :SELECT COUNT(id) AS subdomain_count
+    FROM subdomains WHERE user_id = ?;
+    :Return count;
+
+    |SubdomainES|
+    if (count >= max_subdomains\n(user limit or config)?) then (yes)
+        #FFC0C0:**THROW** APIError
+        'subdomain_limit_reached'
+        { limit };
+        stop
+    else (no — within limit)
+    endif
+else (no — UPDATE)
+endif
+:upstream.upsert(entity, extra)
+— delegate to SQLES;
+
+|SQLES|
+partition "Unique Constraint Check" {
+    repeat
+        :For each property with unique constraint:
+        SELECT COUNT(*) WHERE <property> = ?;
+
+        |Database|
+        :Return count;
+
+        |SQLES|
+        if (count > 0?) then (yes — duplicate)
+            #FFC0C0:**THROW** APIError
+            'already_in_use'
+            { what, value };
+            stop
+        else (no)
+        endif
+    repeat while (more unique properties?)
+}
+
+if (old_entity exists?) then (yes — UPDATE)
+    :update_(entity, old_entity)
+    — build UPDATE SET SQL;
+
+    |Database|
+    :db.write(UPDATE stmt, values);
+    :Return affected rows;
+
+    |SQLES|
+    :Clone & apply old_entity fields
+    — return { data, entity };
+else (no — INSERT)
+    :create_(entity)
+    — build INSERT INTO SQL;
+
+    |Database|
+    :db.write(INSERT stmt, values);
+    :Return insert_id;
+
+    |SQLES|
+    :Return { data, entity, insert_id };
+endif
+
+|EntityStoreService|
+:Return upsert result to caller;
+
+|Caller|
+:Receive upsert result;
+stop
+
+'==============================================================
+' SELECT PIPELINE
+'==============================================================
+
+|Caller|
+start
+:Call **EntityStoreService.select**\n({ predicate, limit, offset, params });
+
+|EntityStoreService|
+if (predicate is Array?) then (yes)
+    :Destructure [p_op, ...p_args];
+    :upstream.create_predicate(p_op, ...p_args)
+    — resolve via SubdomainES;
+
+    |SubdomainES|
+    if (p_op === 'user-can-edit'?) then (yes)
+        :Return **Eq**({ key:'owner', value: Context.user.id })
+        — owner-scoped predicate;
+    else (no)
+        :Delegate to SQLES.create_predicate
+        — default resolution;
+    endif
+
+    |EntityStoreService|
+    :Assign resolved Predicate object;
+else (no)
+endif
+
+if (predicate still null?) then (yes)
+    :predicate = new **Null()**
+    — match-all predicate;
+else (no)
+endif
+
+:upstream.select({ predicate, limit, offset })
+— delegate to SubdomainES;
+
+|SubdomainES|
+:Get actor from **Context**.get('actor')
+— extract user identity;
+
+|PermissionService|
+:svc_permission.check(actor,\n'read-all-subdomains');
+:Return has_permission boolean;
+
+|SubdomainES|
+if (has_permission\n'read-all-subdomains'?) then (no)
+    :options.predicate =
+    predicate.**and**(Eq({ key:'owner', value: user.id }))
+    — force owner filter;
+else (yes — admin/privileged)
+endif
+
+:upstream.select(options)
+— delegate to SQLES;
+
+|SQLES|
+if (predicate instanceof Predicate?) then (yes)
+    :om_to_sql_condition_(predicate)
+    — recursive DSL → SQL translation
+    (handles: Null, And, Or, Eq,
+    StartsWith, IsNotNull, Like);
+    :Produce **RawCondition** { sql, values };
+else (no predicate)
+endif
+
+:Build SQL:
+SELECT * FROM <table>
+[WHERE <condition>]
+[LIMIT n] [OFFSET m];
+
+|Database|
+:db.read(stmt, values)
+— execute SELECT query;
+:Return rows[];
+
+|SQLES|
+:For each row:
+sql_row_to_entity_(row)
+— dereference properties, parse JSON;
+:Return entities[];
+
+|SubdomainES|
+note right
+  BaseES wrapper:
+  IF read_transform defined,
+  map entities through read_transform
+end note
+:Pass entities upstream;
+
+|EntityStoreService|
+:Map entities → entity.**get_client_safe()**
+— strip internal fields;
+:Return client-safe entity array;
+
+|Caller|
+:Receive entity array;
+stop
+
+@enduml

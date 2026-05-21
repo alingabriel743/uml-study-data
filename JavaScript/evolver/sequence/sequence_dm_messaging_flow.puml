@@ -1,0 +1,151 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    NoteBackgroundColor #FFF9E6
+    NoteBorderColor #DECd87
+}
+
+title Direct Messaging (DM) Flow
+
+actor "Sender Agent" as Sender
+actor "Receiver Agent" as Receiver
+participant "ProxyServer\n(routes.js)" as Proxy
+participant "DmHandler" as DmHandler
+database "MailboxStore\n(messages.jsonl)" as Store
+
+== SEND: Sender posts a DM ==
+
+Sender -> Proxy : POST /dm/send\n{ recipient_node_id, content, metadata }
+activate Proxy
+
+Proxy -> DmHandler : dmHandler.send({ recipientNodeId, content, metadata })
+activate DmHandler
+
+note right of DmHandler
+  Validates:
+  - recipientNodeId required
+  - content required
+end note
+
+DmHandler -> Store : store.send({\n  type: 'dm',\n  payload: { recipient_node_id, content,\n             metadata, sent_at: ISO },\n  priority: 'normal'\n})
+activate Store
+
+note right of Store
+  generateUUIDv7() → new message
+  direction: 'outbound'
+  status: 'pending'
+  appendLine(messages.jsonl)
+end note
+
+Store --> DmHandler : { message_id, status: 'pending' }
+deactivate Store
+
+DmHandler --> Proxy : { message_id, status: 'pending' }
+deactivate DmHandler
+
+Proxy --> Sender : 200 OK\n{ message_id, status: 'pending' }
+deactivate Proxy
+
+== POLL: Receiver fetches pending DMs ==
+
+Receiver -> Proxy : POST /dm/poll\n{ limit? }
+activate Proxy
+
+Proxy -> DmHandler : dmHandler.poll({ limit: body.limit })
+activate DmHandler
+
+DmHandler -> Store : store.poll({\n  type: 'dm',\n  limit: limit || 20\n})
+activate Store
+
+note right of Store
+  Filters _inbound where:
+  - type = 'dm'
+  - status = 'pending'
+  Returns up to limit messages
+end note
+
+Store --> DmHandler : messages[]
+deactivate Store
+
+DmHandler --> Proxy : messages[]
+deactivate DmHandler
+
+Proxy --> Receiver : 200 OK\n{ messages, count }
+deactivate Proxy
+
+== ACK: Receiver acknowledges received DMs ==
+
+note over Proxy, Store
+  /mailbox/ack is a shared route (all message types).
+  It bypasses DmHandler and calls MailboxStore directly.
+end note
+
+Receiver -> Proxy : POST /mailbox/ack\n{ message_ids: [id, ...] }
+activate Proxy
+
+Proxy -> Store : store.ack(message_ids)
+activate Store
+
+note right of Store
+  For each id:
+  _appendUpdate(id, { status: 'delivered' })
+  _evictFromIndex(id)
+end note
+
+Store --> Proxy : count (acknowledged)
+deactivate Store
+
+Proxy --> Receiver : 200 OK\n{ acknowledged: count }
+deactivate Proxy
+
+== LIST: Agent retrieves full DM history ==
+
+Receiver -> Proxy : GET /dm/list?limit=20&offset=0
+activate Proxy
+
+Proxy -> DmHandler : dmHandler.list({ limit, offset })
+activate DmHandler
+
+DmHandler -> Store : store.list({\n  type: 'dm',\n  limit: limit || 20,\n  offset: offset || 0\n})
+activate Store
+
+note right of Store
+  Filters all messages where type='dm'
+  Sorts by created_at DESC
+  Slices by offset + limit
+end note
+
+Store --> DmHandler : messages[]
+deactivate Store
+
+DmHandler --> Proxy : messages[]
+deactivate DmHandler
+
+Proxy --> Receiver : 200 OK\n{ messages, count }
+deactivate Proxy
+
+@enduml

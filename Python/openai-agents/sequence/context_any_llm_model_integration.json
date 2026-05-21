@@ -1,0 +1,113 @@
+{
+  "scope": "any_llm_model_integration",
+  "title": "AnyLLM Model Integration",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Caller (Runner/Agent)",
+    "AnyLLMModel",
+    "AnyLLMProvider",
+    "AnyLLM (any-llm SDK factory)",
+    "AnyLLMProviderInstance (any_llm provider object)",
+    "Converter (chatcmpl_converter)",
+    "OpenAIResponsesConverter",
+    "ChatCmplStreamHandler",
+    "TracingSpan (response_span / generation_span)"
+  ],
+  "class_summary": {
+    "AnyLLMModel": {
+      "extends": "Model",
+      "file": "src/agents/extensions/models/any_llm_model.py",
+      "constructor": "__init__(model: str, base_url=None, api_key=None, api: 'responses'|'chat_completions'|None=None)",
+      "key_attributes": ["model (str, 'provider/model' format)", "_provider_name", "_provider_model", "api", "_provider_cache: dict[bool, Any]"],
+      "public_methods": ["get_response(...) -> ModelResponse", "stream_response(...) -> AsyncIterator[TResponseStreamEvent]", "get_retry_advice(request) -> ModelRetryAdvice|None", "close()"],
+      "private_methods": ["_selected_api()", "_get_provider()", "_supports_responses()", "_get_response_via_responses(...)", "_stream_response_via_responses(...)", "_get_response_via_chat(...)", "_stream_response_via_chat(...)", "_fetch_chat_response(..., stream: bool)", "_fetch_responses_response(..., stream: bool)", "_call_any_llm_responses(...)", "_sanitize_any_llm_responses_input(...)", "_normalize_response(...)", "_normalize_chat_completion_response(...)", "_normalize_any_llm_message(...)", "_clone_provider_without_retries(...)"]
+    },
+    "AnyLLMProvider": {
+      "extends": "ModelProvider",
+      "file": "src/agents/extensions/models/any_llm_provider.py",
+      "constructor": "__init__(api_key=None, base_url=None, api: 'responses'|'chat_completions'|None=None)",
+      "public_methods": ["get_model(model_name: str|None) -> AnyLLMModel"]
+    }
+  },
+  "interaction_flow_get_response": [
+    "Caller → AnyLLMModel: get_response(system_instructions, input, model_settings, tools, output_schema, handoffs, tracing, previous_response_id, conversation_id, prompt)",
+    "AnyLLMModel → AnyLLMModel: _selected_api() — checks self.api override or calls _supports_responses()",
+    "AnyLLMModel → AnyLLMModel: _get_provider() — calls AnyLLM.create(provider_name, api_key, api_base), caches by retry-flag",
+    "AnyLLMModel: _get_provider() checks should_disable_provider_managed_retries(); if true → _clone_provider_without_retries() sets max_retries=0",
+    "--- BRANCH: api == 'responses' (provider.SUPPORTS_RESPONSES=True) ---",
+    "AnyLLMModel → AnyLLMModel: _get_response_via_responses(...) — opens response_span",
+    "AnyLLMModel → AnyLLMModel: _fetch_responses_response(..., stream=False)",
+    "  _fetch_responses_response: validates prompt==None (else UserError)",
+    "  _fetch_responses_response: validates _supports_responses() (else UserError)",
+    "  _fetch_responses_response → ItemHelpers: input_to_new_input_list(input)",
+    "  _fetch_responses_response → AnyLLMModel: _sanitize_any_llm_responses_input(list_input) — strips None fields, provider_data, FAKE_RESPONSES_IDs",
+    "  _fetch_responses_response → OpenAIResponsesConverter: convert_tool_choice(...), convert_tools(...), get_response_format(output_schema)",
+    "  _fetch_responses_response → AnyLLMModel: _call_any_llm_responses(request_kwargs, transport_kwargs)",
+    "    _call_any_llm_responses: if no transport_kwargs → provider.aresponses(...)",
+    "    _call_any_llm_responses: if transport_kwargs → builds ResponsesParams → provider._aresponses(params, **transport_kwargs)",
+    "  _fetch_responses_response → AnyLLMModel: _normalize_response(raw) → Response",
+    "AnyLLMModel: builds Usage from response.usage (input/output/total tokens)",
+    "AnyLLMModel → Caller: return ModelResponse(output=response.output, usage, response_id=response.id)",
+    "--- BRANCH: api == 'chat_completions' (provider.SUPPORTS_RESPONSES=False or forced) ---",
+    "AnyLLMModel → AnyLLMModel: _get_response_via_chat(...) — opens generation_span",
+    "AnyLLMModel → AnyLLMModel: _fetch_chat_response(..., stream=False)",
+    "  _fetch_chat_response: validates prompt==None (else UserError)",
+    "  _fetch_chat_response → Converter: items_to_messages(input, preserve_thinking_blocks, model)",
+    "  _fetch_chat_response: inserts system message if system_instructions present",
+    "  _fetch_chat_response → Converter: convert_tool_choice(), convert_response_format(), tool_to_openai() per tool, convert_handoff_tool() per handoff",
+    "  _fetch_chat_response → AnyLLMProviderInstance: acompletion(model=provider_model, messages, tools, temperature, top_p, ...stream=False...)",
+    "  _fetch_chat_response → AnyLLMModel: _normalize_chat_completion_response(ret) → ChatCompletion",
+    "AnyLLMModel → AnyLLMModel: _normalize_any_llm_message(message) — normalizes tool_calls, extracts reasoning_content",
+    "AnyLLMModel → Converter: message_to_output_items(normalized_message, provider_data)",
+    "AnyLLMModel: builds Usage from response.usage (prompt/completion tokens)",
+    "AnyLLMModel → Caller: return ModelResponse(output=items, usage, response_id=None)"
+  ],
+  "interaction_flow_stream_response": [
+    "Caller → AnyLLMModel: stream_response(...) — same params as get_response",
+    "AnyLLMModel → AnyLLMModel: _selected_api() — same routing logic",
+    "--- BRANCH: api == 'responses' ---",
+    "AnyLLMModel → AnyLLMModel: _stream_response_via_responses(...) — opens response_span",
+    "AnyLLMModel → AnyLLMModel: _fetch_responses_response(..., stream=True) — returns AsyncIterator[ResponseStreamEvent]",
+    "AnyLLMModel: iterates stream chunks, detects ResponseCompletedEvent to capture final_response",
+    "AnyLLMModel → Caller: yields each ResponseStreamEvent chunk",
+    "--- BRANCH: api == 'chat_completions' ---",
+    "AnyLLMModel → AnyLLMModel: _stream_response_via_chat(...) — opens generation_span",
+    "AnyLLMModel → AnyLLMModel: _fetch_chat_response(..., stream=True) — returns (Response shell, AsyncIterator[ChatCompletionChunk])",
+    "AnyLLMModel → AnyLLMModel: _normalize_chat_stream(stream) — normalizes each chunk, extracts reasoning text",
+    "AnyLLMModel → ChatCmplStreamHandler: handle_stream(response_shell, normalized_stream, model=self.model)",
+    "AnyLLMModel → Caller: yields each TResponseStreamEvent from ChatCmplStreamHandler"
+  ],
+  "routing_logic": {
+    "_selected_api": "Returns 'responses' if provider.SUPPORTS_RESPONSES=True (or user forced api='responses'), else 'chat_completions'. Raises UserError if user forces 'responses' on unsupported provider.",
+    "model_name_format": "'provider/model' — split on first '/'. If no '/', defaults provider to 'openai'. E.g. 'openrouter/openai/gpt-5.4-mini' → provider='openrouter', model='openai/gpt-5.4-mini'",
+    "provider_cache": "Cached by retry-flag (bool). Base provider created via AnyLLM.create(). Retry-disabled clone created via copy() + client.with_options(max_retries=0).",
+    "responses_transport_path": "If extra_headers/query/body present, uses private provider._aresponses(ResponsesParams, **transport_kwargs). Otherwise uses public provider.aresponses().",
+    "prompt_support": "prompt-managed requests are NOT supported; immediately raises UserError on both chat and responses paths."
+  },
+  "key_relationships": [
+    "AnyLLMModel extends Model (models.interface)",
+    "AnyLLMProvider extends ModelProvider; creates AnyLLMModel via get_model()",
+    "AnyLLMModel depends_on AnyLLM (any-llm SDK) via importlib lazy import",
+    "AnyLLMModel depends_on Converter (chatcmpl_converter) for chat path message/tool conversion",
+    "AnyLLMModel depends_on OpenAIResponsesConverter for responses path tool/format conversion",
+    "AnyLLMModel depends_on ChatCmplStreamHandler for streaming chat chunks → response events",
+    "AnyLLMModel depends_on get_openai_retry_advice for retry guidance",
+    "AnyLLMModel depends_on should_disable_provider_managed_retries for retry runtime control",
+    "AnyLLMModel uses response_span / generation_span for tracing (disabled when ModelTracing.DISABLED)"
+  ],
+  "important_notes": [
+    "Model name MUST be 'provider/model' format; no '/' defaults to 'openai' provider.",
+    "Responses API path: preserves previous_response_id and conversation_id (stateful sessions). Chat path does NOT (response_id=None).",
+    "Input sanitization (_sanitize_any_llm_responses_input) strips: provider_data fields, null/None values, FAKE_RESPONSES_ID ids, and drops full reasoning items with provider_data (cross-adapter replay safety).",
+    "Anthropic/Claude/Gemini models get extra fix_tool_message_ordering() applied to converted messages.",
+    "Streaming chat path builds a fake Response shell (id=FAKE_RESPONSES_ID) before delegating to ChatCmplStreamHandler.",
+    "Provider is lazily created and cached; aclose() propagates to underlying SDK client.",
+    "Reasoning content extracted via _extract_any_llm_reasoning_text() supporting reasoning_content, reasoning.content, thinking attributes.",
+    "Non-OpenAI ChatCompletion payloads (dict or generic BaseModel) are normalized via model_validate before processing."
+  ],
+  "source_files_analyzed": [
+    "src/agents/extensions/models/any_llm_model.py",
+    "src/agents/extensions/models/any_llm_provider.py",
+    "tests/models/test_any_llm_model.py"
+  ]
+}

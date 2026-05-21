@@ -1,0 +1,216 @@
+{
+  "scope": "permission_group_management",
+  "title": "Permission Group Management",
+  "diagram_type": "use_case",
+  "description": "Creating and managing permission groups, assigning users to groups, granting/revoking group permissions, and querying group access",
+
+  "actors": [
+    {
+      "name": "AuthenticatedUser",
+      "description": "Any logged-in user with a valid session token. Must own a group to manage its membership. Must be a UserActorType (not app/API token) to grant/revoke user-group permissions."
+    },
+    {
+      "name": "GroupOwner",
+      "description": "Subset of AuthenticatedUser who created (owns) a specific group. Required for add-users, remove-users operations."
+    },
+    {
+      "name": "SystemAdmin",
+      "description": "System-level config; provides default_user_group and default_temp_group as public groups."
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Create Permission Group",
+      "actor": "AuthenticatedUser",
+      "endpoint": "POST /group/create",
+      "service": "PermissionAPIService → GroupService.create()",
+      "inputs": ["metadata (object, optional)", "extra (object, optional)"],
+      "outputs": ["uid (UUID of new group)"],
+      "validations": ["extra must be non-array object", "metadata must be non-array object", "rate limit: max 20 groups per user per hour → APIError('too_many_requests')"],
+      "db_ops": ["INSERT INTO `group` (uid, owner_user_id, extra, metadata)"]
+    },
+    {
+      "id": "UC2",
+      "name": "Add Users to Group",
+      "actor": "GroupOwner",
+      "endpoint": "POST /group/add-users",
+      "service": "PermissionAPIService → GroupService.add_users()",
+      "inputs": ["uid (group UUID)", "users (array of usernames)"],
+      "validations": [
+        "Group must exist → APIError('entity_not_found')",
+        "Requester must be owner → APIError('forbidden')",
+        "users must be array of strings"
+      ],
+      "db_ops": ["INSERT INTO jct_user_group (user_id, group_id) via JOIN on username"]
+    },
+    {
+      "id": "UC3",
+      "name": "Remove Users from Group",
+      "actor": "GroupOwner",
+      "endpoint": "POST /group/remove-users",
+      "service": "PermissionAPIService → GroupService.remove_users()",
+      "inputs": ["uid (group UUID)", "users (array of usernames)"],
+      "validations": [
+        "Group must exist → APIError('entity_not_found')",
+        "Requester must be owner → APIError('forbidden')",
+        "users must be array of strings"
+      ],
+      "db_ops": ["DELETE FROM jct_user_group WHERE group_id=? AND user_id IN (SELECT by username)"]
+    },
+    {
+      "id": "UC4",
+      "name": "List Groups",
+      "actor": "AuthenticatedUser",
+      "endpoint": "GET /group/list",
+      "service": "PermissionAPIService → GroupService.list_groups_with_owner() + list_groups_with_member() + list_public_groups()",
+      "outputs": ["owned_groups (with members)", "in_groups (with members)", "public_groups (no member detail)"],
+      "db_ops": [
+        "SELECT * FROM `group` WHERE owner_user_id=?",
+        "SELECT * FROM `group` WHERE id IN (SELECT group_id FROM jct_user_group WHERE user_id=?)",
+        "SELECT * FROM `group` WHERE uid IN (default_user_group, default_temp_group) — Redis cached 60s"
+      ]
+    },
+    {
+      "id": "UC5",
+      "name": "Get Public Groups",
+      "actor": "AuthenticatedUser",
+      "endpoint": "GET /group/public-groups",
+      "service": "PermissionAPIService (reads global_config)",
+      "outputs": ["user (default_user_group uid)", "temp (default_temp_group uid)"]
+    },
+    {
+      "id": "UC6",
+      "name": "Grant Permission to Group",
+      "actor": "AuthenticatedUser (UserActorType only)",
+      "endpoint": "POST /auth/grant-user-group",
+      "service": "PermissionService.grant_user_group_permission(actor, group_uid, permission, extra, meta)",
+      "inputs": ["group_uid (string)", "permission (string)", "extra (object, optional)", "meta (object, optional)"],
+      "validations": ["actor must be UserActorType → APIError('forbidden')", "validate_fields on all inputs"],
+      "notes": "Registered by PermissionAPIService in install.routes"
+    },
+    {
+      "id": "UC7",
+      "name": "Revoke Permission from Group",
+      "actor": "AuthenticatedUser (UserActorType only)",
+      "endpoint": "POST /auth/revoke-user-group",
+      "service": "PermissionService.revoke_user_group_permission(actor, group_uid, permission, meta)",
+      "inputs": ["group_uid (string)", "permission (string)", "meta (object, optional)"],
+      "validations": ["actor must be UserActorType → APIError('forbidden')", "group_uid and permission required → APIError('field_missing')"]
+    },
+    {
+      "id": "UC8",
+      "name": "Check App ACL",
+      "actor": "AuthenticatedUser",
+      "endpoint": "GET /auth/check-app-acl",
+      "service": "PermissionAPIService → check-app-acl.endpoint.js handler",
+      "notes": "Registered via eggspress; checks app-level access control"
+    },
+    {
+      "id": "UC9",
+      "name": "Change Password / Email / Username",
+      "actor": "AuthenticatedUser (session-token only, non-temp)",
+      "endpoint": "POST /user-protected/change-password|change-email|change-username",
+      "service": "UserProtectedEndpointsService → respective routers",
+      "middleware_chain": [
+        "edge-rate-limit check → APIError('too_many_requests')",
+        "configurable_auth (no_options_auth, no cached user)",
+        "UserActorType + hasHttpOnlyCookie check → APIError('session_required')",
+        "force-fresh user load",
+        "block temp accounts (password=null AND email=null) → APIError('temporary_account')",
+        "bcrypt password verify OR JWT revalidation cookie verify → APIError('password_mismatch'/'password_required'/'oidc_revalidation_required')"
+      ]
+    },
+    {
+      "id": "UC10",
+      "name": "Disable 2FA",
+      "actor": "AuthenticatedUser (session-token only)",
+      "endpoint": "POST /user-protected/disable-2fa",
+      "service": "UserProtectedEndpointsService → disable-2fa router",
+      "middleware_chain": "Same as UC9 — full user-protected middleware stack"
+    },
+    {
+      "id": "UC11",
+      "name": "Delete Own User",
+      "actor": "AuthenticatedUser (including temp users)",
+      "endpoint": "POST /user-protected/delete-own-user",
+      "service": "UserProtectedEndpointsService → delete-own-user router",
+      "notes": "Only user-protected endpoint that bypasses temp-account check"
+    }
+  ],
+
+  "key_services": [
+    {
+      "name": "PermissionAPIService",
+      "extends": "BaseService",
+      "responsibilities": [
+        "Mounts group CRUD endpoints at /group/*",
+        "Mounts auth permission endpoints via __on_install.routes",
+        "Delegates group operations to GroupService",
+        "Delegates permission grant/revoke to PermissionService (via routers)"
+      ],
+      "group_endpoints": ["POST /group/create", "POST /group/add-users", "POST /group/remove-users", "GET /group/list", "GET /group/public-groups"],
+      "auth_endpoints": ["POST /auth/grant-user-group", "POST /auth/revoke-user-group", "POST /auth/grant-user-user", "POST /auth/revoke-user-user", "POST /auth/grant-user-app", "POST /auth/revoke-user-app", "GET /auth/list-permissions", "POST /auth/check-permissions", "GET /auth/check-app-acl"]
+    },
+    {
+      "name": "GroupService",
+      "extends": "BaseService",
+      "responsibilities": ["CRUD on `group` table", "membership management in jct_user_group", "Redis caching for public_groups (60s TTL)"],
+      "methods": ["create({owner_user_id, extra, metadata})", "get({uid})", "add_users({uid, users[]})", "remove_users({uid, users[]})", "list_groups_with_owner({owner_user_id})", "list_groups_with_member({user_id})", "list_public_groups()", "list_members({uid})"]
+    },
+    {
+      "name": "UserProtectedEndpointsService",
+      "extends": "BaseService",
+      "responsibilities": ["Mounts /user-protected/* routes with strict identity verification middleware"],
+      "auth_requirements": ["session token (HttpOnly cookie)", "UserActorType only", "bcrypt password OR OIDC JWT revalidation cookie"],
+      "protected_endpoints": ["/change-password", "/change-email", "/change-username", "/disable-2fa", "/delete-own-user"]
+    },
+    {
+      "name": "PermissionService",
+      "extends": "BaseService",
+      "relevant_methods": ["grant_user_group_permission(actor, group_uid, permission, extra, meta)", "revoke_user_group_permission(actor, group_uid, permission, meta)"]
+    }
+  ],
+
+  "error_types": [
+    "APIError('forbidden') — actor not owner or not UserActorType",
+    "APIError('entity_not_found') — group uid not found",
+    "APIError('field_invalid') — wrong type for extra/metadata/users",
+    "APIError('field_missing') — required field absent",
+    "APIError('too_many_requests') — rate limit (>20 groups/hour) or edge rate limit",
+    "APIError('temporary_account') — temp user accessing protected endpoints",
+    "APIError('session_required') — no HttpOnly cookie session",
+    "APIError('user_tokens_only') — non-user actor on user-protected route",
+    "APIError('password_mismatch') — bcrypt compare failed",
+    "APIError('password_required') — no password provided",
+    "APIError('oidc_revalidation_required') — OIDC-only account needs revalidation"
+  ],
+
+  "key_relationships": [
+    "PermissionAPIService depends_on GroupService (service registry lookup 'group')",
+    "PermissionAPIService mounts routers that depend_on PermissionService",
+    "UserProtectedEndpointsService depends_on EdgeRateLimitService, OIDCService",
+    "GroupService uses Database (DB_WRITE) and Redis cache",
+    "PermissionService uses Database (DB_WRITE) and Redis cache",
+    "grant-user-group router depends_on PermissionService.grant_user_group_permission",
+    "revoke-user-group router depends_on PermissionService.revoke_user_group_permission"
+  ],
+
+  "database_schema_implied": [
+    "`group` table: id, uid (UUID), owner_user_id, extra (JSON), metadata (JSON), created_at",
+    "`jct_user_group` table: user_id, group_id (junction for group membership)",
+    "`user` table: id, username, password, email"
+  ],
+
+  "important_notes": "All group endpoints require configurable_auth middleware. Group ownership enforced per-operation (not just at creation). Public groups are system-defined via global_config (default_user_group, default_temp_group) and Redis-cached 60s. User-protected endpoints require HTTP-only session cookie — API tokens/GUI tokens rejected. OIDC-only users must use JWT revalidation cookie instead of password. Rate limit on group creation: 20 groups per user per hour.",
+
+  "source_files_analyzed": [
+    "src/backend/src/services/PermissionAPIService.js",
+    "src/backend/src/services/web/UserProtectedEndpointsService.js",
+    "src/backend/src/services/auth/GroupService.js",
+    "src/backend/src/services/auth/PermissionService.js (partial)",
+    "src/backend/src/routers/auth/grant-user-group.js",
+    "src/backend/src/routers/auth/revoke-user-group.js"
+  ]
+}

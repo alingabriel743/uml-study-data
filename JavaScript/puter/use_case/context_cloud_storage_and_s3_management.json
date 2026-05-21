@@ -1,0 +1,199 @@
+{
+  "scope": "cloud_storage_and_s3_management",
+  "title": "Cloud Storage and S3 Management",
+  "diagram_type": "use_case",
+  "description": "Uploading, downloading, copying, and deleting objects in S3-backed storage",
+
+  "actors": [
+    "Client (API Consumer)",
+    "FilesystemAPIService (HTTP Route Registrar)",
+    "S3StorageController (Legacy S3 Backend)",
+    "S3StorageProvider (fsv2 S3 Backend)",
+    "FSEntryController (Metadata / DB Layer)",
+    "AWS S3 (External Storage)"
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Upload File",
+      "actor": "Client",
+      "entry_point": "FilesystemAPIService → POST /write (or /writeFile)",
+      "handler": "S3StorageController.upload({ uid, file, storage_meta, storage_api })",
+      "sub_flows": [
+        "Buffer upload: PutObjectCommand (single PUT)",
+        "Stream upload: CreateMultipartUploadCommand → UploadPartCommand (×N, max 4 concurrent) → CompleteMultipartUploadCommand",
+        "Error path: AbortMultipartUploadCommand"
+      ],
+      "retry": "simple_retry (3 attempts, 200ms delay) on each part",
+      "progress": "progress_tracker.set_total(size) / progress_tracker.set(uploaded)"
+    },
+    {
+      "id": "UC2",
+      "name": "Download / Read File",
+      "actor": "Client",
+      "entry_point": "FilesystemAPIService → GET /read (or /token-read)",
+      "handler": "S3StorageController.read({ location, range, version_id })",
+      "sub_flows": [
+        "GetObjectCommand with optional Range header and VersionId",
+        "Returns Readable stream from response.Body"
+      ]
+    },
+    {
+      "id": "UC3",
+      "name": "Copy File",
+      "actor": "Client",
+      "entry_point": "FilesystemAPIService → POST /copy",
+      "handler": "S3StorageController.copy({ src_node, dst_storage, storage_api })",
+      "sub_flows": [
+        "size < 4 GiB: #copy_simple → CopyObjectCommand",
+        "size ≥ 4 GiB: #copy_multipart → CreateMultipartUploadCommand → UploadPartCopyCommand (×N, 4 GiB parts) → CompleteMultipartUploadCommand"
+      ],
+      "note": "src_node.get('s3:location') resolves bucket/key; progress_tracker updated after copy"
+    },
+    {
+      "id": "UC4",
+      "name": "Delete File",
+      "actor": "Client",
+      "entry_point": "FilesystemAPIService → DELETE /delete",
+      "handler": "S3StorageController.delete({ node })",
+      "sub_flows": [
+        "node.get('s3:location') → resolves bucket_region, bucket, key",
+        "DeleteObjectCommand sent via s3Client"
+      ]
+    },
+    {
+      "id": "UC5",
+      "name": "Create Directory",
+      "actor": "Client",
+      "entry_point": "FilesystemAPIService → POST /mkdir",
+      "handler": "FSEntryController.insert(entry)",
+      "note": "Metadata-only operation; no S3 object created"
+    },
+    {
+      "id": "UC6",
+      "name": "Stat / Read Metadata",
+      "actor": "Client",
+      "entry_point": "FilesystemAPIService → GET /stat",
+      "handler": "FSEntryController.get(uuid, fetch_entry_options)",
+      "sub_flows": [
+        "Applies pending Insert/Update/Delete ops from queue",
+        "Falls back to DB read via NodeUIDSelector if diff exists"
+      ]
+    },
+    {
+      "id": "UC7",
+      "name": "List Directory",
+      "actor": "Client",
+      "entry_point": "FilesystemAPIService → GET /readdir (or /readdir-subdomains)",
+      "handler": "FSEntryController.fast_get_direct_descendants(uuid) or fast_get_descendants(uuid)",
+      "sub_flows": [
+        "Recursive CTE SQL query on fsentries table"
+      ]
+    },
+    {
+      "id": "UC8",
+      "name": "Move / Rename File",
+      "actor": "Client",
+      "entry_point": "FilesystemAPIService → POST /move | /rename",
+      "handler": "FSEntryController.update(uuid, entry)",
+      "note": "Metadata update only; S3 key unchanged (copy+delete pattern if needed at upper layer)"
+    },
+    {
+      "id": "UC9",
+      "name": "Search Files",
+      "actor": "Client",
+      "entry_point": "FilesystemAPIService → GET /search",
+      "handler": "Dedicated search router (filesystem_api/search)"
+    },
+    {
+      "id": "UC10",
+      "name": "Create Signed Upload URL (fsv2)",
+      "actor": "Client (direct S3 upload)",
+      "handler": "S3StorageProvider.createSignedUploadUrl / batchCreateSignedUploadUrls",
+      "sub_flows": [
+        "single mode: PutObjectCommand presigned URL (expires 60s–3600s)",
+        "multipart mode: CreateMultipartUploadCommand → createSignedMultipartPartUrls (UploadPartCommand presigned URLs per part)"
+      ]
+    },
+    {
+      "id": "UC11",
+      "name": "Complete Multipart Upload (fsv2 client-side)",
+      "actor": "Client",
+      "handler": "S3StorageProvider.completeMultipartUpload(input, region)",
+      "sub_flows": [
+        "CompleteMultipartUploadCommand with sorted part ETags"
+      ]
+    },
+    {
+      "id": "UC12",
+      "name": "Server-side Upload (fsv2)",
+      "actor": "Internal Service",
+      "handler": "S3StorageProvider.uploadFromServer(input, region)",
+      "sub_flows": [
+        "Small/known size: PutObjectCommand",
+        "Large/stream: #uploadFromServerMultipart → CreateMultipartUploadCommand → UploadPartCommand (×N) → CompleteMultipartUploadCommand",
+        "Empty file edge case: AbortMultipart + PutObject(empty body)"
+      ]
+    }
+  ],
+
+  "key_components": [
+    {
+      "name": "FilesystemAPIService",
+      "type": "BaseService subclass",
+      "role": "HTTP route registrar; mounts all filesystem API routers on web-server app",
+      "routes_registered": ["batch", "write", "mkdir", "delete", "stat", "touch", "read", "token-read", "readdir", "copy", "move", "rename", "search", "update", "writeFile (v1)", "file (v1)", "df", "cache"]
+    },
+    {
+      "name": "S3StorageController",
+      "type": "Class (legacy extension)",
+      "role": "Primary S3 I/O controller (server-side streaming, copy, delete, read)",
+      "public_methods": ["init()", "upload({uid, file, storage_meta, storage_api})", "copy({src_node, dst_storage, storage_api})", "delete({node})", "read({location, range, version_id})"],
+      "private_methods": ["#get_client(region)", "#upload_stream(...)", "#copy_simple(...)", "#copy_multipart(...)"],
+      "dependencies": ["s3ClientProvider (AWS SDK S3Client)", "EWMA (part-time estimator)", "simple_retry", "chunk_stream", "TeePromise"]
+    },
+    {
+      "name": "S3StorageProvider",
+      "type": "Class (fsv2 TypeScript)",
+      "role": "Signed URL generation + server-side upload for fsv2 architecture",
+      "public_methods": ["createSignedUploadUrl", "batchCreateSignedUploadUrls", "createSignedMultipartPartUrls", "completeMultipartUpload", "abortMutipartUpload", "uploadFromServer", "deleteObject", "getMaxSingleUploadSize", "getMultipartPartSize"],
+      "dependencies": ["@aws-sdk/client-s3", "@aws-sdk/s3-request-presigner", "s3ClientProvider"]
+    },
+    {
+      "name": "FSEntryController",
+      "type": "Class (legacy extension)",
+      "role": "DB metadata manager for filesystem entries (queue-based write serialization)",
+      "public_methods": ["insert(entry)", "update(uuid, entry)", "delete(uuid)", "get(uuid, opts)", "fast_get_descendants(uuid)", "fast_get_direct_descendants(uuid)", "waitForEntry(node, cb)"],
+      "dependencies": ["db (SQL)", "Insert/Update/Delete operation classes", "NodeUIDSelector", "PuterPath"]
+    }
+  ],
+
+  "key_relationships": [
+    "FilesystemAPIService depends_on web-server (Express app)",
+    "FilesystemAPIService registers_routes_for filesystem_api routers",
+    "S3StorageController uses s3ClientProvider (per-region AWS S3Client)",
+    "S3StorageController delegates_to FSEntryController for node metadata (s3:location, size)",
+    "S3StorageProvider uses s3ClientProvider (per-region AWS S3Client)",
+    "FSEntryController wraps Insert/Update/Delete ops in serialized queue",
+    "FSEntryController reads/writes fsentries table via db",
+    "S3StorageController.copy reads node.get('s3:location') → bucket, key, region"
+  ],
+
+  "important_notes": [
+    "Two parallel S3 backends: legacy S3StorageController (streaming, server proxied) and fsv2 S3StorageProvider (signed URLs, client direct upload)",
+    "Multipart threshold: legacy controller uses stream-based chunking (5 MB parts); copy switches to multipart at 4 GB file size",
+    "FSEntryController uses deferred/current queue states to batch DB writes and avoid race conditions",
+    "FilesystemAPIService is event-driven: registers routes via __on_install.routes lifecycle hook",
+    "Progress tracking via storage_api.progress_tracker (set_total / set)",
+    "Retry logic: simple_retry(fn, 3, 200) wraps S3 commands"
+  ],
+
+  "source_files_analyzed": [
+    "extensions/legacyFileSystem/storage/S3StorageController.js",
+    "src/backend/src/services/FilesystemAPIService.js",
+    "extensions/fsv2/src/repositories/S3FileStorageRepository.ts",
+    "extensions/legacyFileSystem/fsentries/FSEntryController.js",
+    "diagrams/use_case/ir_view_use_case.json"
+  ]
+}

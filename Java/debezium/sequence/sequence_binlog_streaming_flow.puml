@@ -1,0 +1,258 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    DividerBackgroundColor #DEE2E6
+    GroupBackgroundColor #F1F3F5
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F0AD4E
+}
+
+title MySQL/MariaDB Binlog Streaming Flow
+
+actor "Kafka Connect\nFramework" as Framework
+participant "BinlogStreaming\nChangeEventSource" as BSCES
+participant "BinaryLogClient\n(shyiko)" as BLC
+participant "ReaderThread\nLifecycleListener" as RTLL
+participant "EventBuffer" as EB
+participant "BinlogOffset\nContext" as OC
+participant "BinlogDatabase\nSchema" as Schema
+participant "EventDispatcher" as ED
+participant "BinlogChangeRecord\nEmitter" as Emitter
+participant "Metrics" as Metrics
+participant "ErrorHandler" as EH
+database "MySQL / MariaDB\nServer" as MySQL
+
+== Setup Phase ==
+
+Framework -> BSCES : execute(context, partition, offsetContext)
+activate BSCES
+
+BSCES -> Schema : assureNonEmptySchema()
+activate Schema
+Schema --> BSCES : ok
+deactivate Schema
+
+BSCES -> BSCES : register eventHandlers\n(STOP, HEARTBEAT, ROTATE,\nTABLE_MAP, QUERY, WRITE_ROWS,\nUPDATE_ROWS, DELETE_ROWS, XID...)
+
+alt bufferSizeForStreamingChangeEventSource > 0
+    BSCES -> EB : new EventBuffer(bufferSize, this, context)
+    activate EB
+    note right of EB
+        Optional: buffers events to
+        filter rolled-back transactions
+    end note
+end
+
+BSCES -> BLC : registerEventListener(event -> buffer.add / handleEvent)
+BSCES -> BLC : registerLifecycleListener(new ReaderThreadLifecycleListener)
+BSCES -> BLC : registerEventListener(event -> onEvent) [metrics tracking]
+
+alt GTID mode enabled
+    BSCES -> BLC : setGtidSet(filteredGtidSet)
+else Position-based replication
+    BSCES -> BLC : setBinlogFilename(filename)\n+ setBinlogPosition(position)
+end
+
+BSCES -> BLC : connect(connectionTimeoutMs)
+activate BLC
+
+== Connection Callback (BinaryLogClient background thread) ==
+
+BLC -> RTLL : onConnect(client)
+activate RTLL
+RTLL -> BSCES : configureLoggingContext('binlog')
+RTLL --> BLC : (connected)
+deactivate RTLL
+
+== Streaming Loop (BinaryLogClient fires events) ==
+
+loop while ChangeEventSourceContext.isRunning()
+
+    MySQL -> BLC : raw binlog bytes (background thread)
+
+    BLC -> Metrics : onEvent(offsetContext, event)\n[calc lag, setMilliSecondsBehindSource]
+    activate Metrics
+    Metrics --> BLC
+    deactivate Metrics
+
+    alt EventBuffer enabled
+        BLC -> EB : add(partition, offsetContext, event)
+
+        alt QUERY / BEGIN
+            EB -> EB : beginTransaction()\n→ addToBuffer(event)
+        else DML event — not in transaction
+            EB -> BSCES : handleEvent(partition, offsetContext, event)
+            activate BSCES
+            note right: direct dispatch
+            BSCES --> EB
+            deactivate BSCES
+        else DML event — inside transaction
+            EB -> EB : addToBuffer(event)
+        else QUERY/COMMIT or XID
+            EB -> EB : completeTransaction(partition, offsetContext)
+            loop for each buffered event
+                EB -> BSCES : handleEvent(partition, offsetContext, bufferedEvent)
+                activate BSCES
+                BSCES --> EB
+                deactivate BSCES
+            end
+            EB -> Metrics : onCommittedTransaction()
+        else QUERY / ROLLBACK
+            EB -> EB : rollbackTransaction()\n→ buffer.clear()
+            EB -> Metrics : onRolledBackTransaction()
+        end
+
+    else No EventBuffer (direct dispatch)
+        BLC -> BSCES : handleEvent(partition, offsetContext, event)
+        activate BSCES
+        BSCES --> BLC
+        deactivate BSCES
+    end
+
+end
+
+== Handle Event — Core Dispatch ==
+
+note over BSCES
+  Called for every event (from BinaryLogClient or EventBuffer)
+end note
+
+BSCES -> BSCES : waitWhenStreamingPaused(context)
+
+BSCES -> OC : setBinlogServerId(serverId)
+activate OC
+
+alt ROTATE event
+    BSCES -> OC : setBinlogStartPoint(filename, position)
+else all other events
+    BSCES -> OC : setEventPosition(position, eventLength)
+end
+
+BSCES -> BSCES : eventHandlers.getOrDefault(eventType, ignoreEvent).accept(event)
+
+alt HEARTBEAT event
+    BSCES -> ED : dispatchHeartbeatEvent(partition, offsetContext)
+    activate ED
+    ED --> BSCES
+    deactivate ED
+end
+
+BSCES -> OC : completeEvent()  [offset commit / advance]
+deactivate OC
+
+== Transaction Begin (QUERY event — SQL = 'BEGIN') ==
+
+BSCES -> BSCES : handleQueryEvent(partition, offsetContext, event)
+BSCES -> OC : startNextTransaction()
+activate OC
+OC --> BSCES
+deactivate OC
+
+BSCES -> ED : dispatchTransactionStartedEvent(partition, transactionId, offsetContext, eventTime)
+activate ED
+ED --> BSCES
+deactivate ED
+
+BSCES -> OC : setBinlogThread(threadId)
+
+== DML Event Handling (INSERT / UPDATE / DELETE) ==
+
+BSCES -> BSCES : handleInsert(partition, offsetContext, event)\n[same pattern for Update / Delete]
+
+BSCES -> Schema : getTableId(binaryTableId)
+activate Schema
+Schema --> BSCES : tableId
+deactivate Schema
+
+BSCES -> Schema : schemaFor(tableId)
+activate Schema
+Schema --> BSCES : tableSchema (or null → skip)
+deactivate Schema
+
+loop for each row in DML event
+
+    BSCES -> OC : setRowNumber(rowIndex, numRows)
+    BSCES -> OC : event(tableId, eventTimestamp)
+
+    BSCES -> ED : dispatchDataChangeEvent(partition, tableId,\nnew BinlogChangeRecordEmitter(partition, offsetContext,\nclock, CREATE/UPDATE/DELETE, before, after, config))
+    activate ED
+    ED -> Emitter : emit(receiver)
+    activate Emitter
+    Emitter --> ED : change record(s)
+    deactivate Emitter
+    ED --> BSCES : dispatched
+    deactivate ED
+
+    BSCES -> OC : changeEventCompleted()
+
+end
+
+== Transaction Commit (XID event) ==
+
+BSCES -> BSCES : handleTransactionCompletion(partition, offsetContext, event)
+
+BSCES -> ED : dispatchTransactionCommittedEvent(partition, offsetContext, eventTime)
+activate ED
+ED --> BSCES
+deactivate ED
+
+BSCES -> OC : commitTransaction()
+BSCES -> OC : setBinlogThread(-1)
+
+== Error / Disconnect Handling ==
+
+alt Communication failure
+    MySQL -> BLC : connection error
+    BLC -> RTLL : onCommunicationFailure(client, ex)
+    activate RTLL
+    RTLL -> BLC : disconnect()
+    RTLL -> EH : setProducerThrowable(wrap(ex))
+    activate EH
+    EH --> RTLL
+    deactivate EH
+    deactivate RTLL
+else Event deserialization failure
+    BLC -> RTLL : onEventDeserializationFailure(client, ex)
+    activate RTLL
+    RTLL -> EH : setProducerThrowable(ex) / log per mode
+    deactivate RTLL
+else Disconnect (clean)
+    BLC -> RTLL : onDisconnect(client)
+    activate RTLL
+    RTLL -> RTLL : log last offset
+    deactivate RTLL
+end
+
+== Shutdown ==
+
+Framework -> BSCES : (ChangeEventSourceContext.isRunning() → false)
+BSCES -> BLC : disconnect()
+deactivate BLC
+deactivate EB
+deactivate BSCES
+
+@enduml

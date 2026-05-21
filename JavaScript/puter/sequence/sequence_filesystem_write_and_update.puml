@@ -1,0 +1,223 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipantBorderColor #495057
+skinparam sequenceParticipantBackgroundColor #F8F9FA
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceGroupBorderColor #6C757D
+skinparam sequenceGroupBackgroundColor #E9ECEF
+skinparam sequenceGroupFontStyle bold
+skinparam noteBorderColor #ADB5BD
+skinparam noteBackgroundColor #FFF3CD
+
+title Filesystem Write, Update, and Delete Flow
+
+actor Caller as caller
+participant "PuterFSProvider" as provider
+participant "storageController" as storage
+participant "FSEntryController" as fsc
+participant "db\n(batch_write)" as db
+participant "svc_acl" as acl
+participant "svc_resource" as resource
+participant "svc_size" as size
+participant "svc_metering" as metering
+participant "svc_event" as event
+participant "svc_fs" as svcfs
+
+' ─────────────────────────────────────────────
+== INSERT: write_new ==
+' ─────────────────────────────────────────────
+
+caller -> provider : write_new({ context, parent, name, file })
+activate provider
+
+provider -> acl : check(actor, parent, 'write')
+activate acl
+acl --> provider : granted
+deactivate acl
+
+provider -> storage : upload({ uid, file, storage_meta, storage_api })
+activate storage
+storage --> provider : upload complete
+deactivate storage
+
+provider -> resource : register({ uid, status: PENDING_CREATE })
+activate resource
+resource --> provider : registered
+deactivate resource
+
+provider -> size : change_usage(user_id, +filesize)
+provider -> metering : incrementUsage(ownerActor, 'filesystem:ingress:bytes', filesize)
+
+provider -> fsc : insert(raw_fsentry)
+activate fsc
+
+fsc -> fsc : enqueue_(InsertOp)
+note right of fsc
+  If queue full (>50),
+  await queueSizePromise
+end note
+
+fsc -> fsc : checkShouldExec_()
+fsc -> fsc : exec_() — sets STATUS_RUNNING_JOB
+
+fsc -> db : batch_write([INSERT INTO fsentries ...])\n(all queued ops in one batch)
+activate db
+db --> fsc : rows saved
+deactivate db
+
+fsc -> fsc : set op STATUS_DONE (resolves TeePromise)
+fsc -> fsc : flipState_()\n(deferredState → currentState)
+
+fsc --> provider : InsertOp (TeePromise)
+deactivate fsc
+
+provider -> event : emit('fs.pending.file', { node, context })
+
+note over provider, resource
+  [async — after awaitDone()]
+end note
+provider -> resource : free(uid)
+provider -> event : emit('fs.create.file', { node, context })
+deactivate resource
+
+provider --> caller : FSNode
+deactivate provider
+
+' ─────────────────────────────────────────────
+== UPDATE: write_overwrite ==
+' ─────────────────────────────────────────────
+
+caller -> provider : write_overwrite({ context, node, file })
+activate provider
+
+provider -> acl : check(actor, node, 'write')
+activate acl
+acl --> provider : granted
+deactivate acl
+
+provider -> storage : upload({ uid, file, storage_meta, storage_api })
+activate storage
+storage --> provider : upload complete
+deactivate storage
+
+provider -> resource : register({ uid, status: PENDING_CREATE })
+activate resource
+resource --> provider : registered
+deactivate resource
+
+provider -> size : change_usage(user_id, +filesize)
+provider -> metering : incrementUsage(ownerActor, 'filesystem:ingress:bytes', filesize)
+
+provider -> fsc : update(uid, raw_fsentry_delta)
+activate fsc
+fsc -> fsc : enqueue_(UpdateOp) → exec_()
+fsc -> db : batch_write([UPDATE fsentries SET field=? WHERE uuid=? LIMIT 1])
+activate db
+db --> fsc : updated
+deactivate db
+fsc -> fsc : STATUS_DONE + flipState_()
+fsc --> provider : UpdateOp (TeePromise)
+deactivate fsc
+
+note over provider, resource
+  [async — after awaitDone()]
+end note
+provider -> resource : free(uid)
+provider -> event : emit('fs.write.file', { node, context })
+deactivate resource
+
+provider --> caller : FSNode
+deactivate provider
+
+' ─────────────────────────────────────────────
+== DELETE: unlink / rmdir ==
+' ─────────────────────────────────────────────
+
+caller -> provider : unlink({ context, node, options })
+activate provider
+
+provider -> provider : #rmnode({ context, node, options })
+
+provider -> size : change_usage(userId, -fileSize)
+provider -> metering : incrementUsage(ownerActor, 'filesystem:delete:bytes', fileSize)
+
+provider -> fsc : delete(node.uid)
+activate fsc
+fsc -> fsc : enqueue_(DeleteOp) → exec_()
+fsc -> db : batch_write([DELETE FROM fsentries WHERE uuid=? LIMIT 1])
+activate db
+db --> fsc : deleted
+deactivate db
+fsc -> fsc : STATUS_DONE + flipState_()
+fsc --> provider : DeleteOp
+deactivate fsc
+
+opt node has S3 storage
+    provider -> storage : create_delete().run({ node })
+    activate storage
+    storage --> provider : blob removed
+    deactivate storage
+end
+
+provider --> caller : success
+deactivate provider
+
+' ─────────────────────────────────────────────
+== MOVE ==
+' ─────────────────────────────────────────────
+
+caller -> provider : move({ context, node, new_parent, new_name, metadata })
+activate provider
+
+provider -> acl : check(actor, new_parent, 'write')
+activate acl
+acl --> provider : granted
+deactivate acl
+
+provider -> fsc : update(node.uid, { parent_uid, path, name, metadata })
+activate fsc
+fsc -> fsc : enqueue_(UpdateOp) → exec_()
+fsc -> db : batch_write([UPDATE fsentries ...])
+activate db
+db --> fsc : updated
+deactivate db
+fsc -> fsc : STATUS_DONE + flipState_()
+fsc --> provider : UpdateOp
+deactivate fsc
+
+provider -> svcfs : update_child_paths(old_path, new_path, user_id)
+provider -> event : emit('fs.move.file', { node, context })
+provider -> event : emit('fs.rename', { node, context })
+
+provider --> caller : moved FSNode
+deactivate provider
+
+' ─────────────────────────────────────────────
+== FSEntryController Queue State Machine ==
+' ─────────────────────────────────────────────
+
+note across
+  **Double-Buffer Queue Pattern**
+  STATUS_READY → ops enqueue to currentState.queue → exec_() fires immediately
+  STATUS_RUNNING_JOB → new ops enqueue to deferredState.queue
+  After exec_(): flipState_() promotes deferredState → currentState; resolves queueSizePromise
+  max_queue = 50 (configurable via svc_params); TeePromise allows multiple awaiters per op
+end note
+
+@enduml

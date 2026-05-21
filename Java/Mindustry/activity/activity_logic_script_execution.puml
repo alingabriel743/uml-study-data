@@ -1,0 +1,188 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleBackgroundColor #E9ECEF
+}
+
+title Logic Script Compilation & Execution
+
+|LogicBuild|
+start
+
+note right
+  **PHASE 1 — COMPILATION**
+  Triggered once on code change
+end note
+
+:Code string ready in LogicBuild.code;
+:Call LAssembler.assemble(code, privileged);
+
+|LParser|
+:new LParser(text, privileged);
+:Clear jumps map and jumpLocations map;
+
+while (pos < length AND line < 1000?) is (more chars)
+  if (char is whitespace or delimiter?) then (yes)
+    :Advance position (skip);
+  else (instruction text)
+    :Tokenize line into tokens[]\n(max 16 tokens per line);
+    if (blank line — tok == 0?) then (yes)
+      :Discard line;
+    elseif (single token ending with ':'?) then (label)
+      :Store jumpLocations[label] = line;
+    else (statement)
+      :checkRead() — apply legacy op-name renames\n(atan2 → angle, dst → len);
+      :LogicIO.read(tokens, tok) → LStatement;
+      if (st is null AND custom mod parser exists?) then (yes)
+        :Run custom mod parser → LStatement;
+      endif
+      if (!privileged AND st.privileged()?) then (blocked)
+        :Replace with InvalidStatement;
+      elseif (st is still null?) then (unknown op)
+        :Add InvalidStatement;
+      else (valid statement)
+      endif
+      if (tokens[0] == 'jump' AND operand is a label?) then (yes)
+        :Record JumpIndex for deferred resolution;
+      endif
+      :statements.add(st);
+      :line++;
+    endif
+  endif
+endwhile (end of source)
+
+:Resolve all deferred jump labels\n(set JumpStatement.destIndex from jumpLocations);
+if (referenced label not found?) then (yes)
+  #FFCCCC:Throw RuntimeException\n"Undefined jump location";
+  stop
+else (all labels resolved)
+  :Return Seq<LStatement>;
+endif
+
+|LAssembler|
+
+note right
+  Variable resolution happens
+  at assemble-time; runtime
+  LVars are pre-resolved references
+end note
+
+:For each LStatement: st.build(asm) → LInstruction\n(null results filtered out);
+
+while (operand symbol to resolve?) is (yes)
+  if (Vars.logicVars.get(symbol) != null?) then (global const)
+    :Return existing global const LVar;
+  elseif (symbol starts or ends with '\"'?) then (string literal)
+    :Create string-constant LVar;
+  elseif (parseDouble(symbol) succeeds?) then (numeric literal)
+    :Create numeric-constant LVar\n(decimal / hex / binary / RRGGBB color);
+  else (identifier)
+    :putVar(symbol) — create or reuse\nmutable LVar;
+  endif
+endwhile (all operands resolved)
+
+:Return populated LAssembler\n(vars: OrderedMap<String,LVar>  +  instructions[]);
+
+note right
+  **PHASE 2 — LOADING**
+  Transfer assembled state
+  into executor instance
+end note
+
+|LogicBuild|
+:executor.load(asm);
+
+|LExecutor|
+:nameMap = null;
+:Copy non-constant vars from asm.vars\ninto executor.vars[] with sequential ids;
+:executor.instructions = asm.instructions;
+:Bind special vars:\n  @counter (numval=0)\n  @unit   (const null object)\n  @this   (const null object)\n  @ipt    (const = build.ipt);
+
+note right
+  **PHASE 3 — PER-TICK EXECUTION**
+  LogicBuild.updateTile() called
+  every game tick
+end note
+
+|LogicBuild|
+repeat
+
+  :updateTile() invoked by game engine;
+
+  if (rules.disableWorldProcessors AND privileged?) then (skip)
+    :Return — privileged processor disabled;
+  elseif (!enabled OR !executor.initialized()?) then (skip)
+    :Return — processor not ready;
+  else (execute)
+
+    if (accumulator > maxInstructionScale × ipt?) then (over budget)
+      :Cap: accumulator = maxInstructionScale × ipt;
+    endif
+
+    while (accumulator >= 1.0?) is (budget available)
+
+      :executor.runOnce();
+
+      |LExecutor|
+      if (counter.numval >= instructions.length\nOR counter.numval < 0?) then (out of bounds)
+        :Wrap: counter.numval = 0;
+      else (in range)
+        :counter.isobj = false;
+        :Fetch instructions[(int)counter.numval];
+        :counter.numval++  (pre-advance program counter);
+        :instruction.run(executor);
+        note right
+          Instruction dispatch:
+          ─────────────────────────────────────
+          EndI       → counter = instructions.length
+          NoOpI      → no operation
+          JumpI      → if condition met: counter = address
+          WaitI      → re-execute + yield=true if not elapsed
+          OpI        → dest = op.function(a, b)
+          SetI       → to = from  (LVar assignment)
+          PrintI     → append value to textBuffer
+          PrintCharI → append (char)floor(val) to textBuffer
+          PrintFlushI→ flush textBuffer to MessageBlock
+          SenseI     → output = target.sense(property)
+          ControlI   → send command to Building / Unit
+          DrawI      → push draw command to graphicsBuffer
+          RadarI     → find nearest / farthest unit by filters
+          GetLinkI   → output = exec.links[index]
+          UnitBindI  → bind next unit of UnitType from team
+        end note
+      endif
+
+      |LogicBuild|
+      if (executor.yield == true?) then (yield requested)
+        :executor.yield = false;
+        break
+      else (continue)
+        :accumulator -= 1;
+      endif
+
+    endwhile (budget exhausted)
+
+    :accumulator += edelta() × ipt\n(accrue fractional instruction budget over time);
+
+  endif
+
+repeat while (game still running?) is (yes)
+-> no;
+
+stop
+
+@enduml

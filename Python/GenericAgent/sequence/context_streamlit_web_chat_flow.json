@@ -1,0 +1,115 @@
+{
+  "scope": "Streamlit Web Chat Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "User",
+    "StreamlitUI (stapp / stapp2)",
+    "init() [@st.cache_resource]",
+    "GeneraticAgent",
+    "agent.run() [daemon thread]",
+    "display_queue [queue.Queue]",
+    "render_streaming_area / agent_backend_stream",
+    "st.session_state"
+  ],
+  "interaction_flow": [
+    "=== APP STARTUP ===",
+    "StreamlitUI → init(): @st.cache_resource — runs once per session",
+    "init() → GeneraticAgent(): instantiate agent",
+    "init() → threading.Thread(target=agent.run, daemon=True).start(): agent loop running in background",
+    "init() → StreamlitUI: return agent",
+    "StreamlitUI → init_session_state(): set defaults (streaming=False, display_queue=None, partial_response='', messages=[])",
+
+    "=== HISTORY RENDER (every rerun) ===",
+    "StreamlitUI → st.session_state.messages: iterate stored messages",
+    "StreamlitUI → render_message(role, content, ts) [stapp2] / with st.chat_message + render_segments() [stapp]: display each message",
+
+    "=== USER SUBMITS MESSAGE ===",
+    "User → StreamlitUI: st.chat_input('...') → prompt",
+    "StreamlitUI → st.session_state.messages.append({role:'user', content:prompt})",
+
+    "--- stapp path ---",
+    "StreamlitUI → agent_backend_stream(prompt): enter generator",
+    "agent_backend_stream → agent.put_task(prompt, source='user'): returns display_queue",
+    "agent.put_task → GeneraticAgent: enqueue task",
+    "GeneraticAgent (daemon) → display_queue.put({'next': partial_text}): on each partial token/chunk",
+    "GeneraticAgent (daemon) → display_queue.put({'done': final_text}): on completion",
+
+    "agent_backend_stream → display_queue.get(timeout=1): poll loop",
+    "agent_backend_stream → StreamlitUI: yield item['next'] (partial) or yield item['done'] (final, break)",
+    "StreamlitUI → fold_turns(response): parse 'LLM Running (Turn N)...' markers into segments list",
+    "StreamlitUI → render_segments([segs[-1]], suffix=' ▌'): render live (last) segment with cursor",
+    "StreamlitUI → render_segments([segs[frozen]]); live = st.empty(); frozen++: promote completed segments to frozen slots",
+    "StreamlitUI (on 'done') → render_segments(remaining_segs): finalize all segments without cursor",
+    "StreamlitUI → st.session_state.messages.append({role:'assistant', content:response})",
+    "StreamlitUI → st.session_state.last_reply_time = int(time.time())",
+
+    "--- stapp2 path ---",
+    "StreamlitUI → start_agent_task(prompt):",
+    "  start_agent_task → agent.put_task(prompt, source='user'): returns display_queue",
+    "  start_agent_task → st.session_state: display_queue=queue, streaming=True, stopping=False, partial_response='', reply_ts=now",
+    "StreamlitUI → st.rerun(): trigger Streamlit rerun",
+
+    "=== STREAMING RERUN LOOP (stapp2) ===",
+    "StreamlitUI → render_streaming_area() [if session_state.streaming]",
+    "render_streaming_area → _get_response_segments(partial_response): split by turn markers",
+    "render_streaming_area → render_message('assistant', seg + '▌', ts=reply_ts): display partial with cursor",
+    "render_streaming_area → poll_agent_output(max_items=20):",
+    "  poll_agent_output → display_queue.get_nowait(): drain up to 20 items",
+    "  display_queue → {'next': text}: st.session_state.partial_response = text",
+    "  display_queue → {'done': text}: st.session_state.partial_response = text; done=True",
+    "  poll_agent_output (if done) → st.session_state: streaming=False, stopping=False, display_queue=None",
+    "  poll_agent_output → return done (bool)",
+    "render_streaming_area (if done) → finish_streaming_message():",
+    "  finish_streaming_message → _get_response_segments(partial_response): split final text",
+    "  finish_streaming_message → st.session_state.messages.extend([{role:'assistant', content:seg}...])",
+    "  finish_streaming_message → st.session_state.last_reply_time = int(time.time())",
+    "  finish_streaming_message → clear partial_response, reply_ts, current_prompt",
+    "render_streaming_area (if not done) → time.sleep(0.2)",
+    "render_streaming_area → st.rerun(): loop back until done"
+  ],
+  "key_relationships": [
+    "StreamlitUI instantiates GeneraticAgent via init() (cached)",
+    "GeneraticAgent.run() executes in background daemon thread (started once)",
+    "StreamlitUI communicates with agent exclusively via display_queue (queue.Queue)",
+    "display_queue carries {'next': str} for partial updates and {'done': str} for completion",
+    "stapp uses Python generator (for response in agent_backend_stream) for streaming",
+    "stapp2 uses Streamlit rerun loop (st.rerun + session_state polling) for streaming",
+    "Both apps use fold_turns / _get_response_segments to parse multi-turn LLM output"
+  ],
+  "state_machine_stapp2": {
+    "idle": "streaming=False, display_queue=None",
+    "streaming": "streaming=True, display_queue=Queue, partial_response updates each rerun",
+    "stopping": "stopping=True (abort sent), waits for done signal",
+    "done": "finish_streaming_message() called → back to idle"
+  },
+  "key_methods": {
+    "init()": "@st.cache_resource; creates GeneraticAgent; starts agent.run() daemon; returns agent",
+    "agent.put_task(prompt, source)": "enqueues user task; returns display_queue:Queue",
+    "agent_backend_stream(prompt) [stapp]": "generator; polls display_queue; yields partial/final text; calls agent.abort() in finally",
+    "start_agent_task(prompt) [stapp2]": "calls agent.put_task; stores queue in session_state; sets streaming=True",
+    "poll_agent_output(max_items) [stapp2]": "drains queue non-blocking; updates partial_response; returns done:bool",
+    "render_streaming_area() [stapp2]": "renders live partial; polls queue; calls finish_streaming_message on done; st.rerun()",
+    "finish_streaming_message() [stapp2]": "appends final segments to messages; resets streaming state",
+    "fold_turns(text) [stapp]": "splits text on 'LLM Running (Turn N)...' → list of {type:text|fold, content} segments",
+    "_get_response_segments(text) [stapp2]": "splits text on turn markers; returns list of segment strings",
+    "render_segments(segments, suffix) [stapp]": "renders each segment as st.expander or st.markdown",
+    "render_message(role, content, ts) [stapp2]": "with st.chat_message(role): st.markdown(content)"
+  },
+  "rendering_pattern": {
+    "stapp": "st.empty() slots + slot.container() + render_segments(); frozen slots for completed turns, live slot for last segment with cursor '▌'",
+    "stapp2": "st.empty().container() wraps all current segments; cursor appended to last segment; entire area re-rendered each rerun"
+  },
+  "important_notes": [
+    "Both stapp and stapp2 import GeneraticAgent from agentmain",
+    "agent.run() is a long-running background loop; frontend communicates via queue only",
+    "display_queue items: {'next': str} = partial update, {'done': str} = final response",
+    "stapp uses Python generator for streaming (blocking for-loop with yield); stapp2 uses non-blocking polling with st.rerun()",
+    "agent.abort() is called in stapp finally block or via 'stop' button in stapp2",
+    "Multi-turn responses are visually folded: earlier turns → st.expander, last turn → visible",
+    "stapp2 has richer session state tracking: reply_ts, current_prompt, stopping flag, autonomous_enabled"
+  ],
+  "source_files_analyzed": [
+    "frontends/stapp.py",
+    "frontends/stapp2.py"
+  ]
+}

@@ -1,0 +1,427 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+title Signaling & Notifications
+
+' ─────────────────────────────────────────────
+' SIGNAL CORE
+' ─────────────────────────────────────────────
+package "io.debezium.pipeline.signal" {
+
+    class SignalProcessor<P extends Partition, O extends OffsetContext> {
+        -{static} int SEMAPHORE_WAIT_TIME
+        -{static} String DATA_COLLECTIONS_FIELD_NAME
+        -Map<String, SignalAction<P>> signalActions
+        -CommonConnectorConfig connectorConfig
+        -List<SignalChannelReader> enabledChannelReaders
+        -List<SignalChannelReader> signalChannelReaders
+        -ScheduledExecutorService signalProcessorExecutor
+        -DocumentReader documentReader
+        -Map<P, O> partitionOffsets
+        -Semaphore semaphore
+        +SignalProcessor(Class<SourceConnector>, CommonConnectorConfig, Map<String,SignalAction<P>>, List<SignalChannelReader>, DocumentReader, Offsets<P,O>)
+        +start(): void
+        +stop(): void
+        +process(): void
+        +processSourceSignal(P partition): void
+        +registerSignalAction(String id, SignalAction<P>): void
+        +setContext(Offsets<P,O>): void
+        +getSignalChannel(Class<T>): T
+        -processSignal(SignalRecord, P): void
+        -executeSignal(SignalAction<P>, SignalRecord, Document, P, O): void
+        -executeWithSemaphore(Runnable): void
+    }
+
+    class SignalRecord {
+        -String id
+        -String type
+        -String data
+        -Map<String, Object> additionalData
+        +SignalRecord(String id, String type, String data, Map<String,Object> additionalData)
+        +SignalRecord(DebeziumEngine.Signal signal)
+        +{static} buildSignalRecordFromChangeEventSource(Struct, CommonConnectorConfig): Optional<SignalRecord>
+        +getId(): String
+        +getType(): String
+        +getData(): String
+        +getAdditionalData(): Map<String,Object>
+        +getAdditionalDataProperty(String, Class<T>): T
+    }
+
+    class SignalPayload<P extends Partition> {
+        +{final} String id
+        +{final} String type
+        +{final} Document data
+        +{final} P partition
+        +{final} OffsetContext offsetContext
+        +{final} Map<String, Object> additionalData
+        +SignalPayload(P, String id, String type, Document, OffsetContext, Map<String,Object>)
+    }
+}
+
+' ─────────────────────────────────────────────
+' SIGNAL CHANNELS
+' ─────────────────────────────────────────────
+package "io.debezium.pipeline.signal.channels" {
+
+    interface SignalChannelReader {
+        +name(): String
+        +init(CommonConnectorConfig): void
+        +reset(T reference): void
+        +read(): List<SignalRecord>
+        +close(): void
+    }
+
+    class KafkaSignalChannel {
+        -{static} String CHANNEL_NAME
+        -{static} String CHANNEL_OFFSET
+        -String topicName
+        -String connectorName
+        -Duration pollTimeoutMs
+        -KafkaConsumer<String, String> signalsConsumer
+        +name(): String
+        +init(CommonConnectorConfig): void
+        +read(): List<SignalRecord>
+        +close(): void
+        +seek(long signalOffset): void
+        -processSignal(ConsumerRecord<String,String>): Optional<SignalRecord>
+        -buildKafkaConfiguration(Configuration): Configuration
+    }
+
+    class FileSignalChannel {
+        +name(): String
+        +init(CommonConnectorConfig): void
+        +read(): List<SignalRecord>
+        +close(): void
+    }
+
+    class SourceSignalChannel {
+        +name(): String
+        +init(CommonConnectorConfig): void
+        +read(): List<SignalRecord>
+        +close(): void
+    }
+}
+
+package "io.debezium.pipeline.signal.channels.jmx" {
+
+    interface JmxSignalChannelMXBean {
+        +signal(String id, String type, String data): void
+    }
+
+    class JmxSignalChannel {
+        -{static} String CHANNEL_NAME
+        -Queue<SignalRecord> signals
+        -CommonConnectorConfig connectorConfig
+        +name(): String
+        +init(CommonConnectorConfig): void
+        +read(): List<SignalRecord>
+        +close(): void
+        +signal(String id, String type, String data): void
+    }
+}
+
+package "io.debezium.pipeline.signal.channels.process" {
+
+    class InProcessSignalChannel {
+        +name(): String
+        +init(CommonConnectorConfig): void
+        +read(): List<SignalRecord>
+        +close(): void
+    }
+}
+
+' ─────────────────────────────────────────────
+' SIGNAL ACTIONS
+' ─────────────────────────────────────────────
+package "io.debezium.pipeline.signal.actions" {
+
+    interface SignalAction<P extends Partition> <<FunctionalInterface>> {
+        +arrived(SignalPayload<P>): boolean
+    }
+
+    interface SignalActionProvider {
+        +createActions(EventDispatcher<P,?>, ChangeEventSourceCoordinator<P,?>, CommonConnectorConfig): Map<String, SignalAction<P>>
+    }
+
+    class StandardActionProvider {
+        +createActions(...): Map<String, SignalAction<P>>
+    }
+
+    abstract class AbstractSnapshotSignal<P extends Partition> {
+        +{static} String FIELD_DATA_COLLECTIONS
+        +{static} String FIELD_ADDITIONAL_CONDITIONS
+        +{static} String FIELD_SURROGATE_KEY
+        +{static} String FIELD_TYPE
+        +{static} getSnapshotType(Document): SnapshotType
+    }
+
+    enum SnapshotType {
+        INCREMENTAL
+        BLOCKING
+    }
+
+    class Log<P extends Partition> {
+        -{static} String NAME
+        +arrived(SignalPayload<P>): boolean
+    }
+
+    class SchemaChanges<P extends Partition> {
+        -{static} String NAME
+        +arrived(SignalPayload<P>): boolean
+    }
+}
+
+package "io.debezium.pipeline.signal.actions.snapshotting" {
+
+    class ExecuteSnapshot<P extends Partition> {
+        -{static} String NAME
+        -EventDispatcher<P,?> dispatcher
+        -ChangeEventSourceCoordinator<P,?> changeEventSourceCoordinator
+        +arrived(SignalPayload<P>): boolean
+        +{static} getDataCollections(Document): List<String>
+        +{static} getSurrogateKey(Document): Optional<String>
+    }
+
+    class StopSnapshot<P extends Partition> {
+        -{static} String NAME
+        +arrived(SignalPayload<P>): boolean
+    }
+
+    class OpenIncrementalSnapshotWindow<P extends Partition> {
+        -{static} String NAME
+        +arrived(SignalPayload<P>): boolean
+    }
+
+    class CloseIncrementalSnapshotWindow<P extends Partition> {
+        -{static} String NAME
+        +arrived(SignalPayload<P>): boolean
+    }
+
+    class PauseIncrementalSnapshot<P extends Partition> {
+        -{static} String NAME
+        +arrived(SignalPayload<P>): boolean
+    }
+
+    class ResumeIncrementalSnapshot<P extends Partition> {
+        -{static} String NAME
+        +arrived(SignalPayload<P>): boolean
+    }
+}
+
+' ─────────────────────────────────────────────
+' NOTIFICATION CORE
+' ─────────────────────────────────────────────
+package "io.debezium.pipeline.notification" {
+
+    class NotificationService<P extends Partition, O extends OffsetContext> {
+        -List<NotificationChannel> notificationChannels
+        -List<String> enabledChannels
+        -IncrementalSnapshotNotificationService<P,O> incrementalSnapshotNotificationService
+        -InitialSnapshotNotificationService<P,O> initialSnapshotNotificationService
+        +NotificationService(List<NotificationChannel>, CommonConnectorConfig, SchemaFactory, BlockingConsumer<SourceRecord>)
+        +notify(Notification): void
+        +notify(Notification, Offsets<P,?>): void
+        +incrementalSnapshotNotificationService(): IncrementalSnapshotNotificationService<P,O>
+        +initialSnapshotNotificationService(): InitialSnapshotNotificationService<P,O>
+        +stop(): void
+        -isEnabled(): Predicate<NotificationChannel>
+        -isConnectChannel(): Predicate<NotificationChannel>
+    }
+
+    class Notification {
+        -{static} ObjectMapper MAPPER
+        -{static} String ID_KEY
+        -{static} String TYPE
+        -{static} String AGGREGATE_TYPE
+        -{static} String ADDITIONAL_DATA
+        -{static} String TIMESTAMP
+        -String id
+        -String aggregateType
+        -String type
+        -Map<String, String> additionalData
+        -Long timestamp
+        +getId(): String
+        +getAggregateType(): String
+        +getType(): String
+        +getAdditionalData(): Map<String,String>
+        +getTimestamp(): Long
+        +toJson(): String
+    }
+
+    class "Notification.Builder" as NotificationBuilder {
+        +withId(String): Builder
+        +withAggregateType(String): Builder
+        +withType(String): Builder
+        +withAdditionalData(Map<String,String>): Builder
+        +withTimestamp(Long): Builder
+        +build(): Notification
+    }
+
+    class IncrementalSnapshotNotificationService<P, O> {
+        +notifyStarted(...): void
+        +notifyCompleted(...): void
+        +notifyPaused(...): void
+        +notifyResumed(...): void
+    }
+
+    class InitialSnapshotNotificationService<P, O> {
+        +notifyStarted(...): void
+        +notifyCompleted(...): void
+    }
+
+    enum SnapshotStatus {
+        STARTED
+        COMPLETED
+        PAUSED
+        RESUMED
+        IN_PROGRESS
+        ABORTED
+    }
+}
+
+' ─────────────────────────────────────────────
+' NOTIFICATION CHANNELS
+' ─────────────────────────────────────────────
+package "io.debezium.pipeline.notification.channels" {
+
+    interface NotificationChannel {
+        +name(): String
+        +init(CommonConnectorConfig): void
+        +send(Notification): void
+        +close(): void
+    }
+
+    interface ConnectChannel {
+        +initConnectChannel(SchemaFactory, BlockingConsumer<SourceRecord>): void
+        +send(Notification, Offsets<P,O>): void
+    }
+
+    class SinkNotificationChannel {
+        -{static} String CHANNEL_NAME
+        -{static} Field NOTIFICATION_TOPIC
+        -BlockingConsumer<SourceRecord> consumer
+        -Schema keySchema
+        -Schema valueSchema
+        -String topicName
+        +name(): String
+        +init(CommonConnectorConfig): void
+        +initConnectChannel(SchemaFactory, BlockingConsumer<SourceRecord>): void
+        +send(Notification): void
+        +send(Notification, Offsets<P,O>): void
+        +close(): void
+    }
+
+    class LogNotificationChannel {
+        -{static} String CHANNEL_NAME
+        +name(): String
+        +init(CommonConnectorConfig): void
+        +send(Notification): void
+        +close(): void
+    }
+}
+
+package "io.debezium.pipeline.notification.channels.jmx" {
+
+    interface JmxNotificationChannelMXBean {
+        +getNotifications(): List<Notification>
+        +reset(): void
+    }
+
+    class JmxNotificationChannel {
+        -{static} String CHANNEL_NAME
+        -{static} String DEBEZIUM_NOTIFICATION_TYPE
+        -List<Notification> notifications
+        -AtomicLong notificationSequence
+        -CommonConnectorConfig connectorConfig
+        +name(): String
+        +init(CommonConnectorConfig): void
+        +send(Notification): void
+        +close(): void
+        +getNotifications(): List<Notification>
+        +reset(): void
+        +getNotificationInfo(): MBeanNotificationInfo[]
+    }
+}
+
+' ─────────────────────────────────────────────
+' RELATIONSHIPS — Signal Core
+' ─────────────────────────────────────────────
+SignalProcessor o-- SignalChannelReader : reads from
+SignalProcessor *-- SignalAction : dispatches
+SignalProcessor ..> SignalRecord : processes
+SignalProcessor ..> SignalPayload : creates
+
+' ─────────────────────────────────────────────
+' RELATIONSHIPS — Signal Channels
+' ─────────────────────────────────────────────
+KafkaSignalChannel ..|> SignalChannelReader
+FileSignalChannel ..|> SignalChannelReader
+SourceSignalChannel ..|> SignalChannelReader
+InProcessSignalChannel ..|> SignalChannelReader
+JmxSignalChannel ..|> SignalChannelReader
+JmxSignalChannel ..|> JmxSignalChannelMXBean
+
+' ─────────────────────────────────────────────
+' RELATIONSHIPS — Signal Actions
+' ─────────────────────────────────────────────
+StandardActionProvider ..|> SignalActionProvider
+AbstractSnapshotSignal ..|> SignalAction
+Log ..|> SignalAction
+SchemaChanges ..|> SignalAction
+
+AbstractSnapshotSignal +-- SnapshotType
+
+ExecuteSnapshot --|> AbstractSnapshotSignal
+StopSnapshot --|> AbstractSnapshotSignal
+OpenIncrementalSnapshotWindow --|> AbstractSnapshotSignal
+CloseIncrementalSnapshotWindow --|> AbstractSnapshotSignal
+PauseIncrementalSnapshot --|> AbstractSnapshotSignal
+ResumeIncrementalSnapshot --|> AbstractSnapshotSignal
+
+StandardActionProvider ..> Log : creates
+StandardActionProvider ..> SchemaChanges : creates
+StandardActionProvider ..> ExecuteSnapshot : creates
+StandardActionProvider ..> StopSnapshot : creates
+StandardActionProvider ..> OpenIncrementalSnapshotWindow : creates
+StandardActionProvider ..> CloseIncrementalSnapshotWindow : creates
+StandardActionProvider ..> PauseIncrementalSnapshot : creates
+StandardActionProvider ..> ResumeIncrementalSnapshot : creates
+
+' ─────────────────────────────────────────────
+' RELATIONSHIPS — Notification Core
+' ─────────────────────────────────────────────
+NotificationService o-- NotificationChannel : notifies
+NotificationService *-- IncrementalSnapshotNotificationService : composes
+NotificationService *-- InitialSnapshotNotificationService : composes
+IncrementalSnapshotNotificationService ..> NotificationService : delegates
+InitialSnapshotNotificationService ..> NotificationService : delegates
+
+Notification +-- NotificationBuilder
+NotificationService ..> Notification : dispatches
+
+' ─────────────────────────────────────────────
+' RELATIONSHIPS — Notification Channels
+' ─────────────────────────────────────────────
+JmxNotificationChannel --|> "NotificationBroadcasterSupport"
+JmxNotificationChannel ..|> NotificationChannel
+JmxNotificationChannel ..|> JmxNotificationChannelMXBean
+SinkNotificationChannel ..|> NotificationChannel
+SinkNotificationChannel ..|> ConnectChannel
+LogNotificationChannel ..|> NotificationChannel
+
+@enduml

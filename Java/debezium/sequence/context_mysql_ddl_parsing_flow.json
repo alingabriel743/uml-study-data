@@ -1,0 +1,86 @@
+{
+  "scope": "mysql_ddl_parsing_flow",
+  "title": "MySQL DDL Parsing Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "MySqlDdlParserPerf",
+    "ParserState",
+    "AntlrDdlParser",
+    "MySqlAntlrDdlParser",
+    "MySqlLexer",
+    "CommonTokenStream",
+    "MySqlParser",
+    "ParseTreeWalker",
+    "MySqlAntlrDdlParserListener",
+    "CreateTableParserListener",
+    "AlterTableParserListener",
+    "DropTableParserListener",
+    "DdlChanges",
+    "BinlogDatabaseSchema",
+    "Tables"
+  ],
+  "interaction_flow": [
+    "MySqlDdlParserPerf.antlr(ParserState) → ParserState.antlrParser.parse(ddl, tables)",
+    "AntlrDdlParser.parse(ddlContent, Tables): CharStreams.fromString(ddlContent) → CodePointCharStream",
+    "AntlrDdlParser → MySqlAntlrDdlParser.createNewLexerInstance(CaseChangingCharStream) → new MySqlLexer(charStream)",
+    "AntlrDdlParser → new CommonTokenStream(lexer) [buffers all tokens from lexer]",
+    "AntlrDdlParser → MySqlAntlrDdlParser.createNewParserInstance(CommonTokenStream) → new MySqlParser(tokenStream)",
+    "AntlrDdlParser: parser.removeErrorListener(ConsoleErrorListener); parser.addErrorListener(ParsingErrorListener)",
+    "AntlrDdlParser → MySqlAntlrDdlParser.parseTree(MySqlParser) → parser.root() → returns ParseTree (AST)",
+    "AntlrDdlParser [if no parse errors] → MySqlAntlrDdlParser.createParseTreeWalkerListener() → new MySqlAntlrDdlParserListener(parser)",
+    "MySqlAntlrDdlParserListener constructor registers sub-listeners: CreateTableParserListener, AlterTableParserListener, DropTableParserListener, RenameTableParserListener, TruncateTableParserListener, CreateAndAlterDatabaseParserListener, DropDatabaseParserListener, CreateViewParserListener, AlterViewParserListener, DropViewParserListener, CreateUniqueIndexParserListener, SetStatementParserListener, UseStatementParserListener",
+    "AntlrDdlParser → ParseTreeWalker.DEFAULT.walk(MySqlAntlrDdlParserListener, parseTree) [AST traversal]",
+    "ParseTreeWalker → MySqlAntlrDdlParserListener: fires enterXxx/exitXxx callbacks, delegates to sub-listeners via ProxyParseTreeListenerUtil",
+    "CreateTableParserListener.exitColumnCreateTable(ctx): builds Table via tableEditor, calls parser.databaseTables().overwriteTable(tableEditor.create()), then parser.signalCreateTable(tableId, ctx) → adds TableCreatedEvent to DdlChanges",
+    "AlterTableParserListener.exitAlterTable(ctx): calls parser.databaseTables().overwriteTable(tableEditor.create()), then parser.signalAlterTable(tableId, null, ctx.getParent()) → adds TableAlteredEvent to DdlChanges",
+    "DropTableParserListener.exitDropTable(ctx): calls parser.databaseTables().removeTable(tableId), then parser.signalDropTable(tableId, statement) → adds TableDroppedEvent to DdlChanges",
+    "AntlrDdlParser.parse() returns getAndResetDdlChanges() (DdlChanges)",
+    "BinlogDatabaseSchema.parseDdl(partition, ddlStatements, databaseName, offset, sourceTime, snapshot): ddlParser.setCurrentSchema(databaseName), then ddlChanges = ddlParser.parse(ddlStatements, tables())",
+    "BinlogDatabaseSchema.parseDdl: ddlChanges.getEventsByDatabase(callback) — iterates events grouped by database",
+    "BinlogDatabaseSchema.parseDdl per event: handleTableEvent(offset, dbName, tableIds, sourceTime) → offset.tableEvent()",
+    "BinlogDatabaseSchema.parseDdl per event: emitChangeEvent(partition, offset, schemaChangeEvents, dbName, event, tableId, type, snapshot) → builds SchemaChangeEvent, adds to list",
+    "BinlogDatabaseSchema.parseDdl returns List<SchemaChangeEvent>",
+    "BinlogDatabaseSchema.applySchemaChange(SchemaChangeEvent): CREATE/ALTER → schemaChange.getTableChanges().forEach(x → buildAndRegisterSchema(x.getTable())); DROP → removeSchema(x.getId())",
+    "BinlogDatabaseSchema.applySchemaChange: record(schemaChange, tableChanges) [persists DDL to schema history store]"
+  ],
+  "entry_points": {
+    "benchmark": "MySqlDdlParserPerf.antlr(ParserState) — JMH @Benchmark, Mode.AverageTime, measures parse() call per column count (1/2/5/10/20/50)",
+    "snapshot": "BinlogDatabaseSchema.parseSnapshotDdl(partition, ddl, db, offset, time) → parseDdl(..., snapshot=true)",
+    "streaming": "BinlogDatabaseSchema.parseStreamingDdl(partition, ddl, db, offset, time) → parseDdl(..., snapshot=false)"
+  },
+  "key_relationships": [
+    "MySqlDdlParserPerf uses ParserState (inner @State(Scope.Thread) class) for JMH setup",
+    "ParserState holds: AbstractDdlParser antlrParser (MySqlAntlrDdlParser), Tables tables, String ddl",
+    "MySqlAntlrDdlParser extends AntlrDdlParser<MySqlLexer, MySqlParser> extends AbstractDdlParser",
+    "BinlogDatabaseSchema extends HistorizedRelationalDatabaseSchema; holds DdlParser ddlParser = MySqlAntlrDdlParser (created via abstract createDdlParser())",
+    "MySqlAntlrDdlParserListener extends MySqlParserBaseListener implements AntlrDdlParserListener; delegates to 13 sub-listeners",
+    "DdlChanges accumulates DdlParserListener.Event objects (TableCreatedEvent, TableAlteredEvent, TableDroppedEvent, SetVariableEvent, etc.) during parse",
+    "TokenStream (debezium-util) is a legacy text-level tokenization utility (Tokenizer + Token + cursor API: start/hasNext/consume); used by non-ANTLR parsers, not in this ANTLR flow directly"
+  ],
+  "data_flow": [
+    "Input: raw DDL String (e.g. 'CREATE TABLE t1 (id int primary key, v0 int)')",
+    "Step 1 — Lexer: DDL String → CodePointCharStream → CaseChangingCharStream (uppercased) → MySqlLexer → token sequence",
+    "Step 2 — Parser: token sequence → CommonTokenStream → MySqlParser.root() → ParseTree (ANTLR AST)",
+    "Step 3 — Listener walk: ParseTree → ParseTreeWalker.walk → MySqlAntlrDdlParserListener → sub-listeners update Tables in-memory model + signal events into DdlChanges",
+    "Step 4 — Schema events: DdlChanges → BinlogDatabaseSchema.parseDdl groups by database → List<SchemaChangeEvent>",
+    "Step 5 — Schema apply: SchemaChangeEvent → buildAndRegisterSchema / removeSchema + record() to schema history"
+  ],
+  "error_handling": [
+    "ParsingErrorListener captures ANTLR syntax errors during parsing; throws ParsingException or MultipleParsingExceptions",
+    "AntlrDdlParserListener collects walk errors; if throwErrorsFromTreeWalk=true, throws after walk",
+    "BinlogDatabaseSchema.parseDdl catches ParsingException/MultipleParsingExceptions; if skipUnparseableDdlStatements() logs warning else rethrows",
+    "MySqlAntlrDdlParserListener skips BEGIN...END blocks (skipNodes flag + skippedNodesCount counter)"
+  ],
+  "important_notes": "MySqlDdlParserPerf is a JMH microbenchmark comparing ANTLR parser performance across column counts (no legacy parser in current code). BinlogDatabaseSchema is abstract; concrete impls (MySqlDatabaseSchema, MariaDbDatabaseSchema) provide createDdlParser(). MySqlAntlrDdlParser uses BinlogSystemVariables for charset/collation resolution. Tables object is the mutable in-memory schema store updated directly by sub-listeners before signaling events. DdlChanges is returned from parse() and drives SchemaChangeEvent generation in BinlogDatabaseSchema.",
+  "source_files_analyzed": [
+    "debezium-microbenchmark/src/main/java/io/debezium/performance/connector/mysql/parser/MySqlDdlParserPerf.java",
+    "debezium-ddl-parser/src/main/java/io/debezium/antlr/AntlrDdlParser.java",
+    "debezium-connector-mysql/src/main/java/io/debezium/connector/mysql/antlr/MySqlAntlrDdlParser.java",
+    "debezium-connector-mysql/src/main/java/io/debezium/connector/mysql/antlr/listener/MySqlAntlrDdlParserListener.java",
+    "debezium-connector-mysql/src/main/java/io/debezium/connector/mysql/antlr/listener/CreateTableParserListener.java",
+    "debezium-connector-mysql/src/main/java/io/debezium/connector/mysql/antlr/listener/AlterTableParserListener.java",
+    "debezium-connector-mysql/src/main/java/io/debezium/connector/mysql/antlr/listener/DropTableParserListener.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogDatabaseSchema.java",
+    "debezium-util/src/main/java/io/debezium/text/TokenStream.java"
+  ]
+}

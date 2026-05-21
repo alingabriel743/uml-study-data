@@ -1,0 +1,116 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam actor {
+    BackgroundColor #D0E8FF
+    BorderColor #3A7BD5
+    FontColor #1A2E4A
+}
+skinparam usecase {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+    ArrowColor #495057
+}
+skinparam rectangle {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+    FontColor #343A40
+}
+skinparam note {
+    BackgroundColor #FFFDE7
+    BorderColor #F9A825
+}
+
+title Extended Multiview Model Training\n(Video-Conditioned Multiview Diffusion — MultiviewExtendDiffusionModel)
+
+left to right direction
+
+' ── Left-side actors (initiators) ───────────────────────────────────────────
+actor "Trainer\n(Training Loop)" as Trainer
+actor "Dataset\n(Waymo Multiview)" as Dataset
+
+' ── Right-side actors (external services) ───────────────────────────────────
+actor "VAE / Tokenizer\n(cosmos_diffusion_tokenizer)" as VAE
+actor "Conditioner\n(video_cond)" as Conditioner
+actor "Sampler\n(Diffusion Sampler)" as Sampler
+actor "Context Parallel Group\n(Megatron CP)" as CPGroup
+
+' ── System boundary ──────────────────────────────────────────────────────────
+rectangle "Extended Multiview Model Training System\n[MultiviewExtendDiffusionModel  ·  FSDPExtendDiffusionModel\nVideoExtendMultiviewGeneralDIT  ·  faditv2_7b backbone]" {
+
+    ' --- Data ingestion & encoding ---
+    usecase "Load & Normalize\nTraining Batch\n(N-view frames, T=57, 5 cameras)" as UC_Load
+    usecase "Encode Multi-View\nVideo to Latent\nrearrange B C (V T) H W → (B V) C T H W\nVAE.encode per-view · scale σ_data" as UC_Encode
+    usecase "Decode Latent to\nMulti-View Video\nVAE.decode per-view · rearrange back" as UC_Decode
+
+    ' --- Conditioning ---
+    usecase "Add Condition Video\nIndicator & Input Mask\nfirst_n (inference) / first_random_n (training)\nbroadcast across TP & CP ranks" as UC_Indicator
+    usecase "Prepare CFG x0 Function\nget_condition / uncondition\nvideo_cond_bool ON/OFF\nCFG: x0 = cond + g·(cond − uncond)" as UC_CFG
+
+    ' --- Core training ---
+    usecase "Compute Training Loss\n(Multi-View CP)\nsplit_inputs_cp across temporal dim\nscale kendall_loss by CP world size" as UC_Loss
+    usecase "Denoise with\nVideo Conditioning\naugment_conditional_latent_frames\nnew_xt = indicator·latent + (1−ind)·noise\nreplace condition region in x0 pred" as UC_Denoise
+
+    ' --- DiT backbone ---
+    usecase "Forward Pass Through DiT\n(VideoExtendMultiviewGeneralDIT)\nconcat condition_video_input_mask (+1 ch)\noptional pose channel · call MultiviewGeneralDIT" as UC_DiT
+
+    ' --- Inference / sampling ---
+    usecase "Generate Samples\nfrom Batch\nseeded x_σmax noise · CP split\nsampler(x0_fn, steps, σ_max)\ncat_outputs_cp to reassemble" as UC_Sample
+
+    ' ── include / extend relationships ─────────────────────────────────────
+    UC_Loss       ..> UC_Denoise   : <<include>>
+    UC_Denoise    ..> UC_DiT       : <<include>>
+    UC_CFG        ..> UC_Indicator : <<include>>
+    UC_Sample     ..> UC_CFG       : <<include>>
+    UC_Sample     ..> UC_Decode    : <<include>>
+    UC_Load       ..> UC_Encode    : <<include>>
+}
+
+' ── Actor → use-case associations ───────────────────────────────────────────
+Trainer  --> UC_Load
+Trainer  --> UC_Loss
+Trainer  --> UC_Sample
+
+Dataset  --> UC_Load
+
+VAE      --> UC_Encode
+VAE      --> UC_Decode
+
+Conditioner --> UC_CFG
+
+Sampler     --> UC_Sample
+
+CPGroup     --> UC_Loss
+CPGroup     --> UC_Denoise
+
+' ── Config note ─────────────────────────────────────────────────────────────
+note bottom of UC_DiT
+  VideoExtendMultiviewGeneralDIT
+  in_channels += 1 (binary condition mask)
+  optionally += 1 (pose channel)
+  n_views = 5 | T = 57 | res 480×848
+end note
+
+note top of UC_Loss
+  FSDPExtendDiffusionModel
+  wraps MultiviewExtendDiffusionModel
+  with FSDP sharding (no extra logic)
+end note
+
+@enduml

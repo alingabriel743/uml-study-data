@@ -1,0 +1,185 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #E9ECEF
+    GroupBorderColor #495057
+    GroupBackgroundColor #DEE2E6
+    DividerBackgroundColor #CED4DA
+    NoteBackgroundColor #FFF3CD
+    NoteBorderColor #856404
+}
+
+title Streaming & Broadcast Response
+
+actor Client
+
+participant "Agent\n(Promptable)" as Agent
+participant "AiManager" as AiMgr
+participant "TextProvider\n(StreamsText)" as Provider
+participant "EventDispatcher" as Events
+participant "StreamableAgentResponse" as StreamResp
+participant "TextGateway" as Gateway
+participant "StreamEvent\n(TextDelta/StreamEnd)" as StreamEvt
+participant "BroadcastAgent\n(Queue Job)" as BroadcastJob
+participant "Laravel Broadcast" as LBroadcast
+database "AI API\n(SSE)" as API
+participant "WebSocket\n/ Channel" as WS
+
+== Direct stream() ==
+
+Client -> Agent: stream(prompt, attachments, provider, model, timeout)
+activate Agent
+
+Agent -> Agent: withModelFailover(callback, provider, model)
+Agent -> AiMgr: textProviderFor(agent, providerName)
+activate AiMgr
+AiMgr --> Agent: TextProvider instance
+deactivate AiMgr
+
+Agent -> Provider: stream(new AgentPrompt(agent, prompt, attachments, ...))
+activate Provider
+
+Provider -> Events: dispatch(new StreamingAgent(invocationId, prompt))
+Provider -> StreamResp: new StreamableAgentResponse(invocationId, generatorClosure, meta)
+activate StreamResp
+Provider --> Agent: StreamableAgentResponse (lazy)
+deactivate Provider
+
+Agent --> Client: StreamableAgentResponse
+deactivate Agent
+
+note over StreamResp: Generator is LAZY —\nTextGateway not called\nuntil first iteration
+
+Client -> StreamResp: iterate (foreach / each())
+activate Client
+
+StreamResp -> Provider: call_user_func(generatorClosure)
+activate Provider
+
+Provider -> Gateway: streamText(invocationId, provider, model,\ninstructions, messages, tools, options, timeout)
+activate Gateway
+
+Gateway -> API: HTTP streaming request
+activate API
+
+loop SSE chunks
+    API --> Gateway: raw SSE chunk
+    Gateway --> Provider: yield StreamEvent\n(StreamStart | TextDelta | StreamEnd)
+    Provider --> StreamResp: yield StreamEvent
+    StreamResp --> Client: yield StreamEvent per chunk
+end
+
+deactivate API
+deactivate Gateway
+deactivate Provider
+
+StreamResp -> StreamResp: collect events, build\ncombined text & usage
+StreamResp -> StreamResp: new StreamedAgentResponse\n(invocationId, events, meta)
+StreamResp -> Events: dispatch(new AgentStreamed\n(invocationId, prompt, response))
+StreamResp -> StreamResp: invoke then() callbacks\n(StreamedAgentResponse)
+deactivate StreamResp
+deactivate Client
+
+== Synchronous broadcast() ==
+
+Client -> Agent: broadcast(prompt, channels, attachments, now=false)
+activate Agent
+
+Agent -> Agent: stream(prompt, attachments, provider, model)\n[same stream() flow as above]
+Agent -> StreamResp: each(callback)
+activate StreamResp
+
+loop per StreamEvent chunk
+    StreamResp -> StreamEvt: callback(event)
+    activate StreamEvt
+
+    alt now = false (queued broadcast)
+        StreamEvt -> LBroadcast: Broadcast::on(channels)\n.as(type).with(toArray()).send()
+    else now = true (immediate broadcastNow)
+        StreamEvt -> LBroadcast: Broadcast::on(channels)\n.as(type).with(toArray()).sendNow()
+    end
+
+    activate LBroadcast
+    LBroadcast --> WS: push event payload to subscribers
+    deactivate LBroadcast
+    deactivate StreamEvt
+end
+
+deactivate StreamResp
+Agent --> Client: return StreamableAgentResponse
+deactivate Agent
+
+== Async broadcastOnQueue() ==
+
+Client -> Agent: broadcastOnQueue(prompt, channels, attachments, provider, model)
+activate Agent
+
+Agent -> BroadcastJob: BroadcastAgent::dispatch(\n  agent, prompt, channels, attachments, provider, model)
+activate BroadcastJob
+
+Agent --> Client: QueuedAgentResponse (PendingDispatch)
+deactivate Agent
+
+note over BroadcastJob: Runs asynchronously\nin a queue worker
+
+BroadcastJob -> Agent: agent->stream(prompt, attachments, provider, model)
+activate Agent
+Agent --> BroadcastJob: StreamableAgentResponse
+deactivate Agent
+
+BroadcastJob -> StreamResp: each(event → event.broadcastNow(channels))
+activate StreamResp
+
+loop per StreamEvent chunk
+    StreamResp -> StreamEvt: broadcastNow(channels)
+    activate StreamEvt
+    StreamEvt -> LBroadcast: Broadcast::on(channels)\n.as(type).with(toArray()).sendNow()
+    activate LBroadcast
+    LBroadcast --> WS: push event payload to subscribers
+    deactivate LBroadcast
+    deactivate StreamEvt
+end
+
+deactivate StreamResp
+
+BroadcastJob -> StreamResp: then(response → store streamedResponse)
+BroadcastJob -> BroadcastJob: withCallbacks()\n[invoke queued response callbacks]
+deactivate BroadcastJob
+
+== HTTP SSE Response (toResponse) ==
+
+Client -> StreamResp: toResponse(request)
+activate StreamResp
+
+alt Vercel AI SDK protocol
+    StreamResp -> StreamResp: toVercelProtocolResponse()
+end
+
+StreamResp -> StreamResp: response()->stream(\n  fn: foreach events → yield 'data: {json}\\n\\n'\n)
+StreamResp --> Client: HttpResponse\n[Content-Type: text/event-stream]
+deactivate StreamResp
+
+@enduml

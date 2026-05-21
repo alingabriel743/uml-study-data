@@ -1,0 +1,215 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #DEE2E6
+    DividerBackgroundColor #CED4DA
+    DividerBorderColor #6C757D
+}
+skinparam noteBackgroundColor #FFF9C4
+skinparam noteBorderColor #F0C040
+
+title S3 Storage and File I/O Flow
+
+' ─── Participants ─────────────────────────────────────────────
+actor       Caller                          as caller
+participant "misc\n(load_from_s3_with_cache)" as misc
+participant "easy_io\n(FileClient)"         as easyio
+participant "Boto3Backend"                  as b3back
+participant "Boto3Client"                   as b3cli
+participant "boto3 S3 Client\n(sync)"       as boto3
+participant "ProcessPoolExecutor"           as ppe
+participant "AsyncEventLoop"               as loop
+participant "aioboto3 S3 Client\n(async)"  as aioboto3
+participant "SharedMemory"                  as shm
+participant "LocalFileSystem"               as lfs
+participant "distributed"                   as dist
+
+' ══════════════════════════════════════════════════════════════
+== 1. load_from_s3_with_cache (Cached Model Artifact Load) ==
+' ══════════════════════════════════════════════════════════════
+
+caller -> misc : load_from_s3_with_cache(\n  s3_path, cache_fp, cache_dir,\n  rank_sync=True, backend_args)
+activate misc
+
+misc -> misc : resolve cache_dir\n(TORCH_HOME → COSMOS_CACHE_DIR\n→ ~/.cache/cosmos)
+misc -> misc : derive cache_fp =\ncache_dir / s3_path.replace("s3://","")
+
+misc -> dist : get_rank()
+activate dist
+dist --> misc : rank (int)
+deactivate dist
+
+misc -> lfs : os.path.exists(cache_fp)\nos.path.getsize(cache_fp)
+activate lfs
+lfs --> misc : (exists: bool, size: int)
+deactivate lfs
+
+alt rank == 0 AND cache miss (file absent or empty)
+    misc -> easyio : copyfile_to_local(\n  src=s3_path, dst=cache_fp,\n  dst_type="file", backend_args)
+    activate easyio
+
+    easyio -> b3back : copyfile_to_local(src, dst, dst_type)
+    activate b3back
+
+    b3back -> b3back : _map_path(path_mapping)\n→ _format_path(fix backslashes)\n→ _replace_prefix(strip legacy prefix)
+    b3back -> b3back : os.makedirs(parent_dir, exist_ok=True)
+    b3back -> b3back : self.get(src)
+
+    b3back -> b3cli : get(filepath)
+    activate b3cli
+
+    b3cli -> b3cli : _check_path(filepath)\n[strips "s3://"]
+
+    note right of b3cli
+      Optional L1 cache check:
+      if _mc_kv_store (memcached) present,
+      check before hitting S3
+    end note
+
+    b3cli -> boto3 : download_fileobj(\n  Bucket, Key,\n  Fileobj=BytesIO)\n[up to 3 retries]
+    activate boto3
+    boto3 --> b3cli : bytes in BytesIO buffer
+    deactivate boto3
+
+    b3cli --> b3back : bytes
+    deactivate b3cli
+
+    b3back -> lfs : open(dst, "wb").write(data)
+    activate lfs
+    lfs --> b3back : written
+    deactivate lfs
+
+    b3back --> easyio : cache_fp written
+    deactivate b3back
+    easyio --> misc : cache_fp (str)
+    deactivate easyio
+end
+
+alt rank_sync == True
+    misc -> dist : barrier()\n[all ranks wait for rank-0 download]
+    activate dist
+    dist --> misc : sync complete
+    deactivate dist
+end
+
+misc -> easyio : load(cache_fp, **easy_io_kwargs)
+activate easyio
+easyio --> misc : loaded data object
+deactivate easyio
+
+misc --> caller : loaded data object
+deactivate misc
+
+' ══════════════════════════════════════════════════════════════
+== 2. Async Multipart Download (download_parts_to_s3) ==
+' ══════════════════════════════════════════════════════════════
+
+caller -> loop : asyncio.new_event_loop()\nrun_until_complete(\n  download_parts_async(...))
+activate loop
+
+loop -> aioboto3 : aioboto3.Session().client(\n  "s3",\n  config=AioConfig(\n    retries=5, adaptive,\n    connect_timeout=10s,\n    read_timeout=30s))
+activate aioboto3
+
+loop -> loop : build tasks = [\n  download_single_part_async(part)\n  for part in part_numbers]
+
+loop -> aioboto3 : asyncio.gather(*tasks)\n[concurrent byte-range fetches]
+
+loop -> aioboto3 : [per task] s3.get_object(\n  Bucket, Key,\n  Range="bytes={start}-{end}")\n[MAX_RETRIES=5, exp backoff]
+aioboto3 --> loop : response["Body"].read() → bytes
+
+loop -> shm : shm.buf[\n  part_number * part_size :\n  offset + len(data)] = data
+activate shm
+shm --> loop : (zero-copy write complete)
+deactivate shm
+
+loop --> caller : None\n(data available in SharedMemory)
+deactivate aioboto3
+deactivate loop
+
+' ══════════════════════════════════════════════════════════════
+== 3. Async Multipart Upload (Boto3Client.fast_put) ==
+' ══════════════════════════════════════════════════════════════
+
+caller -> b3back : fast_put(\n  obj: bytes|BytesIO|str,\n  filepath, num_processes=32)
+activate b3back
+
+b3back -> b3back : _map_path → _format_path\n→ _replace_prefix
+
+b3back -> b3cli : fast_put(obj, filepath, num_processes)
+activate b3cli
+
+b3cli -> b3cli : read obj → bytes\n(bytes / BytesIO / file path)
+
+alt file_size <= part_size (16 MB) * num_processes
+    b3cli -> boto3 : put(obj, filepath)\n[single-part fallback]
+    activate boto3
+    boto3 --> b3cli : OK
+    deactivate boto3
+else multipart upload
+    b3cli -> boto3 : create_multipart_upload(\n  Bucket, Key)\n→ UploadId
+    activate boto3
+    boto3 --> b3cli : UploadId
+    deactivate boto3
+
+    b3cli -> b3cli : np.array_split(\n  arange(num_parts),\n  num_processes)\n→ part_number chunks[]
+
+    b3cli -> ppe : map(upload_parts_to_s3,\n  args[])\n[max_workers=num_processes]
+    activate ppe
+
+    ppe -> loop : [per worker]\nasyncio.new_event_loop()\nrun_until_complete(\n  upload_parts_async(...))
+    activate loop
+
+    loop -> aioboto3 : aioboto3.Session().client(\n  "s3",\n  config=AioConfig(\n    retries=3, adaptive))
+    activate aioboto3
+
+    loop -> loop : build tasks = [\n  upload_single_part_async(part)\n  for part in part_numbers]
+
+    loop -> aioboto3 : asyncio.gather(*tasks)\n[concurrent part uploads]
+
+    loop -> aioboto3 : [per task] s3.upload_part(\n  Bucket, Key,\n  PartNumber, UploadId, Body)\n[MAX_RETRIES=5, exp backoff]
+    aioboto3 --> loop : {PartNumber, ETag}
+
+    loop --> ppe : List[{PartNumber, ETag}] sorted
+    deactivate aioboto3
+    deactivate loop
+
+    ppe --> b3cli : merged parts list
+    deactivate ppe
+
+    b3cli -> boto3 : complete_multipart_upload(\n  Bucket, Key,\n  UploadId, Parts=[...])
+    activate boto3
+    boto3 --> b3cli : ETag (upload complete)
+    deactivate boto3
+end
+
+b3cli --> b3back : OK
+deactivate b3cli
+b3back --> caller : OK
+deactivate b3back
+
+@enduml

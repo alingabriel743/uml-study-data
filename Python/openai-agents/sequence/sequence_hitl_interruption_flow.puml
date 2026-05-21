@@ -1,0 +1,260 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+    DividerBackgroundColor #DEE2E6
+    GroupBackgroundColor #E3F2FD
+    GroupBorderColor #90CAF9
+}
+
+title HITL Interruption Flow
+
+actor Caller as caller
+participant "Runner\n(run.py)" as runner
+participant "RunLoop /\nstart_streaming\n(run_loop.py)" as runloop
+participant "TurnResolution\n(turn_resolution.py)" as turnres
+participant "ToolExecution\n(tool_execution.py)" as toolexec
+participant "ToolPlanning\n(tool_planning.py)" as toolplan
+participant "AgentRunnerHelpers\n(agent_runner_helpers.py)" as helpers
+participant "RunState" as runstate
+participant "RunResult /\nRunResultStreaming" as result
+
+' ─────────────────────────────────────────────
+' PHASE 1 — FRESH RUN: DETECTING APPROVAL NEEDS
+' ─────────────────────────────────────────────
+== Phase 1: Fresh Run — Tool Approval Detection ==
+
+caller -> runner : Runner.run(agent, input)
+activate runner
+
+runner -> runloop : invoke run loop\n(non-streaming) or start_streaming()
+activate runloop
+
+runloop -> turnres : execute_tools_and_side_effects(\n  bindings, processed_response, ...)
+activate turnres
+
+loop for each tool call in model response
+    turnres -> toolexec : function_needs_approval(\n  function_tool, context_wrapper, tool_call)
+    activate toolexec
+
+    note right of toolexec
+        Evaluates needs_approval:
+        • True/False (static)
+        • async callable(ctx, parsed_args, call_id)
+        Also handles: ShellTool, ApplyPatchTool,
+        hosted MCP (McpApprovalRequest),
+        local MCP (require_approval)
+    end note
+
+    toolexec -> toolexec : evaluate_needs_approval_setting(\n  needs_approval, context_wrapper,\n  parsed_args, call_id)
+
+    alt needs approval
+        toolexec --> turnres : create ToolApprovalItem(\n  raw_item, tool_name,\n  tool_namespace, tool_origin)
+    else no approval needed
+        toolexec --> turnres : execute tool normally
+    end
+    deactivate toolexec
+end
+
+turnres -> toolplan : _collect_tool_interruptions(\n  function_results, custom_tool_results,\n  shell_results, apply_patch_results)
+activate toolplan
+
+note right of toolplan
+    Also surfaces nested
+    Agent.as_tool() interruptions —
+    outer run always owns the approval
+end note
+
+toolplan --> turnres : list[ToolApprovalItem]
+deactivate toolplan
+
+turnres -> turnres : processed_response.interruptions\n  = interruptions
+
+' ─────────────────────────────────────────────
+' PHASE 2 — BUILDING INTERRUPTION RESULT
+' ─────────────────────────────────────────────
+== Phase 2: Building the Interruption Result ==
+
+turnres --> runloop : SingleStepResult(\n  next_step=NextStepInterruption(\n    interruptions=[ToolApprovalItem...]))
+deactivate turnres
+
+runloop -> runloop : detect isinstance(\n  turn_result.next_step,\n  NextStepInterruption)
+
+group Non-Streaming Path
+    runloop -> helpers : update_run_state_for_interruption(\n  run_state, model_responses,\n  processed_response, generated_items,\n  session_items, current_turn, next_step)
+    activate helpers
+    helpers -> runstate : set _model_responses,\n  _last_processed_response,\n  _generated_items, _session_items,\n  _current_step=NextStepInterruption,\n  _current_turn
+    activate runstate
+    deactivate runstate
+    deactivate helpers
+
+    runloop -> helpers : build_interruption_result(\n  result_input, session_items,\n  model_responses, current_agent,\n  interruptions=approvals_from_step(next_step),\n  processed_response, ...)
+    activate helpers
+
+    note right of helpers
+        approvals_from_step() extracts
+        list[ToolApprovalItem] from
+        NextStepInterruption
+        (approvals.py:51)
+    end note
+
+    helpers -> helpers : construct RunResult(\n  final_output=None,\n  interruptions=[ToolApprovalItem...],\n  new_items=session_items)
+    helpers --> runloop : RunResult (interrupted)
+    deactivate helpers
+end
+
+group Streaming Path
+    runloop -> runloop : inline update run_state fields\n  (_model_responses, _last_processed_response,\n   _generated_items, _session_items,\n   _current_step, _current_turn)
+
+    runloop -> runloop : _finalize_streamed_interruption(\n  streamed_result, save_items, items,\n  response_id, store_setting,\n  interruptions=approvals_from_step(next_step),\n  processed_response)
+
+    note right of runloop
+        Session items are saved before
+        interruption is surfaced;
+        approval placeholders are excluded
+    end note
+
+    runloop -> runloop : _complete_stream_interruption(\n  streamed_result, interruptions,\n  processed_response)
+    runloop -> runloop : streamed_result.interruptions = interruptions\n  streamed_result.is_complete = True\n  _event_queue.put(QueueCompleteSentinel())
+
+    note right of runloop
+        Stream ends —
+        caller must drain stream_events()
+        before inspecting .interruptions
+    end note
+end
+
+' ─────────────────────────────────────────────
+' PHASE 3 — RUN SUSPENDED: HUMAN REVIEW
+' ─────────────────────────────────────────────
+== Phase 3: Run Suspended — Human Review ==
+
+runloop --> runner : RunResult / RunResultStreaming\n(interruptions populated)
+deactivate runloop
+
+runner --> caller : result with result.interruptions
+deactivate runner
+
+note over caller
+    result.final_output == None
+    result.interruptions == [ToolApprovalItem...]
+    Each ToolApprovalItem exposes:
+      • tool_name, tool_namespace, tool_origin
+      • arguments (parsed tool input)
+      • raw_item (original API object)
+end note
+
+caller -> caller : state = result.to_state()  →  RunState
+
+loop for each interruption in result.interruptions
+    alt approved
+        caller -> runstate : state.approve(interruption,\n  always_approve=False)
+        note right of runstate
+            always_approve=True persists
+            decision across future calls
+            (survives to_json/from_json)
+        end note
+    else rejected
+        caller -> runstate : state.reject(interruption,\n  rejection_message="...")
+        note right of runstate
+            rejection_message overrides
+            RunConfig.tool_error_formatter
+            for this specific call
+        end note
+    end
+end
+
+note over caller
+    Not all interruptions must be resolved
+    in one pass. Unresolved items remain
+    in interruptions on next resume.
+    State can be persisted via
+    state.to_json() / RunState.from_json()
+end note
+
+' ─────────────────────────────────────────────
+' PHASE 4 — RESUMED RUN
+' ─────────────────────────────────────────────
+== Phase 4: Resumed Run ==
+
+caller -> runner : Runner.run(agent, state)\nor Runner.run_streamed(agent, state)
+activate runner
+
+runner -> runloop : is_resumed_state=True\n  run_state._current_step=NextStepInterruption
+activate runloop
+
+runloop -> runloop : detect isinstance(\n  run_state._current_step,\n  NextStepInterruption)
+runloop -> runloop : validate _model_responses\n  and _last_processed_response exist\n  (raises UserError if missing)
+
+runloop -> turnres : resolve_interrupted_turn(\n  bindings, original_input,\n  original_pre_step_items,\n  new_response, processed_response,\n  run_state)
+activate turnres
+
+turnres -> turnres : _pending_approvals_from_state()\n  — read ToolApprovalItems from\n  run_state._current_step.interruptions
+
+loop for each pending tool call
+    turnres -> turnres : _function_requires_approval(run)\n  — check call_id in\n  approval_items_by_call_id
+
+    alt rejected
+        turnres -> turnres : _record_function_rejection()\n  → resolve_approval_rejection_message()\n  → append rejection ToolCallOutputItem
+    else approved
+        turnres -> toolexec : execute tool normally
+        activate toolexec
+        toolexec --> turnres : tool result
+        deactivate toolexec
+    end
+end
+
+turnres --> runloop : SingleStepResult\n(NextStepFinalOutput |\n NextStepRunAgain |\n NextStepInterruption)
+deactivate turnres
+
+alt NextStepFinalOutput
+    runloop --> runner : complete run normally
+    runner --> caller : RunResult (final_output populated)
+else NextStepRunAgain
+    runloop -> runloop : continue agent loop\n(more turns)
+else NextStepInterruption (partial resolution)
+    runloop -> helpers : update_run_state_for_interruption(...)
+    activate helpers
+    helpers --> runloop : RunState updated
+    deactivate helpers
+    runloop -> helpers : build_interruption_result(...)
+    activate helpers
+    helpers --> runloop : RunResult (interrupted again)
+    deactivate helpers
+    runloop --> runner : RunResult with remaining interruptions
+    runner --> caller : result.interruptions (unresolved approvals)
+    note over caller
+        Re-enter Phase 3 for remaining
+        unresolved interruptions
+    end note
+end
+
+deactivate runloop
+deactivate runner
+
+@enduml

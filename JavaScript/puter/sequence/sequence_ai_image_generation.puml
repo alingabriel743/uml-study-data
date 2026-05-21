@@ -1,0 +1,146 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+}
+
+title AI Image Generation Request Flow
+
+actor Client as client
+participant "DriverService" as driver
+participant "EventService" as events
+participant "PermissionService" as perms
+participant "RateLimitService" as ratelimit
+participant "AIImageGenerationService" as aiSvc
+participant "IImageProvider\n(e.g. OpenAiImageGenerationProvider)" as provider
+participant "MeteringService" as metering
+participant "External Image API\n(e.g. OpenAI)" as extAPI
+
+' ── Boot-time note ──────────────────────────────────────────────────────────
+note over aiSvc, driver
+  <b>Boot-time registration</b>
+  AIImageGenerationService registers service aliases per provider
+  (openai-image-generation, gemini-image-generation, etc.) →
+  all route to AIImageGenerationService via DriverService
+end note
+
+' ── Incoming call ────────────────────────────────────────────────────────────
+client -> driver : call({ iface: 'puter-image-generation',\ndriver: 'openai-image-generation',\nmethod: 'generate',\nargs: { prompt, model?, provider?, ratio?, quality? } })
+activate driver
+
+driver -> driver : _process_args(iface, method, args)\n[validates & consolidates arg types from registry]
+
+driver -> driver : resolve driver name\n(iface_to_driver map:\n'puter-image-generation' → 'openai-image-generation')
+
+driver -> driver : resolve service aliases\n(interface_service_aliases lookup)
+
+driver -> driver : get_service_or_throw_(driverName, iface)\n→ AIImageGenerationService
+
+' ── Context + permission ────────────────────────────────────────────────────
+driver -> events : emit('driver.create-call-context', event)\n[sets up client_driver_call context:\nintended_service, test_mode, response_metadata]
+activate events
+events --> driver : context established
+deactivate events
+
+driver -> perms : scan(actor, 'service:<driver>:ii:<iface>')
+activate perms
+perms --> driver : permission options / reading
+deactivate perms
+
+driver -> driver : select_best_option_(options)\n→ get_policies_for_option_(option)\n[resolves effective policy & rate-limit]
+
+driver -> ratelimit : check_and_increment(actor, policy)
+activate ratelimit
+ratelimit --> driver : OK (or throws rate_limit_exceeded)
+deactivate ratelimit
+
+driver -> driver : Invoker.create with decorators:\nenforce-rate-limit → add-metadata → result-coercion
+
+' ── Dispatch to AIImageGenerationService ─────────────────────────────────────
+driver -> aiSvc : service.as('puter-image-generation')\n.generate({ prompt, model, provider, ratio, quality, test_mode })
+activate aiSvc
+
+aiSvc -> aiSvc : Context.get('client_driver_call')\n→ extract test_mode, intended_service (legacyProviderName)
+
+aiSvc -> aiSvc : resolve intendedProvider\n(parameters.provider\n  || legacyProviderName\n  || DEFAULT_PROVIDER 'openai-image-generation'\n  || configuredProviders[0])
+
+aiSvc -> aiSvc : if no model → provider.getDefaultModel()\n(default: 'dall-e-2')
+
+aiSvc -> aiSvc : getModel({ modelId, provider })\n→ lookup #modelIdMap, prefer exact puterId match
+
+aiSvc -> aiSvc : validate/clamp ratio against model.allowedRatios\n(default 1024x1024)\nvalidate quality against model.allowedQualityLevels
+
+' ── Provider dispatch ────────────────────────────────────────────────────────
+aiSvc -> provider : provider.generate({ prompt, model: model.id,\nprovider: model.provider, ratio, quality, test_mode })
+activate provider
+
+alt test_mode == true
+    provider --> aiSvc : 'https://puter-sample-data.puter.site/image_example.png'
+else normal mode
+    provider -> provider : #estimatePromptTokenCount(prompt)\n+ #buildPriceKey(model, quality, size)\n→ estimatedTotalCostInMicroCents
+
+    provider -> metering : hasEnoughCredits(actor, estimatedTotalCostInMicroCents)
+    activate metering
+    alt insufficient credits
+        metering --> provider : throws APIError 'insufficient_funds'
+        provider --> aiSvc : propagate APIError
+    else credits OK
+        metering --> provider : true
+        deactivate metering
+
+        provider -> extAPI : openai.images.generate({ model, prompt,\nsize, quality, user })
+        activate extAPI
+        extAPI --> provider : ImagesResponse\n{ data[0].url | data[0].b64_json, usage? }
+        deactivate extAPI
+
+        provider -> provider : #extractUsage(result)\n→ compute input/output costs in cents
+
+        provider -> metering : batchIncrementUsages(actor,\n[{ usageType, usageAmount, costOverride }])
+        activate metering
+        metering --> provider : usage recorded
+        deactivate metering
+
+        provider -> provider : #setResponseCostMetadata()\n→ writes cost to Context\nclient_driver_call.response_metadata
+
+        provider --> aiSvc : url (string: 'https://...' or 'data:image/...')
+    end
+end
+deactivate provider
+
+' ── Response coercion & metadata ─────────────────────────────────────────────
+aiSvc -> aiSvc : wrap url in TypedValue(\n  { $: 'string:url:web' | 'string:url:data',\n    content_type: 'image' }, url)
+
+aiSvc --> driver : TypedValue
+deactivate aiSvc
+
+driver -> driver : svc_coercion.coerce(desired_type, TypedValue)\n→ coerced value
+
+driver -> driver : add-metadata decorator:\nwraps result as\n{ success: true, service: { name, version },\n  result, metadata: response_metadata }
+
+driver --> client : { success: true,\n  service: { name, version },\n  result: <image url>,\n  metadata: { cost, cost_components } }
+deactivate driver
+
+@enduml

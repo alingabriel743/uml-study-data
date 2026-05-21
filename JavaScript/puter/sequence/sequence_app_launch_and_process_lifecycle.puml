@@ -1,0 +1,192 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceParticipant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequenceArrow {
+    Color #495057
+    FontColor #212529
+    FontSize 11
+}
+skinparam sequenceLifeLine {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam noteBackgroundColor #FFF9C4
+skinparam noteBorderColor #F9A825
+
+title App Launch and Process Lifecycle
+
+participant "GUI / Boot" as GUI
+participant "LaunchOnInitService" as LOIS
+participant "ExecService" as ExecSvc
+participant "IPCService" as IPCSvc
+participant "launch_app\n(helper)" as LaunchHelper
+participant "puter.apps\n(API)" as PuterApps
+participant "ProcessService\n(GUI)" as ProcSvc
+participant "PortalProcess /\nPseudoProcess" as Process
+participant "UIWindow" as UIWin
+participant "BroadcastService" as BroadcastSvc
+participant "User /\nTaskManager" as User
+
+== Boot: GUI Ready ==
+
+GUI -> ProcSvc : _init()
+activate ProcSvc
+ProcSvc -> ProcSvc : register_(InitProcess[NULL_UUID])
+note right: Singleton root process\ncreated at boot
+deactivate ProcSvc
+
+GUI -> LOIS : _init()
+activate LOIS
+LOIS -> LOIS : read gui_params.launch_options.on_initialized
+loop for each INITRC entry
+    LOIS -> ExecSvc : launchApp({ app_name })
+end
+deactivate LOIS
+
+== App Launch: ExecService.launchApp ==
+
+User -> ExecSvc : launchApp({ app_name, args, pseudonym,\nfile_paths, items }, ipc_context)
+activate ExecSvc
+
+ExecSvc -> IPCSvc : add_connection({ source: caller.uuid,\ntarget: child_instance_id })
+activate IPCSvc
+IPCSvc --> ExecSvc : connection registered
+deactivate IPCSvc
+
+ExecSvc -> PuterApps : get(app_name)\n[fetch source app metadata]
+activate PuterApps
+PuterApps --> ExecSvc : source_app_info
+deactivate PuterApps
+
+alt godmode path (elevated permissions)
+    ExecSvc -> PuterApps : get(app_name)\n[fetch target app info]
+    activate PuterApps
+    PuterApps --> ExecSvc : target_app_info
+    deactivate PuterApps
+    ExecSvc -> ExecSvc : puter.fs.sign(target_app.uuid,\n{ path, action: 'write' })
+end
+
+ExecSvc -> LaunchHelper : launch_app(launch_options)
+activate LaunchHelper
+
+== launch_app Helper ==
+
+LaunchHelper -> PuterApps : get(options.name, { icon_size: 64 })
+activate PuterApps
+PuterApps --> LaunchHelper : app_info
+deactivate PuterApps
+
+LaunchHelper -> LaunchHelper : check privateAccess decision
+note right: May recursively redirect\nto fallbackAppName
+
+alt explorer / trash app
+    LaunchHelper -> Process : new PseudoProcess({ uuid, name,\nparent, meta })
+    activate Process
+else standard app (iframe)
+    LaunchHelper -> Process : new PortalProcess({ uuid, name,\nparent, meta })
+    activate Process
+end
+
+== Process Registration ==
+
+LaunchHelper -> ProcSvc : register(process)
+activate ProcSvc
+ProcSvc -> ProcSvc : register_(process)\npush to processes[], processes_map,\nuuid_to_treelist
+ProcSvc -> ProcSvc : attach_to_parent_(process)\nset parent = NULL_UUID if unset,\npush to parent's treelist
+ProcSvc --> LaunchHelper : registered
+deactivate ProcSvc
+
+LaunchHelper -> UIWin : UIWindow({ element_uuid, iframe_url,\ntitle, icon, ...window_options })
+activate UIWin
+UIWin --> LaunchHelper : el_win (window element)
+deactivate UIWin
+
+LaunchHelper -> LaunchHelper : fetchUserAppTokenForLaunch({ appUid })\n[POST /auth/get-user-app-token]
+
+LaunchHelper --> ExecSvc : process handle
+deactivate LaunchHelper
+
+== Child App IPC Attach (post-launch) ==
+
+Process -> ExecSvc : onchange('ipc_status',\nPROCESS_IPC_ATTACHED)
+ExecSvc -> ExecSvc : send_child_launched_msg\n({ uses_sdk: true })
+ExecSvc -> BroadcastSvc : sendSavedBroadcastsTo(child_instance_id)
+activate BroadcastSvc
+BroadcastSvc --> ExecSvc : broadcasts replayed
+deactivate BroadcastSvc
+
+ExecSvc --> User : app launched
+deactivate ExecSvc
+
+== Process Teardown ==
+
+User -> User : end_process(uuid, force=false|true)
+activate User
+
+User -> ProcSvc : get_by_uuid(uuid)
+activate ProcSvc
+ProcSvc --> User : process
+deactivate ProcSvc
+
+alt process.is_init() or force=true
+    User -> User : UIAlert(confirmation message)
+end
+
+User -> Process : process.signal(END_SOFT | END_HARD)
+Process -> ProcSvc : unregister(uuid)
+activate ProcSvc
+ProcSvc -> ProcSvc : delete from processes_map\nsplice from processes[]
+ProcSvc -> ProcSvc : remove from parent's treelist
+loop for each orphaned child
+    ProcSvc -> ProcSvc : child.parent = NULL_UUID\nattach_to_parent_(child)\n→ re-parent to InitProcess
+end
+ProcSvc --> Process : unregistered
+deactivate ProcSvc
+deactivate Process
+
+UIWin -> ExecSvc : el_win.on('remove')
+activate ExecSvc
+ExecSvc -> ExecSvc : report_app_closed(child_process.uuid)\npostMessage({ msg: 'appClosed' })
+deactivate ExecSvc
+deactivate User
+
+== Task Manager: Live Process Tree ==
+
+User -> User : UIWindowTaskManager()
+activate User
+User -> ProcSvc : get_init()
+activate ProcSvc
+ProcSvc --> User : InitProcess
+deactivate ProcSvc
+
+loop every 500ms (setInterval)
+    User -> ProcSvc : get_children_of(uuid) [recursive]
+    activate ProcSvc
+    ProcSvc --> User : child processes
+    deactivate ProcSvc
+    User -> User : generate_task_rows(processes)\nrebuild table UI
+end
+
+User -> User : right-click → UIContextMenu\n(close / force_quit)
+deactivate User
+
+@enduml

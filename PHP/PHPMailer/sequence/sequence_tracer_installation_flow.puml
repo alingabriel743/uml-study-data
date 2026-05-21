@@ -1,0 +1,234 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    GroupBackgroundColor #DEE2E6
+    GroupBorderColor #6C757D
+    GroupFontColor #212529
+    DividerBackgroundColor #CED4DA
+    DividerBorderColor #6C757D
+    NoteBackgroundColor #FFF3CD
+    NoteBorderColor #FFC107
+}
+
+title Datadog Tracer Installation Flow
+
+actor "Operator" as User
+participant "CLI (argv)" as CLI
+participant "main()" as Main
+participant "parse_validate_user_options()" as ParseValidate
+participant "parse_cli_arguments()" as ParseArgs
+participant "install()" as Install
+participant "require_binaries_or_exit()" as RequireBin
+participant "ini_values()" as IniVals
+participant "download()" as Downloader
+participant "safe_copy_extension()" as SafeCopy
+participant "find_main_ini_files()" as FindIni
+participant "get_ini_settings()" as GetIniSettings
+participant "add_missing_ini_settings()" as AddIni
+participant "FileSystem / GitHub Releases" as FS
+
+== CLI Argument Parsing ==
+
+User -> CLI : php datadog-setup.php --php-bin=all\n[--enable-appsec] [--enable-profiling]
+activate CLI
+
+CLI -> Main : invoke main()
+activate Main
+
+note over Main : DD_INSTRUMENT_SERVICE_WITH_APM=false\nprevents APM auto-injection during install
+
+Main -> ParseValidate : parse_validate_user_options()
+activate ParseValidate
+
+ParseValidate -> ParseArgs : parse_cli_arguments($argv)
+activate ParseArgs
+note right of ParseArgs : Tokenizes long opts (--key[=val]),\nshort opts (-k), bare commands,\nand DD_* env vars via map_env_to_ini()
+ParseArgs --> ParseValidate : {cmd, opts} or false
+deactivate ParseArgs
+
+alt --help / -h flag present
+    ParseValidate -> ParseValidate : print_help()
+    ParseValidate --> Main : exit(0)
+end
+
+note right of ParseValidate : Normalizes OPT_INSTALL_DIR\n(default: /opt/datadog),\nOPT_PHP_BIN, OPT_FILE,\nOPT_EXTENSION_DIR, OPT_PHP_INI,\nOPT_ENABLE_APPSEC,\nOPT_ENABLE_PROFILING
+
+ParseValidate --> Main : {cmd: "install", opts}
+deactivate ParseValidate
+
+alt cmd == "config get|set|list"
+    Main -> Main : route to cmd_config_get/set/list()
+else cmd == "uninstall"
+    Main -> Main : uninstall($options)
+else cmd == "install" (default)
+
+== Prerequisite Checks ==
+
+    Main -> Install : install($options)
+    activate Install
+
+    Install -> Install : get_architecture()\n→ x86_64 or aarch64
+
+    Install -> Install : check_library_prerequisite_or_exit('libcurl')
+    Install -> Install : check_library_prerequisite_or_exit('libgcc_s')
+
+    opt --enable-profiling on non-Alpine
+        Install -> Install : check_library_prerequisite_or_exit('libdl.so', 'libpthread', 'librt')
+    end
+
+    Install -> RequireBin : require_binaries_or_exit($options)
+    activate RequireBin
+    note right of RequireBin : If --php-bin=all, searches\nstandard PATH locations for\nall available PHP binaries.\nExits if none found.
+    RequireBin --> Install : resolved PHP binary paths[]
+    deactivate RequireBin
+
+== Per-Binary Inspection ==
+
+    loop foreach PHP binary
+        Install -> Install : check_php_ext_prerequisite_or_exit($binary, 'json')
+        note right of Install : Ensures the json extension\nis loaded for this binary
+
+        Install -> IniVals : ini_values($binary)
+        activate IniVals
+        note right of IniVals : Runs 'php -i' on target binary,\nparses: PHP Version, INI main file,\nINI scan dir, extension_dir,\nthread-safety (ZTS), PHP API,\ndebug build flag
+        IniVals --> Install : phpProperties {version, ini_main,\nscan_dir, extension_dir,\nthread_safety, php_api, debug}
+        deactivate IniVals
+
+        Install -> Install : compute extensionSuffix\n(-debug, -zts) and downloadVersions
+    end
+
+== Archive Download ==
+
+    Install -> Install : build download URL:\nRELEASE_URL_PREFIX + 'dd-library-php-{version}-{arch}-linux-{gnu|musl}[-{phpAPI}].tar.gz'
+
+    Install -> Downloader : download($url, $tmpDirTarGz, $retry)
+    activate Downloader
+    note right of Downloader : Fallback chain:\n1) ext-curl\n2) CLI curl\n3) file_get_contents (allow_url_fopen+openssl)\nExits if all methods fail.
+
+    Downloader -> FS : write archive to /tmp/dd-install/
+    activate FS
+    FS --> Downloader : archive saved
+    deactivate FS
+
+    alt architecture-specific archive returns 404
+        Downloader -> FS : retry with full multi-arch archive\n(tar_gz_suffix='')
+        activate FS
+        FS --> Downloader : full archive saved
+        deactivate FS
+    end
+
+    Downloader --> Install : true (success) / false (failure)
+    deactivate Downloader
+
+== Archive Extraction & File Copy ==
+
+    Install -> FS : extract archive: tar -xf *.tar.gz → $tmpDir
+    activate FS
+    FS --> Install : extracted contents
+    deactivate FS
+
+    Install -> FS : read VERSION file from archive
+    activate FS
+    FS --> Install : installed version string
+    deactivate FS
+
+    Install -> FS : mkdir $installDir/dd-trace-sources;\ncp trace/src → $installDir
+    activate FS
+    FS --> Install : trace sources copied
+    deactivate FS
+
+    opt AppSec present in archive
+        Install -> FS : cp appsec/lib and appsec/etc → $installDir
+        activate FS
+        FS --> Install : AppSec files copied
+        deactivate FS
+    end
+
+== Extension Copy (Atomic) ==
+
+    loop foreach PHP binary, foreach INI file path
+        Install -> SafeCopy : safe_copy_extension(ddtrace.so → extension_dir)
+        activate SafeCopy
+        note right of SafeCopy : Atomic copy: write to .tmp file\nthen rename (avoids segfault on\ncurrently-loaded .so).\nWindows: moves old DLL to TEMP\nbefore replacing.
+        SafeCopy --> Install : ddtrace.so installed
+        deactivate SafeCopy
+
+        opt datadog-profiling.so available for this PHP version
+            Install -> SafeCopy : safe_copy_extension(datadog-profiling.so → extension_dir)
+            activate SafeCopy
+            SafeCopy --> Install : profiling extension installed
+            deactivate SafeCopy
+        end
+
+        opt AppSec available
+            Install -> SafeCopy : safe_copy_extension(ddappsec.so → extension_dir)
+            activate SafeCopy
+            SafeCopy --> Install : AppSec extension installed
+            deactivate SafeCopy
+        end
+    end
+
+== INI Configuration ==
+
+    Install -> FindIni : find_main_ini_files($phpProperties)
+    activate FindIni
+    note right of FindIni : Prefers 98-ddtrace.ini in INI\nscan dir (handles Debian\ncli/fpm/apache2 split).\nFalls back to INI_MAIN.
+    FindIni --> Install : iniFilePaths[]
+    deactivate FindIni
+
+    opt No INI scan dir found
+        Install -> Install : print_warning("fragile install;\nusing INI_MAIN directly")
+    end
+
+    Install -> GetIniSettings : get_ini_settings($sourcesDir, $appsecHelperPath, $appsecRulesPath)
+    activate GetIniSettings
+    note right of GetIniSettings : Returns canonical INI entries:\nextension=ddtrace.so\nextension=datadog-profiling.so (commented)\nextension=ddappsec.so\ndatadog.* settings with defaults
+    GetIniSettings --> Install : settings[], replacements[]
+    deactivate GetIniSettings
+
+    Install -> AddIni : add_missing_ini_settings($iniFilePath, $settings, $replacements)
+    activate AddIni
+    note right of AddIni : On upgrade: regex replacements migrate\nold ddtrace.request_init_hook\n→ datadog.trace.sources_path
+    AddIni -> AddIni : modify_ini_file(): read INI,\napply replacements,\nappend missing entries,\nwrite back
+    AddIni --> Install : INI updated
+    deactivate AddIni
+
+== Success ==
+
+    Install --> Main : installation complete
+    deactivate Install
+
+    Main --> CLI : echo "Installation to $binary was successful"\necho "SUCCESS"
+    deactivate Main
+
+end
+
+CLI --> User : Exit 0
+deactivate CLI
+
+note over FS : /tmp/dd-install is automatically\ncleaned up via register_shutdown_function()
+
+@enduml

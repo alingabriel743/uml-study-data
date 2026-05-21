@@ -1,0 +1,360 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 11
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+}
+skinparam partition {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+    FontColor #343A40
+}
+skinparam note {
+    BackgroundColor #D1ECF1
+    BorderColor #0C5460
+    FontColor #0C5460
+}
+
+title Media File ID3 Tag Analysis Flow\n(getID3 v1.9.22 — WordPress ID3 Media Metadata Analysis)
+
+'─────────────────────────────────────────
+' SWIM LANES
+'─────────────────────────────────────────
+|Caller|
+|getID3|
+|getid3_handler (Module)|
+|Filesystem / PHP|
+
+'─────────────────────────────────────────
+' PHASE 1 — HANDLER CONSTRUCTION
+'─────────────────────────────────────────
+|Caller|
+start
+:Instantiate **getID3()**;
+
+|getID3|
+note right
+  **Startup validation phase**
+  All checks run before any
+  analysis can be performed
+end note
+
+:Check PHP version >= 5.3.0;
+if (PHP version invalid?) then (yes)
+  :Set startup_error\n(PHP version too old);
+endif
+
+:Parse ini **memory_limit**\n(handle M/G suffix);
+if (memory < 4 MB?) then (yes)
+  :Set startup_error\n(insufficient memory);
+elseif (memory < 12 MB?) then (warning)
+  :Set startup_warning\n(low memory);
+endif
+
+:Check **safe_mode** &\n**mbstring.func_overload** bitmask 2;
+if (safe_mode or mbstring overload?) then (yes)
+  :Set startup_error;
+endif
+
+:Check **magic_quotes_runtime** /\n**magic_quotes_gpc** (PHP < 7.4);
+if (magic_quotes on?) then (yes)
+  :Set startup_error;
+endif
+
+:include_once **getid3.lib.php**;
+if (library missing?) then (yes)
+  :Set startup_error;
+endif
+
+:Set **option_max_2gb_check**\n(auto-detect: true when\nPHP_INT_MAX <= 2147483647);
+
+if (Windows OS?) then (yes)
+  :Resolve **GETID3_HELPERAPPSDIR**\nwith 8.3 short-path conversion;
+endif
+
+if (startup_error set?) then (yes)
+  :throw **getid3_exception**\n(fatal startup failure);
+  |Caller|
+  :Catch getid3_exception;
+  stop
+else (no)
+  :Handler ready for analysis calls;
+endif
+
+'─────────────────────────────────────────
+' PHASE 2 — OPEN FILE
+'─────────────────────────────────────────
+|Caller|
+:Call **analyze**($filename, $filesize,\n$original_filename, $fp);
+
+|getID3|
+:Call **openfile**($filename, $filesize, $fp);
+
+if (startup_error present?) then (yes)
+  :throw getid3_exception;
+  stop
+endif
+
+:Emit each accumulated\n**startup_warning** via warning();
+
+:Initialize **$info** array\n(filesize, filepath, filename, filenamepath,\navdataoffset=0, avdataend,\nerror=[], warning=[], tags=[], comments=[], encoding);
+
+if (Remote URL (ht:// or ftp://)?) then (yes)
+  :throw getid3_exception\n(remote URLs not supported);
+  stop
+endif
+
+if (Existing $fp resource provided?) then (yes)
+  |Filesystem / PHP|
+  :Use supplied file pointer;
+else (no)
+  |Filesystem / PHP|
+  :fopen($filename, 'rb');
+  if (fopen failed?) then (yes)
+    |getID3|
+    :error('cannot open file');
+    :Return $info (with error);
+    |Caller|
+    stop
+  endif
+endif
+
+|getID3|
+if (option_max_2gb_check enabled?) then (yes)
+  |Filesystem / PHP|
+  :fseek(0, SEEK_END) + ftell()\nto detect actual file size;
+  if (file size > 2 GB?) then (yes)
+    |getID3|
+    if (32-bit PHP (PHP_INT_MAX <=2GB)?) then (yes)
+      :throw getid3_exception\n(>2GB file on 32-bit PHP);
+      stop
+    else (no)
+      :warning('>2GB file detected;\nresults may be unreliable');
+    endif
+  endif
+endif
+
+'─────────────────────────────────────────
+' PHASE 3 — TAG MODULE PARSING
+'─────────────────────────────────────────
+|getID3|
+note right
+  **Tag modules run BEFORE format detection**
+  to establish avdataoffset / avdataend
+  boundaries for the audio/video data region
+end note
+
+:Process enabled tag modules\n(id3v2, id3v1, apetag, lyrics3);
+
+fork
+  if (option_tag_id3v2?) then (yes)
+    |getid3_handler (Module)|
+    :include 'tag.id3v2'\nnew **getid3_id3v2**($this)\n→ Analyze();
+    |getID3|
+    :Set **avdataoffset** from\nid3v2 tag_offset_end;
+  endif
+fork again
+  if (option_tag_id3v1?) then (yes)
+    |getid3_handler (Module)|
+    :include 'tag.id3v1'\nnew **getid3_id3v1**($this)\n→ Analyze();
+  endif
+fork again
+  if (option_tag_apetag?) then (yes)
+    |getid3_handler (Module)|
+    :include 'tag.apetag'\nnew **getid3_apetag**($this)\n→ Analyze();
+  endif
+fork again
+  if (option_tag_lyrics3?) then (yes)
+    |getid3_handler (Module)|
+    :include 'tag.lyrics3'\nnew **getid3_lyrics3**($this)\n→ Analyze();
+  endif
+end fork
+
+|getID3|
+:Set **avdataend** = min(\nid3v1 / apetag / lyrics3\ntag_offset_start values);
+
+if (!option_tag_id3v2?) then (yes)
+  note right: Even when ID3v2 parsing\nis disabled, detect its header\nto correctly set avdataoffset
+  |Filesystem / PHP|
+  :fseek(0) + fread(10)\n→ Detect ID3v2 header presence;
+  |getID3|
+  :Update avdataoffset if\nID3v2 header found;
+endif
+
+'─────────────────────────────────────────
+' PHASE 4 — FORMAT DETECTION
+'─────────────────────────────────────────
+|Filesystem / PHP|
+:fseek(avdataoffset)\n+ fread(32774)\n→ $formattest buffer\n(FREAD_BUFFER_SIZE = 32768);
+
+|getID3|
+:GetFileFormat($formattest, $filename)\nPattern-match first bytes against\nGetFileFormatArray() signatures;
+
+if (No format matched?) then (yes)
+  |Filesystem / PHP|
+  :fclose file pointer;
+  |getID3|
+  :error('unable to determine file format');
+  :Return $info;
+  |Caller|
+  stop
+endif
+
+:Check **fail_id3** constraint\n(illegal ID3 tags for this format);
+if (fail_id3 = ERROR?) then (yes)
+  :error('ID3 tags not valid for format');
+  :Return $info;
+  |Caller|
+  stop
+elseif (fail_id3 = WARNING?) then (warn)
+  :warning('ID3 tags present on\nnon-ID3 format');
+endif
+
+:Check **fail_ape** constraint\n(illegal APE tags for this format);
+if (fail_ape = ERROR?) then (yes)
+  :error('APE tags not valid for format');
+  :Return $info;
+  |Caller|
+  stop
+elseif (fail_ape = WARNING?) then (warn)
+  :warning('APE tags present on\nnon-APE format');
+endif
+
+:Set **info['mime_type']**;
+
+:Check module file exists\n(module.{group}.{module}.php);
+if (module file missing?) then (yes)
+  :error('module file not found');
+  :Return $info;
+  |Caller|
+  stop
+endif
+
+:Check iconv / mb_convert_encoding\nrequirement for module;
+if (required encoding extension absent?) then (yes)
+  :error('required encoding\nextension not available');
+  :Return $info;
+  |Caller|
+  stop
+endif
+
+'─────────────────────────────────────────
+' PHASE 5 — FORMAT-SPECIFIC ANALYSIS
+'─────────────────────────────────────────
+|Filesystem / PHP|
+:include_once\n**module.{group}.{module}.php**;
+
+|getID3|
+:Instantiate **getid3_{module}**($this)\n(concrete getid3_handler subclass\ne.g. getid3_mp3, getid3_flac, getid3_asf…);
+:Copy matching **options_{group}_{module}_***\nproperties into module instance;
+
+|getid3_handler (Module)|
+note right
+  **Dual-mode I/O dispatch**
+  data_string_flag=true  → string buffer
+  data_string_flag=false → file pointer
+end note
+:$class->**Analyze**()\n(format-specific tag/frame parsing);
+
+' ── AnalyzeString sub-flow ──
+if (Module needs to analyze\na sub-buffer as string?) then (yes)
+  :Call **AnalyzeString**($string);
+  :setStringMode($string)\n(data_string_flag=true,\ndata_string=$string,\ndata_string_length=strlen($string));
+  :Save avdataoffset, avdataend,\nfilesize from getid3->info;
+  :Reset avdataoffset=0,\navdataend=filesize=data_string_length;
+  :Call abstract **Analyze**()\n(operates via overridden\nfread / fseek / ftell / feof / fgets);
+  :Restore avdataoffset, avdataend,\nfilesize to saved values;
+  :data_string_flag = false\n(exit string mode);
+endif
+
+' ── saveAttachment sub-flow ──
+if (Attachment data encountered?) then (yes)
+  :Call **saveAttachment**($name, $offset,\n$length, $image_mime);
+  if (option_save_attachments\n= ATTACHMENTS_NONE (false)?) then (discard)
+    :attachment = null\n(skip binary data);
+  elseif (option_save_attachments\n= ATTACHMENTS_INLINE (true)?) then (inline)
+    |Filesystem / PHP|
+    :fseek($offset)\n+ fread($length)\n→ attachment = raw binary string;
+    |getid3_handler (Module)|
+  else (directory path)
+    |Filesystem / PHP|
+    :Build $dest = dir/name[.ext]\nfopen($dest, 'wb');
+    :fseek($offset)\nLoop: fread(buffersize)\n+ fwrite until bytesLeft == 0\nfclose($dest);
+    if (Exception during write?) then (yes)
+      :fclose + unlink $dest;
+      |getid3_handler (Module)|
+      :attachment = null;
+      :warning('Failed to extract\nattachment to disk');
+    else (no)
+      |getid3_handler (Module)|
+      :attachment = $dest filepath;
+    endif
+  endif
+  |Filesystem / PHP|
+  :fseek($offset + $length)\n(advance past attachment region);
+  |getid3_handler (Module)|
+  :Return $attachment\n(binary | filepath | null);
+endif
+
+'─────────────────────────────────────────
+' PHASE 6 — POST-PROCESSING & CLEANUP
+'─────────────────────────────────────────
+|getID3|
+:unset($class);
+
+|Filesystem / PHP|
+:fclose($this->fp);
+
+|getID3|
+if (option_tags_process?) then (yes)
+  :HandleAllTags()\nCopy & charset-convert tags\nto info['tags'] and info['tags_html'];
+endif
+
+if (option_extra_info?) then (yes)
+  fork
+    :ChannelsBitratePlaytimeCalculations();
+  fork again
+    :CalculateCompressionRatioVideo()\nCalculateCompressionRatioAudio();
+  fork again
+    :CalculateReplayGain();
+  fork again
+    :ProcessAudioStreams();
+  end fork
+endif
+
+if (option_md5_data?) then (yes)
+  if (NOT (option_md5_data_source\nAND md5_data_source already set)?) then (yes)
+    :getHashdata('md5')\n(hash audio/video data region);
+  endif
+endif
+
+if (option_sha1_data?) then (yes)
+  :getHashdata('sha1')\n(hash audio/video data region);
+endif
+
+:CleanUp()\nRemove empty keys from $info\nDeduplicate error[] and warning[] arrays;
+
+note right
+  **Error/Warning Escalation**
+  getID3::error()   → CleanUp() + info['error'][] + return info
+  getID3::warning() → info['warning'][] + return true
+  handler::error()  → info['error'][] + return false
+  handler::warning()→ delegates to getID3::warning()
+  Fatal conditions  → throw getid3_exception (caught here)
+end note
+
+:Return **$this->info**\n(tags, mime_type, bitrate, playtime,\nattachments, error[], warning[]);
+
+|Caller|
+:Receive info array\n(structured media metadata);
+stop
+
+@enduml

@@ -1,0 +1,232 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #E9ECEF
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #DEE2E6
+    DividerBorderColor #6C757D
+    DividerBackgroundColor #CED4DA
+    NoteBackgroundColor #FFF3CD
+    NoteBorderColor #FFC107
+}
+
+title Visualization and Video Output Flow
+
+actor "Caller\n(sample.py)" as caller
+
+box "Lyra-1 Visualization Utilities" #E8F4FD
+    participant "visu.py\n(src/utils/visu.py)" as visu
+    participant "wave_func" as wavefn
+    participant "reshape_video_grid" as gridutil
+end box
+
+box "Post-Processing / Teaser" #FDF6E3
+    participant "create_teaser_video\n(dynamic_scene_video_static_scene.py)" as teaser
+    participant "find_subvideos" as findvid
+end box
+
+box "Lyra-2 / cosmos_predict1 Video Output" #F0FDF4
+    participant "save_img_or_video\n(imaginaire/visualize/video.py)" as savevid2
+    participant "save_video\n(imaginaire/visualize/video.py)" as savevid_imag
+end box
+
+box "I/O & Encoding Backends" #FDF2F8
+    participant "imageio" as imageio
+    participant "ffmpegcv.VideoWriter\n(h264)" as ffmpegcv
+    participant "easy_io" as easyio
+    participant "ffmpeg\n(subprocess)" as ffmpeg
+end box
+
+' ─────────────────────────────────────────────────────────
+' 1. DEPTH COLORIZATION
+' ─────────────────────────────────────────────────────────
+== Lyra-1: Depth Colorization ==
+
+caller -> visu: create_depth_visu(\n  depths_pred [B,T,1,H,W],\n  cmap='jet', min_max_perc=[0.01, 0.99])
+activate visu
+note right of visu
+  Percentile-normalize depth values,
+  apply cv2.applyColorMap per frame
+end note
+visu --> caller: depth_visu [B,T,3,H,W] float in [0,1]
+deactivate visu
+
+' ─────────────────────────────────────────────────────────
+' 2. WAVE VIDEO GENERATION
+' ─────────────────────────────────────────────────────────
+== Lyra-1: Wave Video Generation ==
+
+caller -> visu: generate_wave_video(\n  image_tensor [B,T,3,H,W],\n  depth_tensor [B,T,1,H,W],\n  wave_length, wave_color,\n  use_gradient_color)
+activate visu
+
+visu -> visu: extract image[H,W,3] and depth[H,W]\nfor batch_idx / frame_idx
+
+loop for each wave step (n_frames + 1)
+    visu -> wavefn: wave_func(depth, curr_depth, wave_length)
+    activate wavefn
+    note right of wavefn
+      Cosine-squared falloff:
+      weight = cos²(π·|d – pos| / wave_length)
+      where |d – pos| ≤ wave_length/2
+    end note
+    wavefn --> visu: wave_weights [H,W]
+    deactivate wavefn
+    visu -> visu: blend image with wave_color using weights
+end
+
+visu -> visu: prepend pre_frames static frames
+visu -> visu: stack all frames → np.array\nconvert to Tensor [1, pre+n+1, 3, H, W] in [0,1]
+visu --> caller: wave_tensor [1, T_wave, 3, H, W]
+deactivate visu
+
+' ─────────────────────────────────────────────────────────
+' 3. SAVE VIDEO (Lyra-1 / visu.py path)
+' ─────────────────────────────────────────────────────────
+== Lyra-1: Save Video via imageio ==
+
+caller -> visu: save_video(\n  tensor [B,T,C,H,W], outdir, name, fps=8)
+activate visu
+
+visu -> gridutil: reshape_video_grid(tensor [B,T,C,H,W])
+activate gridutil
+note right of gridutil
+  einops rearrange:
+  batch → grid (N1×N2)
+  output: [T, C, N1·H, N2·W]
+end note
+gridutil --> visu: grid_tensor [T, C, grid_H, grid_W]
+deactivate gridutil
+
+visu -> visu: to numpy → transpose [T,H,W,C]\nscale ×255 → uint8 frames
+
+visu -> imageio: mimwrite(outdir/name.mp4, frames, fps=fps)
+activate imageio
+imageio --> visu: MP4 written
+deactivate imageio
+
+visu --> caller: (None)
+deactivate visu
+
+note over caller, imageio
+  **Multiple save_video calls from sample.py:**
+  • save_video(wave_tensor,      outdir_raw,   'rgb_wave_{idx}',        fps)
+  • save_video(cat(wave, rgb),   outdir_3dgs,  'rgb_{idx}',             fps)
+  • save_video(view_tensor,      outdir_raw,   'rgb_{idx}_view_idx_{v}',fps) [per view]
+  • save_video(rgb+depth_concat, outdir_full,  'sample_{idx}',          fps)
+  • save_video(batch_cat_tensor, outdir_grid,  'sample_grid_{step}',    fps) [if save_grid]
+end note
+
+' ─────────────────────────────────────────────────────────
+' 4. TEASER ASSEMBLY
+' ─────────────────────────────────────────────────────────
+== Teaser Assembly: dynamic_scene_video_static_scene.py ==
+
+caller -> teaser: create_teaser_video(\n  mp4_paths_or_dir,\n  wave_output_dir, single_output_dir,\n  grid_output_dir, grid_rows=2, grid_cols=3)
+activate teaser
+
+teaser -> teaser: list & natural_sort RGB .mp4s\n(exclude wave / view / grid files)
+
+loop for each sample MP4
+    teaser -> findvid: find_subvideos(main_mp4_path)
+    activate findvid
+    note right of findvid
+      Parse sample_idx + param suffix,
+      locate 'rgb_wave_{idx}_{param}.mp4'
+      and per-view mp4s
+    end note
+    findvid --> teaser: wave_path, view_paths[]
+    deactivate findvid
+
+    teaser -> ffmpeg: concat wave [+ optional mirror/reverse]\n→ wave_output_dir/{sample_idx}.mp4\n(libx264, crf=18, preset=fast)
+    activate ffmpeg
+    ffmpeg --> teaser: wave MP4 saved
+    deactivate ffmpeg
+
+    teaser -> ffmpeg: concat views [+ optional mirror]\n→ single_output_dir/{sample_idx}.mp4\n(libx264, crf=18, preset=fast)
+    activate ffmpeg
+    ffmpeg --> teaser: single-view MP4 saved
+    deactivate ffmpeg
+end
+
+opt grid_output_dir provided
+    teaser -> ffmpeg: filter_complex hstack cols + vstack rows\nover batched single videos\n→ grid_output_dir/grid_{i}.mp4 (libx264)
+    activate ffmpeg
+    ffmpeg --> teaser: grid MP4 saved
+    deactivate ffmpeg
+end
+
+teaser --> caller: (None)
+deactivate teaser
+
+' ─────────────────────────────────────────────────────────
+' 5. LYRA-2 / cosmos_predict1 SAVE PATHS
+' ─────────────────────────────────────────────────────────
+== Lyra-2 / cosmos_predict1: save_img_or_video ==
+
+caller -> savevid2: save_img_or_video(\n  tensor [C,T,H,W] in [0,1],\n  save_fp_wo_ext, fps=24)
+activate savevid2
+
+savevid2 -> savevid2: clamp float or normalize uint8 → [0,1]
+
+alt T == 1  (single frame → image)
+    savevid2 -> easyio: dump(save_fp+'.jpg',\n  format='JPEG', quality=85)
+    activate easyio
+    easyio --> savevid2: JPEG written
+    deactivate easyio
+else T > 1  (video)
+    savevid2 -> savevid2: rearrange [C,T,H,W]→[T,H,W,C]\nscale ×255 → uint8
+    savevid2 -> easyio: dump(save_fp+'.mp4',\n  format='mp4', fps=fps)
+    activate easyio
+    easyio --> savevid2: MP4 written
+    deactivate easyio
+end
+
+savevid2 --> caller: (None)
+deactivate savevid2
+
+== Lyra-2 / cosmos_predict1: save_video (ffmpegcv path) ==
+
+caller -> savevid_imag: save_video(\n  grid [C,T,H,W] float in [0,1],\n  video_name, fps=30)
+activate savevid_imag
+
+savevid_imag -> savevid_imag: scale ×255\ntranspose [C,T,H,W] → [T,H,W,C]
+
+savevid_imag -> ffmpegcv: VideoWriter(video_name, codec='h264', fps=fps)
+activate ffmpegcv
+
+loop for each frame t in [0, T)
+    savevid_imag -> ffmpegcv: write(cv2.cvtColor(frame_t, RGB→BGR))
+end
+
+savevid_imag -> ffmpegcv: release()
+ffmpegcv --> savevid_imag: MP4 written (h264)
+deactivate ffmpegcv
+
+savevid_imag --> caller: (None)
+deactivate savevid_imag
+
+@enduml

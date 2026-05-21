@@ -1,0 +1,123 @@
+@startuml activity_conversation_memory_flow
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    BarColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam note {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+    FontColor #212529
+}
+
+title Conversation Memory & History Flow
+
+|Caller / App|
+start
+:Prepare conversation context;
+
+if (Conversation mode?) then (New Conversation)
+  :agent.forUser(user)\nSets conversationUser\nClears conversationId;
+elseif (mode?) then (Continue Specific)
+  :agent.continue(conversationId, user)\nSets conversationId + conversationUser;
+else (Continue Last)
+  :agent.continueLastConversation(user);
+  |ConversationStore / DB|
+  :latestConversationId(user.id)\nLookup most recent conversation UUID;
+  |Caller / App|
+  :Resolved conversationId stored on agent;
+endif
+
+if (Agent is queued?) then (yes)
+  :agent.promptLater();
+  |Queue / InvokeAgent Job|
+  :Create InvokeAgent job\nWrapped in QueuedAgentResponse;
+  |Caller / App|
+  :Register optional callbacks\n• then(Closure) → thenCallbacks[]\n• catch(Closure) → catchCallbacks[]\n(Serialized via SerializableClosure);
+  |Queue / InvokeAgent Job|
+  :Dispatch job to queue;
+  :Queue worker picks up job\nInvokeAgent.handle() called;
+  :withCallbacks(fn → agent.prompt(…));
+else (no — sync)
+  |Caller / App|
+  :agent.prompt() — synchronous;
+endif
+
+|GeneratesText Pipeline|
+:gatherMiddlewareFor(agent);
+if (agent uses RemembersConversations\nAND hasConversationParticipant()?) then (yes)
+  :Prepend RememberConversation\nmiddleware to pipeline;
+else (no)
+  :Skip conversation middleware;
+endif
+:Execute pipeline → core handler;
+
+|Agent (Core Handler)|
+if (agent implements Conversational?) then (yes)
+  :Call agent.messages();
+  if (conversationId is set?) then (yes)
+    |ConversationStore / DB|
+    :getLatestConversationMessages\n(conversationId, maxMessages=100)\nReturns Collection<Message>;
+    |Agent (Core Handler)|
+    :Prepend history messages to context;
+  else (no)
+    :Use empty message list;
+  endif
+endif
+:Append new UserMessage\n(prompt + attachments) to messages;
+:textGateway.generateText(…messages…)\nReturns steps[], toolCalls, toolResults;
+:Build AgentResponse\n(steps, toolCalls, toolResults, usage, meta);
+
+|RememberConversation Middleware|
+note right
+  Runs post-response via
+  .then() callback on pipeline
+end note
+
+if (agent.currentConversation() is null?\n(brand-new conversation)) then (yes)
+  :generateTitle(prompt)\nCalls cheapest AI model\n→ 3–5 word title\n(fallback: truncated prompt);
+  |ConversationStore / DB|
+  :storeConversation(userId, title)\nINSERT into agent_conversations\nReturns new UUID7;
+  |RememberConversation Middleware|
+  :agent.continue(newConversationId, participant)\nUpdates agent state with new UUID;
+else (no — existing conversation)
+  :Conversation record already exists\nSkip creation;
+endif
+
+|ConversationStore / DB|
+:storeUserMessage\n(conversationId, userId, AgentPrompt)\nINSERT user role record\ninto agent_conversation_messages;
+:storeAssistantMessage\n(conversationId, userId,\nAgentPrompt, AgentResponse)\nINSERT assistant role record\n(toolCalls, toolResults, usage, meta);
+
+|RememberConversation Middleware|
+:response.withinConversation\n(conversationId, participant)\nAttach conversation context\nto AgentResponse;
+
+|Queue / InvokeAgent Job|
+if (Execution was queued?) then (yes)
+  if (agent.prompt() succeeded?) then (yes)
+    :Iterate thenCallbacks[]\nCall each callback(AgentResponse);
+  else (failure / exception)
+    :InvokeAgent.failed(Throwable)\nIterate catchCallbacks[]\nCall each callback(Throwable);
+  endif
+endif
+
+|Caller / App|
+:Receive AgentResponse\n(contains conversationId\nfor future continuation calls);
+stop
+
+@enduml

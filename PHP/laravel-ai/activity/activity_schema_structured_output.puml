@@ -1,0 +1,141 @@
+@startuml activity_schema_structured_output
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #343A40
+    EndColor #343A40
+    BarColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title Schema-Based Structured Output
+
+|Agent|
+start
+:Agent implements **HasStructuredOutput**\n(provides schema() method);
+
+|GeneratesText (Trait)|
+:GeneratesText::prompt() invoked;
+if (agent instanceof HasStructuredOutput?) then (yes)
+    :Call agent->schema(\n  new JsonSchemaTypeFactory\n)\n→ returns array<string, Type>;
+    :schema = populated array;
+else (no)
+    :schema = null;
+endif
+
+:Call TextGateway::generateText(\n  provider, model, instructions,\n  messages, tools, **schema**,\n  TextGenerationOptions, timeout\n);
+
+|Gateway (Provider-Specific)|
+if (Which gateway / schema strategy?) then (Groq / DeepSeek\nMistral / Ollama)
+    note right
+        Uses **ComposesSchemaInstructions** trait
+    end note
+    if (Has tools AND has schema?) then (yes — inline)
+        :ComposesSchemaInstructions::\ncomposeInstructions(\n  instructions, schema\n);
+        :new ObjectSchema(schema)->toSchema()\n→ JSON-encode schema;
+        :Append JSON schema mandate\nto system instructions string;
+        :Merged instructions returned\n(no response_format field);
+    else (no — native)
+        :buildResponseFormat(schema);
+        :new ObjectSchema(schema)->toSchema();
+        :Set body['response_format'] =\n{ type:'json_schema',\n  json_schema:{name, schema, strict:true} };
+    endif
+elseif (OpenAI / AzureOpenAI\n/ OpenRouter) then
+    if (schema filled?) then (yes)
+        :buildSchemaFormat(schema);
+        :new ObjectSchema(schema)\n→ toSchema()\n→ Arr::except(['name']);
+        :Set body['text']['format'] =\n{ type:'json_schema',\n  name, schema, strict:true };
+    else (no)
+        :No format field added;
+    endif
+elseif (Anthropic) then
+    if (schema filled?) then (yes)
+        if (supportsNativeStructuredOutput?\n(beta header: 'structured-outputs')) then (yes — native)
+            :Set body['output_config']['format'] =\n{ type:'json_schema',\n  schema: ObjectSchema->toSchema() };
+        else (no — tool fallback)
+            :buildStructuredOutputTool(schema);
+            :new ObjectSchema(schema)->toSchema();
+            :Create synthetic tool:\n{ name:'output_structured_data',\n  input_schema:{properties, required} };
+            if (Anthropic thinking mode?) then (yes)
+                :resolveToolChoice() → tool_choice: auto;
+            else (no)
+                :resolveToolChoice() →\nforced to { type:'tool',\n  name:'output_structured_data' };
+            endif
+        endif
+    else (no)
+        :No structured output format applied;
+    endif
+else (FakeTextGateway\n— testing)
+    :generateText → nextResponse\n→ marshalResponse;
+    if (No pre-configured response\nAND schema is set?) then (yes)
+        :generate_fake_data_for_json_schema_type(\n  new ObjectType(schema)\n);
+        fork
+            :ObjectType\n→ iterate properties,\n  recurse each;
+        fork again
+            :ArrayType\n→ random_int(minItems,maxItems)\n  items, recurse item type;
+        fork again
+            :StringType\n→ format-aware\n  (date/email/uuid/url)\n  OR Str::random(len);
+        fork again
+            :IntegerType → random_int(min,max)\nNumberType → random float\nBooleanType → random_int(0,1)\nenum → array_rand(enum)\ndefault → return default;
+        end fork
+        :Returns generated array\n→ marshal as\nStructuredTextResponse(array, json_encode(array));
+    else (no response + preventStrayPrompts)
+        :Throw RuntimeException;
+        stop
+    endif
+endif
+
+:Make HTTP call to Provider API;
+:Receive raw API response JSON;
+
+|ParsesTextResponses (Trait)|
+:ParsesTextResponses::processResponse(\n  data, provider, structured=true, ...\n);
+:extractText(output) → raw JSON string;
+:extractUsage(data) → Usage object;
+:extractFinishReason(data) → FinishReason enum;
+if (structured === true?) then (yes)
+    :json_decode(text, true)\n→ structuredData array;
+    :new StructuredTextResponse(\n  structuredData, text, usage, meta\n);
+    :withToolCallsAndResults() → withSteps();
+else (no)
+    :new TextResponse(text, usage, meta);
+endif
+
+|GeneratesText (Trait)|
+if (schema was not empty?) then (yes)
+    :new StructuredAgentResponse(\n  invocationId,\n  response->structured,\n  response->text,\n  usage, meta\n);
+else (no)
+    :new AgentResponse(\n  invocationId,\n  response->text,\n  usage, meta\n);
+endif
+:Dispatch AgentPrompted event;
+
+|Agent|
+:Receive AgentResponse\n| StructuredAgentResponse;
+stop
+
+@enduml

@@ -1,0 +1,214 @@
+{
+  "scope": "gitlab_ci_pipeline_generation",
+  "title": "GitLab CI Pipeline Configuration Generation",
+  "diagram_type": "use_case",
+  "description": "PHP-based CI automation that generates GitLab YAML pipeline configurations for tracer, profiler, appsec, shared components, and packaging jobs.",
+
+  "actors": [
+    "CI Engineer (Pipeline Maintainer)",
+    "GitLab CI Runner",
+    "PHP Version Matrix (7.0–8.5)",
+    "Architecture Matrix (amd64, arm64)"
+  ],
+
+  "generators": [
+    {
+      "file": ".gitlab/generate-common.php",
+      "role": "Shared foundation – included by all other generators",
+      "produces": "YAML anchors, service definitions, default retry policy, shared PHP functions",
+      "key_data": [
+        "$php_versions_to_abi: PHP 7.0–8.5 → ABI map",
+        "$all_minor_major_targets: all versions",
+        "$asan_minor_major_targets: 7.4+ only",
+        "$windows_minor_major_targets: 7.2+ only",
+        "$profiler_minor_major_targets: 7.1+ only",
+        "$arch_targets: [amd64, arm64]",
+        "$service_bind_address: 0.0.0.0 or 127.0.0.1 depending on GITLAB_CI env"
+      ],
+      "functions": [
+        "unset_dd_runner_env_vars(): emits YAML to unset DD_SERVICE, DD_ENV, DD_TAGS, etc.",
+        "dockerhub_login(): emits .gitlab/dockerhub-login.sh call",
+        "windows_git_setup(): emits PowerShell workspace-cleanup + git clone + submodule init",
+        "windows_git_setup_with_packages(): wraps windows_git_setup preserving packages/ artifacts"
+      ],
+      "yaml_output": [
+        "default: retry policy (max 2, on unknown/data_integrity/runner/scheduler/api/timeout failures)",
+        ".all_targets anchor (all PHP versions)",
+        ".asan_targets anchor (7.4+)",
+        ".no_asan_targets anchor (<7.4)",
+        ".arch_targets anchor",
+        ".services: test-agent, request-replayer, httpbin-integration, mysql, elasticsearch2/7, zookeeper, kafka, redis, memcache, amqp, mongodb, sqlsrv, googlespanner"
+      ]
+    },
+    {
+      "file": ".gitlab/generate-tracer.php",
+      "role": "Tracer (dd-trace-php extension) pipeline",
+      "includes": "generate-common.php",
+      "stages": ["compile", "test", "integrations test", "web test", "aggregate versions"],
+      "functions": [
+        "after_script($execute_dir, $has_test_agent): emits artifacts/junit/after_script YAML",
+        "sidecar_logs(): emits _DD_DEBUG_SIDECAR_LOG_LEVEL/METHOD variables",
+        "before_script_steps($with_docker_auth): emits switch-php, git config, mkdir, mv ddtrace.so",
+        "agent_httpbin_service(): emits test-agent + request-replayer + httpbin-integration service refs"
+      ],
+      "jobs_generated": [
+        "compile extension: debug — matrix: all_minor_major_targets × arch_targets; runs .gitlab/compile_extension.sh",
+        "compile extension: debug-zts-asan — extends compile:debug; asan_minor_major_targets × arch_targets",
+        "windows test_c — windows-v2:2019 runner; windows_minor_major_targets; Docker-based NTS build + run-tests.php",
+        "Prepare code — PHP 8.2 CLI; runs make generate; produces src/bridge/_generated_*.php",
+        ".base_test (template) — debug build; docker image php-${PHP_MAJOR_MINOR}_bookworm-7; timeout 60m",
+        ".asan_test (template) — extends .base_test; SWITCH_PHP_VERSION=debug-zts-asan + ASAN_OPTIONS",
+        ".debug_test (template) — extends .base_test; SWITCH_PHP_VERSION=debug",
+        "ASAN test_c: [ver, arch] — per asan target × arch; make test_c",
+        "ASAN Internal api randomized tests: [ver, arch] — make test_internal_api_randomized",
+        "ASAN init hook tests: [ver] — amd64 only; make test_with_init_hook",
+        "ASAN test_c with multiple observers: [ver] — PHP 8.0+, amd64; make test_c_observer",
+        "ASAN Opcache tests: [ver] — amd64; make test_opcache",
+        "test_extension_ci: [ver] — make test_extension_ci; timeout 120m",
+        "Unit tests: [ver] — make test_unit",
+        "API unit tests: [ver] — make test_api_unit",
+        "Disabled test_c run: [ver] — make test_c_disabled",
+        "Internal api randomized tests: [ver] — make test_internal_api_randomized",
+        "Opcache tests: [ver] — make test_opcache",
+        "PHP Language Tests: [ver] — make install_all + run_php_language_tests.sh",
+        ".cli_integration_test (template) — parses Makefile TEST_INTEGRATIONS_*/TEST_WEB_* targets; SAPI matrix for web (7.2+: cli-server/cgi-fcgi/apache2handler)",
+        "Dynamic integration/web jobs: [target, ver, sapi] — conditional service injection per target name (mysql, elasticsearch, kafka, redis, mongodb, sqlsrv, etc.)",
+        "test_auto_instrumentation / test_composer / test_integration: [ver] — cli_integration_test + mongodb",
+        "test_distributed_tracing: [ver, sapi] — cli-server + cgi-fcgi variants",
+        "xDebug tests: [ver, xdebug_version] — matrix PHP 7.0–8.4 × xDebug 2.7–3.4",
+        "aggregate tested versions — master/manual; runs create_or_update_supported_versions_pr.sh via dd-octo-sts"
+      ]
+    },
+    {
+      "file": ".gitlab/generate-profiler.php",
+      "role": "Profiler (Rust-based datadog-php-profiling) pipeline",
+      "includes": "generate-common.php",
+      "stages": ["test"],
+      "target_filter": "profiler_minor_major_targets (PHP 7.1+)",
+      "jobs_generated": [
+        "profiling tests — matrix: profiler_targets × arch_targets × {alpine + centos-7 images}; builds NTS via switch-php + cargo build profiler-release; runs run-tests.php phpt; then repeats for ZTS",
+        "clippy NTS — amd64 only; all_profiler_targets; switch-php nts; cargo clippy all-targets all-features -D warnings",
+        "Cargo test — amd64; PHP 8.5 bookworm; switch-php nts; cargo test --all-features"
+      ],
+      "artifact_output": "artifacts/profiler-tests/nts-results.xml, zts-results.xml"
+    },
+    {
+      "file": ".gitlab/generate-appsec.php",
+      "role": "AppSec (WAF/ddappsec) pipeline",
+      "includes": "generate-common.php",
+      "stages": ["test", "docker-build"],
+      "helpers": [
+        "$ecrLoginSnippet: AWS STS assume-role + ECR docker login for 669783387624.dkr.ecr.us-east-1.amazonaws.com"
+      ],
+      "templates": [
+        ".appsec_test: apt install clang-tidy-17/libc++-17; boost-cache; arch-tagged",
+        ".appsec_integration_tests: docker-in-docker:amd64; Gradle-based; loads/saves Docker volume caches",
+        ".docker_push_job: docker:29.4.0-noble + ECR login + dockerhub login + openjdk-17-jre"
+      ],
+      "jobs_generated": [
+        "test appsec extension — matrix: all_targets × arch × {debug, debug-zts, debug-zts-asan}; cmake + make xtest",
+        "appsec integration tests — Gradle targets test7.0..test8.5-release/-zts/-musl",
+        "appsec integration tests (ssi) — test8.3-release-ssi",
+        "appsec integration tests (helper-rust) — -PuseHelperRust flag; selective PHP versions",
+        "helper-rust build and test — gradlew testHelperRust",
+        "helper-rust code coverage — LLVM profraw → lcov; Codecov upload via Vault token",
+        "helper-rust integration coverage — buildHelperRustWithCoverage + test8.3-debug + generateHelperRustIntegrationCoverage",
+        "appsec code coverage — cmake -DDD_APPSEC_ENABLE_COVERAGE=ON; llvm-cov-17 → lcov; Codecov + Datadog CI upload",
+        "push appsec images — manual; gradlew pushAll; amd64+arm64",
+        "push appsec docker images multiarch — gradlew pushMultiArch; needs push appsec images",
+        "appsec lint — clang-format-17 + clang-tidy-17; make format tidy",
+        "test appsec helper asan — cmake ASAN flags; make ddappsec_helper_test",
+        "check libxml2 version — Python script checks local vs latest GNOME GitLab tag"
+      ]
+    },
+    {
+      "file": ".gitlab/generate-package.php",
+      "role": "Release packaging pipeline (full release stages)",
+      "includes": "generate-common.php",
+      "stages": ["prepare", "profiler", "appsec", "tracing", "packaging", "benchmarks", "gate", "notify", "verify", "shared-pipeline", "pre-release", "release"],
+      "build_platforms": [
+        "x86_64-alpine-linux-musl → .apk.x86_64",
+        "aarch64-alpine-linux-musl → .apk.aarch64",
+        "x86_64-unknown-linux-gnu (centos-7) → .rpm.x86_64, .deb.x86_64, .tar.gz.x86_64",
+        "aarch64-unknown-linux-gnu (centos-7) → .rpm.arm64, .deb.arm64, .tar.gz.aarch64",
+        "x86_64-pc-windows-msvc → dbgsym.tar.gz"
+      ],
+      "asan_build_platforms": [
+        "x86_64-unknown-linux-gnu (bookworm-7)",
+        "aarch64-unknown-linux-gnu (bookworm-7)"
+      ],
+      "includes_yaml": [".gitlab/one-pipeline.locked.yml", ".gitlab/benchmarks.yml"],
+      "one_pipeline_overrides": [
+        "validate_supported_configurations_v2_local_file: metadata/supported-configurations.json",
+        "update_central_configurations_version_range_v2: dd-trace-php / php / single release line",
+        "configure_system_tests: scenarios=simple_onboarding,profiling,appsec,lib-injection,docker-ssi"
+      ],
+      "global_vars": [
+        "CARGO_HOME: ${CI_PROJECT_DIR}/.cache/cargo",
+        "OCI_PACKAGE_MAX_SIZE_BYTES: 150_000_000",
+        "LIB_INJECTION_IMAGE_MAX_SIZE_BYTES: 210_000_000"
+      ]
+    },
+    {
+      "file": ".gitlab/generate-shared.php",
+      "role": "Shared C/Rust components pipeline (ZAI, Tea, components)",
+      "includes": "generate-common.php",
+      "stages": ["build", "test"],
+      "switch_php_versions": ["debug", "debug-zts-asan", "nts", "zts"],
+      "jobs_generated": [
+        "C components ASAN — matrix: centos-7/alpine/bookworm-7; cmake -DCMAKE_TOOLCHAIN_FILE=asan.cmake; make all + test",
+        "C components UBSAN — bookworm-7; cmake ubsan toolchain; make all + test (repeat until-fail:10)",
+        "Build & Test Tea — all PHP × switch_php_versions; .gitlab/build-tea.sh + make test; produces tmp/tea artifacts",
+        "Configuration Consistency — validates metadata/supported-configurations.json vs tooling/generate-supported-configurations.sh",
+        "Zend Abstract Interface Tests: [ver, switch_php_version] — per all_targets × switch_php_versions; cmake Tea_ROOT + zend_abstract_interface; make test",
+        "ZAI Shared Tests: [7.4/8.0] — shared ext images; TEA_INI_IGNORE=0",
+        "Extension Tea Tests: [ver, switch_php_version] — make install + cmake tests/tea; make test"
+      ]
+    }
+  ],
+
+  "use_cases": [
+    "UC1: Generate Tracer CI Pipeline — CI Engineer invokes generate-tracer.php; generates compile + test + integration YAML for PHP tracer extension across all PHP versions and architectures",
+    "UC2: Generate Profiler CI Pipeline — generate-profiler.php produces Rust profiler test jobs for PHP 7.1+ on Alpine and CentOS-7 images",
+    "UC3: Generate AppSec CI Pipeline — generate-appsec.php produces WAF extension tests, Gradle integration tests, helper-rust coverage, Docker image publish jobs",
+    "UC4: Generate Package/Release Pipeline — generate-package.php produces full multi-stage release pipeline (prepare→release) with cross-platform packaging (.apk/.rpm/.deb/.tar.gz) and one-pipeline integration",
+    "UC5: Generate Shared Components Pipeline — generate-shared.php produces C component (ASAN/UBSAN), ZAI, and Tea framework tests",
+    "UC6: Define Shared Services — generate-common.php defines all reusable test service containers (test-agent, httpbin, databases, message queues)",
+    "UC7: Define PHP Version Matrices — generate-common.php controls which PHP versions are targeted per component (all/asan-only/profiler/windows)",
+    "UC8: Windows Build & Test — generate-tracer.php generates PowerShell-based Docker NTS build + run-tests.php job for windows-v2:2019 runners",
+    "UC9: Dynamic Integration Test Job Generation — generate-tracer.php parses Makefile TEST_INTEGRATIONS_* and TEST_WEB_* targets to emit per-target CI jobs with auto-detected service dependencies",
+    "UC10: Aggregate Tested Versions — generate-tracer.php emits job that collects tested_versions.json artifacts and creates GitHub PR via dd-octo-sts"
+  ],
+
+  "key_relationships": [
+    "generate-tracer.php includes generate-common.php",
+    "generate-profiler.php includes generate-common.php",
+    "generate-appsec.php includes generate-common.php",
+    "generate-package.php includes generate-common.php",
+    "generate-shared.php includes generate-common.php",
+    "generate-package.php includes .gitlab/one-pipeline.locked.yml and .gitlab/benchmarks.yml",
+    "generate-tracer.php parses Makefile to derive integration test job names and versions",
+    "generate-tracer.php parses generate-common.php to extract .services names for service injection"
+  ],
+
+  "important_notes": [
+    "All generators are PHP scripts that emit YAML via echo/heredoc — they are executed to produce .gitlab-ci.yml files",
+    "generate-common.php is the single source of truth for PHP version/ABI mapping and service definitions",
+    "PHP version filters: all (7.0–8.5), asan (7.4+), profiler (7.1+), windows (7.2+)",
+    "Architecture support: Linux jobs use amd64+arm64; Windows jobs amd64 only",
+    "Service bind address adapts: 0.0.0.0 locally, 127.0.0.1 on GitLab CI (Kubernetes)",
+    "Package formats per platform: Alpine→APK, GNU Linux→RPM+DEB+tar.gz, Windows→dbgsym.tar.gz",
+    "AppSec uses AWS ECR (role arn:aws:iam::669783387624:role/ddbuild-dd-trace-php-ci) for Docker images",
+    "Coverage reporting: AppSec/helper-rust use Codecov + Datadog CI; Vault for token retrieval",
+    "generate-tracer.php auto-injects services based on make target name substring matching (e.g. 'kafka' → zookeeper+kafka services)"
+  ],
+
+  "source_files_analyzed": [
+    ".gitlab/generate-common.php",
+    ".gitlab/generate-tracer.php",
+    ".gitlab/generate-profiler.php",
+    ".gitlab/generate-appsec.php",
+    ".gitlab/generate-package.php",
+    ".gitlab/generate-shared.php"
+  ]
+}

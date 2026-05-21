@@ -1,0 +1,128 @@
+{
+  "scope": "fog_of_war_update",
+  "title": "Fog of War Update Cycle",
+  "diagram_type": "activity",
+  "key_participants": ["Logic (main thread)", "FogControl", "StaticFogThread", "DynamicFogThread", "FogData[team]", "AsyncCore", "PhysicsProcess"],
+
+  "entry_point": "Logic.update() calls fogControl.update() each game tick when state.rules.fog == true",
+
+  "activity_flow": [
+    "START: Logic.update() tick fires",
+    "[Guard] state.rules.fog? → NO: skip fog entirely",
+    "FogControl.update() entered",
+    "[Init] fog array null? → allocate FogData[256]",
+    "[Guard] staticFog && !loadedStatic → pushStaticBlocks(false) + updateStatic() (sync, main thread) → loadedStatic=true",
+    "[Thread init] staticFogThread == null? → spawn StaticFogThread (daemon, NORM_PRIORITY-1)",
+    "[Thread init] dynamicFogThread == null? → spawn DynamicFogThread (daemon, NORM_PRIORITY-1)",
+    "dynamicEventQueue.clear()",
+    "--- Building visibility chunk pass ---",
+    "[Guard] !headless && Groups.build.size > 0",
+    "  Compute iterated = max(1, size / min(5, size)) — iterate ~20% of buildings per tick",
+    "  Loop buildings[lastEntityUpdateIndex..lastEntityUpdateIndex+iterated]: call build.updateFogVisibility()",
+    "    updateFogVisibility(): if !wasVisible && !inFogTo(player.team()) → mark visible, update minimap shadow",
+    "  Advance lastEntityUpdateIndex (circular)",
+    "--- Per-team dynamic event collection ---",
+    "For each non-AI team in state.teams.present:",
+    "  unitEventQueue.clear()",
+    "  Get or create FogData for team",
+    "  synchronized(staticEvents):",
+    "    For each unit in team.units:",
+    "      [Guard] unit.type.fogRadius <= 0 → skip",
+    "      Compute FogEvent(tx, ty, fogRadius, teamId)",
+    "      Add to unitEventQueue",
+    "      [Guard] unit.lastFogPos changed?",
+    "        YES → pushEvent(event, skipRender=false): add to staticEvents, send to renderer.fog if player's team",
+    "        YES → unit.lastFogPos = pos; data.dynamicUpdated = true",
+    "  [Throttle check] data.dynamicUpdated && timeSinceMillis(lastDynamicMs) > 40ms (25fps interval)?",
+    "    YES → data.dynamicUpdated=false; data.lastDynamicMs=now",
+    "    YES → add all hasFogRadius buildings for team → dynamicEventQueue (FogEvent per build)",
+    "    YES → dynamicEventQueue.addAll(unitEventQueue)",
+    "--- Flush dynamic events ---",
+    "[Guard] dynamicEventQueue.size > 0?",
+    "  synchronized(dynamicEvents): dynamicEvents.clear(); addAll(dynamicEventQueue)",
+    "  dynamicEventQueue.clear()",
+    "  [Guard] justLoaded? → updateDynamic(new Bits(256)) inline; justLoaded=false  (force no pop-in)",
+    "  synchronized(notifyDynamic): notifyDynamic.notify() → wake DynamicFogThread",
+    "--- Flush static events ---",
+    "[Guard] staticFog && staticEvents.size > 0 && staticFogThread != null?",
+    "  synchronized(notifyStatic): notifyStatic.notify() → wake StaticFogThread",
+    "END FogControl.update()"
+  ],
+
+  "static_fog_thread_flow": [
+    "StaticFogThread.run(): loop waiting on notifyStatic.wait()",
+    "On notify → updateStatic():",
+    "  synchronized(staticEvents): iterate all events",
+    "  For each event: decode (x, y, radius, team); get FogData",
+    "  circle(data.staticData, x, y, radius): Bresenham circle → hline() sets Bits in staticData",
+    "  staticEvents.clear()",
+    "Result: staticData Bits permanently set (explored tiles never re-concealed)"
+  ],
+
+  "dynamic_fog_thread_flow": [
+    "DynamicFogThread.run(): loop waiting on notifyDynamic.wait()",
+    "On notify → updateDynamic(cleared):",
+    "  cleared.clear()",
+    "  synchronized(dynamicEvents): draw step:",
+    "    For each event: decode (x, y, radius+1, team)",
+    "    If team not yet in cleared: data.write.clear() (erase previous frame visibility)",
+    "    cleared.set(team)",
+    "    circle(data.write, x, y, radius+1): draw new visibility circles",
+    "    dynamicEvents.clear()",
+    "  Swap step (no lock needed):",
+    "    For each team in cleared: swap data.read ↔ data.write",
+    "Result: data.read now reflects current dynamic visibility; data.write ready for next frame"
+  ],
+
+  "async_core_relationship": [
+    "AsyncCore.begin(): calls p.begin() for all AsyncProcess, submits p.process() to thread pool",
+    "AsyncCore.end(): awaits all futures, calls p.end() for all AsyncProcess",
+    "PhysicsProcess: begin() syncs unit positions into PhysicsBody refs; process() runs PhysicsWorld.update() (collision resolution) on async thread; end() moves entities by delta",
+    "NOTE: FogControl is NOT an AsyncProcess — it runs synchronously in Logic.update(), separate from AsyncCore pipeline"
+  ],
+
+  "key_data_structures": [
+    "FogData.staticData: Bits[ww*wh] — permanently revealed tiles (written by StaticFogThread)",
+    "FogData.read: Bits[ww*wh] — current dynamic visibility, read by game logic (isVisible calls)",
+    "FogData.write: Bits[ww*wh] — scratch buffer redrawn each dynamic update cycle",
+    "FogData.dynamicUpdated: dirty flag set by unit move / tile change / unit death events",
+    "FogData.lastDynamicMs: throttle timestamp, dynamic updates capped at 25 FPS (40ms interval)",
+    "staticEvents: LongSeq — packed FogEvent longs (x:16, y:16, radius:16, team:8) for static updates",
+    "dynamicEvents: LongSeq (sync) — packed FogEvent longs for current dynamic update pass",
+    "dynamicEventQueue: LongSeq — staging area, flushed to dynamicEvents under lock"
+  ],
+
+  "event_triggers": [
+    "WorldLoadEvent → stop() + pushStaticBlocks(initial=true) + updateStatic() synchronously",
+    "ResetEvent → stop(): interrupt both threads, null fog array",
+    "TileChangeEvent (build with hasFogRadius) → pushEvent to staticEvents + data.dynamicUpdated=true",
+    "TilePreChangeEvent (build removed) → data.dynamicUpdated=true",
+    "UnitDestroyEvent → fog[team].dynamicUpdated=true",
+    "forceUpdate(team, build) called by Building (e.g. Turret, Radar) → dynamicUpdated=true + push static event"
+  ],
+
+  "reveal_conceal_logic": [
+    "REVEAL (static): circle() paints hlines into staticData Bits — permanent, never cleared",
+    "REVEAL (dynamic): circle() paints hlines into write buffer; buffer swap makes it live",
+    "CONCEAL (dynamic): write buffer is fully cleared before redrawing each update cycle — tiles not covered by any current unit/building fog radius are automatically concealed",
+    "CONCEAL (static): never — static data is append-only",
+    "Visibility query: isVisible(team, x, y) reads data.read.get(pos); isDiscovered reads staticData.get(pos)"
+  ],
+
+  "concurrency_notes": [
+    "staticEvents: synchronized on its own object for main↔StaticFogThread access",
+    "dynamicEvents: synchronized on its own object for main↔DynamicFogThread access",
+    "notifyStatic / notifyDynamic: separate monitor objects for waking threads",
+    "fog array: volatile reference; FogData.read/write: volatile Bits fields",
+    "Comment in code: dynamic thread notify WILL block until rendering done — known bottleneck",
+    "PhysicsProcess runs on separate AsyncLogic-Thread pool, fully independent of fog threads"
+  ],
+
+  "source_files_analyzed": [
+    "core/src/mindustry/game/FogControl.java",
+    "core/src/mindustry/async/AsyncCore.java",
+    "core/src/mindustry/async/PhysicsProcess.java",
+    "core/src/mindustry/core/Logic.java (grep: fogControl.update call site)",
+    "core/src/mindustry/entities/comp/BuildingComp.java (grep: updateFogVisibility)"
+  ]
+}

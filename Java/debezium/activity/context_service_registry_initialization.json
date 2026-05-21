@@ -1,0 +1,157 @@
+{
+  "scope": "service_registry_initialization",
+  "title": "Service Registry Initialization",
+  "diagram_type": "activity",
+  "key_actors": [
+    "DefaultServiceRegistry",
+    "ServiceRegistration",
+    "ServiceProvider",
+    "Service (instance)",
+    "Configurable",
+    "ServiceRegistryAware",
+    "Startable",
+    "Closeable (BeanRegistry/any)"
+  ],
+  "activities": [
+    {
+      "phase": "Construction",
+      "steps": [
+        "new DefaultServiceRegistry(Configuration, BeanRegistry)",
+        "Store configuration field",
+        "Create ServiceRegistration(BeanRegistry.class, beanRegistry) — pre-initialized instance",
+        "Call registerService(registration, beanRegistry) → put in serviceRegistrations + registrations list"
+      ]
+    },
+    {
+      "phase": "Provider Registration (registerServiceProvider)",
+      "steps": [
+        "Caller invokes registerServiceProvider(ServiceProvider<T>)",
+        "Create new ServiceRegistration(serviceProvider) — lazy, no instance yet",
+        "Put into serviceRegistrations map keyed by serviceProvider.getServiceClass()",
+        "NOTE: registrations list NOT updated until service is actually initialized"
+      ]
+    },
+    {
+      "phase": "getService — Lazy Initialization",
+      "steps": [
+        "Cast-check initializedServices map for serviceClass → if found, return immediately (fast path)",
+        "SYNC block (double-checked locking)",
+        "Re-check initializedServices inside sync → if found, return",
+        "findRegistration(serviceClass) → lookup serviceRegistrations map",
+        "[NOT FOUND] → throw UnknownServiceException(serviceClass)",
+        "[FOUND] registration.getService() → if non-null (pre-initialized), skip init",
+        "[NULL service] → call initializeService(registration)",
+        "Put initialized service into initializedServices map",
+        "Return service"
+      ]
+    },
+    {
+      "phase": "initializeService",
+      "steps": [
+        "createService(registration) — delegate to overloaded createService(ServiceRegistration)",
+        "  → registration.getServiceProvider() → if null → throw UnknownServiceException",
+        "  → serviceProvider.createService(configuration, this) — factory call",
+        "  → if returned service == null → return null (aborts init)",
+        "  → registerService(registration, service): registration.setService(service), add to registrations list + serviceRegistrations map",
+        "If service null → return null",
+        "doMultiPhaseInitialization(registration)"
+      ]
+    },
+    {
+      "phase": "doMultiPhaseInitialization — Phase 1: Inject Dependencies",
+      "steps": [
+        "injectDependencies(registration)",
+        "  → doInjections(service): iterate all public methods via reflection",
+        "  → For each method with @InjectService annotation → doInjection(service, method, injectService)",
+        "    → Validate method has exactly 1 parameter (else ServiceDependencyException)",
+        "    → Resolve requestedServiceType from annotation or parameter type",
+        "    → getService(requestedServiceType) — RECURSIVE call (may trigger nested initialization)",
+        "    → If null and required=true → throw ServiceDependencyException(missing service)",
+        "    → method.invoke(service, requestedService) — inject via setter",
+        "    → On reflection error → throw ServiceDependencyException",
+        "  → If service instanceof ServiceRegistryAware → service.injectServiceRegistry(this)"
+      ]
+    },
+    {
+      "phase": "doMultiPhaseInitialization — Phase 2: Configure",
+      "steps": [
+        "configureService(registration)",
+        "  → If service instanceof Configurable → service.configure(configuration)",
+        "  → Else skip"
+      ]
+    },
+    {
+      "phase": "doMultiPhaseInitialization — Phase 3: Start",
+      "steps": [
+        "startService(registration)",
+        "  → If service instanceof Startable → service.start()",
+        "  → Else skip"
+      ]
+    },
+    {
+      "phase": "close — Graceful Stop",
+      "steps": [
+        "initializedServices.clear()",
+        "SYNC on registrations list",
+        "Create ListIterator at END of registrations list",
+        "Iterate in REVERSE order (LIFO — last registered, first stopped)",
+        "  → stopService(registration)",
+        "    → If service instanceof Closeable → service.close()",
+        "    → IOException caught and logged (non-fatal, continues iteration)",
+        "registrations.clear()",
+        "serviceRegistrations.clear()",
+        "Log: 'Debezium ServiceRegistry stopped.'"
+      ]
+    }
+  ],
+  "decision_points": [
+    "getService: initializedServices hit? → fast return (no sync)",
+    "getService: registration found? → if not → UnknownServiceException",
+    "getService: service already set? → skip initializeService",
+    "initializeService: service provider null? → UnknownServiceException",
+    "initializeService: created service null? → return null, skip multi-phase init",
+    "doInjection: @InjectService.service() set? → use annotation type, else use param type",
+    "doInjection: requested service null AND required=true? → ServiceDependencyException",
+    "injectDependencies: service instanceof ServiceRegistryAware? → inject registry ref",
+    "configureService: service instanceof Configurable? → call configure()",
+    "startService: service instanceof Startable? → call start()",
+    "stopService: service instanceof Closeable? → call close()"
+  ],
+  "exception_paths": [
+    "UnknownServiceException: getService() cannot find registration",
+    "UnknownServiceException: createService() has no ServiceProvider",
+    "ServiceDependencyException: @InjectService method has wrong param count",
+    "ServiceDependencyException: required dependency not found",
+    "ServiceDependencyException: method.invoke fails during injection",
+    "DebeziumException: serviceProvider.createService() throws any exception"
+  ],
+  "key_relationships": [
+    "DefaultServiceRegistry implements ServiceRegistry, Closeable",
+    "DefaultServiceRegistry composes ConcurrentMap<Class, ServiceRegistration> serviceRegistrations (lazy providers)",
+    "DefaultServiceRegistry composes ConcurrentMap<Class, Service> initializedServices (live instances)",
+    "DefaultServiceRegistry composes List<ServiceRegistration> registrations (ordered, for LIFO stop)",
+    "ServiceRegistration<T> holds ServiceProvider<T> (nullable) + volatile T service",
+    "ServiceRegistration variant 1: pre-initialized (serviceProvider=null, service set)",
+    "ServiceRegistration variant 2: lazy-init (serviceProvider set, service initially null)",
+    "ServiceProvider SPI: createService(Configuration, ServiceRegistry) → T",
+    "Configurable SPI: configure(Configuration)",
+    "Startable SPI: start()",
+    "Closeable: close() throws IOException",
+    "ServiceRegistryAware SPI: injectServiceRegistry(ServiceRegistry)",
+    "@InjectService annotation on setter methods drives reflection-based DI"
+  ],
+  "concurrency_notes": "Double-checked locking in getService(); registerService() syncs on registrations list; close() syncs on registrations list; initializedServices is ConcurrentHashMap.",
+  "important_notes": [
+    "BeanRegistry is always pre-registered at construction time",
+    "Service init is lazy — triggered on first getService() call",
+    "Multi-phase init order: inject → configure → start (always this order)",
+    "Stop order is strictly LIFO (reverse of registration order)",
+    "stopService IOException is caught and logged but does NOT abort shutdown",
+    "doInjections catches all exceptions and logs them (non-fatal for injection loop)",
+    "Recursive getService() calls during injection may trigger nested initialization"
+  ],
+  "source_files_analyzed": [
+    "debezium-connector-common/src/main/java/io/debezium/service/DefaultServiceRegistry.java",
+    "debezium-connector-common/src/main/java/io/debezium/service/ServiceRegistration.java"
+  ]
+}

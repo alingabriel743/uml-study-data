@@ -1,0 +1,124 @@
+{
+  "scope": "context_parallel_position_embedding",
+  "title": "Context Parallel Position Embedding",
+  "diagram_type": "use_case",
+  "description": "System enables or disables context parallelism for distributed position embedding computation across MultiviewVideoPositionEmb and MultiviewVideoRopePosition3DEmb classes.",
+
+  "actors": [
+    "DistributedTrainer",
+    "InferenceEngine",
+    "ContextParallelGroup (torch.distributed.ProcessGroup)",
+    "DiTNetwork (caller of forward)"
+  ],
+
+  "use_cases": [
+    "Enable Context Parallel",
+    "Disable Context Parallel",
+    "Compute Position Embeddings (full sequence)",
+    "Split Embeddings for CP Rank",
+    "Forward Pass — Single View with CP",
+    "Forward Pass — Multiview RoPE with CP",
+    "Forward Pass — Multiview SinCos with CP",
+    "Generate Single-View Embeddings (per batch)",
+    "Generate Multiview Embeddings (concatenate n_views)"
+  ],
+
+  "actors_to_use_cases": [
+    "DistributedTrainer → Enable Context Parallel",
+    "DistributedTrainer → Disable Context Parallel",
+    "InferenceEngine → Disable Context Parallel",
+    "DiTNetwork → Forward Pass — Single View with CP",
+    "DiTNetwork → Forward Pass — Multiview RoPE with CP",
+    "DiTNetwork → Forward Pass — Multiview SinCos with CP",
+    "ContextParallelGroup (torch.distributed.ProcessGroup) → Split Embeddings for CP Rank"
+  ],
+
+  "class_hierarchy": [
+    "nn.Module ← VideoPositionEmb (single-view base)",
+    "nn.Module ← MultiviewVideoPositionEmb (multiview base)",
+    "VideoPositionEmb ← VideoRopePosition3DEmb",
+    "VideoPositionEmb ← LearnablePosEmbAxis",
+    "VideoPositionEmb ← SinCosPosEmbAxis",
+    "VideoPositionEmb ← SinCosPosEmb",
+    "VideoPositionEmb ← SinCosPosEmb_FPS_Aware",
+    "VideoPositionEmb ← LearnableEmb3D",
+    "VideoPositionEmb ← VideoRopePositionEmb",
+    "MultiviewVideoPositionEmb ← MultiviewVideoRopePosition3DEmb",
+    "MultiviewVideoPositionEmb ← MultiviewSinCosPosEmbAxis"
+  ],
+
+  "key_methods": {
+    "MultiviewVideoPositionEmb": [
+      "enable_context_parallel(cp_group: ProcessGroup) → sets self.cp_group",
+      "disable_context_parallel() → sets self.cp_group = None",
+      "forward(x_B_T_H_W_C: Tensor, fps: Optional[Tensor]) → Tensor",
+      "generate_embeddings(B_T_H_W_C: torch.Size, fps) → raises NotImplementedError (abstract)"
+    ],
+    "MultiviewVideoRopePosition3DEmb": [
+      "__init__(head_dim, len_h, len_w, len_t, base_fps=24, h/w/t_extrapolation_ratio=1.0, n_views=4)",
+      "generate_embedding_for_batch(B_T_H_W_C, fps, h/w/t_ntk_factor) → em_T_H_W_D tensor",
+      "generate_embeddings(B_T_H_W_C, fps, h/w/t_ntk_factor) → concatenates n_views calls to generate_embedding_for_batch"
+    ],
+    "VideoPositionEmb": [
+      "enable_context_parallel(cp_group: ProcessGroup) → sets self.cp_group",
+      "disable_context_parallel() → sets self.cp_group = None",
+      "forward(x_B_T_H_W_C: Tensor, fps) → Tensor",
+      "generate_embeddings(B_T_H_W_C, fps) → raises NotImplementedError (abstract)"
+    ]
+  },
+
+  "cp_forward_logic": {
+    "when_cp_enabled": [
+      "1. Read local (split) tensor shape: B, T_local, H, W, C",
+      "2. Reconstruct full T: B_T_H_W_C = (B, T_local * cp_size, H, W, C)",
+      "3. Call generate_embeddings(full_B_T_H_W_C, fps) to get full embeddings",
+      "4. Split full embeddings back for this CP rank via split_inputs_cp(embeddings, seq_dim, cp_group)"
+    ],
+    "multiview_rope_cp_split_path": [
+      "rearrange '(V T) H W D -> V (T H W) 1 1 D'",
+      "split_inputs_cp on seq_dim=1",
+      "rearrange back 'V T 1 1 D -> (V T) 1 1 D'"
+    ],
+    "multiview_sincos_cp_split_path": [
+      "rearrange 'B (V T) H W C -> (B V) T H W C'",
+      "split_inputs_cp on seq_dim=1",
+      "rearrange back '(B V) T H W C -> B (V T) H W C'"
+    ],
+    "no_cp_multiview_rope_path": [
+      "rearrange raw output 't h w d -> (t h w) 1 1 d'"
+    ]
+  },
+
+  "dependencies": [
+    "split_inputs_cp ← diffusion.module.parallel (diffusion/module path)",
+    "split_inputs_cp ← diffusion.training.context_parallel (training/module path)",
+    "torch.distributed.ProcessGroup — cp_group type",
+    "torch.distributed.get_process_group_ranks — get cp_size from group",
+    "einops.rearrange, repeat — tensor reshaping",
+    "cosmos_predict1.diffusion.module.attention.normalize — used in LearnablePosEmbAxis",
+    "cosmos_predict1.diffusion.module.timm.trunc_normal_ — weight init"
+  ],
+
+  "key_relationships": [
+    "MultiviewVideoPositionEmb aggregates cp_group (ProcessGroup) — optional composition",
+    "MultiviewVideoRopePosition3DEmb extends MultiviewVideoPositionEmb",
+    "MultiviewSinCosPosEmbAxis extends MultiviewVideoPositionEmb",
+    "MultiviewVideoPositionEmb.forward depends_on split_inputs_cp",
+    "MultiviewVideoRopePosition3DEmb.generate_embeddings calls generate_embedding_for_batch × n_views",
+    "VideoPositionEmb.forward isinstance-checks VideoRopePosition3DEmb to determine seq_dim (0 vs 1)",
+    "MultiviewVideoPositionEmb.forward isinstance-checks MultiviewVideoRopePosition3DEmb to choose split path"
+  ],
+
+  "important_notes": [
+    "Two parallel file trees exist: diffusion/module/ (inference) and diffusion/training/module/ (training) — both implement the same classes with nearly identical logic but different split_inputs_cp import paths.",
+    "CP forward pattern: input is already pre-split by caller; the class reconstructs full size, generates full embeddings, then re-splits for the local rank.",
+    "n_views (default 4) merges camera view dimension into T; embeddings are identical per view (same generate_embedding_for_batch called n_views times).",
+    "VideoRopePosition3DEmb uses seq_dim=0 when splitting (flat (T*H*W) layout); all other embeddings use seq_dim=1 (B, T, H, W, C layout).",
+    "NTK-aware RoPE: h/w/t_ntk_factor computed from extrapolation_ratio to extend frequency range for out-of-distribution resolutions."
+  ],
+
+  "source_files_analyzed": [
+    "Lyra-1/cosmos_predict1/diffusion/module/position_embedding.py",
+    "Lyra-1/cosmos_predict1/diffusion/training/module/position_embedding.py"
+  ]
+}

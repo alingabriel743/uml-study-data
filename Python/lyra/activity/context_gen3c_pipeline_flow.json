@@ -1,0 +1,148 @@
+{
+  "scope": "gen3c_pipeline_flow",
+  "title": "Gen3C Generation Pipeline",
+  "diagram_type": "activity",
+  "key_participants": [
+    "Gen3cPipeline",
+    "DiffusionVideo2WorldGenerationPipeline",
+    "DiffusionText2WorldGenerationPipeline",
+    "BaseWorldGenerationPipeline",
+    "DiffusionGen3CModel",
+    "inference_utils (generate_world_from_video, get_video_batch, load_model_by_config)"
+  ],
+  "class_hierarchy": [
+    "Gen3cPipeline extends DiffusionVideo2WorldGenerationPipeline",
+    "DiffusionVideo2WorldGenerationPipeline extends DiffusionText2WorldGenerationPipeline",
+    "DiffusionText2WorldGenerationPipeline extends BaseWorldGenerationPipeline"
+  ],
+  "activities": [
+    {
+      "method": "Gen3cPipeline.__init__",
+      "steps": [
+        "Accept inference params: inference_type, checkpoint_dir, checkpoint_name, guidance, num_steps, height, width, fps, num_video_frames, seed",
+        "Accept offload flags: offload_network, offload_tokenizer, offload_text_encoder_model, offload_prompt_upsampler, offload_guardrail_models",
+        "Accept feature flags: enable_prompt_upsampler, has_text_input, disable_guardrail, disable_prompt_encoder",
+        "Call super().__init__ with all params + num_input_frames=1",
+        "[if enable_prompt_upsampler AND NOT offload_prompt_upsampler] → _load_prompt_upsampler_model()"
+      ]
+    },
+    {
+      "method": "Gen3cPipeline._load_model",
+      "steps": [
+        "Call load_model_by_config(config_job_name=self.model_name, config_file='cosmos_predict1/diffusion/config/config.py', model_class=DiffusionGen3CModel)",
+        "Assign result to self.model",
+        "NOTE: Overrides parent which loads DiffusionT2WModel"
+      ]
+    },
+    {
+      "method": "Gen3cPipeline.generate",
+      "signature": "generate(prompt, image_path, rendered_warp_images: Tensor, rendered_warp_masks: Tensor, negative_prompt=None, return_latents=False) -> (video, prompt) | (video, prompt, latents) | None",
+      "steps": [
+        "START",
+        "Log image_path, negative_prompt, enable_prompt_upsampler, prompt",
+        "[DECISION] disable_guardrail?",
+        "  NO → _run_guardrail_on_prompt_with_offload(prompt)",
+        "    [DECISION] is_safe?",
+        "      NO → log critical, RETURN None",
+        "      YES → log pass, continue",
+        "  YES → log 'Not running guardrail', continue",
+        "Build prompts list: [prompt] or [prompt, negative_prompt] if negative_prompt provided",
+        "_run_text_embedding_on_prompt_with_offload(prompts) → prompt_embeddings",
+        "Extract prompt_embedding = prompt_embeddings[0]",
+        "Extract negative_prompt_embedding = prompt_embeddings[1] if negative_prompt else None",
+        "_run_model_with_offload(prompt_embedding, negative_prompt_embedding, image_path, rendered_warp_images, rendered_warp_masks, return_latents) → gen_dict",
+        "Extract video = gen_dict['video']",
+        "[DECISION] disable_guardrail?",
+        "  NO → _run_guardrail_on_video_with_offload(video)",
+        "    [DECISION] video is None (unsafe)?",
+        "      YES → log critical, RETURN None",
+        "      NO → log pass, continue",
+        "  YES → continue",
+        "[DECISION] return_latents?",
+        "  YES → RETURN (video, prompt, gen_dict['latents'])",
+        "  NO  → RETURN (video, prompt)",
+        "END"
+      ]
+    },
+    {
+      "method": "Gen3cPipeline._run_model_with_offload",
+      "signature": "_run_model_with_offload(prompt_embedding, image_or_video_path, rendered_warp_images, rendered_warp_masks, negative_prompt_embedding=None, return_latents=False) -> dict",
+      "steps": [
+        "START",
+        "[DECISION] offload_tokenizer?",
+        "  YES → _load_tokenizer() (reload tokenizer into GPU)",
+        "_run_tokenizer_encoding(image_or_video_path) → condition_latent",
+        "[DECISION] offload_network?",
+        "  YES → _load_network() (reload diffusion transformer into GPU)",
+        "_run_model(prompt_embedding, condition_latent, rendered_warp_images, rendered_warp_masks, negative_prompt_embedding) → sample",
+        "[DECISION] return_latents?",
+        "  YES → save latents = sample (raw latent tensor before decoding)",
+        "[DECISION] offload_network?",
+        "  YES → _offload_network() (move diffusion transformer off GPU)",
+        "_run_tokenizer_decoding(sample) → decoded video frames",
+        "[DECISION] offload_tokenizer?",
+        "  YES → _offload_tokenizer() (move tokenizer off GPU)",
+        "Build out_dict = {'video': sample}",
+        "[DECISION] return_latents?",
+        "  YES → add out_dict['latents'] = latents",
+        "RETURN out_dict",
+        "END"
+      ]
+    },
+    {
+      "method": "Gen3cPipeline._run_model",
+      "signature": "_run_model(embedding, condition_latent, rendered_warp_images, rendered_warp_masks, negative_prompt_embedding=None) -> Tensor",
+      "steps": [
+        "START",
+        "get_video_batch(model=self.model, prompt_embedding=embedding, negative_prompt_embedding, height, width, fps, num_video_frames) → data_batch, state_shape",
+        "Set data_batch['condition_state'] = rendered_warp_images  (3D warp conditioning)",
+        "Set data_batch['condition_state_mask'] = rendered_warp_masks",
+        "generate_world_from_video(model=self.model, state_shape=model.state_shape, is_negative_prompt=True, data_batch=data_batch, guidance=self.guidance, num_steps=self.num_steps, seed=self.seed, condition_latent=condition_latent, num_input_frames=self.num_input_frames) → video",
+        "RETURN video",
+        "END"
+      ]
+    }
+  ],
+  "key_relationships": [
+    "Gen3cPipeline inherits DiffusionVideo2WorldGenerationPipeline",
+    "Gen3cPipeline overrides _load_model to use DiffusionGen3CModel (vs parent DiffusionT2WModel)",
+    "Gen3cPipeline overrides generate() with 3D warp conditioning inputs",
+    "Gen3cPipeline overrides _run_model_with_offload() with warp tensor pass-through",
+    "Gen3cPipeline overrides _run_model() to inject condition_state and condition_state_mask into data_batch",
+    "generate() calls _run_model_with_offload() which orchestrates tokenizer/network offload",
+    "_run_model_with_offload() calls _run_model() for core diffusion inference",
+    "_run_model() delegates to inference_utils.get_video_batch and inference_utils.generate_world_from_video"
+  ],
+  "offload_patterns": {
+    "offload_tokenizer": "If True: _load_tokenizer() before encoding, _offload_tokenizer() after decoding",
+    "offload_network": "If True: _load_network() before _run_model(), _offload_network() after _run_model()",
+    "offload_prompt_upsampler": "If True: prompt upsampler not preloaded in __init__; loaded on demand",
+    "offload_guardrail_models": "Guardrail models loaded/unloaded per call via _run_guardrail_on_*_with_offload()"
+  },
+  "gen3c_specific_inputs": {
+    "rendered_warp_images": "torch.Tensor — pre-rendered 3D warped image frames for conditioning",
+    "rendered_warp_masks": "torch.Tensor — masks indicating valid warp regions",
+    "image_path": "str — path to reference image for tokenizer conditioning",
+    "return_latents": "bool — if True, also returns raw latent tensor before decoding"
+  ],
+  "return_values": {
+    "safe_with_latents": "(video: np.ndarray [T,H,W,C], prompt: str, latents: Tensor)",
+    "safe_no_latents": "(video: np.ndarray [T,H,W,C], prompt: str)",
+    "unsafe": "None"
+  },
+  "inherited_methods_used": [
+    "_run_guardrail_on_prompt_with_offload(prompt) → bool  [BaseWorldGenerationPipeline]",
+    "_run_text_embedding_on_prompt_with_offload(prompts) → (embeddings, _)  [BaseWorldGenerationPipeline]",
+    "_run_guardrail_on_video_with_offload(video) → video | None  [BaseWorldGenerationPipeline]",
+    "_run_tokenizer_encoding(image_or_video_path) → condition_latent  [DiffusionVideo2WorldGenerationPipeline]",
+    "_run_tokenizer_decoding(sample) → np.ndarray  [DiffusionVideo2WorldGenerationPipeline]",
+    "_load_network()  [DiffusionText2WorldGenerationPipeline]",
+    "_load_tokenizer()  [DiffusionText2WorldGenerationPipeline]",
+    "_load_prompt_upsampler_model()  [DiffusionText2WorldGenerationPipeline]"
+  ],
+  "important_notes": "Gen3C adds 3D-consistent generation via rendered_warp_images/masks injected into data_batch as condition_state/condition_state_mask. Uses DiffusionGen3CModel instead of standard DiffusionT2WModel. num_input_frames=1 hardcoded. All offload flags control GPU memory by loading/unloading model components around inference calls.",
+  "source_files_analyzed": [
+    "Lyra-1/cosmos_predict1/diffusion/inference/gen3c_pipeline.py",
+    "Lyra-1/cosmos_predict1/diffusion/inference/world_generation_pipeline.py (partial)"
+  ]
+}

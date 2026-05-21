@@ -1,0 +1,180 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+skinparam NoteBackgroundColor #E8F4F8
+skinparam NoteBorderColor #5B9BD5
+
+title Lyra Checkpoint Download & Conversion\n<size:11><i>scripts/download_lyra_checkpoints.py</i></size>
+
+|CLI|
+start
+:parse_args()
+**--checkpoint_dir** (default: "checkpoints");
+
+|main()|
+:Set **ORG_NAME** = 'nvidia'
+Set **extra_models** = \[\] (empty list);
+:Create **checkpoints_dir**
+Path(args.checkpoint_dir).mkdir(parents=True);
+:Configure download:
+  model_name = 'Lyra'
+  repo_id = 'nvidia/Lyra'
+  local_dir = checkpoints_dir/Lyra
+  allow_patterns = \['lyra_static.pt', 'lyra_dynamic.pt'\];
+
+|get_md5_checksum()|
+:Collect **expected_files** from MD5_CHECKSUM_LOOKUP
+where key starts with 'Lyra/';
+
+note right
+  MD5 Registry:
+  Lyra/lyra_static.pt  → 28ddd050...
+  Lyra/lyra_dynamic.pt → 91c1b392...
+end note
+
+if (expected_files list is empty?) then (yes)
+  :Check if model_dir exists\nand is non-empty;
+  if (model_dir exists & non-empty?) then (yes)
+    :Return **True**\n(treat as verified);
+  else (no)
+    :Return **False**\n(download required);
+  endif
+else (no)
+  :Iterate over each expected file;
+  if (file exists on disk?) then (no)
+    :Return **False**\n(file missing);
+  else (yes)
+    :Compute **hashlib.md5(file)**
+    read in 8 KB chunks;
+    if (computed MD5 == stored hash?) then (no)
+      :Return **False**\n(checksum mismatch);
+    else (yes)
+      :Continue to next file;
+      :All files verified;
+      :Return **True**\n(checksums match);
+    endif
+  endif
+endif
+
+|main()|
+if (checksum check returned False?) then (yes — download needed)
+  :local_dir.mkdir(parents=True, exist_ok=True);
+  |HuggingFace Hub|
+  :snapshot_download(
+    repo_id = 'nvidia/Lyra'
+    local_dir = checkpoints_dir/Lyra
+    allow_patterns = \['lyra_static.pt',
+                       'lyra_dynamic.pt'\]
+    local_dir_use_symlinks = False
+  );
+  |main()|
+  :**lyra_static.pt** + **lyra_dynamic.pt**
+  saved to checkpoints_dir/Lyra;
+else (no — skip download)
+  :Files already verified\n(checksums matched — skip);
+endif
+
+note right
+  extra_models = \[\] — loop body
+  never executes in current config
+end note
+
+stop
+
+' ─────────────────────────────────────────────────
+' Utility: convert_pixtral_checkpoint (standalone)
+' Not invoked by main() — available for direct use
+' ─────────────────────────────────────────────────
+
+|convert_pixtral_checkpoint()|
+note
+  <b>Utility Function — not called from main()</b>
+  Inputs: checkpoint_dir, checkpoint_name, vit_type
+end note
+
+start
+:Resolve **save_dir** = checkpoint_dir/checkpoint_name
+Resolve **save_path** = save_dir/model.pt;
+
+if (save_path exists and size > 0?) then (yes)
+  :Print "already exists"
+  **Early return (idempotent)**;
+  stop
+else (no)
+  :Resolve **pixtral_ckpt_dir** = checkpoint_dir/Pixtral-12B-2409
+  os.makedirs(pixtral_ckpt_dir);
+  |HuggingFace Hub|
+  :snapshot_download(
+    repo_id = 'mistralai/Pixtral-12B-2409'
+    allow_patterns = \['params.json',
+                       'consolidated.safetensors'\]
+    local_dir = pixtral_ckpt_dir
+  );
+  |convert_pixtral_checkpoint()|
+  :Set **dtype** = torch.bfloat16
+  torch.set_default_dtype(bfloat16);
+  :Glob **\*.safetensors** in pixtral_ckpt_dir
+  Assert exactly 1 file found;
+  :Load checkpoint via **safetensors.load_file()**;
+  :Split checkpoint into sub-dicts:
+  • **vit_ckpt** — keys with prefix 'vision_encoder.'
+  • **projector_ckpt** — keys with prefix 'vision_language_adapter.'
+  • **llm_ckpt** — all remaining keys;
+  :Rename projector keys:
+  w_in → projector.0
+  w_out → projector.2;
+  :Assemble **vlm_ckpt**:
+  llm keys  → 'model.*'
+  projector → 'mm_projector.*'
+  vit keys  → 'vision_encoder.*';
+  :Load **params.json** → pixtral_config;
+  :Extract **vision_encoder_config**
+  from pixtral_config\['vision_encoder'\];
+  if (vision_encoder_config matches\nhardcoded vit_config\n(dim=1024, 24 layers, 16 heads)?) then (no)
+    :Raise **AssertionError**\n(config mismatch);
+    stop
+  else (yes)
+    :Build **llm_config** from pixtral_config:
+    rename hidden_dim → ffn_hidden_size
+    set vision_encoder = vit_type;
+    :torch.save(\{
+      'model': vlm_ckpt,
+      'mm_projector': projector_ckpt,
+      'vision_encoder': vit_ckpt
+    \}, save_path);
+    :Write **config.json** (llm_config) to save_dir;
+    :Restore original dtype
+    torch.set_default_dtype(orig_dtype);
+    :shutil.rmtree(pixtral_ckpt_dir)
+    **Cleanup original Pixtral download**;
+    stop
+  endif
+endif
+
+@enduml

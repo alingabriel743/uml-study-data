@@ -1,0 +1,247 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #F8F9FA
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Logging Pipeline and Debug Service Flow
+
+actor Caller as caller
+actor Developer as dev
+
+box "putility — Logger Chain" #E3F2FD
+    participant "LoggerFacade" as facade
+    participant "FieldsLogger" as fields
+    participant "PrefixLogger" as prefix
+    participant "CategorizedToggleLogger" as toggle
+    participant "ConsoleLogger" as console
+end box
+
+box "GUI — Debug Control" #FCE4EC
+    participant "DebugService" as dbgsvc
+    participant "ExecService\n(svc_exec)" as execsvc
+end box
+
+box "puter-js SDK" #E8F5E9
+    participant "Debug module\n(puter-js)" as debug
+    participant "SimpleLogger\n(puter-js)" as simplelogger
+end box
+
+participant "console\n(stdout/stderr)" as stdout
+participant "iframe\n(child app)" as iframe
+
+' ─────────────────────────────────────────────────────────────
+' 1. NORMAL LOG CALL
+' ─────────────────────────────────────────────────────────────
+== Normal Log Call ==
+
+caller -> facade : .info(message, ...values)
+activate facade
+facade -> toggle : .log("info", message, {}, values)
+activate toggle
+note right of toggle : reads fields.category
+alt category is enabled
+    toggle -> console : .log("info", message, fields, values)
+    activate console
+    console -> stdout : console.log(ANSI_colored_str, ...values)
+    activate stdout
+    stdout --> console
+    deactivate stdout
+    console --> toggle
+    deactivate console
+else category NOT enabled
+    toggle --> facade : (message dropped silently)
+end
+toggle --> facade
+deactivate toggle
+facade --> caller : void
+deactivate facade
+
+' ─────────────────────────────────────────────────────────────
+' 2. FIELDS ENRICHMENT (decorator wrapping)
+' ─────────────────────────────────────────────────────────────
+== Fields Enrichment (.fields() Call) ==
+
+caller -> facade : .fields({ category, ...extras })
+activate facade
+facade -> fields ** : new FieldsLogger({ fields, delegate: this.impl })
+note right of fields : wraps existing impl;\nstores default fields
+facade --> caller : new LoggerFacade(impl=FieldsLogger)
+deactivate facade
+
+caller -> facade : .info(message, ...values)
+activate facade
+facade -> fields : .log("info", message, {}, values)
+activate fields
+note right of fields : Object.assign({}, this.fields, incomingFields)
+fields -> toggle : .log("info", message, mergedFields, values)
+activate toggle
+alt category enabled
+    toggle -> console : .log("info", message, mergedFields, values)
+    activate console
+    console -> stdout : console.log(str, ...values)
+    activate stdout
+    stdout --> console
+    deactivate stdout
+    console --> toggle
+    deactivate console
+end
+toggle --> fields
+deactivate toggle
+fields --> facade
+deactivate fields
+facade --> caller
+deactivate facade
+
+' ─────────────────────────────────────────────────────────────
+' 3. PREFIX ENRICHMENT
+' ─────────────────────────────────────────────────────────────
+== Prefix Enrichment (PrefixLogger Decoration) ==
+
+caller -> prefix : .log("info", message, fields, values)
+activate prefix
+note right of prefix : prepends this.prefix to message
+prefix -> toggle : .log("info", "[prefix] message", fields, values)
+activate toggle
+alt category enabled
+    toggle -> console : .log("info", "[prefix] message", fields, values)
+    activate console
+    console -> stdout : console.log(ANSI_str, ...values)
+    activate stdout
+    stdout --> console
+    deactivate stdout
+    console --> toggle
+    deactivate console
+end
+toggle --> prefix
+deactivate toggle
+prefix --> caller
+deactivate prefix
+
+' ─────────────────────────────────────────────────────────────
+' 4. CONSOLE OUTPUT DETAIL
+' ─────────────────────────────────────────────────────────────
+== Console Output — ANSI Formatting ==
+
+caller -> console : .log("error", message, fields, values)
+activate console
+note right of console
+  Builds ANSI-colored string:
+  • info  → \x1b[32;1m [INFO]
+  • warn  → \x1b[33;1m [WARN]
+  • error → \x1b[31;1m [ERROR]
+  • debug → \x1b[34;1m [DEBUG]
+  Appends key=value pairs from fields
+end note
+alt level == "error"
+    console -> stdout : console.error(str, ...values)
+    activate stdout
+    stdout --> console
+    deactivate stdout
+else level != "error"
+    console -> stdout : console.log(str, ...values)
+    activate stdout
+    stdout --> console
+    deactivate stdout
+end
+console --> caller
+deactivate console
+
+' ─────────────────────────────────────────────────────────────
+' 5. CATEGORY TOGGLE VIA DEBUGSERVICE (GUI side)
+' ─────────────────────────────────────────────────────────────
+== Category Toggle via DebugService (GUI) ==
+
+dev -> dbgsvc : .logs(category)
+activate dbgsvc
+note right of dbgsvc : pushes category to this.enabled_logs[]
+dbgsvc -> simplelogger : puter.logger.on(category)
+activate simplelogger
+simplelogger --> dbgsvc
+deactivate simplelogger
+dbgsvc -> iframe : postMessage({ $:'puterjs-debug', cmd:'log.on', category })
+activate iframe
+iframe --> dbgsvc
+deactivate iframe
+dbgsvc --> dev
+deactivate dbgsvc
+
+' ─────────────────────────────────────────────────────────────
+' 6. EXEC PARAM PROVIDER (DebugService → svc_exec)
+' ─────────────────────────────────────────────────────────────
+== DebugService Exec Param Provider Registration ==
+
+dbgsvc -> execsvc : register_param_provider(fn)
+activate execsvc
+note right of execsvc
+  fn returns:
+  { enabled_logs: "cat1;cat2" }
+  when categories are set
+end note
+execsvc --> dbgsvc
+deactivate execsvc
+
+' ─────────────────────────────────────────────────────────────
+' 7. PUTER-JS DEBUG MODULE INIT
+' ─────────────────────────────────────────────────────────────
+== puter-js Debug Module Initialization ==
+
+[-> debug : _init()
+activate debug
+debug -> debug : reads URL param "enabled_logs"\n(semicolon-separated)
+loop for each category in enabled_logs
+    debug -> simplelogger : puter.logger.on(category)
+    activate simplelogger
+    simplelogger --> debug
+    deactivate simplelogger
+end
+debug --> [
+deactivate debug
+
+[-> debug : postMessage({ $:'puterjs-debug', cmd:'log.on', category })
+activate debug
+debug -> simplelogger : puter.logger.on(e.data.category)
+activate simplelogger
+simplelogger --> debug
+deactivate simplelogger
+debug --> [
+deactivate debug
+
+' ─────────────────────────────────────────────────────────────
+' 8. SIMPLELOGGER INIT IN PUTER-JS
+' ─────────────────────────────────────────────────────────────
+== SimpleLogger Initialization in puter-js ==
+
+[-> simplelogger ** : new SimpleLogger()
+note right of simplelogger : assigned to puter.logger
+
+[-> simplelogger : .fields({ prefix: "[appName]" })
+activate simplelogger
+simplelogger --> [ : new SimpleLogger (with prefix field)
+deactivate simplelogger
+note right of simplelogger : puter.logger reassigned\nto prefixed logger instance
+
+@enduml

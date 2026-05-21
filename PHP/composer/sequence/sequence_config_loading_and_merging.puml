@@ -1,0 +1,250 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #E9ECEF
+    NoteBackgroundColor #FFF3CD
+    NoteBorderColor #856404
+}
+
+title Configuration Loading and Merging
+
+actor Caller as caller
+participant "Factory" as factory
+participant "Config" as config
+participant "JsonFile" as jsonfile
+participant "JsonConfigSource" as configsource
+participant "Platform" as platform
+participant "IOInterface" as io
+participant "RepositoryFactory" as repofactory
+
+== createConfig(): Global Defaults & Home Directory ==
+
+caller -> factory : createConfig(?IOInterface $io, ?string $cwd)
+activate factory
+
+alt cwd is null
+    factory -> platform : getCwd(true)
+    activate platform
+    platform --> factory : $cwd
+    deactivate platform
+end
+
+factory -> config : new Config(useEnvironment=true, baseDir=$cwd)
+activate config
+config -> config : $this->config = static::$defaultConfig\n(~50 default keys)
+config -> config : $this->repositories = static::$defaultRepositories
+config -> config : setSourceOfConfigValue(..., SOURCE_DEFAULT)\nfor each default key
+config --> factory : Config instance
+deactivate config
+
+factory -> factory : getHomeDir()\n[checks COMPOSER_HOME, APPDATA, XDG_CONFIG_HOME]
+
+factory -> config : merge(['config' => [home, cache-dir, data-dir]],\nSOURCE_DEFAULT)
+activate config
+config --> factory
+deactivate config
+
+== createConfig(): Global config.json ==
+
+factory -> jsonfile : new JsonFile($home/config.json)
+activate jsonfile
+
+opt global config.json exists
+    factory -> factory : validateJsonSchema($io, $file)
+    factory -> jsonfile : read()
+    jsonfile --> factory : $fileData (array)
+    factory -> config : merge($fileData, 'config.json path')
+    activate config
+    note right of config
+      Merges: oauth tokens, domains,
+      preferred-install, repositories, etc.
+    end note
+    config --> factory
+    deactivate config
+    factory -> configsource : new JsonConfigSource($file)
+    activate configsource
+    configsource --> factory : JsonConfigSource
+    deactivate configsource
+    factory -> config : setConfigSource(JsonConfigSource)
+end
+
+== createConfig(): Global auth.json ==
+
+factory -> jsonfile : new JsonFile($home/auth.json)
+
+opt global auth.json exists
+    factory -> factory : validateJsonSchema($io, $file, AUTH_SCHEMA)
+    factory -> jsonfile : read()
+    jsonfile --> factory : $authData (array)
+    factory -> config : merge(['config' => $authData], 'auth.json path')
+    activate config
+    config --> factory
+    deactivate config
+    factory -> configsource : new JsonConfigSource($file, authConfig=true)
+    activate configsource
+    configsource --> factory
+    deactivate configsource
+    factory -> config : setAuthConfigSource(JsonConfigSource)
+end
+
+deactivate jsonfile
+
+== createConfig(): COMPOSER_AUTH Environment Variable ==
+
+factory -> platform : getEnv('COMPOSER_AUTH')
+activate platform
+platform --> factory : $authEnv (string|null)
+deactivate platform
+
+opt COMPOSER_AUTH env var is set
+    factory -> jsonfile : validateJsonSchema(source, $authData, AUTH_SCHEMA)
+    factory -> config : merge(['config' => $authData], 'COMPOSER_AUTH')
+    activate config
+    config --> factory
+    deactivate config
+end
+
+factory --> caller : Config instance
+deactivate factory
+
+== createComposer(): Load Local composer.json ==
+
+caller -> factory : createComposer($io, $localConfig, ...)
+activate factory
+
+factory -> factory : getComposerFile()\n[checks COMPOSER env, defaults to ./composer.json]
+
+factory -> jsonfile : new JsonFile($localConfig, null, $io)
+activate jsonfile
+factory -> jsonfile : validateSchema(LAX_SCHEMA)
+factory -> jsonfile : read()
+jsonfile --> factory : $localConfig (array)
+deactivate jsonfile
+
+factory -> factory : createConfig($io, $cwd)\n[global config+auth loaded as above]
+
+factory -> config : merge($localConfig, $composerFile path)
+activate config
+note right of config
+  Local composer.json overrides
+  global config (lower priority only)
+end note
+config --> factory
+deactivate config
+
+== createComposer(): Local auth.json ==
+
+factory -> jsonfile : new JsonFile(dirname($composerFile)/auth.json)
+activate jsonfile
+
+opt local auth.json exists
+    factory -> factory : validateJsonSchema($io, $localAuthFile, AUTH_SCHEMA)
+    factory -> jsonfile : read()
+    jsonfile --> factory : $localAuthData
+    factory -> config : merge(['config' => $localAuthData],\n$localAuthFile->getPath())
+    activate config
+    config --> factory
+    deactivate config
+    factory -> configsource : new JsonConfigSource($localAuthFile, authConfig=true)
+    activate configsource
+    configsource --> factory
+    deactivate configsource
+    factory -> config : setLocalAuthConfigSource(JsonConfigSource)
+end
+
+deactivate jsonfile
+
+== createComposer(): Re-apply COMPOSER_AUTH (wins over local auth) ==
+
+factory -> factory : loadComposerAuthEnv($config, $io)
+note right of factory
+  COMPOSER_AUTH is intentionally applied
+  twice — it always wins over local auth.json
+end note
+
+factory -> config : merge(['config' => $authEnvData], 'COMPOSER_AUTH')
+activate config
+config --> factory
+deactivate config
+
+== createComposer(): Build Composer Instance ==
+
+factory -> config : get('vendor-dir')
+activate config
+config -> platform : getEnv('COMPOSER_VENDOR_DIR') [env override check]
+activate platform
+platform --> config
+deactivate platform
+config -> config : process($value, $flags)\n[replaces {$key} refs via recursive get()]
+config -> platform : expandPath($val) [~ expansion]
+activate platform
+platform --> config
+deactivate platform
+config -> config : realpath($path)\n[prepend baseDir if relative]
+config --> factory : resolved vendor-dir path
+deactivate config
+
+factory -> io : loadConfiguration($config)\n[loads auth tokens into IO]
+activate io
+io --> factory
+deactivate io
+
+factory -> repofactory : manager($io, $config, $httpDownloader, ...)
+activate repofactory
+repofactory -> config : getRepositories()
+activate config
+config --> repofactory : merged repository list
+deactivate config
+repofactory --> factory : RepositoryManager
+deactivate repofactory
+
+factory --> caller : Composer instance
+deactivate factory
+
+== Config.merge() — Key Merge Strategies ==
+
+note over config
+  **Merge Priority (lowest → highest):**
+  1. Static $defaultConfig / $defaultRepositories
+  2. home / cache-dir / data-dir (from env vars)
+  3. ~/.composer/config.json  (global config)
+  4. ~/.composer/auth.json    (global auth)
+  5. COMPOSER_AUTH env var
+  6. ./composer.json          (local project)
+  7. ./auth.json              (local project auth)
+  8. COMPOSER_AUTH env var    (re-applied, always wins)
+
+  **Special merge rules inside Config::merge():**
+  • OAuth / http-basic tokens  → array_merge (accumulate)
+  • allow-plugins              → local wins (triple merge)
+  • gitlab/github-domains      → array_unique(array_merge)
+  • preferred-install          → append, keep '*' last
+  • repositories               → prepend (new repos first),
+                                 false = disable, packagist auto-deactivated
+  • audit.ignore               → array_merge; other keys override
+end note
+
+@enduml

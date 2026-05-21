@@ -1,0 +1,83 @@
+{
+  "scope": "synchronous_process_execution",
+  "title": "Synchronous Process Execution",
+  "diagram_type": "activity",
+  "key_participants": ["ProcessExecutor", "Platform", "Process (Symfony)", "SignalHandler", "IOInterface", "ExecutableFinder"],
+  "entry_points": [
+    "execute($command, &$output=null, $cwd=null): int",
+    "executeTty($command, $cwd=null): int"
+  ],
+  "activity_flow": [
+    "START: caller invokes execute() or executeTty()",
+    "[executeTty] DECISION: Platform::isTty()? → tty=true : tty=false",
+    "[execute] DECISION: output arg passed (func_num_args > 1)? → doExecute with $output ref : doExecute without output",
+    "BOTH call doExecute($command, $cwd, $tty, &$output)",
+    "doExecute: call outputCommandRun() → logs command to io->writeError() if debug mode (sanitizes credentials)",
+    "doExecute: set captureOutput = (func_num_args > 3), reset errorOutput = ''",
+    "doExecute: call requiresGitDirEnv($command) → check if git command needing GIT_DIR (show/log/branch/remote set-url)",
+    "DECISION: cwd !== null AND requiresGitDirEnv?",
+    "  YES → DECISION: is bare repository (no .git subdir)?",
+    "    YES → runProcess(['git','config','safe.bareRepository'], cwd, ['GIT_DIR'=>cwd], tty, $configValue)",
+    "         DECISION: configValue === 'explicit'? → env = ['GIT_DIR' => cwd] : env = null",
+    "    NO  → env = null",
+    "  NO  → env = null",
+    "doExecute: call runProcess($command, $cwd, $env, $tty, &$output) → return exit code",
+    "runProcess: DECISION: command is string?",
+    "  YES (string) → DECISION: Windows AND matches executable prefix?",
+    "    YES → replace executable with self::getExecutable(match) (uses ExecutableFinder, skips builtins)",
+    "    → Process::fromShellCommandline($command, $cwd, $env, null, timeout)",
+    "  NO (array) → DECISION: Windows AND no path separator in command[0]?",
+    "    YES → command[0] = self::getExecutable(command[0])",
+    "    → new Process($command, $cwd, $env, null, timeout)",
+    "runProcess: DECISION: NOT Windows AND tty=true? → process->setTty(true) (catch RuntimeException, ignore)",
+    "runProcess: DECISION: $output is callable? → use $output as callback : use $this->outputHandler() closure",
+    "runProcess: register SignalHandler for SIGINT/SIGTERM/SIGHUP → on trigger, log 'Received X, aborting when child process is done'",
+    "runProcess: try { process->run($callback) }",
+    "  process->run() streams output through callback on each chunk",
+    "  outputHandler($type, $buffer):",
+    "    DECISION: captureOutput? → return (suppress output)",
+    "    DECISION: io is null? → echo $buffer directly",
+    "    DECISION: type === ERR? → io->writeErrorRaw($buffer, false) : io->writeRaw($buffer, false)",
+    "runProcess: DECISION: captureOutput AND NOT callable($output)? → $output = process->getOutput()",
+    "runProcess: errorOutput = process->getErrorOutput()",
+    "runProcess: catch ProcessSignaledException → DECISION: signalHandler->isTriggered()? → signalHandler->exitWithLastSignal()",
+    "runProcess: finally { signalHandler->unregister() }",
+    "runProcess: return process->getExitCode()",
+    "END: exit code integer returned to original caller"
+  ],
+  "key_decisions": [
+    "executeTty: TTY mode only enabled if Platform::isTty() returns true",
+    "doExecute: captureOutput flag set only when output reference argument is provided",
+    "doExecute: bare git repo check triggers extra runProcess call to read safe.bareRepository config",
+    "doExecute: GIT_DIR env injected only for specific git subcommands (show, log, branch, remote set-url) in bare repos with explicit policy",
+    "runProcess: Windows path resolution uses ExecutableFinder; built-in CMD commands (assoc, dir, echo, etc.) are passed through unchanged",
+    "runProcess: TTY silently fails on Windows or if process rejects it (RuntimeException swallowed)",
+    "runProcess: custom callable output bypasses outputHandler entirely",
+    "outputHandler: when captureOutput=true all output is suppressed from io/echo (captured into $output var instead)",
+    "outputHandler: stderr vs stdout routed to io->writeErrorRaw vs io->writeRaw"
+  ],
+  "method_signatures": {
+    "execute": "public execute($command: string|list<string>, &$output=null, $cwd: ?string): int",
+    "executeTty": "public executeTty($command: string|list<string>, $cwd: ?string): int",
+    "doExecute": "private doExecute($command, $cwd: ?string, $tty: bool, &$output=null): int",
+    "runProcess": "private runProcess($command, $cwd: ?string, $env: ?array, $tty: bool, &$output=null): ?int",
+    "outputHandler": "protected outputHandler($type: string, $buffer: string): void",
+    "outputCommandRun": "private outputCommandRun($command, $cwd: ?string, $async: bool): void",
+    "requiresGitDirEnv": "public requiresGitDirEnv($command): bool",
+    "getExecutable": "private static getExecutable($name: string): string"
+  },
+  "data_flow": [
+    "$output ref: passed caller → execute → doExecute → runProcess; populated via process->getOutput() if captureOutput",
+    "$errorOutput: set in runProcess via process->getErrorOutput(); accessible via getErrorOutput()",
+    "$env: null by default; set to ['GIT_DIR'=>$cwd] only for bare git repos with explicit safe.bareRepository",
+    "timeout: static $timeout (default 300s) passed to every Process constructor via getTimeout()"
+  ],
+  "error_handling": [
+    "RuntimeException on setTty → silently ignored",
+    "ProcessSignaledException → if signal was triggered externally, calls exitWithLastSignal() (process exits)",
+    "SignalHandler always unregistered in finally block",
+    "Async startJob() rejects promise on Throwable during Process construction or start()"
+  ],
+  "important_notes": "Synchronous path: execute/executeTty → doExecute → runProcess → process.run() (blocking). No promises involved. captureOutput=true when &$output ref is passed. Credentials in command strings are redacted in debug logs (regex scrub for tokens/passwords). Windows requires special exe resolution via ExecutableFinder. Static $timeout=300s applies globally.",
+  "source_files_analyzed": ["src/Composer/Util/ProcessExecutor.php"]
+}

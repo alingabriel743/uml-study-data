@@ -1,0 +1,95 @@
+{
+  "scope": "run_state_serialization",
+  "title": "Run State Serialization & Deserialization",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Caller",
+    "RunState",
+    "RunContextWrapper",
+    "_build_run_state_from_json",
+    "Agent",
+    "ProcessedResponse",
+    "TraceState",
+    "AgentToolState"
+  ],
+  "schema_version": "1.9 (CURRENT_SCHEMA_VERSION); versions 1.0–1.9 all supported",
+
+  "serialization_flow": [
+    "Caller → RunState: to_string() [optional wrapper over to_json()]",
+    "RunState → RunState: to_json(context_serializer?, strict_context?, include_tracing_api_key?)",
+    "RunState → RunState: _serialize_approvals() → reads context._approvals → returns dict[tool_name → {approved, rejected, rejection_messages?, sticky_rejection_message?}]",
+    "RunState → RunState: _serialize_model_responses() → for each ModelResponse: {usage, output[], response_id, request_id}",
+    "RunState → RunState: _serialize_original_input() → normalises assistant messages (adds 'status':'completed', wraps string content)",
+    "RunState → RunState: _serialize_context_payload(context_serializer, strict_context) → tries Mapping > context_serializer > model_dump > dataclasses.asdict > {} + warning; returns (payload, context_meta)",
+    "RunState → RunState: _serialize_tool_input(context.tool_input) → dataclass/pydantic/raw coercion",
+    "RunState → RunState: _merge_generated_items_with_processed() → deduplicates _generated_items + last_processed_response.new_items by (id,type) / (call_id,type)",
+    "RunState → RunState: _serialize_item(item) for each generated_item / session_item → {type, raw_item, agent, output?, source_agent?, target_agent?, tool_name?, tool_lookup_key?, tool_origin?, ...}",
+    "RunState → RunState: _serialize_current_step() → if NextStepInterruption: {type:'next_step_interruption', data:{interruptions:[...]}} via _serialize_tool_approval_interruption()",
+    "RunState → RunState: _serialize_processed_response(last_processed_response) → calls _serialize_tool_action_groups() + _serialize_pending_nested_agent_tool_runs()",
+    "RunState → _serialize_tool_action_groups: returns dict with keys functions/computer_actions/custom_tool_actions/local_shell_actions/shell_actions/apply_patch_actions/handoffs/mcp_approval_requests",
+    "RunState → _serialize_pending_nested_agent_tool_runs: for each function_run peek_agent_tool_run_result() → if pending nested RunResult with interruptions → nested_state.to_json() embedded as entry['agent_run_state']",
+    "RunState → TraceState: _serialize_trace_data() → trace_state.to_json(include_tracing_api_key)",
+    "RunState → Caller: returns dict with $schemaVersion, current_turn, current_agent, original_input, model_responses, context, generated_items, session_items, current_step, last_processed_response, last_model_response, trace, sandbox?, tool_use_tracker, guardrail results, conversation_id, previous_response_id, reasoning_item_id_policy, generated_prompt_cache_key"
+  ],
+
+  "deserialization_flow": [
+    "Caller → RunState: from_string(initial_agent, state_string, context_override?, context_deserializer?, strict_context?) → json.loads() → from_json()",
+    "Caller → RunState: from_json(initial_agent, state_json, context_override?, context_deserializer?, strict_context?) → delegates to _build_run_state_from_json()",
+    "_build_run_state_from_json: 1. validate $schemaVersion against SUPPORTED_SCHEMA_VERSIONS",
+    "_build_run_state_from_json: 2. _build_agent_map(initial_agent) + _build_agent_identity_map(initial_agent) via BFS over handoffs + agent-as-tool instances",
+    "_build_run_state_from_json: 3. resolve current_agent via _resolve_agent_from_data() (identity key > name lookup)",
+    "_build_run_state_from_json: 4. restore context: context_override (RunContextWrapper|Mapping) > context_deserializer(mapping) > plain Mapping restore; set usage; call context._rebuild_approvals(approvals_dict); restore tool_input",
+    "_build_run_state_from_json: 5. construct RunState(context, original_input, starting_agent, max_turns, conversation_id, previous_response_id)",
+    "_build_run_state_from_json: 6. state._model_responses = _deserialize_model_responses() → for each entry: deserialize usage + output items (ResponseOutputMessage, ResponseFunctionToolCall, ResponseComputerToolCall, ResponseReasoningItem, etc.)",
+    "_build_run_state_from_json: 7. state._generated_items = _deserialize_items(generated_items, agent_map)",
+    "_build_run_state_from_json: 8. state._last_processed_response = await _deserialize_processed_response(last_processed_response_data, current_agent, context, agent_map)",
+    "_deserialize_processed_response → current_agent.get_all_tools(context) → build maps: FunctionTool/ComputerTool/CustomTool/LocalShellTool/ShellTool/ApplyPatchTool/HostedMCPTool/Handoff",
+    "_deserialize_processed_response → _deserialize_action_groups(): for each action group (functions/computer_actions/etc.) call _deserialize_actions() with tool_map + call_parser + action_factory",
+    "_deserialize_processed_response → await _restore_pending_nested_agent_tool_runs(): for each function_entry with 'agent_run_state' → recursively await _build_run_state_from_json() → _SerializedAgentToolRunResult → record_agent_tool_run_result()",
+    "_deserialize_processed_response → deserialize mcp_approval_requests, interruptions via _deserialize_tool_approval_item()",
+    "_deserialize_processed_response → return ProcessedResponse(new_items, handoffs, functions, computer_actions, custom_tool_calls, shell_calls, apply_patch_calls, mcp_approval_requests, interruptions)",
+    "_build_run_state_from_json: 9. restore session_items (or merge from generated+processed if absent in payload)",
+    "_build_run_state_from_json: 10. restore current_step → NextStepInterruption from interruptions data via _deserialize_tool_approval_item()",
+    "_build_run_state_from_json: 11. restore guardrail results: input/output/tool_input/tool_output guardrail stubs",
+    "_build_run_state_from_json: 12. restore trace_state = TraceState.from_json(), sandbox, tool_use_tracker, reasoning_item_id_policy, generated_prompt_cache_key",
+    "_build_run_state_from_json → Caller: returns rebuilt RunState"
+  ],
+
+  "approval_methods": [
+    "RunState.approve(approval_item, always_approve=False) → context.approve_tool()",
+    "RunState.reject(approval_item, always_reject=False, rejection_message?) → context.reject_tool()",
+    "RunState.get_interruptions() → list[ToolApprovalItem] from _current_step (NextStepInterruption)"
+  ],
+
+  "key_data_structures": {
+    "json_top_level_keys": ["$schemaVersion", "current_turn", "current_agent", "original_input", "model_responses", "context", "generated_items", "session_items", "current_step", "last_processed_response", "last_model_response", "trace", "sandbox", "tool_use_tracker", "input_guardrail_results", "output_guardrail_results", "tool_input_guardrail_results", "tool_output_guardrail_results", "conversation_id", "previous_response_id", "auto_previous_response_id", "reasoning_item_id_policy", "generated_prompt_cache_key", "max_turns", "no_active_agent_run"],
+    "context_payload": {"usage": "serialized Usage", "approvals": "dict[tool_name → {approved, rejected, rejection_messages, sticky_rejection_message}]", "context": "mapping or null", "context_meta": "{original_type, serialized_via, requires_deserializer, omitted, class_path?}", "tool_input": "optional serialized tool input"},
+    "model_response_entry": {"usage": "serialized", "output": "list of raw output items", "response_id": "str", "request_id": "str"},
+    "run_item_entry": {"type": "item type string", "raw_item": "dict from model_dump or passthrough", "agent": "{name, identity?}", "output?": "any", "tool_name?": "str", "tool_lookup_key?": "dict", "tool_origin?": "dict"},
+    "processed_response_entry": {"new_items": "list", "tools_used": "list", "functions": "list[{tool_call, tool, agent_run_state?}]", "computer_actions": "list[{tool_call, computer}]", "custom_tool_actions": "list[{tool_call, custom_tool}]", "handoffs": "list[{tool_call, handoff:{tool_name}}]", "mcp_approval_requests": "list[{request_item, mcp_tool}]", "interruptions": "list[{type, raw_item, agent, tool_name?, tool_namespace?, tool_origin?, tool_lookup_key?, allow_bare_name_alias?}]"}
+  },
+
+  "context_serialization_strategies": [
+    "Mapping → direct dict copy (no deserializer needed)",
+    "Pydantic model → model_dump(exclude_unset) + warning",
+    "Dataclass → dataclasses.asdict() + warning",
+    "Custom with context_serializer callable → serializer(context)",
+    "Unknown → {} + warning (omitted=True in meta)",
+    "strict_context=True → raises UserError if no safe path"
+  ],
+
+  "important_notes": [
+    "Schema versioning: CURRENT=1.9; all versions 1.0–1.9 supported. to_json() always emits 1.9. Older SDKs reject newer unsupported versions (fail-fast forward compat).",
+    "Nested Agent.as_tool() interruptions: serialized recursively inside last_processed_response.functions[n].agent_run_state; restored via _restore_pending_nested_agent_tool_runs() → record_agent_tool_run_result()",
+    "Deduplication: _merge_generated_items_with_processed() uses (id,type) and (call_id,type) sets to avoid duplicating items already in _generated_items",
+    "Approval persistence: always_approve/always_reject decisions survive serialization in context.approvals; per-call rejection_message also persisted (schema 1.6+)",
+    "to_string() is JSON string wrapper over to_json(); from_string() parses then delegates to from_json()",
+    "Agent identity for duplicate names tracked via _agent_tool_state_scope_id and agent_identity_keys_by_id map (identity != name stored as 'identity' field)",
+    "Trace, sandbox, guardrail results all serialized as optional fields; TraceState.from_json/to_json handles trace metadata including optional API key"
+  ],
+
+  "source_files_analyzed": [
+    "src/agents/run_state.py",
+    "docs/human_in_the_loop.md"
+  ]
+}

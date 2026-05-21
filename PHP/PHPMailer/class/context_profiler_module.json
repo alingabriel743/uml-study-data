@@ -1,0 +1,380 @@
+{
+  "scope": "profiler_module",
+  "title": "Profiler Module",
+  "diagram_type": "class",
+  "description": "Datadog PHP profiler (Rust extension). Collects wall-time, CPU-time, allocation, exception, timeline, and I/O samples from PHP via Zend Engine hooks. Profiles are aggregated into pprof format and uploaded to the Datadog agent every 67 seconds.",
+
+  "classes": [
+    {
+      "name": "Profiler",
+      "file": "src/profiling/mod.rs",
+      "kind": "struct",
+      "fields": [
+        "fork_barrier: Arc<Barrier>",
+        "interrupt_manager: Arc<InterruptManager>",
+        "message_sender: Sender<ProfilerMessage>",
+        "upload_sender: Sender<UploadMessage>",
+        "time_collector_handle: JoinHandle<()>",
+        "uploader_handle: JoinHandle<()>",
+        "should_join: AtomicBool",
+        "sample_types_filter: SampleTypeFilter",
+        "system_settings: AtomicPtr<SystemSettings>"
+      ],
+      "methods": [
+        "init(system_settings: &SystemSettings) [static, initializes global OnceLock]",
+        "get() -> Option<&'static Profiler> [static]",
+        "new(system_settings: &SystemSettings) -> Self [spawns TimeCollector + Uploader threads]",
+        "add_interrupt(interrupt: VmInterrupt)",
+        "remove_interrupt(interrupt: VmInterrupt)",
+        "fork_prepare() -> anyhow::Result<()>",
+        "post_fork_parent()",
+        "send_sample(message: SampleMessage) -> Result",
+        "send_local_root_span_resource(message: LocalRootSpanResourceMessage) -> Result",
+        "stop(timeout: Duration) [static, unsafe]",
+        "shutdown(timeout: Duration) -> Result<(), JoinError> [static, unsafe]",
+        "kill() [static, unsafe, leaks on fork]",
+        "collect_time(execute_data: *mut zend_execute_data, interrupt_count: u32)",
+        "collect_allocations(execute_data, alloc_samples: i64, alloc_size: i64, interrupt_count: Option<u32>)",
+        "collect_exception(execute_data, exception: String, message: Option<String>)",
+        "collect_compile_string(now: i64, duration: i64, filename: String, line: u32)",
+        "collect_compile_file(now: i64, duration: i64, filename: String, include_type: &str)",
+        "collect_idle(now: i64, duration: i64, reason: &str)",
+        "collect_garbage_collection(now: i64, duration: i64, reason: &str, collected: i64)",
+        "collect_fatal(now: i64, file: String, line: u32, message: String)",
+        "collect_thread_start_end(now: i64, event: &str) [ZTS only]",
+        "collect_opcache_restart(now: i64, file: String, line: u32, reason: &str)",
+        "collect_stack_sample_timed(execute_data) -> Result<Backtrace, CollectStackSampleError> [private]",
+        "prepare_and_send_message(frames, samples, labels, timestamp) -> Result [private]",
+        "prepare_sample_message(frames, samples, labels, timestamp) -> SampleMessage [private]",
+        "common_labels(n_extra_labels) -> Vec<Label> [static, private]",
+        "get_timeline_timestamp() -> i64 [private]",
+        "is_timeline_enabled() -> bool [private]",
+        "join_and_drop_sender(timeout: Duration)",
+        "join_collector_and_uploader(timeout: Duration) -> Result<(), JoinError>"
+      ],
+      "notes": "Global singleton stored in static mut PROFILER: OnceLock<Profiler>. Upload period=67s, wall-time tick=10ms."
+    },
+    {
+      "name": "TimeCollector",
+      "file": "src/profiling/mod.rs",
+      "kind": "struct (private)",
+      "fields": [
+        "fork_barrier: Arc<Barrier>",
+        "interrupt_manager: Arc<InterruptManager>",
+        "message_receiver: Receiver<ProfilerMessage>",
+        "upload_sender: Sender<UploadMessage>",
+        "upload_period: Duration"
+      ],
+      "methods": [
+        "run(self) [main loop: ticks wall-time interrupt + upload every 67s]",
+        "handle_timeout(profiles, last_export) -> WallTime",
+        "handle_sample_message(message, profiles, started_at) [static]",
+        "handle_resource_message(message, profiles) [static]",
+        "create_profile(message: &SampleMessage, started_at: SystemTime) -> InternalProfile [static]"
+      ],
+      "notes": "Runs in 'ddprof_time' thread. Drives InterruptManager to trigger VM interrupts every 10ms. Batches SampleMessages into InternalProfile per ProfileIndex. Sends UploadRequest to Uploader on timeout."
+    },
+    {
+      "name": "Uploader",
+      "file": "src/profiling/uploader.rs",
+      "kind": "struct (private)",
+      "fields": [
+        "fork_barrier: Arc<Barrier>",
+        "receiver: Receiver<UploadMessage>",
+        "output_pprof: Option<Cow<str>> [optional file output]",
+        "endpoint: AgentEndpoint",
+        "start_time: String",
+        "process_tags: Option<String>"
+      ],
+      "methods": [
+        "new(fork_barrier, receiver, output_pprof, endpoint, start_time, process_tags) -> Self",
+        "run(self) [main loop: receives UploadMessage, calls upload()]",
+        "upload(message: Box<UploadRequest>, last_cpu: &mut Option<ThreadTime>) -> anyhow::Result<u16>",
+        "create_internal_metadata() -> Option<serde_json::Value> [static, resets counters]",
+        "create_profiler_info(&self) -> Option<serde_json::Value>"
+      ],
+      "notes": "Runs in 'ddprof_upload' thread. Serializes InternalProfile to compressed pprof via libdd_profiling::ProfileExporter. Sends HTTP to Datadog agent. Supports writing to .zst file for debug."
+    },
+    {
+      "name": "SampleTypeFilter",
+      "file": "src/profiling/sample_type_filter.rs",
+      "kind": "struct",
+      "fields": [
+        "sample_types: Vec<ValueType>",
+        "sample_types_mask: [bool; 23]"
+      ],
+      "methods": [
+        "new(system_settings: &SystemSettings) -> Self",
+        "sample_types(&self) -> Vec<ValueType>",
+        "filter(&self, sample_values: SampleValues) -> Vec<i64>"
+      ],
+      "notes": "23 possible sample types. Always-on: sample/count, wall-time/ns. Optional: cpu-time, alloc-samples, alloc-size, timeline, exception-samples, 16 IO types. Controlled by SystemSettings feature flags."
+    },
+    {
+      "name": "InterruptManager",
+      "file": "src/profiling/interrupts.rs",
+      "kind": "struct",
+      "fields": [
+        "vm_interrupts: Arc<Mutex<HashSet<VmInterrupt>>>"
+      ],
+      "methods": [
+        "new() -> Self",
+        "add_interrupt(interrupt: VmInterrupt)",
+        "remove_interrupt(interrupt: VmInterrupt)",
+        "has_interrupts() -> bool",
+        "trigger_interrupts() [atomically increments interrupt_count + sets engine flag]"
+      ]
+    },
+    {
+      "name": "VmInterrupt",
+      "file": "src/profiling/interrupts.rs",
+      "kind": "struct",
+      "fields": [
+        "interrupt_count_ptr: *const AtomicU32",
+        "engine_ptr: *const AtomicBool"
+      ],
+      "notes": "Raw pointers into PHP VM thread-local state. unsafe Send impl."
+    },
+    {
+      "name": "Backtrace",
+      "file": "src/profiling/backtrace.rs",
+      "kind": "struct",
+      "fields": ["frames: Vec<ZendFrame>"],
+      "methods": [
+        "new(frames: Vec<ZendFrame>) -> Self",
+        "len() -> usize",
+        "is_empty() -> bool",
+        "iter() -> impl Iterator<Item = &ZendFrame>"
+      ],
+      "traits": ["Deref<Target=[ZendFrame]>"]
+    },
+    {
+      "name": "ZendFrame",
+      "file": "src/profiling/stack_walking.rs",
+      "kind": "struct",
+      "fields": [
+        "function: Cow<'static, str>",
+        "file: Option<Cow<'static, str>>",
+        "line: u32"
+      ],
+      "notes": "Max string length = 16,383 bytes (varint fits 2 bytes). Truncated to [suspiciously large string] if exceeded. Max stack depth = 512 frames; last frame replaced with [truncated]."
+    },
+    {
+      "name": "SampleValues",
+      "file": "src/profiling/mod.rs",
+      "kind": "struct (Default)",
+      "fields": [
+        "interrupt_count: i64",
+        "wall_time: i64",
+        "cpu_time: i64",
+        "alloc_samples: i64",
+        "alloc_size: i64",
+        "timeline: i64",
+        "exception: i64",
+        "socket_read_time: i64",
+        "socket_write_time: i64",
+        "file_read_time: i64",
+        "file_write_time: i64",
+        "socket_read_size: i64",
+        "socket_write_size: i64",
+        "file_read_size: i64",
+        "file_write_size: i64",
+        "+ 8 *_samples counterparts"
+      ]
+    },
+    {
+      "name": "ProfileIndex",
+      "file": "src/profiling/mod.rs",
+      "kind": "struct (Clone, Eq, Hash)",
+      "fields": [
+        "sample_types: Vec<ValueType>",
+        "tags: Arc<Vec<Tag>>"
+      ],
+      "notes": "Key for HashMap<ProfileIndex, InternalProfile>. Different services/tags produce separate profiles."
+    },
+    {
+      "name": "SampleData",
+      "file": "src/profiling/mod.rs",
+      "kind": "struct",
+      "fields": [
+        "frames: Backtrace",
+        "labels: Vec<Label>",
+        "sample_values: Vec<i64>",
+        "timestamp: i64"
+      ]
+    },
+    {
+      "name": "SampleMessage",
+      "file": "src/profiling/mod.rs",
+      "kind": "struct",
+      "fields": [
+        "key: ProfileIndex",
+        "value: SampleData"
+      ]
+    },
+    {
+      "name": "ProfilerMessage",
+      "file": "src/profiling/mod.rs",
+      "kind": "enum",
+      "variants": ["Cancel", "Sample(SampleMessage)", "LocalRootSpanResource(LocalRootSpanResourceMessage)", "Pause", "Wake"]
+    },
+    {
+      "name": "UploadMessage",
+      "file": "src/profiling/mod.rs",
+      "kind": "enum",
+      "variants": ["Pause", "Upload(Box<UploadRequest>)"]
+    },
+    {
+      "name": "UploadRequest",
+      "file": "src/profiling/mod.rs",
+      "kind": "struct",
+      "fields": [
+        "index: ProfileIndex",
+        "profile: InternalProfile",
+        "end_time: SystemTime",
+        "duration: Option<Duration>"
+      ]
+    },
+    {
+      "name": "Label",
+      "file": "src/profiling/mod.rs",
+      "kind": "struct",
+      "fields": ["key: &'static str", "value: LabelValue"],
+      "notes": "Common labels: thread_id, thread_name, local_root_span_id, span_id, trace_endpoint"
+    },
+    {
+      "name": "LabelValue",
+      "file": "src/profiling/mod.rs",
+      "kind": "enum",
+      "variants": ["Str(Cow<'static, str>)", "Num(i64, &'static str)"]
+    },
+    {
+      "name": "ValueType",
+      "file": "src/profiling/mod.rs",
+      "kind": "struct (Copy, Eq, Hash)",
+      "fields": ["type: &'static str", "unit: &'static str"],
+      "methods": ["new(type, unit) -> Self [const]"]
+    },
+    {
+      "name": "AllocationProfilingStats",
+      "file": "src/allocation/mod.rs",
+      "kind": "struct",
+      "fields": [
+        "next_sample: i64",
+        "poisson: Poisson<f64>",
+        "rng: StdRng | ThreadRng"
+      ],
+      "methods": [
+        "new(sampling_distance: NonZeroU64) -> Self",
+        "next_sampling_interval(&mut self)",
+        "should_collect_allocation(&mut self, len: size_t) -> bool"
+      ],
+      "notes": "Default sampling distance = 4 MiB. Poisson sampling. Thread-local. ALLOCATION_PROFILING_INTERVAL: AtomicU64 global."
+    },
+    {
+      "name": "ExceptionProfilingStats",
+      "file": "src/exception.rs",
+      "kind": "struct",
+      "fields": [
+        "next_sample: u32",
+        "poisson: Poisson<f64>",
+        "rng: ThreadRng"
+      ],
+      "methods": [
+        "new() -> Self",
+        "next_sampling_interval(&mut self)",
+        "should_collect_exception(&mut self) -> bool"
+      ],
+      "notes": "Default interval = every 100 exceptions. Poisson sampling. Thread-local. EXCEPTION_PROFILING_INTERVAL: AtomicU32 global."
+    },
+    {
+      "name": "Globals",
+      "file": "src/profiling/mod.rs",
+      "kind": "struct",
+      "fields": ["interrupt_count: AtomicU32", "last_interrupt: SystemTime"]
+    },
+    {
+      "name": "LocalRootSpanResourceMessage",
+      "file": "src/profiling/mod.rs",
+      "kind": "struct",
+      "fields": ["local_root_span_id: u64", "resource: String"]
+    },
+    {
+      "name": "SystemSettings",
+      "file": "src/config.rs",
+      "kind": "struct (external dependency)",
+      "notes": "Holds all profiling feature flags: profiling_enabled, profiling_experimental_cpu_time_enabled, profiling_allocation_enabled, profiling_exception_enabled, profiling_timeline_enabled, profiling_io_enabled, profiling_endpoint_collection_enabled, etc. Also: uri: AgentEndpoint, output_pprof."
+    }
+  ],
+
+  "key_relationships": [
+    "Profiler owns SampleTypeFilter (composition)",
+    "Profiler owns Arc<InterruptManager> (shared with TimeCollector)",
+    "Profiler spawns TimeCollector thread (owns JoinHandle)",
+    "Profiler spawns Uploader thread (owns JoinHandle)",
+    "Profiler sends ProfilerMessage to TimeCollector via bounded channel (capacity 100)",
+    "TimeCollector sends UploadMessage to Uploader via bounded channel (capacity 8)",
+    "TimeCollector uses InterruptManager::trigger_interrupts() on wall-time tick",
+    "TimeCollector aggregates SampleMessage into HashMap<ProfileIndex, InternalProfile>",
+    "TimeCollector::create_profile creates InternalProfile (libdd_profiling external)",
+    "Uploader uses libdd_profiling::ProfileExporter to serialize+upload profiles",
+    "Backtrace contains Vec<ZendFrame>",
+    "SampleMessage contains ProfileIndex + SampleData",
+    "SampleData contains Backtrace + Vec<Label> + Vec<i64>",
+    "UploadRequest contains ProfileIndex + InternalProfile",
+    "SampleTypeFilter depends_on SystemSettings (reads feature flags)",
+    "AllocationProfilingStats is thread-local, calls Profiler::collect_allocations",
+    "ExceptionProfilingStats is thread-local, calls Profiler::collect_exception",
+    "ProfileIndex implements Hash/Eq for use as HashMap key",
+    "Label converts to ApiLabel (libdd_profiling) via From trait",
+    "Profiler depends_on SystemSettings (AtomicPtr reference)",
+    "Profiler depends_on collect_stack_sample (stack_walking module)"
+  ],
+
+  "key_enums": [
+    "ProfilerMessage: Cancel | Sample(SampleMessage) | LocalRootSpanResource(...) | Pause | Wake",
+    "UploadMessage: Pause | Upload(Box<UploadRequest>)",
+    "LabelValue: Str(Cow) | Num(i64, unit)",
+    "CollectStackSampleError: AccessError | BorrowError | BorrowMutError | TryReserveError",
+    "SystemSettingsState: ConfigUnaware | ConfigAware | Disabled"
+  ],
+
+  "sample_types_supported": [
+    "sample/count (always on)",
+    "wall-time/nanoseconds (always on)",
+    "cpu-time/nanoseconds (opt-in: experimental)",
+    "alloc-samples/count (opt-in)",
+    "alloc-size/bytes (opt-in)",
+    "timeline/nanoseconds (opt-in)",
+    "exception-samples/count (opt-in)",
+    "socket-read/write-time and size (opt-in, io_profiling feature)",
+    "file-io-read/write-time and size (opt-in, io_profiling feature)"
+  ],
+
+  "important_notes": [
+    "Rust implementation of a Datadog PHP profiler (datadog-profiling Zend extension)",
+    "Profiler is a global singleton (OnceLock), initialized on first RINIT, destroyed on mshutdown",
+    "Three-thread model: PHP request thread(s) + TimeCollector thread + Uploader thread",
+    "VM interrupts: TimeCollector ticks every 10ms -> triggers PHP engine interrupt -> PHP thread calls collect_time()",
+    "Poisson sampling for allocations (default 4 MiB interval) and exceptions (default every 100)",
+    "Profiles serialized to compressed pprof, uploaded every 67s to Datadog agent endpoint",
+    "Fork-safe: uses Arc<Barrier> (3 participants) to pause threads before fork, kill() on child",
+    "Stack walk: max 512 frames, string length capped at 16383 bytes, frameless calls handled",
+    "ProfileIndex hash key aggregates samples by service/tag combination into separate profiles",
+    "Endpoint profiling: LocalRootSpanResourceMessage updates profile with trace endpoint labels",
+    "PHP version compatibility: conditional compile for PHP 7/8, ZTS/NTS, 8.3-/8.4+ allocator hooks"
+  ],
+
+  "source_files_analyzed": [
+    "profiling/src/profiling/mod.rs",
+    "profiling/src/profiling/uploader.rs",
+    "profiling/src/profiling/backtrace.rs",
+    "profiling/src/profiling/stack_walking.rs",
+    "profiling/src/profiling/interrupts.rs",
+    "profiling/src/profiling/sample_type_filter.rs",
+    "profiling/src/allocation/mod.rs",
+    "profiling/src/exception.rs",
+    "profiling/src/config.rs",
+    "profiling/src/lib.rs"
+  ]
+}

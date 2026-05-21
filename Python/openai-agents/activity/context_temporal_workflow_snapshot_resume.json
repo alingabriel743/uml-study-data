@@ -1,0 +1,134 @@
+{
+  "scope": "temporal_workflow_snapshot_resume",
+  "title": "Temporal Workflow Snapshot and Resume",
+  "diagram_type": "activity",
+  "description": "Serialize agent state into WorkflowSnapshot, persist via Temporal durable execution, deserialize and resume sandbox session after replay or fork",
+
+  "key_participants": [
+    "AgentWorkflow (Temporal @workflow.defn)",
+    "SessionManagerWorkflow (Temporal @workflow.defn, singleton registry)",
+    "SandboxRuntimeSessionManager",
+    "WorkflowSnapshot (Pydantic model)",
+    "Runner (SDK runner)",
+    "BaseSandboxClient (Daytona | Docker | E2B | UnixLocal)",
+    "SandboxSession / BaseSandboxSession"
+  ],
+
+  "main_activities": [
+    "--- TURN EXECUTION & STATE CAPTURE ---",
+    "1. AgentWorkflow.run() waits on pending_messages (workflow.wait_condition)",
+    "2. Dequeues user_messages, sets _turn_status='thinking'",
+    "3. Calls _build_agent(manifest) -> SandboxAgent",
+    "4. Calls _run_turn(agent, user_messages)",
+    "5.   _run_turn builds RunConfig with SandboxRunConfig(client=temporal_sandbox_client, session_state=self._sandbox_session_state, snapshot=self._snapshot)",
+    "6.   Runner.run(agent, input, run_config, hooks, previous_response_id) -> RunResult",
+    "7.   Extracts _previous_response_id = result.last_response_id",
+    "8.   result.to_state() -> RunState; state.to_json() -> dict",
+    "9.   dict['sandbox']['session_state'] parsed via SandboxSessionState.parse()",
+    "10.  Stores _sandbox_session_state; updates _snapshot = _sandbox_session_state.snapshot",
+    "--- STATE SERIALIZATION (within Runner cleanup) ---",
+    "11. SandboxRuntimeSessionManager.cleanup() iterates _resources_by_agent",
+    "12.   Calls resources.cleanup() for each session",
+    "13.   Calls serialize_resume_state() -> dict",
+    "14.     serialize_resume_state builds: {backend_id, current_agent_key, current_agent_name, session_state: client.serialize_session_state(resources.state), sessions_by_agent: _serialize_sessions_by_agent(client)}",
+    "15.   Returns resume_state stored in RunState._sandbox",
+    "--- SNAPSHOT QUERY ---",
+    "16. TUI or SessionManagerWorkflow queries AgentWorkflow.get_snapshot() (@workflow.query)",
+    "17.   get_snapshot() reads _sandbox_session_state.snapshot (or falls back to _snapshot)",
+    "18.   Returns WorkflowSnapshot(sandbox_session_state, snapshot, previous_response_id, history)",
+    "--- FORK OPERATION (SessionManagerWorkflow.fork_session) ---",
+    "19. SessionManagerWorkflow.fork_session(ForkSessionRequest) called via Temporal update",
+    "20.   Looks up source SessionInfo from _sessions registry",
+    "21.   Executes activity: pause_workflow(source_workflow_id)",
+    "22.     pause_workflow connects to Temporal, calls handle.execute_update(AgentWorkflow.pause)",
+    "23.     AgentWorkflow.pause sets _pause_requested=True, waits until _paused=True",
+    "24.   Executes activity: query_workflow_snapshot(source_workflow_id)",
+    "25.     query_workflow_snapshot calls handle.query(AgentWorkflow.get_snapshot)",
+    "26.     Returns WorkflowSnapshot",
+    "27.   Extracts portable snapshot = workflow_snapshot.snapshot (SnapshotBase, no backend session_state)",
+    "28.   Starts new child workflow: workflow.start_child_workflow(AgentWorkflow.run, AgentRequest(snapshot=snapshot, history=workflow_snapshot.history, previous_response_id=..., sandbox_session_state=None))",
+    "29.   Registers new SessionInfo in _sessions registry",
+    "--- RESUME IN NEW/CONTINUING WORKFLOW ---",
+    "30. New AgentWorkflow.run(AgentRequest) initializes: _snapshot=request.snapshot, _conversation_history=request.history, _previous_response_id",
+    "31. On first user message, calls _run_turn -> RunConfig(sandbox=SandboxRunConfig(snapshot=self._snapshot))",
+    "32. SandboxRuntimeSessionManager.ensure_session(agent, capabilities, is_resumed_state) called",
+    "33.   No existing resources -> calls _create_resources(agent, capabilities, is_resumed_state)",
+    "34.   sandbox_config.session is None, calls _resolve_client() -> BaseSandboxClient",
+    "35.   _resume_state_payload_for_agent(client, agent, agent_id) checks run_state._sandbox",
+    "36.     If backend_id mismatch -> raises ValueError",
+    "37.     Looks up sessions_by_agent by resume_key (stable name-based key) or agent_id",
+    "38.     Falls back to current_agent_key / current_agent_name matching",
+    "39.     Returns session_state dict or None",
+    "40.   IF resumed payload found (turn-to-turn or RunState resume):",
+    "41.     explicit_state = client.deserialize_session_state(resumed_payload) -> SandboxSessionState",
+    "42.     _process_resumed_state_manifest(agent, capabilities, session_state) applies capability manifest transforms",
+    "43.     client.resume(explicit_state) -> BaseSandboxSession (existing sandbox reconnected)",
+    "44.   ELSE (fork from snapshot, no session_state):",
+    "45.     _resolve_snapshot_spec(sandbox_config.snapshot) returns SnapshotBase or resolves default",
+    "46.     effective_manifest = _resolve_manifest(agent) / _process_manifest(capabilities, manifest)",
+    "47.     client.create(snapshot=snapshot_spec, manifest=effective_manifest, options=options) -> new SandboxSession seeded from snapshot",
+    "48.   _configure_session_materialization(session, concurrency_limits) sets concurrency",
+    "49.   Returns _SandboxSessionResources(session, client, owns_session=True)",
+    "50. ensure_session calls resources.ensure_started() -> session.start() if not running",
+    "51. Returns BaseSandboxSession; agent tools execute within resumed workspace"
+  ],
+
+  "key_data_structures": {
+    "WorkflowSnapshot": "sandbox_session_state (backend-specific, nullable), snapshot (SnapshotBase portable, nullable), previous_response_id (str|None), history (list[dict])",
+    "AgentRequest": "messages, cwd, backend (str), sandbox_session_state, snapshot (SnapshotBase), previous_response_id, history, manifest",
+    "serialize_resume_state output": "{backend_id, current_agent_key, current_agent_name, session_state: dict, sessions_by_agent: {key: {agent_name, session_state}}}",
+    "SandboxSessionState": "Pydantic model with manifest, parsed via SandboxSessionState.parse(dict)",
+    "SnapshotBase": "Portable snapshot; parsed via SnapshotBase.parse(dict); survives backend switches"
+  },
+
+  "resume_paths": [
+    "turn-to-turn: _sandbox_session_state held in AgentWorkflow memory, passed as RunConfig.session_state each turn",
+    "RunState resume: serialize_resume_state() -> RunState._sandbox -> _resume_state_payload_for_agent() -> client.deserialize_session_state() -> client.resume()",
+    "fork-from-snapshot: WorkflowSnapshot.snapshot passed as RunConfig.snapshot -> client.create(snapshot=...) seeds new session from workspace filesystem"
+  ],
+
+  "branching_conditions": [
+    "sandbox_config.session not None -> use live injected session (no create/resume)",
+    "explicit_state (session_state) provided -> client.resume(explicit_state)",
+    "resumed payload from run_state -> client.deserialize + resume",
+    "snapshot only (fork) -> client.create(snapshot, manifest, options)",
+    "backend_id mismatch -> raise ValueError",
+    "cross_backend fork -> session_state dropped, only portable snapshot carried",
+    "pause_requested -> _paused=True, waits for next message before proceeding",
+    "_done=True -> break main loop, return AgentResponse"
+  ],
+
+  "temporal_mechanisms": [
+    "@workflow.run: AgentWorkflow.run() is the durable event loop",
+    "@workflow.query: get_snapshot(), get_turn_state(), get_history() — read-only state reads",
+    "@workflow.update: pause(), switch_backend() — request-reply mutations with await",
+    "@workflow.signal: send_message(), destroy() — fire-and-forget",
+    "@activity.defn: pause_workflow, query_workflow_snapshot, switch_workflow_backend — run outside sandbox",
+    "SandboxedWorkflowRunner: workflow code runs in restricted sandbox; activities bypass it",
+    "parent_close_policy=ABANDON: child AgentWorkflows survive SessionManagerWorkflow restarts"
+  ],
+
+  "key_relationships": [
+    "AgentWorkflow orchestrates SandboxRuntimeSessionManager (via Runner.run)",
+    "SessionManagerWorkflow forks/destroys AgentWorkflow instances",
+    "WorkflowSnapshot carries state between AgentWorkflow instances (fork boundary)",
+    "SandboxRuntimeSessionManager wraps BaseSandboxClient to create/resume sessions",
+    "SnapshotBase (portable) vs SandboxSessionState (backend-specific) — fork uses only SnapshotBase"
+  ],
+
+  "important_notes": [
+    "WorkflowSnapshot.snapshot is SnapshotBase (portable workspace filesystem snapshot), not session_state",
+    "SandboxSessionState is backend-specific and NOT passed across forks",
+    "serialize_resume_state() is called during cleanup() after each Runner.run()",
+    "_resume_state_payload_for_agent() uses stable agent name-based keys for multi-agent runs",
+    "Temporal durable execution replays workflow history; activities (LLM calls, sandbox ops) are NOT replayed",
+    "pause() is an @workflow.update (awaitable) to safely quiesce before snapshot query",
+    "All sandbox operations run as Temporal activities via OpenAIAgentsPlugin"
+  ],
+
+  "source_files_analyzed": [
+    "examples/sandbox/extensions/temporal/temporal_sandbox_agent.py",
+    "examples/sandbox/extensions/temporal/temporal_session_manager.py",
+    "src/agents/sandbox/runtime_session_manager.py"
+  ]
+}

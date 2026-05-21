@@ -1,0 +1,229 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+}
+
+title Proxy Startup and Initialization
+
+actor "Process" as proc
+participant "main\n(index.js)" as main
+participant "acquireLock /\nreleaseLock" as lock
+participant "startProxy\n(src/proxy/index.js)" as startProxy
+participant "EvoMapProxy" as proxy
+participant "MailboxStore" as store
+participant "LifecycleManager" as lifecycle
+participant "TaskMonitor /\nSkillUpdater /\nDmHandler /\nSessionHandler" as extensions
+participant "SyncEngine" as sync
+participant "OutboundSync /\nInboundSync" as syncsubs
+participant "buildRoutes" as routes
+participant "ProxyHttpServer" as server
+participant "Hub\n(external HTTP)" as hub
+
+proc -> main: node index.js
+
+== Lock Acquisition ==
+
+activate main
+main -> lock: acquireLock()
+activate lock
+note right of lock
+  Writes PID to evolver.pid (flag:wx)
+  If EEXIST: reads existing PID,
+  kill -0 to check liveness;
+  stale PID → overwrite
+end note
+lock --> main: true (lock acquired)
+deactivate lock
+
+alt lock not acquired
+    main -> proc: process.exit(0)
+end
+
+main -> main: register signal handlers\nprocess.on(exit/SIGINT/SIGTERM/\nuncaughtException) → releaseLock()
+
+== Environment Check & Proxy Start ==
+
+main -> main: check env\nEVOMAP_PROXY===1 ||\nA2A_TRANSPORT===mailbox
+
+main -> startProxy: startProxy({ hubUrl: process.env.A2A_HUB_URL })
+activate startProxy
+
+startProxy -> proxy: new EvoMapProxy({ hubUrl, dataDir, port, logger, skillPath })
+activate proxy
+proxy --> startProxy: evoMapProxy instance
+deactivate proxy
+
+startProxy -> proxy: proxy.start()
+activate proxy
+
+== Subsystem Construction ==
+
+proxy -> store: new MailboxStore(dataDir)
+activate store
+note right of store: Opens/creates\nSQLite-backed store
+store --> proxy: mailboxStore instance
+deactivate store
+
+proxy -> lifecycle: new LifecycleManager({ hubUrl, store, logger, getTaskMeta })
+activate lifecycle
+lifecycle --> proxy: lifecycleManager (_running=false)
+deactivate lifecycle
+
+proxy -> extensions: new TaskMonitor({ store, logger })
+activate extensions
+proxy -> extensions: new SkillUpdater({ store, skillPath, logger })
+proxy -> extensions: new DmHandler({ store, logger })
+proxy -> extensions: new SessionHandler({ store, logger })
+extensions --> proxy: extension instances
+deactivate extensions
+
+proxy -> sync: new SyncEngine({ store, hubUrl,\n  getHeaders: ()=>lifecycle._buildHeaders(),\n  onAuthError: ()=>lifecycle.reAuthenticate(),\n  onInboundReceived: ()=>skillUpdater.pollAndApply() })
+activate sync
+sync -> syncsubs: new OutboundSync({ store, hubUrl, getHeaders, logger })
+sync -> syncsubs: new InboundSync({ store, hubUrl, getHeaders, logger })
+activate syncsubs
+syncsubs --> sync: outbound/inbound instances
+deactivate syncsubs
+sync --> proxy: syncEngine instance
+deactivate sync
+
+== Route Building & HTTP Server ==
+
+proxy -> routes: buildRoutes(store, proxyHandlers, taskMonitor,\n{ dmHandler, skillUpdater, sessionHandler, getHubMailboxStatus })
+activate routes
+routes --> proxy: routes map
+deactivate routes
+
+proxy -> proxy: wrap OUTBOUND_ROUTES handlers\nto call sync.notifyNewOutbound() after each call
+
+proxy -> server: new ProxyHttpServer(routes, { port, logger })
+activate server
+server --> proxy: proxyHttpServer (basePort=19820)
+deactivate server
+
+proxy -> server: server.start()
+activate server
+
+server -> server: clearIfStale()\n(removes stale settings file)
+server -> server: http.createServer((req,res) => _handleRequest())
+server -> server: tryListen(server, port)\n(scans ports 19820..19919\nuntil success or EADDRINUSE)
+server -> server: writeSettings({ proxy: { url, pid, started_at } })\n(writes proxy config to disk)
+server --> proxy: { port, url }
+deactivate server
+
+== Hub Lifecycle Hello ==
+
+alt hubUrl is set
+    proxy -> lifecycle: lifecycle.hello()
+    activate lifecycle
+
+    lifecycle -> lifecycle: _buildHeaders()\n(Content-Type + Bearer node_secret\n+ x-correlation-id)
+
+    lifecycle -> hub: POST /a2a/hello\n{ protocol:'gep-a2a', protocol_version:'1.0.0',\n  message_type:'hello', sender_id,\n  env_fingerprint, payload:{ capabilities } }\n[timeout=15s]
+    activate hub
+
+    alt hub rejects registration
+        hub --> lifecycle: { payload: { status: 'rejected' } }
+        lifecycle --> proxy: { ok: false, error }
+    else hub accepts
+        hub --> lifecycle: { payload: { node_secret?, status? } }
+        deactivate hub
+
+        lifecycle -> store: setState('node_secret', secret)
+        activate store
+        store --> lifecycle: ok
+        deactivate store
+
+        lifecycle -> store: setState('node_id', nodeId)
+        activate store
+        store --> lifecycle: ok
+        deactivate store
+
+        lifecycle --> proxy: { ok: true, nodeId, response }
+    end
+    deactivate lifecycle
+
+    == Heartbeat Loop ==
+
+    proxy -> lifecycle: lifecycle.startHeartbeatLoop(intervalMs=360000)
+    activate lifecycle
+    lifecycle -> lifecycle: _running = true
+    lifecycle -> lifecycle: tick() [immediate]
+    activate lifecycle
+    lifecycle -> lifecycle: heartbeat()
+    lifecycle -> hub: POST /a2a/heartbeat\n{ node_id, evolver_version, env_fingerprint,\n  meta: { proxy_version, outbound_pending,\n    inbound_pending, ...taskMeta } }\n[timeout=10s]
+    activate hub
+    hub --> lifecycle: { events[]?, min_proxy_version? }
+    deactivate hub
+
+    opt events present
+        lifecycle -> store: writeInboundBatch(events)
+        activate store
+        store --> lifecycle: ok
+        deactivate store
+    end
+
+    opt min_proxy_version > current
+        lifecycle -> store: writeInbound({ type:'system',\n  payload:{ action:'proxy_upgrade_required' } })
+        activate store
+        store --> lifecycle: ok
+        deactivate store
+    end
+
+    lifecycle -> lifecycle: setTimeout(nextTick,\ninterval or backoff if failures)
+    deactivate lifecycle
+    deactivate lifecycle
+
+    == SyncEngine Start ==
+
+    proxy -> sync: sync.start()
+    activate sync
+    sync -> sync: _running = true
+    sync -> sync: _scheduleOutbound(500ms)\n→ after 500ms: outbound.flush()\n  POST /a2a/mailbox/send
+    sync -> sync: _scheduleInbound(1000ms)\n→ after 1000ms: inbound.pull()\n  + inbound.ackDelivered()
+    sync --> proxy: (sync running)
+    deactivate sync
+
+else hubUrl not set
+    proxy -> proxy: warn: offline mode\n(skip hello/heartbeat/sync)
+end
+
+== Startup Complete ==
+
+proxy --> startProxy: { url, port, nodeId: lifecycle.nodeId }
+deactivate proxy
+
+startProxy --> main: { proxy, url, port, nodeId }
+deactivate startProxy
+
+main -> main: log '[Proxy] Started on ' + proxyInfo.url
+main -> main: registerMailboxTransport()\n(registers mailbox as A2A transport)
+main -> main: process.env.A2A_TRANSPORT = 'mailbox'
+
+deactivate main
+
+@enduml

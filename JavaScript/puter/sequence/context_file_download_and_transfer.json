@@ -1,0 +1,105 @@
+{
+  "scope": "file_download_and_transfer",
+  "title": "File Download and Archive Transfer Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "User",
+    "ContextMenu/OpenItem",
+    "trigger_download",
+    "downloadFile",
+    "AntiCSRFEndpoint",
+    "tarItems",
+    "createTar",
+    "untarItem",
+    "parseTar",
+    "undo_last_action",
+    "undo_upload",
+    "puter.fs",
+    "UIWindowProgress",
+    "Browser"
+  ],
+  "interaction_flows": {
+    "flow_1_single_file_download": [
+      "User → ContextMenu: clicks 'Download' on a file",
+      "ContextMenu → trigger_download: trigger_download([fsentry.path])",
+      "trigger_download → AntiCSRFEndpoint: GET /get-anticsrf-token (Bearer auth_token)",
+      "AntiCSRFEndpoint → trigger_download: { token: anti_csrf }",
+      "trigger_download → downloadFile: downloadFile(url, { anti_csrf, auth_token: puter.authToken })",
+      "downloadFile → Browser: createElement('iframe') + createElement('form'), form.action = '/down?path=...', method POST",
+      "downloadFile → Browser: appends hidden inputs (anti_csrf, auth_token), form.submit()",
+      "Browser → User: triggers file download via iframe form POST",
+      "downloadFile → Browser: setTimeout → removeChild(iframe) after 1000ms"
+    ],
+    "flow_2_tar_creation_download": [
+      "User → ContextMenu: clicks 'Download' on a directory",
+      "ContextMenu → tarItems: tarItems(el_item, dirPath, download=true)",
+      "tarItems → UIWindowProgress: setTimeout 500ms → UIWindowProgress({ title:'tar', show_progress:true })",
+      "tarItems → puter.fs: [dir] readDirectoryRecursive(targetPath) → children[]",
+      "tarItems → puter.fs: [file] puter.fs.read(targetPath) → blob",
+      "tarItems: blobToUint8Array(blob) → Uint8Array; builds files[] = [{name, content:Uint8Array, isDir}]",
+      "tarItems → createTar: createTar(files[]) → Uint8Array (512-byte header blocks + content + padding)",
+      "tarItems: new Blob([tarContents]) → tarBlob",
+      "tarItems → Browser: [download=true] URL.createObjectURL(tarBlob), createElement('a'), a.click() → triggers download",
+      "tarItems → puter.fs: [download=false] puter.fs.write(targetDirPath/name.tar, tarBlob, { overwrite:false, dedupeName:true })"
+    ],
+    "flow_3_tar_extraction": [
+      "User → untarItem: untarItem(itemPath) — e.g. from context menu 'Extract'",
+      "untarItem → UIWindowProgress: setTimeout 500ms → UIWindowProgress({ title:'untar', show_progress:true })",
+      "untarItem → puter.fs: puter.fs.read(filePath) → blob",
+      "untarItem: blobToUint8Array(blob) → Uint8Array file data",
+      "untarItem → parseTar: parseTar(Uint8Array) → files[] = [{name, content:Uint8Array, isDir}]",
+      "untarItem → puter.fs: puter.fs.mkdir(dirname/basename_no_ext, { dedupeName:true }) → rootdir",
+      "untarItem: builds queuedFileWrites[] = [new File([blob], name)] for non-dir entries",
+      "untarItem → puter.fs: puter.fs.upload(queuedFileWrites, rootdir.path+'/', { createFileParent:true, generateThumbnails:true })",
+      "puter.fs → untarItem: progress callback → progwin.set_progress(op_progress)",
+      "puter.fs → untarItem: success callback → progwin.set_progress(100), progwin.close() after delay"
+    ],
+    "flow_4_undo_upload": [
+      "User → undo_last_action: triggers undo (e.g. Ctrl+Z)",
+      "undo_last_action: pops last_action from window.actions_history",
+      "undo_last_action: reads { operation, data } — if operation === 'upload'",
+      "undo_last_action → undo_upload: undo_upload(data) where data = [filePaths...]",
+      "undo_upload → delete_item_with_path: for each file path: delete_item_with_path(file)",
+      "delete_item_with_path → puter.fs: puter.fs.delete({ paths: path, descendantsOnly:false, recursive:true })"
+    ]
+  },
+  "key_function_signatures": {
+    "downloadFile": "function downloadFile(url, postData = {}) — creates hidden iframe form POST",
+    "trigger_download": "window.trigger_download = (paths: string[]) => void — fetches anti-CSRF then calls downloadFile per path",
+    "tarItems": "window.tarItems = async (el_items, targetDirPath, download=true) => void",
+    "createTar": "function createTar(files: [{name, content:Uint8Array, isDir}]) : Uint8Array",
+    "untarItem": "window.untarItem = async (itemPath: string) => void",
+    "parseTar": "function parseTar(data: Uint8Array) : [{name, content:Uint8Array, isDir}]",
+    "undo_last_action": "window.undo_last_action = async () => void — dispatches to undo handlers map",
+    "undo_upload": "window.undo_upload = async (files: string[]) => void",
+    "delete_item_with_path": "window.delete_item_with_path = async (path: string) => void"
+  },
+  "key_relationships": [
+    "ContextMenu/OpenItem depends_on trigger_download (for single file download)",
+    "ContextMenu depends_on tarItems (for directory download)",
+    "trigger_download calls downloadFile",
+    "trigger_download calls AntiCSRFEndpoint (/get-anticsrf-token)",
+    "tarItems calls createTar, puter.fs.read, puter.fs.write, readDirectoryRecursive",
+    "untarItem calls parseTar, puter.fs.read, puter.fs.mkdir, puter.fs.upload",
+    "undo_last_action dispatches_to undo_upload (operation='upload')",
+    "undo_upload calls delete_item_with_path",
+    "delete_item_with_path calls puter.fs.delete"
+  ],
+  "important_notes": [
+    "downloadFile uses hidden iframe + form POST (not fetch) to trigger browser's native download dialog",
+    "trigger_download constructs URL as: window.origin + '/down?path=' + paths[index]",
+    "Auth: anti_csrf token fetched from /get-anticsrf-token, puter.authToken used as auth_token in form POST",
+    "createTar: pure sync function — builds POSIX tar with 512-byte headers, octal size, checksum fields",
+    "parseTar: pure sync function — reads 512-byte headers, validates checksum (256 = EOF), extracts name/size/type",
+    "tarItems download=true branch: uses URL.createObjectURL + anchor click (no server); download=false: writes to puter.fs",
+    "untarItem always writes extracted files to puter.fs via puter.fs.upload with createFileParent:true",
+    "undo_upload deletes all uploaded file paths via puter.fs.delete (recursive)",
+    "Progress UI (UIWindowProgress) shown only if operation takes > 500ms (setTimeout guard)",
+    "window.actions_history stack drives all undo operations; operation types: create_file, create_folder, upload, copy, move, delete, rename"
+  ],
+  "source_files_analyzed": [
+    "src/gui/src/helpers.js (lines 1375-1403: downloadFile, 1426-1454: trigger_download, 2586-2684: tarItems+createTar, 2754-2827: untarItem, 2835+: parseTar, 3006-3038: undo_last_action+undo_upload, 2994-3004: delete_item_with_path)",
+    "src/gui/src/helpers/generate_file_context_menu.js (trigger_download call for file download)",
+    "src/gui/src/helpers/open_item.js (trigger_download call for unsupported file type)"
+  ]
+}

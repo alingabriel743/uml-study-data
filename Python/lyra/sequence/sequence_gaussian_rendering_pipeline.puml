@@ -1,0 +1,155 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipantBackgroundColor #F8F9FA
+skinparam sequenceParticipantBorderColor #495057
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceBoxBackgroundColor #E9ECEF
+skinparam sequenceBoxBorderColor #6C757D
+skinparam noteBorderColor #ADB5BD
+skinparam noteBackgroundColor #FFF9E6
+skinparam activationBarColor #495057
+
+title Gaussian Rendering Pipeline
+
+actor Caller as caller
+
+participant "LatentRecon" as recon
+participant "forward_gaussians" as fg
+participant "patch_embed /\nenc_blocks /\ndecoder" as encoder
+participant "gaussian_processing" as gp
+participant "gaussian_pruning" as gprun
+participant "GaussianRendererDeferred" as grd
+participant "DeferredBP /\nDeferredBPPatch" as dbp
+participant "gsplat.rasterization" as gsplat
+
+== Scene Encoding ==
+
+caller -> recon : forward(data)\n//rays_os, rays_ds, plucker_embedding,\nimages_input_embed, time_embeddings,\ncam_view, intrinsics//
+activate recon
+
+recon -> fg : forward_gaussians(\n  images, plucker_embedding,\n  rays_os, rays_ds,\n  time_embeddings,\n  num_input_multi_views)
+activate fg
+
+fg -> fg : reshape_mv_temp_to_batch(\n  images, plucker, rays_os, rays_ds)
+
+fg -> encoder : forward_checkpointing(patch_embed, images_input)\n//patchify [B,V,C,H,W] → tokens//
+activate encoder
+
+opt Time embeddings present
+    fg -> encoder : get_time_embedding(time_embeddings)\n//add input + target time tokens//
+end
+
+fg -> encoder : forward_checkpointing(patch_plucker_embed, plucker_embedding)\n//add Plucker ray tokens//
+
+loop Transformer/Mamba encoder blocks
+    fg -> encoder : forward_checkpointing(blk, x)
+end
+
+fg -> encoder : forward_checkpointing(enc_norm, x)
+note right : optional channel\nreduction linear
+
+fg -> encoder : forward_checkpointing(deconv / decoder_cosmos, x)\n//upsample [B,C,T,H,W]//
+encoder --> fg : upsampled feature tokens
+deactivate encoder
+
+opt Gaussian subsampling enabled
+    fg -> fg : subsample_x_and_rays_wrapper(x, rays_os, rays_ds)\n//learned mask or random pruning//
+end
+
+== Gaussian Parameter Prediction ==
+
+fg -> gp : gaussian_processing(x, rays_os, rays_ds)
+activate gp
+
+gp -> gp : split x → distance(1), rgb(3),\n  scaling(3), rotation(4), opacity(1)
+note right
+  Activations applied:
+  opacity  = sigmoid(x − 2.0)
+  scale    = min(exp(x − shift), cap)
+  rotation = F.normalize(x, dim=−1)
+  rgb      = 0.5 × tanh(x) + 0.5
+  pos      = rays_os + rays_ds × depth
+end note
+
+gp --> fg : gaussians [B, N, 14]\n//layout: pos(0:3)|opacity(3:4)|scale(4:7)|rot(7:11)|rgb(11:14)//
+deactivate gp
+
+fg -> gprun : gaussian_pruning(gaussians)\n//rank by opacity; keep top-K + random fraction//
+activate gprun
+gprun --> fg : pruned gaussians, gaussians_mask
+deactivate gprun
+
+fg --> recon : gaussians [B, N, 14], gaussians_mask
+deactivate fg
+
+== Deferred Rasterization ==
+
+recon -> grd : gs.render(\n  gaussians, cam_view, bg_color,\n  intrinsics, patch_size)
+activate grd
+
+grd -> grd : parse gaussian tensor\n//means3D[0:3], opacity[3], scale[4:7],\nrotation[7:11], rgb[11:14]//\nbuild viewmat, Ks, backgrounds
+
+note over grd : OOM guard: loops over\ndownscale factors [1,2,4,8];\nrescales intrinsics + interpolates\noutput back to original size
+
+alt patch_size is None → DeferredBP path
+    grd -> dbp : DeferredBP.apply(\n  means3D, rgbs, scales, rotations, opacity,\n  viewmat, Ks, W, H, near, far,\n  backgrounds, raster_kwargs)
+    activate dbp
+
+    loop B × V views
+        dbp -> gsplat : rasterization(\n  means, quats, scales, opacities,\n  colors, viewmats, Ks, W, H,\n  near, far, backgrounds,\n  render_mode='RGB+ED')
+        activate gsplat
+        gsplat --> dbp : rgbd[H,W,4], alpha[H,W,1]
+        deactivate gsplat
+        dbp -> dbp : store image, alpha, depth\n//requires_grad=True for deferred backward//
+    end
+
+    dbp --> grd : images[B,V,H,W,3],\nalphas[B,V,H,W,1],\ndepths[B,V,H,W,1]
+    deactivate dbp
+
+else patch_size is set → DeferredBPPatch path
+    grd -> dbp : DeferredBPPatch.apply(\n  ..., patch_size, ...)
+    activate dbp
+
+    loop B × V views (patch-tiled)
+        dbp -> gsplat : rasterization(...)\n//patch-cropped Ks, H_patch, W_patch//
+        activate gsplat
+        gsplat --> dbp : patch rgbd, alpha
+        deactivate gsplat
+    end
+
+    dbp --> grd : assembled images, alphas, depths
+    deactivate dbp
+end
+
+grd -> grd : permute → [B,V,3,H,W] / [B,V,1,H,W]
+
+grd --> recon : out_dict {\n  images_pred [B,V,3,H,W],\n  alphas_pred [B,V,1,H,W],\n  depths_pred [B,V,1,H,W]}
+deactivate grd
+
+== Output ==
+
+alt Training mode
+    recon --> caller : out {\n  images_pred, depths_pred,\n  opacity_pred}
+else Inference mode
+    recon --> caller : out {\n  images_pred, depths_pred,\n  opacity_pred, gaussians,\n  gaussians_mask, + full results}
+end
+
+deactivate recon
+
+@enduml

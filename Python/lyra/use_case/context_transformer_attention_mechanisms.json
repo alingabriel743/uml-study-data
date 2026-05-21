@@ -1,0 +1,176 @@
+{
+  "scope": "transformer_attention_mechanisms",
+  "title": "Transformer Attention Mechanisms",
+  "diagram_type": "use_case",
+  "description": "System applies various attention strategies within DIT blocks (full, cross, memory-efficient) for multi-view video diffusion transformers.",
+
+  "actors": [
+    "DITBuildingBlock",
+    "Block",
+    "CrossAttentionBlock",
+    "GeneralDITTransformerBlock",
+    "MultiviewGeneralDIT"
+  ],
+
+  "attention_classes": [
+    {
+      "name": "Attention",
+      "base": "nn.Module",
+      "file": "Lyra-1/src/models/utils/attention.py:114",
+      "type": "full_self_attention",
+      "signature": "__init__(dim, num_heads=8, qkv_bias=False, proj_bias=True, attn_drop=0.0, proj_drop=0.0, use_qk_norm=False)",
+      "forward": "forward(x: Tensor) -> Tensor",
+      "mechanism": "Single qkv linear → split Q/K/V → scaled dot-product softmax attention",
+      "key_components": ["qkv: nn.Linear(dim, dim*3)", "proj: nn.Linear(dim, dim)", "optional q_norm/k_norm: RMSNorm(head_dim)"]
+    },
+    {
+      "name": "CrossAttention",
+      "base": "nn.Module",
+      "file": "Lyra-1/src/models/utils/attention.py:173",
+      "type": "cross_attention",
+      "signature": "__init__(dim, num_heads=8, qkv_bias=False, proj_bias=True, attn_drop=0.0, proj_drop=0.0, use_qk_norm=False)",
+      "forward": "forward(x: Tensor, y: Tensor) -> Tensor",
+      "mechanism": "Separate to_q(x), to_k(y), to_v(y) projections → scaled dot-product softmax cross-attention",
+      "key_components": ["to_q: nn.Linear(dim, dim)", "to_k: nn.Linear(dim, dim)", "to_v: nn.Linear(dim, dim)", "proj: nn.Linear(dim, dim)"]
+    },
+    {
+      "name": "MemEffAttentionFlash",
+      "base": "Attention",
+      "file": "Lyra-1/src/models/utils/attention.py:236",
+      "type": "memory_efficient_self_attention",
+      "forward": "forward(x: Tensor, attn_bias=None) -> Tensor",
+      "mechanism": "Inherits Attention layers; overrides forward with flash_attn_func(q, k, v); no explicit softmax",
+      "backend": "flash_attn.flash_attn_func",
+      "note": "Skips manual softmax; supports optional qk_norm"
+    },
+    {
+      "name": "MemEffCrossAttentionFlash",
+      "base": "CrossAttention",
+      "file": "Lyra-1/src/models/utils/attention.py:254",
+      "type": "memory_efficient_cross_attention",
+      "forward": "forward(q: Tensor, k: Tensor, v: Tensor, attn_bias=None) -> Tensor",
+      "mechanism": "Pre-split q/k/v tensors → to_q/to_k/to_v projections → flash_attn_func(q, k, v)",
+      "backend": "flash_attn.flash_attn_func",
+      "note": "Accepts externally split q/k/v unlike base CrossAttention which accepts (x, y)"
+    },
+    {
+      "name": "MemEffAttentionFlex",
+      "base": "nn.Module",
+      "file": "Lyra-1/src/models/utils/attention.py:273",
+      "type": "flex_self_attention",
+      "signature": "__init__(dim, num_heads=8, qkv_bias=False, proj_bias=True, attn_drop=0.0, proj_drop=0.0, flex_attn_block_mask=None, use_qk_norm=False)",
+      "forward": "forward(x: Tensor, attn_bias=None) -> Tensor",
+      "mechanism": "Single qkv linear → unbind Q/K/V → permute to (B,H,N,D) → flex_attn_func_compiled(q, k, v, block_mask=...)",
+      "backend": "torch.nn.attention.flex_attention (compiled)",
+      "note": "Supports custom sparsity via flex_attn_block_mask; torch.compile for efficiency; independent from Attention class"
+    }
+  ],
+
+  "block_wrappers": [
+    {
+      "name": "Block",
+      "file": "Lyra-1/src/models/utils/attention.py:346",
+      "forward": "forward(x) -> x + drop_path(attn(norm1(x))) + drop_path(mlp(norm2(x)))",
+      "attention_selection": "if use_flex_attention → MemEffAttentionFlex(flex_attn_block_mask=...) else MemEffAttentionFlash",
+      "components": ["norm1: LayerNorm", "attn: MemEffAttentionFlex OR MemEffAttentionFlash", "norm2: LayerNorm", "mlp: Mlp", "drop_path: DropPath"]
+    },
+    {
+      "name": "CrossAttentionBlock",
+      "file": "Lyra-1/src/models/utils/attention.py:386",
+      "forward": "forward(x: Tensor, y: Tensor) → x + drop_path(attn(norm1(x), y, y)) + drop_path(mlp(norm2(x)))",
+      "attention_selection": "always MemEffCrossAttentionFlash",
+      "note": "norm_y(y) applied before passing y as k/v to attn"
+    },
+    {
+      "name": "DITBuildingBlock (cosmos_predict1)",
+      "file": "Lyra-1/cosmos_predict1/diffusion/module/blocks.py:344",
+      "block_type_mapping": {
+        "fa / full_attn": "full self-attention via VideoAttention (uses TE DotProductAttention backend)",
+        "ca / cross_attn": "cross-attention",
+        "mlp / ff": "feedforward MLP"
+      },
+      "training_extra_types": ["ssa / spatial_sa", "tsa / temporal_sa", "wa / window_attn"]
+    },
+    {
+      "name": "GeneralDITTransformerBlock",
+      "file": "Lyra-1/cosmos_predict1/diffusion/module/blocks.py:478",
+      "pattern": "Parses block_config string (e.g. 'FA-CA-MLP') by splitting on '-' and creating a DITBuildingBlock per token",
+      "forward": "forward(x, emb_B_D, crossattn_emb, crossattn_mask, rope_emb_L_1_1_D, adaln_lora_B_3D, extra_per_block_pos_emb)",
+      "extra_pos_emb": "added to x before iterating blocks"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "name": "Perform Full Self-Attention",
+      "actors": ["Block", "DITBuildingBlock(fa)"],
+      "attention_impl": ["Attention (standard softmax)", "MemEffAttentionFlash (default in Block)", "MemEffAttentionFlex (when use_flex_attention=True)"],
+      "input": "x: Tensor [B, N, C]",
+      "output": "attended x: Tensor [B, N, C]"
+    },
+    {
+      "name": "Perform Cross-Attention",
+      "actors": ["CrossAttentionBlock", "DITBuildingBlock(ca)"],
+      "attention_impl": ["CrossAttention (standard softmax)", "MemEffCrossAttentionFlash (default in CrossAttentionBlock)"],
+      "input": "x (query source), y (key/value source: context embeddings)",
+      "output": "context-attended x: Tensor [B, N, C]"
+    },
+    {
+      "name": "Apply Flash Attention Backend",
+      "actors": ["MemEffAttentionFlash", "MemEffCrossAttentionFlash"],
+      "trigger": "Default when Flash Attention library is available",
+      "benefit": "Memory-efficient, fused kernel, no explicit softmax materialization"
+    },
+    {
+      "name": "Apply Flex Attention with Block Mask",
+      "actors": ["MemEffAttentionFlex"],
+      "trigger": "Block constructed with use_flex_attention=True and flex_attn_block_mask",
+      "benefit": "Sparse/custom attention patterns (e.g., causal, sliding window) via compiled mask"
+    },
+    {
+      "name": "Configure Block Sequence via block_config",
+      "actors": ["GeneralDITTransformerBlock", "MultiviewGeneralDIT"],
+      "mechanism": "block_config string (e.g. 'FA-CA-MLP') → parsed → DITBuildingBlock per token",
+      "example_configs": ["FA-CA-MLP", "ca-fa-mlp"],
+      "note": "MultiviewGeneralDIT adds n_views parameter and supports layer_mask to skip blocks"
+    },
+    {
+      "name": "Apply QK Normalization",
+      "actors": ["Attention", "CrossAttention", "MemEffAttentionFlash", "MemEffCrossAttentionFlash", "MemEffAttentionFlex"],
+      "trigger": "use_qk_norm=True at construction",
+      "mechanism": "q_norm and k_norm: RMSNorm(head_dim) applied before attention computation"
+    }
+  ],
+
+  "inheritance_hierarchy": [
+    "MemEffAttentionFlash extends Attention (overrides forward only)",
+    "MemEffCrossAttentionFlash extends CrossAttention (overrides forward signature to accept pre-split q/k/v)",
+    "MemEffAttentionFlex extends nn.Module (independent, not from Attention)",
+    "MultiviewGeneralDIT extends GeneralDIT (reinitializes self.blocks with n_views support)"
+  ],
+
+  "key_relationships": [
+    "Block composes MemEffAttentionFlash OR MemEffAttentionFlex (selected at init)",
+    "CrossAttentionBlock composes MemEffCrossAttentionFlash (always)",
+    "DITBuildingBlock instantiates VideoAttention (TE-based) for fa/ca block types",
+    "GeneralDITTransformerBlock composes list of DITBuildingBlock from block_config string",
+    "MultiviewGeneralDIT composes GeneralDITTransformerBlock per block index (with optional layer_mask)"
+  ],
+
+  "important_notes": [
+    "Two parallel attention stacks: (1) src/models/utils/attention.py uses Flash/Flex backends; (2) cosmos_predict1 uses TransformerEngine DotProductAttention",
+    "block_config='FA-CA-MLP' is default for MultiviewGeneralDIT (full-attn → cross-attn → MLP per transformer block)",
+    "Training variant of GeneralDITTransformerBlock supports additional window/spatial/temporal attention types",
+    "MemEffCrossAttentionFlash.forward has a bug: uses self.to_q(v) instead of self.to_v(v) at line 263",
+    "flex_attn_func is compiled with torch.compile and may not be available on all platforms (guarded with try/except)",
+    "All attention classes support optional QK normalization via RMSNorm for training stability"
+  ],
+
+  "source_files_analyzed": [
+    "Lyra-1/src/models/utils/attention.py",
+    "Lyra-1/cosmos_predict1/diffusion/networks/general_dit_multiview.py",
+    "Lyra-1/cosmos_predict1/diffusion/training/networks/general_dit_multiview.py",
+    "Lyra-1/cosmos_predict1/diffusion/module/blocks.py",
+    "Lyra-1/cosmos_predict1/diffusion/training/module/blocks.py"
+  ]
+}

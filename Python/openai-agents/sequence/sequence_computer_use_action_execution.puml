@@ -1,0 +1,228 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipant underline
+skinparam sequenceBoxBackgroundColor #E9ECEF
+skinparam sequenceBoxBorderColor #6C757D
+skinparam noteBackgroundColor #FFF9C4
+skinparam noteBorderColor #F0AD4E
+skinparam activationBarColor #ADB5BD
+skinparam sequenceLifeLineBorderColor #495057
+
+title Computer Use Action Execution
+
+actor "Agent Runner\n(ToolPlanning)" as runner
+
+participant "execute_computer\n_actions()" as exec_fn
+participant "ComputerAction\n.execute()" as ca
+participant "with_tool_function\n_span()" as span
+participant "resolve_computer()" as resolve
+participant "RunHooks /\nAgentHooks" as hooks
+participant "_execute_action\n_and_capture()" as eac
+participant "LocalPlaywright\nComputer" as lpc
+
+== Orchestration ==
+
+runner -> exec_fn : execute_computer_actions(\n  agent, actions: list[ToolRunComputerAction],\n  hooks, context_wrapper, config)
+activate exec_fn
+
+note over exec_fn
+  Iterates **serially** over each
+  ToolRunComputerAction in the list
+end note
+
+loop for each ToolRunComputerAction
+
+    == Safety Check (optional) ==
+
+    opt pending_safety_checks exist on tool_call
+        exec_fn -> hooks : on_safety_check(\n  ComputerToolSafetyCheckData)
+        activate hooks
+        hooks --> exec_fn : bool (acknowledged?)
+        deactivate hooks
+        note right of exec_fn
+          Builds acknowledged_safety_checks list
+          for inclusion in ComputerCallOutput
+        end note
+    end
+
+    == Action Execution with Tracing ==
+
+    exec_fn -> ca : ComputerAction.execute(\n  agent, action, hooks,\n  context_wrapper, config,\n  acknowledged_safety_checks)
+    activate ca
+
+    ca -> span : with_tool_function_span(\n  config, tool_name='computer', fn=_run_action)
+    activate span
+    note right of span
+      Span input set to serialized
+      tool_call payload only when
+      trace_include_sensitive_data=True
+    end note
+
+    == Resolve Computer Backend ==
+
+    span -> resolve : resolve_computer(\n  tool=action.computer_tool,\n  run_context=context_wrapper)
+    activate resolve
+    note right of resolve
+      If computer is **ComputerProvider**:
+        → provider.create(run_context)
+      Else: return computer directly.
+      Result cached in WeakKeyDictionary
+      per run_context.
+    end note
+    resolve --> span : ComputerLike\n(Computer | AsyncComputer)
+    deactivate resolve
+
+    == Hook Notifications (concurrent) ==
+
+    span -> hooks : on_tool_start(\n  context_wrapper, agent, computer_tool)
+    activate hooks
+    note right of hooks
+      RunHooks and AgentHooks
+      called concurrently
+    end note
+    hooks --> span : (acknowledged)
+    deactivate hooks
+
+    == Dispatch & Capture ==
+
+    span -> eac : _execute_action_and_capture(\n  computer, tool_call: ResponseComputerToolCall)
+    activate eac
+
+    note over eac
+      **_iter_actions(tool_call)** normalises
+      both GA (actions[] array) and legacy
+      (single action field) into a list
+    end note
+
+    alt action.type == "screenshot"
+        eac -> lpc : screenshot()
+        activate lpc
+        lpc --> eac : base64 PNG string\n(result cached;\nlast_action_was_screenshot=True)
+        deactivate lpc
+
+    else action.type == "click"
+        eac -> lpc : click(x, y, button, keys?)
+        activate lpc
+        note right of lpc
+          _hold_keys(keys) → mouse.click()
+          → keyboard.up (reverse order)
+          _filter_supported_kwargs drops
+          unsupported kwargs with warning
+        end note
+        lpc --> eac : (done)
+        deactivate lpc
+
+    else action.type == "double_click"
+        eac -> lpc : double_click(x, y, keys?)
+        activate lpc
+        lpc --> eac : (done)
+        deactivate lpc
+
+    else action.type == "type"
+        eac -> lpc : type(text)
+        activate lpc
+        lpc --> eac : (done)
+        deactivate lpc
+
+    else action.type == "keypress"
+        eac -> lpc : keypress(keys)
+        activate lpc
+        note right of lpc
+          Keys normalised via
+          CUA_KEY_TO_PLAYWRIGHT_KEY map
+        end note
+        lpc --> eac : (done)
+        deactivate lpc
+
+    else action.type == "scroll"
+        eac -> lpc : scroll(x, y, scroll_x, scroll_y, keys?)
+        activate lpc
+        note right of lpc
+          mouse.move(x,y) →
+          window.scrollBy(scroll_x, scroll_y)
+        end note
+        lpc --> eac : (done)
+        deactivate lpc
+
+    else action.type == "drag"
+        eac -> lpc : drag(path: list[tuple[int,int]], keys?)
+        activate lpc
+        note right of lpc
+          mouse.down() → move each
+          path point → mouse.up()
+        end note
+        lpc --> eac : (done)
+        deactivate lpc
+
+    else action.type == "move"
+        eac -> lpc : move(x, y, keys?)
+        activate lpc
+        lpc --> eac : (done)
+        deactivate lpc
+
+    else action.type == "wait"
+        eac -> lpc : wait()
+        activate lpc
+        lpc --> eac : (done)
+        deactivate lpc
+    end
+
+    opt last action was NOT a screenshot
+        eac -> lpc : screenshot()
+        activate lpc
+        note right of lpc
+          Always capture final browser
+          state after non-screenshot actions
+        end note
+        lpc --> eac : base64 PNG string
+        deactivate lpc
+    end
+
+    eac --> span : base64 screenshot string
+    deactivate eac
+
+    == Post-action Hook & Output Assembly ==
+
+    span -> hooks : on_tool_end(\n  context_wrapper, agent,\n  computer_tool, output)
+    activate hooks
+    note right of hooks
+      RunHooks and AgentHooks
+      called concurrently
+    end note
+    hooks --> span : (acknowledged)
+    deactivate hooks
+
+    note over span
+      image_url = 'data:image/png;base64,{output}'
+      Span output set to image_url only when
+      trace_include_sensitive_data=True
+    end note
+
+    span --> ca : image_url (base64 data URI)
+    deactivate span
+
+    ca --> exec_fn : ToolCallOutputItem(\n  agent,\n  output=image_url,\n  raw_item=ComputerCallOutput{\n    type='computer_call_output',\n    output={type='computer_screenshot',\n            image_url=image_url},\n    acknowledged_safety_checks=...})
+    deactivate ca
+
+end
+
+exec_fn --> runner : list[ToolCallOutputItem]
+deactivate exec_fn
+
+@enduml

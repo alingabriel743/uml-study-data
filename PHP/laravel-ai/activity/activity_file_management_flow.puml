@@ -1,0 +1,158 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam note {
+    BackgroundColor #E8F4FD
+    BorderColor #6C757D
+    FontSize 11
+}
+
+title File Upload & Management Flow
+
+|Caller|
+start
+
+if (Operation?) then (Upload File)
+
+  if (Entry Point?) then (putFromPath)
+    |Files Facade|
+    :Files::putFromPath(path, ?mimeType, ?name, ?provider);
+    :Document::fromPath(path)\n→ create LocalDocument;
+    note right
+      content() = file_get_contents(path)
+      mimeType() = Filesystem->mimeType(path)
+      name() = basename(path)
+    end note
+    if (File readable from path?) then (no)
+      #FFB3B3:throw RuntimeException;
+      detach
+    else (yes)
+    endif
+    :Delegate to Files::put(LocalDocument, mimeType, name, provider);
+
+  elseif (putFromStorage) then (putFromStorage)
+    |Files Facade|
+    :Files::putFromStorage(path, ?disk, ?name, ?provider);
+    :Document::fromStorage(path, disk)\n→ create StoredDocument;
+    note right
+      content() = Storage::disk(disk)->get(path)
+      mimeType() = Storage::disk(disk)->mimeType(path)
+    end note
+    if (File exists on Storage disk?) then (no)
+      #FFB3B3:throw RuntimeException;
+      detach
+    else (yes)
+    endif
+    :Delegate to Files::put(StoredDocument, null, name, provider);
+
+  else (put / CanBeUploadedToProvider)
+    |Files Facade|
+    :Files::put(file, ?mimeType, ?name, ?provider)\nor Document->put() via CanBeUploadedToProvider trait;
+  endif
+
+  |Files Facade|
+  if (Input type of $file?) then (string)
+    :Wrap → Base64Document\n(base64_encode(string), mimeType)\n->as(name);
+  elseif (UploadedFile) then (UploadedFile)
+    :Wrap → Base64Document::fromUpload(file)\n->as(name ?? file->getClientOriginalName());
+  else (StorableFile already\nBase64Document / LocalDocument\n/ StoredDocument)
+    :Use StorableFile as-is;
+  endif
+
+  :Ai::fakeableFileProvider(provider)\n→ resolve FileProvider instance;
+
+  |ManagesFiles (Provider)|
+  :Generate UUID7 invocationId;
+
+  if (Ai::filesAreFaked()?) then (yes)
+    :Ai::recordFileUpload(file)\n[stub for test assertions — no HTTP call];
+    |Files Facade|
+    :Return stub StoredFileResponse;
+    |Caller|
+    :Receive StoredFileResponse;
+    stop
+
+  else (no — real upload)
+
+    :Dispatch StoringFile event\n(invocationId, provider, file);
+
+    |FileGateway|
+    :PreparesStorableFiles::prepareStorableFile(file)\n→ extract [content, mimeType, name];
+
+    if (Provider?) then (OpenAI)
+      :POST /files\nContent-Type: multipart/form-data\npart: file (content + name)\npurpose = 'user_data';
+    elseif (Anthropic) then (Anthropic)
+      :POST /files\nanthropic-beta: files-api-2025-04-14\nContent-Type: multipart/form-data\npart: file (content + mimeType + name);
+    else (Gemini)
+      :POST /upload/v1beta/files\nX-Goog-Upload-Protocol: multipart\ndisplay_name in JSON metadata part\nfile content in binary part;
+    endif
+
+    :Parse provider response\n→ extract file ID;
+    :Return StoredFileResponse(responseId);
+
+    |ManagesFiles (Provider)|
+    :Dispatch FileStored event\n(invocationId, provider, file, StoredFileResponse);
+
+    |Files Facade|
+    :Return StoredFileResponse to Caller;
+
+    |Caller|
+    :Receive StoredFileResponse\n(holds provider-side file ID);
+    stop
+
+  endif
+
+else (Delete File)
+
+  if (Entry Point?) then (Files::delete\nor ProviderDocument->delete()\nvia CanBeRetrievedOrDeletedFromProvider)
+  endif
+
+  |Files Facade|
+  :Files::delete(fileId, ?provider);
+
+  :Ai::fakeableFileProvider(provider)\n→ resolve FileProvider instance;
+
+  |ManagesFiles (Provider)|
+  :Generate UUID7 invocationId;
+
+  if (Ai::filesAreFaked()?) then (yes)
+    :Ai::recordFileDeletion(fileId)\n[stub for test assertions — no HTTP call];
+    |Caller|
+    stop
+
+  else (no — real delete)
+
+    |FileGateway|
+    :DELETE /files/{fileId}\n(Gemini: normalise ID → "files/{id}" prefix if missing);
+
+    :HTTP 200/204 response;
+
+    |ManagesFiles (Provider)|
+    :Dispatch FileDeleted event\n(invocationId, provider, fileId);
+
+    |Caller|
+    stop
+
+  endif
+
+endif
+
+@enduml

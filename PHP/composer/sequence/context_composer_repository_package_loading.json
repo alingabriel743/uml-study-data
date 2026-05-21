@@ -1,0 +1,109 @@
+{
+  "scope": "composer_repository_package_loading",
+  "title": "Composer Repository Package Loading",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "PoolBuilder",
+    "ComposerRepository",
+    "Cache",
+    "HttpDownloader",
+    "Loop",
+    "EventDispatcher",
+    "ArrayLoader",
+    "Pool"
+  ],
+  "class_structure": {
+    "ComposerRepository": {
+      "extends": "ArrayRepository",
+      "implements": ["ConfigurableRepositoryInterface", "AdvisoryProviderInterface", "FilterListProviderInterface"],
+      "constructor": "__construct(array $repoConfig, IOInterface $io, Config $config, HttpDownloader $httpDownloader, ?EventDispatcher $eventDispatcher)",
+      "key_fields": ["$url", "$baseUrl", "$cache (Cache)", "$httpDownloader", "$loop (Loop)", "$loader (ArrayLoader)", "$lazyProvidersUrl", "$providersUrl", "$rootData", "$availablePackages", "$hasAvailablePackageList", "$providerListing", "$partialPackagesByName"]
+    },
+    "PoolBuilder": {
+      "key_method": "buildPool(array $repositories, Request $request): Pool",
+      "const": "LOAD_BATCH_SIZE = 50"
+    }
+  },
+  "interaction_flow": [
+    "== V2 Protocol (Packagist / metadata-url) ==",
+    "PoolBuilder → PoolBuilder: buildPool(repositories, request)",
+    "PoolBuilder → PoolBuilder: loop while packagesToLoad > 0 → loadPackagesMarkedForLoading(request, repositories)",
+    "PoolBuilder → ComposerRepository: loadPackages(packageNameMap, acceptableStabilities, stabilityFlags, alreadyLoaded)",
+    "ComposerRepository → ComposerRepository: hasProviders() → triggers loadRootServerFile()",
+    "ComposerRepository → Cache: read('packages.json')",
+    "alt [cache miss OR stale]",
+    "  ComposerRepository → EventDispatcher: dispatch(PRE_FILE_DOWNLOAD, filename='packages.json')",
+    "  ComposerRepository → HttpDownloader: get(packagesJsonUrl, options) → Response",
+    "  ComposerRepository → Response: decodeJson() → rootData",
+    "  ComposerRepository → Cache: write('packages.json', json)",
+    "  ComposerRepository → EventDispatcher: dispatch(POST_FILE_DOWNLOAD)",
+    "alt [cache hit with last-modified]",
+    "  ComposerRepository → HttpDownloader: get(url, {If-Modified-Since: lastModifiedTime}) → 304 or new data",
+    "end",
+    "ComposerRepository → ComposerRepository: parse rootData → set lazyProvidersUrl (metadata-url), availablePackages, hasAvailablePackageList",
+    "ComposerRepository → ComposerRepository: loadAsyncPackages(packageNameMap, acceptableStabilities, stabilityFlags, alreadyLoaded)",
+    "loop [for each packageName in packageNameMap]",
+    "  ComposerRepository → ComposerRepository: startCachedAsyncDownload(name, realName) → Promise",
+    "  ComposerRepository → Cache: read('provider-{name}~dev.json') → lastModified",
+    "  ComposerRepository → EventDispatcher: dispatch(PRE_FILE_DOWNLOAD, metadataUrl/%package%)",
+    "  ComposerRepository → HttpDownloader: addCopy/async GET(metadataUrl, options) → Promise<Response>",
+    "end",
+    "ComposerRepository → Loop: wait(promises) [resolve all async downloads]",
+    "loop [for each resolved response]",
+    "  ComposerRepository → ComposerRepository: MetadataMinifier::expand(versions) [if minified v2]",
+    "  ComposerRepository → ComposerRepository: isVersionAcceptable(constraint, name, versionData, stabilities)",
+    "  ComposerRepository → ArrayLoader: createPackages(versionsToLoad, packagesSource)",
+    "  ComposerRepository → Package: setRepository(this)",
+    "end",
+    "ComposerRepository → PoolBuilder: return {namesFound, packages}",
+    "PoolBuilder → PoolBuilder: markPackageNameForLoading for each new dependency found",
+    "== After all packages loaded ==",
+    "PoolBuilder → PoolBuilder: runSecurityAdvisoryFilter(pool, repositories, request)",
+    "PoolBuilder → PoolBuilder: runFilterListFilter(pool, repositories, request)",
+    "PoolBuilder → PoolBuilder: runOptimizer(request, pool)",
+    "PoolBuilder → Pool: new Pool(packages, unacceptableFixedOrLockedPackages)",
+    "PoolBuilder → caller: return pool",
+    "",
+    "== V1 Protocol (providers-url) ==",
+    "ComposerRepository → ComposerRepository: loadPackages() → hasProviders=true → calls whatProvides(name,...)",
+    "ComposerRepository → Cache: read('provider-{vendor}${pkg}.json') check sha256",
+    "alt [cache miss]",
+    "  ComposerRepository → ComposerRepository: fetchFile(providerUrl, cacheKey, sha256Hash)",
+    "  ComposerRepository → HttpDownloader: get(url, options) [up to 3 retries]",
+    "  ComposerRepository → Cache: write(cacheKey, json)",
+    "alt [cache hit by last-modified (lazyProvidersUrl V1)]",
+    "  ComposerRepository → ComposerRepository: fetchFileIfLastModified(url, cacheKey, lastModified)",
+    "  ComposerRepository → HttpDownloader: get(url, {If-Modified-Since}) → 304 or data",
+    "end",
+    "ComposerRepository → ComposerRepository: createPackages(versionsToLoad, packagesSource) → BasePackage[]",
+    "ComposerRepository → PoolBuilder: return packages"
+  ],
+  "key_relationships": [
+    "PoolBuilder depends_on ComposerRepository (calls loadPackages)",
+    "ComposerRepository depends_on HttpDownloader (HTTP GET, async)",
+    "ComposerRepository depends_on Cache (read/write JSON files)",
+    "ComposerRepository depends_on Loop (React promise waiting)",
+    "ComposerRepository depends_on EventDispatcher (PRE/POST_FILE_DOWNLOAD hooks)",
+    "ComposerRepository depends_on ArrayLoader (createPackages from raw data)",
+    "ComposerRepository extends ArrayRepository (fallback loadPackages for static repos)",
+    "PoolBuilder creates Pool (final result)"
+  ],
+  "protocol_variants": {
+    "v2_metadata_url": "Uses lazyProvidersUrl (metadata-url), async HTTP, MetadataMinifier::expand(), supports available-packages list for filtering, per-package JSON at p2/{vendor}/{pkg}.json",
+    "v1_providers_url": "Uses providersUrl with sha256 hash in URL, synchronous fetchFile(), provider listing must be loaded first",
+    "v1_lazy_providers": "Uses providers-lazy-url, last-modified conditional fetch, fetchFileIfLastModified()",
+    "static_packages_json": "No providers/lazyUrl, falls through to parent ArrayRepository::loadPackages()"
+  },
+  "caching_strategy": {
+    "root_file": "packages.json in cache-repo-dir, conditional fetch via If-Modified-Since",
+    "provider_files": "provider-{vendor}~{pkg}.json (V2) or provider-{vendor}${pkg}.json (V1), keyed by sha256 (V1) or last-modified (V2)",
+    "cache_read_only": "respected - no writes if cache-read-only=true",
+    "degraded_mode": "on HTTP error, falls back to stale cache with warning"
+  },
+  "important_notes": "ComposerRepository supports both V1 (providers-url + sha256) and V2 (metadata-url + async + minified) protocols. V2 is preferred for Packagist. The loadAsyncPackages method fires all HTTP requests as React promises and resolves them via Loop::wait(). PoolBuilder calls loadPackages iteratively in batches (LOAD_BATCH_SIZE=50) until the dependency graph is fully resolved. EventDispatcher hooks allow plugins to intercept/modify download URLs and options (PRE_FILE_DOWNLOAD / POST_FILE_DOWNLOAD).",
+  "source_files_analyzed": [
+    "src/Composer/Repository/ComposerRepository.php",
+    "src/Composer/DependencyResolver/PoolBuilder.php",
+    "src/Composer/DependencyResolver/Pool.php"
+  ]
+}

@@ -1,0 +1,107 @@
+{
+  "scope": "base_pipeline_lifecycle",
+  "title": "Base World Generation Pipeline Lifecycle",
+  "diagram_type": "activity",
+  "source_files_analyzed": [
+    "Lyra-1/cosmos_predict1/utils/base_world_generation_pipeline.py"
+  ],
+  "class": {
+    "name": "BaseWorldGenerationPipeline",
+    "type": "abstract (ABC)",
+    "module": "cosmos_predict1.utils.base_world_generation_pipeline"
+  },
+  "init_parameters": [
+    "inference_type: str | None",
+    "checkpoint_dir: str | None",
+    "checkpoint_name: str | None",
+    "has_text_input: bool = False",
+    "offload_network: bool = False",
+    "offload_tokenizer: bool = False",
+    "offload_text_encoder_model: bool = False",
+    "offload_guardrail_models: bool = False",
+    "disable_guardrail: bool = False",
+    "disable_prompt_encoder: bool = False"
+  ],
+  "instance_state_initialized": [
+    "self.text_guardrail = None",
+    "self.video_guardrail = None",
+    "self.text_encoder = None",
+    "self.model = None"
+  ],
+  "initialization_flow": [
+    "START: __init__ called",
+    "STEP 1 [always]: _load_model() — abstract, must be implemented by subclass",
+    "STEP 2 [condition: NOT offload_text_encoder_model OR disable_prompt_encoder]: _load_text_encoder_model()",
+    "  BRANCH A [disable_prompt_encoder=True]: self.text_encoder = DummyT5TextEncoder(device='cuda')",
+    "  BRANCH B [disable_prompt_encoder=False]: self.text_encoder = CosmosT5TextEncoder(cache_dir=checkpoint_dir/google-t5/t5-11b)",
+    "STEP 3 [condition: NOT disable_guardrail AND NOT offload_guardrail_models]:",
+    "  BRANCH A [has_text_input=True]: _load_text_guardrail() → guardrail_presets.create_text_guardrail_runner(checkpoint_dir)",
+    "  BRANCH B [always in this block]: _load_video_guardrail() → guardrail_presets.create_video_guardrail_runner(checkpoint_dir)",
+    "STEP 4 [condition: NOT offload_network]: _load_network() — no-op in base, overridden by subclass",
+    "STEP 5 [condition: NOT offload_tokenizer]: _load_tokenizer() — no-op in base, overridden by subclass",
+    "END: Pipeline ready"
+  ],
+  "offload_methods": [
+    {
+      "name": "_offload_network",
+      "action": "del self.model.model → self.model.model=None → gc.collect() → torch.cuda.empty_cache()"
+    },
+    {
+      "name": "_offload_tokenizer",
+      "action": "del self.model.tokenizer → self.model.tokenizer=None → gc.collect() → torch.cuda.empty_cache()"
+    },
+    {
+      "name": "_offload_guardrail_models",
+      "action": "del text_guardrail (if exists) → del video_guardrail (if exists) → gc.collect() → torch.cuda.empty_cache()"
+    },
+    {
+      "name": "_offload_text_encoder_model",
+      "action": "del text_encoder (if exists) → self.text_encoder=None → gc.collect() → torch.cuda.empty_cache()"
+    }
+  ],
+  "lazy_load_with_offload_pattern": [
+    {
+      "method": "_run_guardrail_on_prompt_with_offload(prompt)",
+      "flow": "IF offload_guardrail_models → _load_text_guardrail() | _run_guardrail_on_prompt(prompt) | IF offload_guardrail_models → _offload_guardrail_models() | return is_safe: bool"
+    },
+    {
+      "method": "_run_guardrail_on_video_with_offload(video)",
+      "flow": "IF offload_guardrail_models → _load_video_guardrail() | _run_guardrail_on_video(video) | IF offload_guardrail_models → _offload_guardrail_models() | return video: np.ndarray | None"
+    },
+    {
+      "method": "_run_text_embedding_on_prompt_with_offload(prompts, **kwargs)",
+      "flow": "IF offload_text_encoder_model → _load_text_encoder_model() | _run_text_embedding_on_prompt(prompts) → loops prompts → text_encoder.encode_prompts([prompt]) | IF offload_text_encoder_model → _offload_text_encoder_model() | return (embeddings, masks)"
+    },
+    {
+      "method": "_run_model_with_offload(*args, **kwargs)",
+      "flow": "Abstract (pass) — subclass must implement load-run-offload cycle for main model"
+    }
+  ],
+  "abstract_methods": [
+    "_load_model(checkpoint_name) → Any",
+    "_run_model(*args, **kwargs) → torch.Tensor",
+    "_run_model_with_offload(*args, **kwargs) → torch.Tensor",
+    "_run_tokenizer_decoding(samples: torch.Tensor) → np.ndarray",
+    "generate(*args, **kwargs)"
+  ],
+  "no_op_base_methods": [
+    "_load_tokenizer() — pass",
+    "_load_network() — pass"
+  ],
+  "external_dependencies": [
+    "guardrail_presets.create_text_guardrail_runner(checkpoint_dir) → text_guardrail runner",
+    "guardrail_presets.create_video_guardrail_runner(checkpoint_dir) → video_guardrail runner",
+    "guardrail_presets.run_text_guardrail(prompt, text_guardrail) → bool",
+    "guardrail_presets.run_video_guardrail(video, video_guardrail) → np.ndarray | None",
+    "CosmosT5TextEncoder(cache_dir=checkpoint_dir/google-t5/t5-11b)",
+    "DummyT5TextEncoder(device='cuda')"
+  ],
+  "key_conditions_summary": {
+    "skip_text_encoder_load": "offload_text_encoder_model=True AND disable_prompt_encoder=False → deferred to _run_text_embedding_on_prompt_with_offload",
+    "skip_all_guardrails": "disable_guardrail=True OR offload_guardrail_models=True → deferred to with_offload methods",
+    "text_guardrail_only_when": "has_text_input=True (pipeline receives text prompts)",
+    "skip_network_load": "offload_network=True → deferred to _run_model_with_offload",
+    "skip_tokenizer_load": "offload_tokenizer=True → deferred to _run_tokenizer_decoding"
+  },
+  "important_notes": "BaseWorldGenerationPipeline is an ABC; _load_model() is always called first (unconditionally) and is the only mandatory subclass method called in __init__. All other components are conditionally loaded based on offload/disable flags. The 'with_offload' variants implement a lazy load→use→unload pattern for each component to minimize GPU memory footprint. gc.collect() + torch.cuda.empty_cache() are called after every offload operation."
+}

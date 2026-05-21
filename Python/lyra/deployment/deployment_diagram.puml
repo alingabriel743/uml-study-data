@@ -1,0 +1,144 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam node {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam artifact {
+    BackgroundColor #DEE2E6
+    BorderColor #6C757D
+}
+skinparam database {
+    BackgroundColor #D1ECF1
+    BorderColor #0C5460
+}
+skinparam cloud {
+    BackgroundColor #FFF3CD
+    BorderColor #856404
+}
+skinparam ArrowColor #495057
+skinparam ArrowFontSize 11
+
+title Lyra / Cosmos Predict1 — Deployment Diagram
+
+' ─────────────────────────────────────────────
+'  LOCAL HPC / WORKSTATION NODE
+' ─────────────────────────────────────────────
+node "GPU Workstation / HPC Node" <<Local Machine>> as host {
+
+    node "Conda Environment: lyra\n(Python 3.10 · CUDA 12.4)" <<Runtime>> as conda {
+
+        artifact "train.py\n[Training Entry Point]" as train
+        artifact "sample.py\n[Inference Entry Point]" as sample
+
+        node "Lyra-1 — cosmos_predict1" <<Package>> as lyra1 {
+            artifact "DiffusionT2WModel\n[Text-to-World]" as t2w
+            artifact "DiffusionV2WModel\n[Video-to-World]" as v2w
+            artifact "DiffusionWorldInterpolatorWModel\n[World Interpolator]" as wint
+            artifact "Gen3C Pipeline\n[3D Gaussian World]" as gen3c
+            artifact "Prompt Upsampler\n(T5 / Pixtral VLM)" as upsampler
+            artifact "Cosmos Tokenizer\n(CV8x8x8-720p)" as tokenizer
+        }
+
+        node "Lyra-1 — src" <<Package>> as lyrasrc {
+            artifact "LatentRecon\n[3DGS Reconstruction]" as latentrecon
+            artifact "Gaussian Splatting Renderer\n(gsplat)" as gsrenderer
+            artifact "VAE Encoder / Decoder" as vae
+        }
+
+        node "Distributed Training Stack" <<Framework>> as distrib {
+            artifact "HuggingFace Accelerate\n(Multi-GPU / FSDP / DeepSpeed)" as accelerate
+            artifact "DeepSpeed\n(ZeRO Optimizer)" as deepspeed
+            artifact "Megatron-Core\n(Model Parallelism)" as megatron
+            artifact "MPI4Py\n(Process Communication)" as mpi
+        }
+    }
+
+    node "GPU Cluster\n(8× NVIDIA GPU · CUDA 12.4)" <<Hardware>> as gpus {
+        artifact "GPU Process 0..N\n[DDP / FSDP Workers]" as gpuprocs
+    }
+}
+
+' ─────────────────────────────────────────────
+'  LOCAL FILESYSTEM
+' ─────────────────────────────────────────────
+database "Local Filesystem" as localfs {
+    artifact "checkpoints/\n  Cosmos-Predict1-7B-*\n  Cosmos-Predict1-14B-*\n  Cosmos-Tokenize1-CV8x8x8-720p\n  Gen3C-Cosmos-7B\n  google-t5/t5-11b\n  Lyra/lyra_static.pt\n  Lyra/lyra_dynamic.pt" as ckptstore
+    artifact "OUTPUT_ROOT/\n[Training Checkpoints & Logs]" as outstore
+    artifact "configs/\n  inference/*.yaml\n  training/*.yaml\n  accelerate/*.yaml\n  demo/*.yaml" as cfgstore
+}
+
+' ─────────────────────────────────────────────
+'  EXTERNAL SERVICES
+' ─────────────────────────────────────────────
+cloud "HuggingFace Hub\nhttps://huggingface.co" as hfhub {
+    artifact "nvidia/Lyra\n(lyra_static.pt, lyra_dynamic.pt)" as hf_lyra
+    artifact "nvidia/Cosmos-Predict1-*\n(7B / 14B models)" as hf_cosmos
+    artifact "nvidia/Gen3C-Cosmos-7B" as hf_gen3c
+    artifact "nvidia/Cosmos-Tokenize1-*\n(Tokenizer weights)" as hf_tokenizer
+    artifact "google-t5/t5-11b\n(Text Encoder)" as hf_t5
+    artifact "mistralai/Pixtral-12B-2409\n(VLM for Prompt Upsampling)" as hf_pixtral
+    artifact "nvidia/Cosmos-UpsamplePrompt1\n(Prompt Upsampler)" as hf_upsampler
+}
+
+' ─────────────────────────────────────────────
+'  RELATIONSHIPS
+' ─────────────────────────────────────────────
+
+' Entry points → packages
+train --> accelerate : "launches via\nAccelerate CLI"
+train --> lyra1 : "imports"
+train --> lyrasrc : "imports"
+sample --> lyrasrc : "imports"
+sample --> lyra1 : "imports"
+
+' Package internal wiring
+lyra1 --> tokenizer : "encodes/decodes\nvideo tokens"
+lyra1 --> upsampler : "enhances prompts"
+t2w --> tokenizer
+v2w --> tokenizer
+gen3c --> tokenizer
+latentrecon --> vae : "encodes latents"
+latentrecon --> gsrenderer : "renders 3DGS"
+
+' Distributed stack wiring
+accelerate --> deepspeed : "DeepSpeedPlugin"
+accelerate --> megatron : "tensor parallelism"
+accelerate --> mpi : "process coordination"
+accelerate --> gpuprocs : "distributes work\nacross GPUs"
+deepspeed --> gpuprocs
+conda --> gpus : "CUDA 12.4"
+
+' Checkpoint I/O
+ckptstore --> lyra1 : "loads model weights\n(.pt / .safetensors)"
+ckptstore --> lyrasrc : "loads model weights"
+train --> outstore : "saves checkpoints\n& training state"
+cfgstore --> train : "YAML configs"
+cfgstore --> sample : "YAML configs"
+
+' External downloads (script-driven, one-time)
+hf_lyra ..> ckptstore : "snapshot_download\n(scripts/download_lyra_checkpoints.py)"
+hf_cosmos ..> ckptstore : "snapshot_download\n(scripts/download_lyra_checkpoints.py)"
+hf_gen3c ..> ckptstore : "snapshot_download\n(scripts/download_gen3c_checkpoints.py)"
+hf_tokenizer ..> ckptstore : "snapshot_download\n(scripts/download_tokenizer_checkpoints.py)"
+hf_t5 ..> ckptstore : "snapshot_download"
+hf_pixtral ..> ckptstore : "snapshot_download\n(convert_pixtral_checkpoint)"
+hf_upsampler ..> ckptstore : "snapshot_download"
+
+@enduml

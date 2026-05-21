@@ -1,0 +1,247 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #F1F3F5
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #6C757D
+    GroupBorderColor #868E96
+    GroupBackgroundColor #F8F9FA
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title HITL Resume & Approval Flow
+
+actor "Caller" as caller
+participant "Runner\n(run.py)" as runner
+participant "RunResult /\nRunResultStreaming" as runresult
+participant "RunState" as runstate
+participant "RunContextWrapper" as ctx
+participant "resolve_interrupted_turn\n(turn_resolution.py)" as resolve
+participant "_select_function_tool_runs\n_for_resume (tool_planning.py)" as selectruns
+participant "_build_plan_for_resume_turn\n(tool_planning.py)" as buildplan
+participant "_execute_tool_plan\n(tool_planning.py)" as execplan
+participant "append_approval_error_output\n(approvals.py)" as approvalerr
+participant "update_run_state_after_resume\n(session_persistence.py)" as updatestate
+participant "save_resumed_turn_items\n(session_persistence.py)" as saveitems
+participant "Session" as session
+
+== Phase 1: Initial Run — Suspends on Tool Approval ==
+
+caller -> runner : Runner.run(agent, input)
+activate runner
+
+runner -> runner : run_single_turn()\nget model response
+runner -> runner : execute_tools_and_side_effects()\n_build_plan_for_fresh_turn()
+runner -> runner : _execute_tool_plan()\n_collect_tool_interruptions()
+note right of runner
+  Tools marked needs_approval=True
+  are intercepted before execution
+  and collected as ToolApprovalItems
+end note
+
+runner -> runresult : SingleStepResult(\n  next_step=NextStepInterruption(\n    [ToolApprovalItem...]\n  )\n)
+activate runresult
+
+runner --> caller : RunResult with\n.interruptions = [ToolApprovalItem...]
+deactivate runner
+
+== Phase 2: Human Decision — Approve or Reject ==
+
+caller -> runresult : result.to_state()
+runresult --> caller : RunState
+activate runstate
+
+note over runstate
+  RunState._current_step =
+  NextStepInterruption(interruptions=[...])
+  RunState._approvals = {}  (empty initially)
+end note
+
+deactivate runresult
+
+alt Approve tool call
+    caller -> runstate : state.approve(interruption,\n  always_approve=False)
+    activate runstate
+    runstate -> ctx : approve_tool(item)\n→ _approvals[tool_name]\n  .approved.add(call_id)
+    activate ctx
+    ctx --> runstate : approval recorded
+    deactivate ctx
+    deactivate runstate
+else Reject tool call
+    caller -> runstate : state.reject(interruption,\n  rejection_message="...")
+    activate runstate
+    runstate -> ctx : reject_tool(item)\n→ _approvals[tool_name]\n  .rejected.add(call_id)
+    activate ctx
+    ctx --> runstate : rejection recorded
+    deactivate ctx
+    deactivate runstate
+end
+
+opt Persist state for durable / long-running approvals
+    caller -> runstate : state.to_json() / to_string()
+    runstate --> caller : serialized RunState\n(includes approvals, usage, trace metadata)
+    note over caller
+      Store in DB or queue.
+      Sticky always_approve / always_reject
+      decisions survive serialization.
+    end note
+    caller -> runstate : RunState.from_json(agent, stored)
+    runstate --> caller : restored RunState
+end
+
+== Phase 3: Resume Run ==
+
+caller -> runner : Runner.run(agent, state=run_state)\n[or Runner.run_streamed]
+activate runner
+
+runner -> runner : detect run_state._current_step\nis NextStepInterruption\n→ "Continuing from interruption"
+
+runner -> resolve : resolve_interrupted_turn(\n  bindings, original_input,\n  generated_items,\n  last_model_response,\n  last_processed_response,\n  run_state=run_state\n)
+activate resolve
+
+note right of resolve
+  Resume does NOT re-query the LLM.
+  It replays last processed_response
+  with resolved approvals applied.
+end note
+
+resolve -> resolve : _pending_approvals_from_state()\n→ read run_state._current_step\n  .interruptions as list[ToolApprovalItem]
+resolve -> resolve : index_approval_items_by_call_id(\n  pending_approval_items\n)\n→ approval_items_by_call_id map
+resolve -> resolve : _build_tool_output_index(\n  original_pre_step_items\n)\n→ output_index (already-completed call_ids)
+
+== Phase 3a: Filter Runs by Approval Status ==
+
+resolve -> selectruns : _select_function_tool_runs_for_resume(\n  processed_response.functions,\n  approval_items_by_call_id,\n  output_index, ...\n)
+activate selectruns
+
+loop for each ToolRunFunction
+    selectruns -> selectruns : output_exists_checker(run)\n→ already in pre_step_items?
+    alt Already executed (output exists)
+        selectruns -> selectruns : skip — avoid double-execution
+    else Check approval status
+        selectruns -> ctx : get_approval_status(tool_name, call_id)
+        activate ctx
+        ctx --> selectruns : True / False / None
+        deactivate ctx
+
+        alt approval_status is True (approved)
+            selectruns -> selectruns : add to selected (approved runs)
+        else approval_status is False (rejected)
+            selectruns -> approvalerr : append_approval_error_output(\n  call_id, tool_call,\n  function_tool\n)
+            activate approvalerr
+            note right of approvalerr
+              Emits synthetic ToolCallOutputItem
+              so model sees why tool was blocked.
+              rejection_message overrides
+              run-wide tool_error_formatter.
+            end note
+            approvalerr --> selectruns : rejection error item appended
+            deactivate approvalerr
+        else approval_status is None (still pending)
+            selectruns -> selectruns : pending_interruption_adder(\n  pending_item_builder(run)\n)\n→ re-surface as interruption
+        else does not require approval
+            selectruns -> selectruns : add to selected (no approval needed)
+        end
+    end
+end
+
+selectruns --> resolve : function_tool_runs (approved subset)
+deactivate selectruns
+
+resolve -> resolve : _collect_runs_by_approval(\n  shell_calls, ...\n) — same filter for ShellTool
+resolve -> resolve : _collect_runs_by_approval(\n  apply_patch_calls, ...\n) — same filter for ApplyPatchTool
+resolve -> resolve : _collect_runs_by_approval(\n  custom_tool_calls, ...\n) — same filter for custom tools
+
+== Phase 3b: Build Execution Plan & Run Approved Tools ==
+
+resolve -> buildplan : _build_plan_for_resume_turn(\n  processed_response,\n  function_runs=approved_functions,\n  shell_calls=approved_shell,\n  apply_patch_calls=approved_apply_patch,\n  custom_tool_calls=approved_custom,\n  pending_interruptions=...\n)
+activate buildplan
+buildplan -> buildplan : _collect_mcp_approval_plan()\n→ handle hosted MCP approvals
+buildplan --> resolve : ToolExecutionPlan
+deactivate buildplan
+
+resolve -> execplan : _execute_tool_plan(\n  plan, bindings, hooks,\n  context_wrapper, run_config\n)
+activate execplan
+execplan -> execplan : execute_function_tool_calls()\nexecute_shell_calls()\nexecute_apply_patch_calls()\nexecute_custom_tool_calls()\n[parallel execution]
+execplan --> resolve : (function_results, guardrail_results,\n computer_results, ...)
+deactivate execplan
+
+resolve -> resolve : _collect_tool_interruptions(\n  function_results, custom_tool_results, ...\n)\n→ collect any NEW nested interruptions
+resolve -> resolve : _make_unique_item_appender()\n→ deduplicate items
+resolve -> resolve : _build_tool_result_items()\n→ assemble new_step_items
+
+alt Still has pending_interruptions (partial approval)
+    resolve --> runner : SingleStepResult(\n  next_step=NextStepInterruption(\n    remaining interruptions\n  )\n)
+    note right of runner
+      Partial approval supported:
+      unresolved interruptions re-surface;
+      resolved ones already executed.
+    end note
+else All interruptions resolved
+    resolve -> resolve : _append_mcp_callback_results()\nexecute_handoffs() /\nexecute_final_output() /\ncheck_for_final_output_from_tools()
+    resolve --> runner : SingleStepResult(\n  next_step=NextStepRunAgain\n  | NextStepFinalOutput\n  | NextStepHandoff\n)
+end
+deactivate resolve
+
+== Phase 4: Update Run State & Persist ==
+
+runner -> runner : resumed_turn_items(turn_result)\n→ split into generated_items\n  + session_items
+
+runner -> updatestate : update_run_state_after_resume(\n  run_state, turn_result,\n  generated_items, session_items\n)
+activate updatestate
+updatestate -> runstate : run_state._original_input =\n  copy_input_items(turn_result.original_input)
+updatestate -> runstate : run_state._generated_items = generated_items
+updatestate -> runstate : run_state._session_items = session_items
+updatestate -> runstate : run_state._current_step = turn_result.next_step
+updatestate --> runner : RunState mutated in place
+deactivate updatestate
+
+runner -> saveitems : save_resumed_turn_items(\n  session, items=turn_session_items,\n  persisted_count, response_id\n)
+activate saveitems
+note right of saveitems
+  persisted_count avoids
+  re-persisting already-saved
+  items after retries.
+end note
+saveitems -> session : session.add_items(items)
+activate session
+session --> saveitems : items written to session backend
+deactivate session
+saveitems --> runner : items persisted
+deactivate saveitems
+
+alt next_step is still NextStepInterruption
+    runner --> caller : RunResult with\n.interruptions = [remaining items]\nnote: caller must approve/reject again
+else next_step resolved (RunAgain / FinalOutput / Handoff)
+    runner -> runner : is_resumed_state = False\n→ continue normal turn loop
+    runner --> caller : RunResult with .final_output
+end
+
+deactivate runner
+deactivate runstate
+
+@enduml

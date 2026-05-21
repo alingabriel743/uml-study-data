@@ -1,0 +1,187 @@
+@startuml sequence_agent_run_loop_non_streamed
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipantBackgroundColor #F8F9FA
+skinparam sequenceParticipantBorderColor #495057
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceBoxBackgroundColor #E9ECEF
+skinparam sequenceBoxBorderColor #6C757D
+skinparam noteBorderColor #6C757D
+skinparam noteBackgroundColor #FFF9C4
+skinparam sequenceGroupBorderColor #495057
+skinparam sequenceGroupHeaderFontStyle bold
+skinparam sequenceGroupBackgroundColor #F0F4FF
+
+title Agent Run Loop (Non-Streamed)
+
+actor "Caller" as caller
+participant "Runner" as runner
+participant "InputGuardrail" as ig
+participant "run_single_turn" as rst
+participant "RunHooks /\nAgentHooks" as hooks
+participant "get_new_response" as gnr
+participant "Model" as model
+participant "process_model_\nresponse" as pmr
+participant "execute_tools_and_\nside_effects" as etse
+participant "OutputGuardrail" as og
+
+== Initialization ==
+
+caller -> runner : run(starting_agent, input, context,\nmax_turns, run_config)
+activate runner
+
+runner -> runner : normalize input (str → TResponseInputItem)\ninit current_turn=0, generated_items=[]\ncreate context_wrapper, task_span, SandboxRuntime
+
+note over runner
+  Non-streamed path: Runner.run() /
+  Runner.run_sync() — synchronous,
+  returns RunResult when complete
+end note
+
+== Agent Loop (one iteration per turn) ==
+
+loop each turn (while True)
+
+    runner -> runner : CHECK current_turn >= max_turns
+
+    alt max_turns exceeded
+        runner -> runner : invoke error_handlers['max_turns'] OR\nraise MaxTurnsExceeded
+        runner --> caller : MaxTurnsExceeded exception
+    end
+
+    opt turn == 0 (first turn only)
+        runner -> ig : run_input_guardrails(agent, guardrails,\ninput, context_wrapper)
+        activate ig
+        ig --> runner : InputGuardrailResult[]
+        deactivate ig
+        note right of ig
+          Raises InputGuardrailTripwireTriggered
+          if a guardrail trips
+        end note
+    end
+
+    runner -> rst : run_single_turn(bindings, all_tools,\noriginal_input, generated_items,\nhooks, context_wrapper, run_config)
+    activate rst
+
+    rst -> hooks : on_agent_start(context, agent)\n[if first turn or after handoff]
+    activate hooks
+    hooks --> rst : ok
+    deactivate hooks
+
+    rst -> rst : get_system_prompt(context_wrapper) → str | None\nget_prompt(context_wrapper) → ResponsePromptParam | None\nget_handoffs(execution_agent, context_wrapper) → list[Handoff]\n_prepare_turn_input_items(original_input, generated_items,\n  reasoning_id_policy) → list[TResponseInputItem]
+
+    == Model Call ==
+
+    rst -> gnr : get_new_response(bindings, system_prompt,\ninput_items, output_schema, all_tools,\nhandoffs, hooks, context_wrapper, run_config)
+    activate gnr
+
+    gnr -> gnr : maybe_filter_model_input(agent, run_config,\n  context_wrapper, input_items, system_instructions)\n→ ModelInputData\ndeduplicate_input_items_preferring_latest(filtered.input)\nget_model(execution_agent, run_config) → Model\nresolve model_settings\nmaybe_reset_tool_choice(agent, tool_use_tracker,\n  model_settings)
+
+    gnr -> hooks : on_llm_start(context_wrapper, agent,\ninstructions, input)
+    activate hooks
+    hooks --> gnr : ok
+    deactivate hooks
+
+    gnr -> model : get_response_with_retry(\n  λ → model.get_response(\n    system_instructions, input, model_settings,\n    tools, output_schema, handoffs,\n    tracing, previous_response_id,\n    conversation_id, prompt))
+    activate model
+    model --> gnr : ModelResponse\n(output items + usage)
+    deactivate model
+
+    gnr -> gnr : context_wrapper.usage.add(new_response.usage)
+
+    gnr -> hooks : on_llm_end(context_wrapper, agent, new_response)
+    activate hooks
+    hooks --> gnr : ok
+    deactivate hooks
+
+    gnr --> rst : ModelResponse
+    deactivate gnr
+
+    == Response Processing ==
+
+    rst -> pmr : process_model_response(agent, all_tools,\nresponse, output_schema, handoffs,\nexisting_items)
+    activate pmr
+    pmr --> rst : ProcessedResponse\n(new_items, run_handoffs, functions,\ncomputer_actions, tools_used, interruptions)
+    deactivate pmr
+
+    rst -> rst : tool_use_tracker.record_processed_response\n(agent, processed_response)
+
+    == Tool Execution & Step Resolution ==
+
+    rst -> etse : execute_tools_and_side_effects(\nbindings, original_input, pre_step_items,\nnew_response, processed_response,\noutput_schema, hooks, context_wrapper, run_config)
+    activate etse
+
+    etse -> etse : _build_plan_for_fresh_turn(\n  processed_response, agent,\n  context_wrapper, approval_items)\n_execute_tool_plan(plan, bindings, hooks,\n  context_wrapper, run_config)\n→ (function_results, computer_results,\n  custom_tool_results, shell_results)\n_build_tool_result_items(function_results, ...)\n→ new_step_items\n_collect_tool_interruptions(...)\n→ interruptions
+
+    note over etse
+      FunctionTool, ComputerTool,
+      CustomTool, ShellTool,
+      HostedMCPTool, ApplyPatchTool
+    end note
+
+    alt interruptions present (human-in-the-loop)
+        etse --> rst : SingleStepResult\n(next_step=NextStepInterruption)
+
+    else handoffs present
+        etse -> etse : execute_handoffs(public_agent,\noriginal_input, pre_step_items,\nnew_step_items, run_handoffs,\nhooks, context_wrapper, run_config)
+        etse --> rst : SingleStepResult\n(next_step=NextStepHandoff(new_agent))
+
+    else tool produces final output
+        etse -> etse : _maybe_finalize_from_tool_results\n→ check ToolsToFinalOutputResult
+        etse --> rst : SingleStepResult\n(next_step=NextStepFinalOutput)
+
+    else text output (no pending tool calls)
+        etse -> etse : execute_final_output(agent, original_input,\n  new_response, pre_step_items,\n  new_step_items, final_output,\n  hooks, context_wrapper)
+        etse -> hooks : on_agent_end(context_wrapper, agent, final_output)\n[run_final_output_hooks]
+        activate hooks
+        hooks --> etse : ok
+        deactivate hooks
+        etse --> rst : SingleStepResult\n(next_step=NextStepFinalOutput(output))
+
+    else tools ran, no final output yet
+        etse --> rst : SingleStepResult\n(next_step=NextStepRunAgain)
+    end
+
+    deactivate etse
+
+    rst --> runner : SingleStepResult
+    deactivate rst
+
+    == Loop Routing (inspect next_step) ==
+
+    alt next_step = NextStepFinalOutput
+        runner -> og : run_output_guardrails(agent, guardrails,\noutput, context_wrapper)
+        activate og
+        og --> runner : OutputGuardrailResult[]\n(or raises OutputGuardrailTripwireTriggered)
+        deactivate og
+        runner --> caller : RunResult\n(final_output, new_items,\nraw_responses, guardrail_results)
+        deactivate runner
+
+    else next_step = NextStepInterruption
+        runner --> caller : RunState\n(serializable; resume via run(RunState))
+
+    else next_step = NextStepHandoff
+        runner -> runner : current_agent = next_step.new_agent\ncurrent_turn++\ncontinue loop
+
+    else next_step = NextStepRunAgain
+        runner -> runner : current_turn++\ncontinue loop
+    end
+
+end
+
+@enduml

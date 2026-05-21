@@ -1,0 +1,144 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activityBackgroundColor #F8F9FA
+skinparam activityBorderColor #495057
+skinparam activityArrowColor #495057
+skinparam activityFontColor #212529
+skinparam noteBorderColor #6C757D
+skinparam noteBackgroundColor #FFFDE7
+skinparam swimlaneBorderColor #6C757D
+skinparam swimlaneTitleFontColor #212529
+skinparam swimlaneTitleBackgroundColor #E9ECEF
+
+title Batch Trace Processor Run Loop
+
+|#E3F2FD|Application / TraceProvider|
+start
+:Agent run begins — trace or span event fires;
+
+|#F3E5F5|BatchTraceProcessor|
+note right
+  **Entry points (enqueue items):**
+  on_trace_start(trace) → queue.put_nowait(trace)
+  on_span_end(span)     → queue.put_nowait(span)
+  on_trace_end()        → no-op
+  on_span_start()       → no-op
+end note
+:on_trace_start(trace) or on_span_end(span) called;
+
+:_ensure_thread_started();
+if (Worker thread already alive?) then (yes)
+  note right: Fast path — returns immediately
+else (no — first call)
+  :Acquire _thread_start_lock\n(double-checked locking);
+  if (Thread still not alive?) then (yes)
+    :Create daemon Thread(target=_run);
+    :thread.start();
+  endif
+endif
+
+:queue.put_nowait(trace or span);
+if (queue.Full exception raised?) then (yes)
+  :Log Warning:\n"Queue is full, dropping trace/span";
+  note right: max_queue_size = 8192 items
+  stop
+else (no)
+  :Item enqueued successfully;
+endif
+
+|#FFF9C4|Background Thread (_run)|
+:Daemon thread running;
+note right
+  **Shutdown trigger (external):**
+  shutdown() → sets _shutdown_event →
+  joins thread (waits for final drain)
+
+  **force_flush() (external):**
+  Calls _export_batches(force=True)
+  synchronously; _export_lock ensures
+  it waits for any in-flight export
+end note
+
+while (shutdown_event NOT set?) is (continue running)
+  :current_time = time.time();
+  :queue_size   = _queue.qsize();
+  if (Scheduled export due?\ncurrent_time >= _next_export_time\n——OR——\nQueue threshold reached?\nqueue_size >= _export_trigger_size?) then (export triggered)
+    note right
+      **Scheduled:** every schedule_delay = 5 s
+      **Threshold:** export_trigger_ratio × max_queue_size
+      = 70% × 8192 = 5734 items
+    end note
+
+    |#E8F5E9|_export_batches (force=False)|
+    :Acquire _export_lock;
+    note right
+      Serializes concurrent calls from
+      _run loop and force_flush()
+    end note
+
+    while (Queue not empty?) is (yes)
+      :Dequeue up to max_batch_size = 128 items;
+      if (queue.Empty during dequeue?\n[race condition]) then (yes)
+        break
+      endif
+      if (items_to_export is empty?) then (yes)
+        break
+      endif
+
+      |#FBE9E7|BackendSpanExporter|
+      :Group items by tracing_api_key;
+      :Sanitize: truncate input/output fields\nto 100,000 bytes for OpenAI endpoint;
+      :HTTP POST https://api.openai.com/v1/traces/ingest;
+
+      if (Response status?) then (2xx — success)
+        :Export acknowledged;
+      elseif (5xx Server Error\nor httpx.RequestError?) then (retry)
+        :Exponential backoff with 10% jitter\n(base_delay=1s, max_delay=30s);
+        :Retry — up to max_retries = 3;
+      else (4xx Client Error)
+        :Log error — no retry (client-side fault);
+      endif
+
+      |#E8F5E9|_export_batches (force=False)|
+    endwhile (queue empty — batch loop done)
+    :Release _export_lock;
+
+    |#FFF9C4|Background Thread (_run)|
+    :Reset _next_export_time\n= time.time() + schedule_delay (5s);
+
+  else (neither condition met — sleep)
+    :time.sleep(0.2 s)\n[short poll — avoids busy-wait];
+  endif
+endwhile (shutdown_event IS set)
+
+:Exiting loop — begin final drain;
+:_export_batches(force=True)\n[Flush all remaining items before exit];
+
+|#E8F5E9|_export_batches (force=True)|
+:Acquire _export_lock;
+note right
+  force=True: ignores max_batch_size cap
+  — dequeues everything in one pass
+end note
+
+while (Queue not empty?) is (yes)
+  :Dequeue ALL remaining items\n(no batch size limit when force=True);
+  if (items_to_export is empty?) then (yes)
+    break
+  endif
+
+  |#FBE9E7|BackendSpanExporter|
+  :Export items to /v1/traces/ingest\n(retry logic same as normal export);
+  |#E8F5E9|_export_batches (force=True)|
+endwhile (queue fully drained)
+:Release _export_lock;
+
+|#FFF9C4|Background Thread (_run)|
+:Thread exits cleanly\n(shutdown() join() call returns);
+stop
+
+@enduml

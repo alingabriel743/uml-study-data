@@ -1,0 +1,151 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 11
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF9C4
+    DiamondBorderColor #F9A825
+}
+skinparam swimlane {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleBackgroundColor #DEE2E6
+}
+skinparam note {
+    BackgroundColor #FFFDE7
+    BorderColor #F9A825
+    FontColor #212529
+}
+
+title Service Manager Lifecycle
+' Registration · Lazy Initialization · Dependency Resolution · Retrieval
+
+|Caller|
+start
+:call register(name, factory, options);
+
+|ServiceManager|
+:Yield one event-loop tick\n(setTimeout 0) — allows batch\nregistrations before processing;
+
+|Factory|
+:factory.create({ parameters, context })\n→ returns new service instance (ins);
+
+|ServiceManager|
+:Create entry = { name, instance: ins, status: **Registering** };
+:Append to services_l_  •  Store in services_m_[name];
+
+note right
+  Entry is created and indexed.
+  Status begins as **Registering**.
+end note
+
+:=== maybe_init_(name) ===;
+:entry.instance.as(TService).get_depends() → depends[];
+:get_waiting_for_(depends) → waiting_for[];
+
+if (waiting_for[] is empty?) then (yes\nall deps Running)
+  note right: All dependencies already Running.\nProceed directly to initialization.
+else (no\nunresolved deps exist)
+  :For each unresolved dep:\n  waiting_[dep].add(name);
+  :Set entry.status = **Pending**;
+  :Set entry.statusWaitingFor = waiting_for[];
+  note right
+    Service is deferred.
+    Each pending dependency holds
+    this service in waiting_[dep].
+    Re-attempt fires when the last
+    dependency reaches Running.
+  end note
+  :— suspended — awaiting dependency resolution —;
+  :Dependency reaches Running →\ntriggers maybe_init_(name,\n{ no_init_listeners: true });
+endif
+
+:=== init_service_(name, modifiers) ===;
+:Set entry.status = **Initializing**;
+:service_impl = entry.instance.as(TService);
+
+|TService|
+:await service_impl.init();
+
+|ServiceManager|
+:Set entry.status = **Running**;
+:Set entry.statusStartTS = new Date();
+
+:Look up waiting_[name] → maybe_ready_set\n(services blocked on this one);
+
+if (maybe_ready_set has blocked dependents?) then (yes)
+  :For each blocked dependent:\n  push maybe_init_(dep,\n  { no_init_listeners: true });
+  :await Promise.all(promises)\n[parallel cascade initialization];
+  note right
+    Cascade effect: resolving one service
+    can unblock an entire chain of
+    dependents via recursive maybe_init_.
+  end note
+endif
+
+if (modifiers.no_init_listeners is falsy?) then (yes\nroot-level init)
+  :For each listener in init_listeners_:\n  await listener();
+  note right
+    Notifies wait_for_init() and
+    aget() promise waiters that a
+    new service is now Running.
+  end note
+else (no\ncascade init)
+  :Skip init_listeners_ notifications\n(suppress duplicate notifications\nduring dependency cascade);
+endif
+
+:Service is fully **Running** and available;
+
+|Caller|
+:Choose retrieval path;
+
+|#DDEEFF|ServiceManager — get(name)|
+
+:=== get(name) — synchronous retrieval ===;
+:Look up info = services_m_[name];
+
+if (info missing?) then (yes)
+  :**throw** Error("Service not registered");
+elseif (info.status ≠ Running?) then (yes)
+  :Return **undefined**\n(registered but not yet Running);
+else (Running)
+  :Return **info.instance**;
+endif
+
+|#DDEEFF|ServiceManager — aget(name)|
+
+:=== aget(name) — async-safe retrieval ===;
+:await wait_for_init([name]);
+
+:get_waiting_for_([name]) → still_waiting[];
+
+if (still_waiting[] is empty?) then (yes\nalready Running)
+  :Resolve Promise immediately;
+else (no\nnot yet Running)
+  :Register check() in init_listeners_;
+  note right
+    Push-listener pattern — no polling.
+    check() is called by init_service_
+    each time a service reaches Running.
+  end note
+  :Suspend — await init_service_ to fire listeners;
+  :check() invoked → re-call get_waiting_for_();
+  :Remove check() from init_listeners_;
+  :Resolve Promise;
+endif
+
+:call get(name) → return **info.instance**;
+
+|Caller|
+:Receive service instance;
+stop
+
+@enduml

@@ -1,0 +1,212 @@
+{
+  "scope": "hub_review_search_and_verification",
+  "title": "Hub Review, Search & Verification",
+  "diagram_type": "use_case",
+  "description": "Search hub for relevant skills, verify contributions before solidification, and run LLM-based review on code diffs",
+
+  "actors": [
+    {
+      "name": "GEP Evolver",
+      "type": "primary",
+      "description": "The autonomous code evolution engine that initiates hub interactions during the evolution cycle"
+    },
+    {
+      "name": "A2A Hub",
+      "type": "external_system",
+      "description": "Remote hub server at A2A_HUB_URL; provides skill search, peer review, and solidify-permit endpoints"
+    },
+    {
+      "name": "External LLM",
+      "type": "external_system",
+      "description": "LLM subprocess (node child process) invoked for automated code review; activated by EVOLVER_LLM_REVIEW=true"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Search Hub for Relevant Skills",
+      "module": "hubSearch.js",
+      "actor": "GEP Evolver",
+      "secondary_actor": "A2A Hub",
+      "description": "Query A2A Hub for skills relevant to the current evolution context, using either semantic or keyword search",
+      "preconditions": ["A2A_HUB_URL is set"],
+      "key_behaviors": [
+        "Checks HUBSEARCH_SEMANTIC env var to choose search mode (semantic vs keyword)",
+        "Maintains an in-memory LRU/bounded cache for search results (get/evict/clear)",
+        "Sends HTTP requests to hub search endpoint",
+        "Returns matched skill entries or empty on offline/failure"
+      ],
+      "env_vars": ["A2A_HUB_URL", "HUBSEARCH_SEMANTIC"],
+      "async": true
+    },
+    {
+      "id": "UC2",
+      "name": "Check Skill Existence on Hub",
+      "module": "hubReview.js",
+      "actor": "GEP Evolver",
+      "secondary_actor": "A2A Hub",
+      "description": "Verify whether a specific skill/contribution already exists on the hub before submitting",
+      "preconditions": ["A2A_HUB_URL is set"],
+      "key_behaviors": [
+        "Reads A2A_HUB_URL (stripped of trailing slashes)",
+        "Queries hub for skill existence check",
+        "Returns boolean indicating hub skill presence"
+      ],
+      "env_vars": ["A2A_HUB_URL"],
+      "async": false
+    },
+    {
+      "id": "UC3",
+      "name": "Fetch Hub Review for Contribution",
+      "module": "hubReview.js",
+      "actor": "GEP Evolver",
+      "secondary_actor": "A2A Hub",
+      "description": "Fetch peer/community review data from the hub for a given contribution or gene change",
+      "preconditions": ["A2A_HUB_URL is set"],
+      "key_behaviors": [
+        "Async call to A2A Hub review endpoint",
+        "Parses response for approval/rejection signals",
+        "Handles connection errors gracefully"
+      ],
+      "env_vars": ["A2A_HUB_URL"],
+      "async": true
+    },
+    {
+      "id": "UC4",
+      "name": "Request Solidify Permit",
+      "module": "hubVerify.js",
+      "actor": "GEP Evolver",
+      "secondary_actor": "A2A Hub",
+      "description": "Before solidifying a code mutation, request a permit from the hub to authorize the change",
+      "preconditions": ["isSolidifyVerifyEnabled() returns true"],
+      "exported_functions": [
+        "isSolidifyVerifyEnabled() → boolean",
+        "requestSolidifyPermitSync({ geneId, signals, mutation }) → { ok, offline }",
+        "consumeOfflinePermit() → { ok, offline }"
+      ],
+      "key_behaviors": [
+        "isSolidifyVerifyEnabled: checks A2A_HUB_URL is set AND EVOLVER_SOLIDIFY_VERIFY != 'false' (in test env only)",
+        "In production env EVOLVER_SOLIDIFY_VERIFY='false' is ignored (always enabled when hub URL present)",
+        "requestSolidifyPermitSync: synchronous HTTP call to hub permit endpoint with geneId/signals/mutation",
+        "Returns { ok: false, offline: true } when A2A_HUB_URL is absent",
+        "consumeOfflinePermit: consumes a cached offline permit token; returns { ok: false, offline: true } if no token cached"
+      ],
+      "env_vars": ["A2A_HUB_URL", "EVOLVER_SOLIDIFY_VERIFY", "NODE_ENV"],
+      "async": false
+    },
+    {
+      "id": "UC5",
+      "name": "Run LLM-Based Code Review",
+      "module": "llmReview.js",
+      "actor": "GEP Evolver",
+      "secondary_actor": "External LLM",
+      "description": "Build a structured review prompt from diff+gene+signals+mutation, then execute an LLM subprocess to get approval/rejection with confidence",
+      "preconditions": ["EVOLVER_LLM_REVIEW=true"],
+      "exported_functions": [
+        "isLlmReviewEnabled() → boolean",
+        "buildReviewPrompt({ diff, gene, signals, mutation }) → string",
+        "runLlmReview({ diff, gene, signals, mutation }) → { approved, confidence, concerns[], summary }"
+      ],
+      "key_behaviors": [
+        "isLlmReviewEnabled: checks process.env.EVOLVER_LLM_REVIEW === 'true'",
+        "buildReviewPrompt: composes multi-section markdown prompt (gene ID, category, signals list ≤8, rationale ≤500 chars, diff preview ≤6000 chars, 4 review criteria)",
+        "runLlmReview: writes prompt to temp file, runs node subprocess via execFileSync, parses JSON response; 30s timeout",
+        "Review criteria: (1) addresses signals? (2) regressions/bugs? (3) proportionate blast radius? (4) security concerns?",
+        "Response schema: { approved: bool, confidence: 0.0-1.0, concerns: string[], summary: string }",
+        "Falls back to { approved: true, confidence: 0.5 } on timeout or parse error",
+        "Auto-approves with confidence=0.7 when no external LLM configured"
+      ],
+      "env_vars": ["EVOLVER_LLM_REVIEW"],
+      "timeout_ms": 30000,
+      "async": false
+    },
+    {
+      "id": "UC6",
+      "name": "Build Review Prompt",
+      "module": "llmReview.js",
+      "actor": "GEP Evolver",
+      "secondary_actor": null,
+      "description": "Construct a structured LLM prompt from gene metadata and code diff for code review",
+      "include": "UC5",
+      "key_behaviors": [
+        "Inputs: diff (string), gene (id, category), signals (string[]), mutation (category, rationale)",
+        "Truncates diff to 6000 chars, signals to first 8, rationale to 500 chars",
+        "Formats as markdown with diff block and review criteria sections"
+      ]
+    }
+  ],
+
+  "use_case_relationships": [
+    "UC5 includes UC6 (runLlmReview calls buildReviewPrompt)",
+    "UC4 extends UC2 (solidify verification extends hub skill check)",
+    "UC1 precedes UC2 (search before checking existence)",
+    "UC3 relates UC1 (review fetched after skills found)"
+  ],
+
+  "key_relationships": [
+    "solidify.js calls hubVerify.isSolidifyVerifyEnabled + requestSolidifyPermitSync before committing changes",
+    "solidify.js calls llmReview.runLlmReview before committing changes",
+    "questionGenerator.js consumes llmReviewRejected + llmReviewReason outcome flags",
+    "hubReview.js, hubSearch.js, hubVerify.js are all obfuscated; llmReview.js is plain source",
+    "All hub modules depend on A2A_HUB_URL env var for hub connectivity",
+    "hubSearch.js, hubReview.js listed in selfPR.js OBFUSCATED_FILES set"
+  ],
+
+  "module_summary": {
+    "hubReview.js": {
+      "obfuscated": true,
+      "role": "Hub peer-review fetcher; checks skill existence and fetches community reviews from A2A Hub",
+      "env_deps": ["A2A_HUB_URL"],
+      "named_exports": "unknown (obfuscated)"
+    },
+    "hubSearch.js": {
+      "obfuscated": true,
+      "role": "Skill search on A2A Hub; supports semantic and keyword modes with in-memory result cache",
+      "env_deps": ["A2A_HUB_URL", "HUBSEARCH_SEMANTIC"],
+      "named_exports": "unknown (obfuscated)",
+      "notable": "Contains LRU-style cache with evict/clear; multiple async HTTP calls"
+    },
+    "hubVerify.js": {
+      "obfuscated": true,
+      "role": "Solidify-permit gating; requests authorization from hub before code mutations are committed",
+      "env_deps": ["A2A_HUB_URL", "EVOLVER_SOLIDIFY_VERIFY", "NODE_ENV"],
+      "named_exports": [
+        "isSolidifyVerifyEnabled()",
+        "requestSolidifyPermitSync({ geneId, signals, mutation })",
+        "consumeOfflinePermit()"
+      ]
+    },
+    "llmReview.js": {
+      "obfuscated": false,
+      "role": "LLM-based automated code reviewer; evaluates diffs against gene signals before solidification",
+      "env_deps": ["EVOLVER_LLM_REVIEW"],
+      "named_exports": [
+        "isLlmReviewEnabled()",
+        "buildReviewPrompt({ diff, gene, signals, mutation })",
+        "runLlmReview({ diff, gene, signals, mutation })"
+      ]
+    }
+  },
+
+  "important_notes": [
+    "hubReview.js, hubSearch.js, hubVerify.js are intentionally obfuscated (listed in selfPR.js OBFUSCATED_FILES)",
+    "All hub operations are gated: no A2A_HUB_URL = offline mode with ok:false, offline:true responses",
+    "LLM review is opt-in (EVOLVER_LLM_REVIEW env var); auto-approves when not configured",
+    "hubVerify solidify-permit enforcement is mandatory in production but can be disabled in test env via EVOLVER_SOLIDIFY_VERIFY=false",
+    "These modules are part of the GEP (Genetic Evolution Pipeline) Hub Integration package",
+    "Hub endpoint pattern: A2A_HUB_URL/<path> — trailing slashes stripped"
+  ],
+
+  "source_files_analyzed": [
+    "src/gep/llmReview.js",
+    "src/gep/hubReview.js",
+    "src/gep/hubSearch.js",
+    "src/gep/hubVerify.js",
+    "test/hubVerify.test.js",
+    "test/hubEvents.test.js",
+    "diagrams/component/component_diagram.puml",
+    "src/gep/selfPR.js",
+    "ir_postprocessed.json"
+  ]
+}

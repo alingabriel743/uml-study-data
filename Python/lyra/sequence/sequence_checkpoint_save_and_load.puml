@@ -1,0 +1,342 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #6C757D
+    GroupBackgroundColor #E3F2FD
+    GroupBorderColor #1565C0
+}
+
+title Checkpoint Save and Load Flow
+
+participant "Trainer" as trainer
+participant "DDPCheckpointer" as ddp
+participant "FSDPCheckpointer" as fsdp
+participant "AbstractCheckpointer" as base
+participant "CallBackGroup" as cbg
+participant "Model" as model
+participant "Optimizer /\nScheduler" as optim
+participant "FSDP" as fsdplib
+participant "easy_io" as easyio
+participant "broadcast_object" as broadcast
+participant "SaveThread\n(async)" as thread
+participant "Filesystem" as fs
+
+== DDP: Save Checkpoint ==
+
+trainer -> ddp : save(model, optimizer,\nscheduler, grad_scaler, iteration)
+activate ddp
+
+ddp -> cbg : on_save_checkpoint_start(model, iteration)
+activate cbg
+cbg --> ddp
+deactivate cbg
+
+ddp -> ddp : format_checkpoint_filename(model, iteration)\n→ "iter_{iteration:09}.pt"
+
+note over ddp : Only rank_dp_w_cp == 0\ngenerates state dict
+
+ddp -> ddp : generate_save_state_dict(model, optimizer,\nscheduler, grad_scaler, iteration)
+activate ddp
+  ddp -> model : state_dict()
+  activate model
+  model --> ddp : model_state
+  deactivate model
+
+  ddp -> optim : state_dict()  [optimizer]
+  activate optim
+  optim --> ddp : optim_state
+  deactivate optim
+
+  ddp -> optim : state_dict()  [scheduler]
+  activate optim
+  optim --> ddp : scheduler_state
+  deactivate optim
+
+  ddp -> cbg : on_save_checkpoint(model, state_dict=trainer_state)
+  activate cbg
+  cbg --> ddp
+  deactivate cbg
+
+  ddp -> ddp : misc.to([states], device='cpu')
+deactivate ddp
+
+ddp -> ddp : _map_state_dict_path_during_save(state_dict, checkpoint_file, model)\n→ add_type_postfix(): "iter_*_model.pt", "iter_*_optim.pt",\n  "iter_*_scheduler.pt", "iter_*.pt"
+
+ddp -> thread : Thread(_save_worker, state_dict,\ncheckpoint_file, rank).start()
+activate thread
+
+  thread -> easyio : dump(model_state, iter_*_model.pt, fast_backend=True)
+  activate easyio
+  easyio -> fs : write file
+  fs --> easyio
+  easyio --> thread
+  deactivate easyio
+
+  thread -> easyio : dump(optim_state, iter_*_optim.pt, fast_backend=True)
+  activate easyio
+  easyio -> fs : write file
+  fs --> easyio
+  easyio --> thread
+  deactivate easyio
+
+  thread -> easyio : dump(scheduler_state, iter_*_scheduler.pt, fast_backend=True)
+  activate easyio
+  easyio -> fs : write file
+  fs --> easyio
+  easyio --> thread
+  deactivate easyio
+
+  note over thread : distributed.barrier()\nif mp_world_size > 1
+
+  thread -> base : _write_latest_checkpoint_file(checkpoint_file)\n[rank 0 only]
+  activate base
+  base -> fs : write latest_checkpoint.txt
+  fs --> base
+  base --> thread
+  deactivate base
+
+  thread -> cbg : on_save_checkpoint_success(iteration)
+  activate cbg
+  cbg --> thread
+  deactivate cbg
+
+deactivate thread
+
+ddp -> cbg : on_save_checkpoint_end(model=None, iteration)
+activate cbg
+cbg --> ddp
+deactivate cbg
+
+ddp --> trainer
+deactivate ddp
+
+== DDP: Load Checkpoint ==
+
+trainer -> ddp : load(model, optimizer, scheduler, grad_scaler)
+activate ddp
+
+ddp -> cbg : on_load_checkpoint_start(model)
+activate cbg
+cbg --> ddp
+deactivate cbg
+
+ddp -> ddp : keys_to_resume_during_load()
+activate ddp
+  ddp -> base : _read_latest_checkpoint_file()
+  activate base
+  base -> easyio : load(latest_checkpoint.txt)
+  activate easyio
+  easyio -> fs : read
+  fs --> easyio
+  easyio --> base : checkpoint_filename
+  deactivate easyio
+  base --> ddp : checkpoint_path
+  deactivate base
+  ddp --> ddp : (resume_keys_set, checkpoint_path)
+deactivate ddp
+
+ddp -> base : _check_checkpoint_exists(checkpoint_path)
+activate base
+base --> ddp
+deactivate base
+
+ddp -> ddp : load_broadcast_state_dict(checkpoint_path,\nmodel, resume_keys)
+activate ddp
+
+  note over ddp : rank_dp_w_cp == 0\nloads from disk
+
+  ddp -> ddp : add_type_postfix_to_checkpoint_path(key, checkpoint_path, model)\n→ resolves per-key file paths
+
+  ddp -> easyio : load(ckpt_path, fast_backend=True)
+  activate easyio
+  easyio -> fs : read iter_*_model.pt / optim / scheduler
+  fs --> easyio
+  easyio --> ddp : state_dicts
+  deactivate easyio
+
+  note over ddp : distributed.barrier() — sync all ranks
+
+  alt broadcast_via_filesystem = False
+    ddp -> broadcast : broadcast_object(state_dict[key],\nmin_rank, group=dp_group, device=cuda)
+    activate broadcast
+    broadcast --> ddp : state_dict (all ranks)
+    deactivate broadcast
+  else broadcast_via_filesystem = True (e.g. PEFTCheckpointer)
+    ddp -> easyio : load(local_cache_path) [non-rank-0 ranks]
+    activate easyio
+    easyio --> ddp : state_dict
+    deactivate easyio
+  end
+
+deactivate ddp
+
+ddp -> optim : load_state_dict(optimizer_state)
+activate optim
+optim --> ddp
+deactivate optim
+
+ddp -> cbg : on_load_checkpoint(model, state_dict=trainer_state)
+activate cbg
+cbg --> ddp
+deactivate cbg
+
+ddp -> optim : load_state_dict(scheduler_state)\nscheduler.last_epoch = iteration
+activate optim
+optim --> ddp
+deactivate optim
+
+ddp -> model : load_state_dict(model_state, strict=strict_resume)
+activate model
+model --> ddp
+deactivate model
+
+ddp -> cbg : on_load_checkpoint_end(model)
+activate cbg
+cbg --> ddp
+deactivate cbg
+
+ddp --> trainer : iteration
+deactivate ddp
+
+== FSDP: Save Checkpoint ==
+
+trainer -> fsdp : save(model, optimizer, scheduler,\ngrad_scaler, iteration, async_saving=True)
+activate fsdp
+
+fsdp -> cbg : on_save_checkpoint_start(model, iteration)
+activate cbg
+cbg --> fsdp
+deactivate cbg
+
+fsdp -> model : state_dict_model()
+activate model
+model --> fsdp : {model: reg_state_dict, ema: ema_state_dict}
+deactivate model
+
+fsdp -> fsdp : get_optim_scheduler_state(optimizer, model.model, scheduler)
+activate fsdp
+  fsdp -> fsdplib : state_dict_type(fsdp_model, FULL_STATE_DICT,\nFullStateDictConfig(offload_to_cpu=True, rank0_only=True))
+  activate fsdplib
+  fsdplib --> fsdp : context manager active
+  deactivate fsdplib
+
+  fsdp -> fsdplib : full_optim_state_dict(fsdp_model, optim)
+  activate fsdplib
+  fsdplib --> fsdp : full optimizer state (rank 0)
+  deactivate fsdplib
+
+  fsdp -> optim : state_dict()  [scheduler]
+  activate optim
+  optim --> fsdp : scheduler_state
+  deactivate optim
+deactivate fsdp
+
+fsdp -> cbg : on_save_checkpoint(model, state_dict={iteration})
+activate cbg
+cbg --> fsdp
+deactivate cbg
+
+fsdp -> model : get_ckpt_postfix()
+activate model
+model --> fsdp : (postfix, replicate_idx, shard_idx, total_ema_num)
+deactivate model
+
+fsdp -> thread : Thread(_save_worker_local, model_state_dict,\noptim_scheduler_state_dict, state_dict,\ncheckpoint_file, rank).start()
+activate thread
+
+  thread -> fs : torch.save(reg_model_state, iter_*_reg_model.pt)
+  thread -> fs : torch.save(ema_state_dict, iter_*_ema_model.pt)
+  thread -> fs : torch.save(optim_scheduler_state, iter_*_optim.pt)
+  thread -> fs : torch.save(trainer_state, iter_*.pt)
+
+  thread -> fsdp : _write_latest_checkpoint_file(checkpoint_file)\n[rank 0]
+  activate fsdp
+  fsdp -> fs : write latest_checkpoint.txt
+  fs --> fsdp
+  fsdp --> thread
+  deactivate fsdp
+
+  thread -> cbg : on_save_checkpoint_success(iteration)
+  activate cbg
+  cbg --> thread
+  deactivate cbg
+
+deactivate thread
+
+fsdp -> cbg : on_save_checkpoint_end(model=None, iteration)
+activate cbg
+cbg --> fsdp
+deactivate cbg
+
+fsdp --> trainer
+deactivate fsdp
+
+== FSDP: Load Checkpoint (init time) ==
+
+trainer -> fsdp : load_model_during_init(model, is_ema=False, ema_id=0)
+activate fsdp
+
+fsdp -> fsdp : _load_ckpt_file_during_init()\n→ reads latest_checkpoint.txt or uses load_path
+
+fsdp -> fs : torch.load(iter_*_reg_model.pt,\nmap_location=cpu, weights_only=False)
+activate fs
+fs --> fsdp : model state_dict
+deactivate fs
+
+fsdp -> model : load_state_dict(state_dict, strict=strict_resume)
+activate model
+model --> fsdp
+deactivate model
+
+fsdp --> trainer
+deactivate fsdp
+
+trainer -> fsdp : load_optim_scheduler_during_init(fsdp_model,\noptimizer, scheduler)
+activate fsdp
+
+fsdp -> fsdp : _load_ckpt_file_during_init() [if resume=True]
+
+fsdp -> fs : torch.load(iter_*_optim.pt)  [rank 0 only]
+activate fs
+fs --> fsdp : optim_scheduler_state_dict
+deactivate fs
+
+note over fsdp : distributed.barrier()
+
+fsdp -> fsdplib : scatter_full_optim_state_dict(\noptim_state['optimizer'], fsdp_model)
+activate fsdplib
+fsdplib --> fsdp : sharded_optimizer_state_dict
+deactivate fsdplib
+
+fsdp -> optim : load_state_dict(sharded_optimizer_state_dict)
+activate optim
+optim --> fsdp
+deactivate optim
+
+fsdp --> trainer
+deactivate fsdp
+
+@enduml

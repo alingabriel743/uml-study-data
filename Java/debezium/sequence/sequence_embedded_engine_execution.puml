@@ -1,0 +1,182 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #E9ECEF
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #6C757D
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #E9ECEF
+    NoteBackgroundColor #FFF3CD
+    NoteBorderColor #856404
+}
+
+title Embedded Engine Execution Flow
+
+actor "TestCase" as test
+participant "AbstractConnectorTest" as act
+participant "ExecutorService" as exec
+participant "AsyncEmbeddedEngine" as engine
+participant "EngineSourceConnector\n(wraps BinlogConnector)" as connector
+participant "BinlogConnector" as binlogConn
+participant "BaseSourceTask\n/ BinlogSourceTask" as sourceTask
+participant "ChangeEventSource\nCoordinator" as coordinator
+participant "PollRecords\n(Callable)" as pollRecords
+participant "RecordProcessor" as processor
+participant "Consumer\n<SourceRecord>" as consumer
+participant "consumedLines\n(BlockingQueue)" as queue
+
+== Setup Phase ==
+
+test -> act : @BeforeEach initializeConnectorTestFramework()
+activate act
+act -> act : consumedLines = new ArrayBlockingQueue(100)
+act -> act : executor = Executors.newFixedThreadPool(1)
+deactivate act
+
+== Engine Build & Submit ==
+
+test -> act : start(connectorClass, connectorConfig)
+activate act
+act -> act : config = Configuration.copy(connectorConfig)\n  .with(ENGINE_NAME, CONNECTOR_CLASS,\n  OFFSET_STORE_PATH, OFFSET_FLUSH_INTERVAL_MS=0)\n  .build()
+act -> act : latch = new CountDownLatch(1)
+act -> act : builder = createEngineBuilder()\n  .using(config.asProperties())\n  .notifying(consumer)\n  .using(classLoader)\n  .using(wrapperCallback)\n  .using(wrapperConnectorCallback)
+act -> act : engine = createEngine(builder)\n  [creates AsyncEmbeddedEngine]
+act -> exec : executor.execute(() -> engine.run())
+note right of exec : Engine runs in\ndedicated thread
+act -> act : latch.await(5, MINUTES)\n[blocks test thread]
+deactivate act
+
+== Engine Startup (executor thread) ==
+
+activate engine
+engine -> engine : run() — state CREATING → INITIALIZING
+engine -> engine : initializeConnector()
+engine -> engine : createAndStartOffsetStore(connectorConfig)
+engine -> engine : new OffsetStorageReaderImpl(...)\nnew OffsetStorageWriter(...)
+engine -> connector : connector.initialize(\n  new EngineSourceConnectorContext(...))
+activate connector
+connector --> engine : context initialized
+deactivate connector
+
+engine -> binlogConn : connector.connectConnector().start(connectorConfig)\n[stores immutable properties]
+activate binlogConn
+binlogConn --> engine : started
+deactivate binlogConn
+
+engine -> act : connectorCallback.connectorStarted()\n→ isEngineRunning.set(true)
+
+== Task Creation (state CREATING_TASKS) ==
+
+engine -> engine : createSourceTasks(connector, tasks)
+engine -> binlogConn : connector.connectConnector().taskClass()\n[returns MySqlConnectorTask or MariaDbConnectorTask]
+activate binlogConn
+binlogConn --> engine : taskClass
+engine -> binlogConn : connector.connectConnector().taskConfigs(1)\n[returns singleton list of props]
+binlogConn --> engine : taskConfigList
+deactivate binlogConn
+
+engine -> sourceTask : taskClass.getDeclaredConstructor().newInstance()\n[creates BinlogSourceTask]
+activate sourceTask
+engine -> sourceTask : task.initialize(new EngineSourceTaskContext(\n  taskConfig, offsetReader, offsetWriter,\n  offsetCommitPolicy, clock, transformations))
+engine -> engine : tasks.add(new EngineSourceTask(task, taskContext))
+
+== Task Start (state STARTING_TASKS) ==
+
+engine -> engine : startSourceTasks(tasks)
+engine -> sourceTask : taskCompletionService.submit(\n  () -> task.connectTask().start(taskConfig))
+note over sourceTask : BaseSourceTask.start() [final]
+sourceTask -> sourceTask : setTaskState(INITIAL)
+sourceTask -> sourceTask : config = Configuration.from(props)
+sourceTask -> sourceTask : cdcSourceTaskContext = preStart(config)\n[abstract — builds BinlogTaskContext]
+sourceTask -> coordinator : this.coordinator = start(config)\n[creates ChangeEventSourceCoordinator]
+activate coordinator
+coordinator --> sourceTask : coordinator ready
+sourceTask -> sourceTask : validateBinlogConfiguration(snapshotter, connection)\n[checks ROW format & FULL row_image]
+sourceTask -> sourceTask : setTaskState(RUNNING)
+deactivate sourceTask
+
+engine -> act : connectorCallback.taskStarted()\n→ latch.countDown()
+act -> test : latch unblocked — test thread resumes
+
+== Polling Loop (state POLLING_TASKS) ==
+
+engine -> engine : runTasksPolling(tasks)
+engine -> act : connectorCallback.pollingStarted()
+engine -> processor : createRecordProcessor(processorClassName, task)\n[selects ParallelSmtBatchProcessor\nor ParallelSmtConsumerProcessor etc.]
+activate processor
+engine -> processor : processor.initialize(recordService, transformations)
+engine -> pollRecords : taskCompletionService.submit(\n  new PollRecords(task, processor, state))
+deactivate engine
+activate pollRecords
+
+loop polling loop
+    pollRecords -> sourceTask : task.connectTask().poll()\n[blocks until records available]
+    activate sourceTask
+    sourceTask -> sourceTask : startIfNeededAndPossible()
+    sourceTask -> sourceTask : performCommit() [if shouldPerformCommit]
+    sourceTask -> coordinator : doPoll() [abstract — reads from binlog\nvia ChangeEventSourceCoordinator]
+    activate coordinator
+    coordinator --> sourceTask : List<SourceRecord>
+    deactivate coordinator
+    sourceTask -> sourceTask : logStatistics(records)\nresetErrorHandlerRetriesIfNeeded(records)
+    sourceTask --> pollRecords : List<SourceRecord> changeRecords
+    deactivate sourceTask
+
+    pollRecords -> processor : processor.processRecords(changeRecords)\n[applies SMTs, converts records]
+    activate processor
+    processor -> consumer : consumer.accept(record)\nor handler.handleBatch(records, committer)
+    activate consumer
+    consumer -> queue : consumedLines.offer(record)
+    activate queue
+    queue --> consumer : offered
+    deactivate queue
+    consumer --> processor : accepted
+    deactivate consumer
+    processor --> pollRecords : processed
+    deactivate processor
+end
+
+== Test Consumes Records ==
+
+test -> act : consumeRecords(n, recordConsumer)
+activate act
+act -> queue : consumedLines.poll(pollTimeoutInMs, MILLISECONDS)\n[blocking]
+activate queue
+queue --> act : SourceRecord
+deactivate queue
+act -> test : recordConsumer.accept(record)
+deactivate act
+
+== Shutdown ==
+
+test -> act : @AfterEach stopConnector()
+activate act
+act -> engine : engine.close()
+activate engine
+engine -> engine : setEngineState(currentState, STOPPING)
+engine -> engine : stopConnector(tasks, stateBeforeStop)
+engine -> pollRecords : pollingFuture.cancel(true)\n[stops polling loop]
+deactivate pollRecords
+engine -> sourceTask : task.connectTask().stop()
+deactivate coordinator
+engine -> binlogConn : connector.connectConnector().stop()
+engine -> act : connectorCallback.connectorStopped()\n→ isEngineRunning.set(false)
+engine -> act : completionCallback.handle(success, msg, error)
+deactivate engine
+act -> exec : executor.shutdownNow()
+deactivate act
+
+@enduml

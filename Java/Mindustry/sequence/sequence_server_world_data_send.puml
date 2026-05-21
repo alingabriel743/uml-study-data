@@ -1,0 +1,216 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #6C757D
+    GroupBackgroundColor #F1F3F5
+    GroupBorderColor #6C757D
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Server World Data Transmission
+
+actor Client
+participant "NetServer" as NetServer
+participant "Administration" as Admin
+participant "NetworkIO" as NetworkIO
+participant "SaveIO.SaveWriter" as SaveWriter
+participant "NetConnection" as NetConn
+participant "Groups.sync" as GroupsSync
+participant "BuildingComp\n/ UnitComp" as EntityComp
+
+== Phase 1: Client Connection & Validation ==
+
+Client -> NetServer: ConnectPacket(uuid, usid, name, version, mods, color, locale)
+activate NetServer
+
+NetServer -> NetServer: Events.fire(ConnectPacketEvent(con, packet))
+
+NetServer -> Admin: isIPBanned(con.address) / isSubnetBanned(con.address)
+activate Admin
+Admin --> NetServer: boolean
+deactivate Admin
+
+NetServer -> Admin: getInfo(uuid) → PlayerInfo
+activate Admin
+Admin --> NetServer: PlayerInfo
+deactivate Admin
+
+NetServer -> Admin: isIDBanned(uuid) / isNameBanned(name)
+activate Admin
+Admin --> NetServer: boolean
+deactivate Admin
+
+NetServer -> Admin: getKickTime(uuid, address)
+activate Admin
+Admin --> NetServer: long kickTime
+deactivate Admin
+
+NetServer -> Admin: getPlayerLimit() / isAdmin(uuid, usid)
+activate Admin
+Admin --> NetServer: limit / isAdmin
+deactivate Admin
+
+NetServer -> NetServer: mods.getIncompatibility(packet.mods)
+
+NetServer -> Admin: isWhitelisted(uuid, usid)
+activate Admin
+Admin --> NetServer: boolean
+deactivate Admin
+
+NetServer -> Admin: updatePlayerJoined(uuid, ip, name)
+activate Admin
+Admin --> NetServer: PlayerInfo updated
+deactivate Admin
+
+NetServer -> NetServer: Player.create()\nassign name, color, locale, con, team
+
+== Phase 2: World Data Serialisation & Streaming ==
+
+NetServer -> NetServer: sendWorldData(player)
+
+NetServer -> NetworkIO: writeWorld(player, DeflaterOutputStream)
+activate NetworkIO
+
+NetworkIO -> SaveWriter: writeContentHeader(stream)
+activate SaveWriter
+SaveWriter --> NetworkIO: done
+deactivate SaveWriter
+
+NetworkIO -> SaveWriter: writeContentPatches(stream)
+activate SaveWriter
+SaveWriter --> NetworkIO: done
+deactivate SaveWriter
+
+NetworkIO -> SaveWriter: writeMap(stream)  [tile floor/wall data]
+activate SaveWriter
+SaveWriter --> NetworkIO: done
+deactivate SaveWriter
+
+NetworkIO -> SaveWriter: writeTeamBlocks(stream)  [building state snapshots]
+activate SaveWriter
+SaveWriter --> NetworkIO: done
+deactivate SaveWriter
+
+NetworkIO -> SaveWriter: writeMarkers(stream)
+activate SaveWriter
+SaveWriter --> NetworkIO: done
+deactivate SaveWriter
+
+NetworkIO -> SaveWriter: writeCustomChunks(stream, true)
+activate SaveWriter
+SaveWriter --> NetworkIO: done
+deactivate SaveWriter
+
+NetworkIO -> NetworkIO: compress to ByteArrayOutputStream\n(FastDeflater / DEFLATE)
+NetworkIO --> NetServer: compressedBytes
+deactivate NetworkIO
+
+NetServer -> NetServer: WorldStream.stream = ByteArrayInputStream(compressedBytes)
+
+NetServer -> NetConn: sendStream(WorldStream)  [TCP to client]
+activate NetConn
+NetConn --> Client: WorldStream (compressed TCP)
+deactivate NetConn
+
+== Phase 3: Client Confirmation ==
+
+Client -> NetServer: @Remote connectConfirm(player)  [after world load complete]
+
+NetServer -> NetServer: player.add()  [adds player to Groups]
+NetServer -> NetServer: player.con.hasConnected = true
+NetServer -> NetServer: Events.fire(PlayerJoin(player))
+
+deactivate NetServer
+
+== Phase 4: Periodic Entity Snapshot Sync (update loop) ==
+
+loop every snapshotInterval (ms, configurable)
+    NetServer -> NetServer: update() → sync() → writeEntitySnapshot(player)
+    activate NetServer
+
+    NetServer -> GroupsSync: iterate all Syncc entities
+    activate GroupsSync
+    GroupsSync --> NetServer: entity list
+    deactivate GroupsSync
+
+    loop per entity
+        NetServer -> EntityComp: entity.beforeWrite()
+        activate EntityComp
+        EntityComp --> NetServer: ready
+        deactivate EntityComp
+
+        NetServer -> EntityComp: entity.writeSync(dataStream)\n[id + classId + state]
+        activate EntityComp
+        EntityComp --> NetServer: bytes written
+        deactivate EntityComp
+
+        opt snapshot size ≥ 800 bytes (maxSnapshotSize)
+            NetServer --> Client: Call.entitySnapshot(con, count, compressedBytes)\n[flush partial batch]
+        end
+    end
+
+    NetServer --> Client: Call.entitySnapshot(con, count, compressedBytes)  [final batch]
+
+    opt hidden entities exist
+        NetServer --> Client: Call.hiddenSnapshot(con, hiddenIds)
+    end
+
+    deactivate NetServer
+end
+
+== Phase 5: Block-State Snapshot Sync (every 6s) ==
+
+loop every 6 seconds (Timekeeper blockSyncInterval)
+    NetServer -> NetServer: writeBlockSnapshots()
+    activate NetServer
+
+    NetServer -> NetServer: indexer.getFlagged(team, BlockFlag.synced)\n→ Seq<Building>
+
+    loop per synced Building
+        NetServer -> EntityComp: build.writeSync(dataStream)\n[pos + block.id + state]
+        activate EntityComp
+        EntityComp --> NetServer: bytes written
+        deactivate EntityComp
+    end
+
+    NetServer --> Client: Call.blockSnapshot(count, compressedBytes)  [broadcast to all clients]
+    deactivate NetServer
+end
+
+== Phase 6: On-demand Re-sync (/sync command) ==
+
+Client -> NetServer: /sync command
+activate NetServer
+NetServer -> NetServer: Call.worldDataBegin(player.con)
+NetServer -> NetServer: sendWorldData(player)  [re-runs Phase 2]
+note right of NetServer: Full world re-serialisation\nand streaming triggered
+deactivate NetServer
+
+@enduml

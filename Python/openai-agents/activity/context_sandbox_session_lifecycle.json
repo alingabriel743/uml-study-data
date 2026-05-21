@@ -1,0 +1,151 @@
+{
+  "scope": "sandbox_session_lifecycle",
+  "title": "Sandbox Session Lifecycle",
+  "diagram_type": "activity",
+  "key_participants": [
+    "SandboxRuntimeSessionManager",
+    "_SandboxSessionResources",
+    "_SandboxConcurrencyGuard",
+    "BaseSandboxClient",
+    "BaseSandboxSession",
+    "SandboxSession",
+    "SandboxSessionState",
+    "Manifest",
+    "RunState"
+  ],
+  "activity_phases": [
+    {
+      "phase": "1. acquire_agent(agent: SandboxAgent)",
+      "steps": [
+        "Check if agent_id already in _acquired_agents → if yes, return (idempotent)",
+        "Get or create _SandboxConcurrencyGuard on agent",
+        "Acquire guard.lock → if guard.active_runs > 0 → raise RuntimeError (concurrent reuse forbidden)",
+        "Increment guard.active_runs",
+        "Store agent in _acquired_agents[agent_id]",
+        "Call _ensure_resume_key(agent) to assign stable resume key"
+      ]
+    },
+    {
+      "phase": "2. ensure_session(agent, capabilities, is_resumed_state) → BaseSandboxSession",
+      "steps": [
+        "Look up existing resources for agent_id in _resources_by_agent",
+        "[DECISION] If resources is None → call _create_resources(agent, capabilities, is_resumed_state)",
+        "Store resources in _resources_by_agent[agent_id]",
+        "Set _current_agent_id = agent_id",
+        "Call resources.ensure_started()",
+        "Return resources.session"
+      ]
+    },
+    {
+      "phase": "3. _create_resources (three branching paths)",
+      "steps": [
+        "[PATH A — Live Injected Session] If sandbox_config.session is not None:",
+        "  → _configure_session_materialization(session, concurrency_limits)",
+        "  → await session.running() to check if already running",
+        "  → _process_live_session_manifest(agent, capabilities, session, running)",
+        "  → If entries_to_apply: await session._apply_entry_batch(entries, base_dir)",
+        "  → If processed_manifest changed: update session.state with new manifest",
+        "  → Return _SandboxSessionResources(session, client=None, owns_session=False)",
+        "",
+        "[PATH B — Resume from state] If session_state or run_state resume payload available:",
+        "  → _resume_state_payload_for_agent(client, agent, agent_id) → lookup sessions_by_agent by resume key or agent name",
+        "  → client.deserialize_session_state(payload) → SandboxSessionState",
+        "  → _process_resumed_state_manifest(agent, capabilities, session_state) → apply capability manifest transforms",
+        "  → TRACE: custom_span('sandbox.resume_session')",
+        "  → await client.resume(explicit_state) → resumed_session",
+        "  → _configure_session_materialization(resumed_session, concurrency_limits)",
+        "  → Return _SandboxSessionResources(session=resumed_session, client, owns_session=True)",
+        "",
+        "[PATH C — Fresh session] No session or state:",
+        "  → _resolve_manifest(agent, resume_from_run_state) → agent.default_manifest or sandbox_config.manifest",
+        "  → _agent_run_as_user(agent) → User | None",
+        "  → _process_manifest(capabilities, manifest, run_as_user) → apply capability transforms + add user",
+        "  → Check sandbox_config.options (required if client.supports_default_options is False)",
+        "  → TRACE: custom_span('sandbox.create_session')",
+        "  → await client.create(snapshot=_resolve_snapshot_spec(...), manifest, options) → session",
+        "  → _configure_session_materialization(session, concurrency_limits)",
+        "  → _ensure_session_manifest_has_run_as_user(session, agent)",
+        "  → Return _SandboxSessionResources(session, client, owns_session=True)"
+      ]
+    },
+    {
+      "phase": "4. _SandboxSessionResources.ensure_started()",
+      "steps": [
+        "[DECISION] If _started AND await session.running() → return (already running)",
+        "[DECISION] If NOT owns_session AND await session.running() → set _started=True, return",
+        "Otherwise: await session.start()",
+        "Set _started = True"
+      ]
+    },
+    {
+      "phase": "5. serialize_resume_state() → dict | None",
+      "steps": [
+        "Load existing_payload from run_state._sandbox (deep copy) if available",
+        "[DECISION] If sandbox_config is None → return existing_payload (pass-through)",
+        "[DECISION] If sandbox_config.session is not None (injected live session) → return None (no resume state)",
+        "[DECISION] If _current_agent_id is None → return existing_payload",
+        "[DECISION] If sandbox_config.client is None → return existing_payload",
+        "Resolve client and current_agent",
+        "_serialize_sessions_by_agent(client): merge legacy entries + current resources",
+        "Return dict with: backend_id, current_agent_key, current_agent_name, session_state, sessions_by_agent"
+      ]
+    },
+    {
+      "phase": "6. cleanup() → dict | None (resume_state)",
+      "steps": [
+        "Open TRACE custom_span('sandbox.cleanup_sessions') if resources exist and tracing active",
+        "Iterate all _resources_by_agent values:",
+        "  → [If owns_session] Acquire _cleanup_lock; check _cleaned flag (idempotent)",
+        "  → await session.run_pre_stop_hooks()",
+        "  → await session.stop()",
+        "  → await session.shutdown()",
+        "  → If client is not None AND session is SandboxSession: await client.delete(session)",
+        "  → await session._aclose_dependencies()",
+        "  → Accumulate first error; continue remaining cleanup steps regardless",
+        "If no cleanup_error: resume_state = self.serialize_resume_state()",
+        "Finally: _resources_by_agent.clear(), _current_agent_id = None, _release_agents()",
+        "_release_agents(): decrement guard.active_runs for all acquired agents, clear bookkeeping dicts",
+        "If cleanup_error: raise it",
+        "Return resume_state"
+      ]
+    }
+  ],
+  "key_conditions_and_decisions": [
+    "Concurrent reuse guard: SandboxAgent cannot be used in >1 run simultaneously (RuntimeError)",
+    "owns_session flag: injected live sessions are NOT stopped/deleted on cleanup; created/resumed sessions ARE",
+    "Idempotent cleanup: _cleaned flag + _cleanup_lock prevents double-cleanup races",
+    "Resume key assignment priority: stable IR-derived key > prior run's current_agent_key > agent name deduplication > allocated unique key",
+    "Backend ID validation: RunState sandbox backend must match configured client (ValueError on mismatch)",
+    "Snapshot fallback: resolve_default_local_snapshot_spec() → falls back to NoopSnapshotSpec() on OSError",
+    "Live session manifest restrictions: cannot change root/environment/users/groups/mounts on a running injected session; new Dir entries allowed if no mounts"
+  ],
+  "key_data_structures": [
+    "_resources_by_agent: dict[int, _SandboxSessionResources] — keyed by id(agent)",
+    "_acquired_agents: dict[int, SandboxAgent] — concurrency ownership tracking",
+    "_resume_keys_by_agent_id: dict[int, str] — stable resume key per agent",
+    "SandboxSessionState: Pydantic model with session_id(UUID), snapshot, manifest, exposed_ports, workspace_root_ready",
+    "serialize_resume_state payload: {backend_id, current_agent_key, current_agent_name, session_state, sessions_by_agent}",
+    "sessions_by_agent entry: {agent_name: str, session_state: dict}"
+  ],
+  "key_relationships": [
+    "SandboxRuntimeSessionManager owns _SandboxSessionResources (one per agent)",
+    "_SandboxSessionResources wraps BaseSandboxSession + BaseSandboxClient + ownership flag",
+    "SandboxSession wraps BaseSandboxSession (instrumentation/tracing decorator pattern)",
+    "SandboxRuntimeSessionManager reads/writes RunState._sandbox for cross-run resume state",
+    "BaseSandboxClient creates/resumes/deletes SandboxSession objects",
+    "Capability.process_manifest() transforms Manifest during session creation/resume"
+  ],
+  "tracing_integration": [
+    "custom_span('sandbox.create_session') wraps client.create()",
+    "custom_span('sandbox.resume_session') wraps client.resume()",
+    "custom_span('sandbox.cleanup_sessions') wraps bulk cleanup",
+    "SandboxSession._annotate() wraps every session op with start/finish audit events + trace spans"
+  ],
+  "important_notes": "SandboxRuntimeSessionManager is Generic[TContext]. The class is the bridge between Runner run-config (SandboxRunConfig) and actual session lifecycle. Resume state is serialized as a dict and stored in RunState._sandbox, enabling cross-run session persistence. Concurrency is guarded per-agent via a threading.Lock-protected counter. The three _create_resources paths are mutually exclusive: injected session > resume state > fresh creation.",
+  "source_files_analyzed": [
+    "src/agents/sandbox/runtime_session_manager.py",
+    "src/agents/sandbox/session/sandbox_session.py",
+    "src/agents/sandbox/session/sandbox_session_state.py",
+    "docs/sandbox_agents.md"
+  ]
+}

@@ -1,0 +1,120 @@
+{
+  "scope": "otel_context_propagation",
+  "title": "OpenTelemetry Context and Propagation Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Caller",
+    "Context (OpenTelemetry\\Context\\Context)",
+    "ScopeInterface (OpenTelemetry\\Context\\ScopeInterface)",
+    "Tracer (DDTrace\\Tracer)",
+    "ScopeManager (DDTrace\\ScopeManager)",
+    "Scope (DDTrace\\Scope)",
+    "Span (DDTrace\\Contracts\\Span)",
+    "SpanContext (DDTrace\\SpanContext / DDTrace\\OpenTelemetry\\API\\Trace\\SpanContext)",
+    "Propagator (DDTrace\\Propagator interface)",
+    "TextMap (DDTrace\\Propagators\\TextMap)",
+    "Convention (DDTrace\\OpenTelemetry\\Convention)"
+  ],
+
+  "interaction_flow": [
+    "--- SCENARIO A: OTel Context Activation ---",
+    "Caller → Context::getCurrent(): ContextInterface  [static, returns active context from storage]",
+    "Caller → Context::getRoot(): ContextInterface  [@internal, returns immutable root context]",
+    "Caller → Context::resolve($context, ?$storage): ContextInterface  [resolves false/null → current]",
+    "Caller → Context::storage(): ContextStorageInterface  [returns ExecutionContextAware storage]",
+    "Caller → context->with(ContextKeyInterface, $value): Context  [immutable copy with new value]",
+    "Caller → context->withContextValue(ImplicitContextKeyedInterface): ContextInterface  [attach span/baggage]",
+    "Caller → context->activate(): ScopeInterface  [makes context current, returns scope handle]",
+    "Caller → context->get(ContextKeyInterface): mixed  [read value from context]",
+    "Caller → scope->detach()  [ends active period, restores previous context]",
+
+    "--- SCENARIO B: Outbound Propagation (Inject) ---",
+    "Caller → tracer->getScopeManager(): ScopeManager",
+    "Caller → scopeManager->getActive(): ?Scope",
+    "Caller → scope->getSpan(): SpanInterface",
+    "Caller → span->getContext(): SpanContext  [DDTrace\\Contracts\\SpanContext]",
+    "Caller → tracer->inject(spanContext, Formats::HTTP_HEADERS, &$carrier)",
+    "Tracer → propagators[format]->inject(spanContext, &$carrier)  [looks up by format string]",
+    "TextMap → carrier['x-datadog-trace-id'] = spanContext->traceId",
+    "TextMap → carrier['x-datadog-parent-id'] = spanContext->spanId",
+    "TextMap → carrier['x-datadog-sampling-priority'] = spanContext->propagatedPrioritySampling",
+    "TextMap → carrier['x-datadog-origin'] = spanContext->origin",
+    "TextMap → carrier['ot-baggage-{key}'] = baggageItem  [for each baggage item]",
+
+    "--- SCENARIO C: Inbound Propagation (Extract) ---",
+    "Caller → tracer->extract(Formats::HTTP_HEADERS, $carrier): ?SpanContext",
+    "Tracer → propagators[format]->extract($carrier): SpanContext",
+    "TextMap reads x-datadog-trace-id, x-datadog-parent-id, x-datadog-sampling-priority, x-datadog-origin",
+    "TextMap → new SpanContext(traceId, spanId, parentId, baggageItems, isDistributedTracingActivationContext=true)",
+    "SpanContext->propagatedPrioritySampling set from x-datadog-sampling-priority header",
+    "SpanContext->origin set from x-datadog-origin header",
+    "TextMap → return SpanContext  [with isDistributedTracingActivationContext=true for distributed tracing]",
+
+    "--- SCENARIO D: OTel SpanContext Creation ---",
+    "Caller → SpanContext::createFromRemoteParent(traceId, spanId, traceFlags, ?traceState): SpanContextInterface  [isRemote=true]",
+    "Caller → SpanContext::create(traceId, spanId, traceFlags, ?traceState): SpanContextInterface  [local]",
+    "Caller → SpanContext::createFromLocalSpan(SpanData, sampled, ?traceId, ?spanId)  [from DD internal span]",
+    "Caller → SpanContext::getInvalid(): SpanContextInterface  [NOOP invalid context]",
+
+    "--- SCENARIO E: Operation Name via Convention ---",
+    "Caller → Convention::defaultOperationName(SpanData): string  [resolves OTel-to-DD operation name mapping]",
+
+    "--- SCENARIO F: DDTrace Scope Lifecycle ---",
+    "Caller → scopeManager->activate(Span, finishSpanOnClose=true): Scope  [push span onto active stack]",
+    "Caller → scopeManager->getActive(): ?Scope  [peek top of active stack]",
+    "Caller → scope->close()  [pop from stack; optionally finish span]",
+    "Caller → scopeManager->deactivate(Scope)  [internal deactivation]",
+    "Caller → scopeManager->getPrimaryRoot()  [@internal root span]",
+    "Caller → scopeManager->getTopScope()  [@internal top scope]",
+    "Caller → tracer->getRootScope(): ?Scope  [scope saved by startRootSpan]"
+  ],
+
+  "key_relationships": [
+    "DDTrace\\Propagators\\TextMap implements DDTrace\\Propagator",
+    "DDTrace\\SpanContext extends DDTrace\\Data\\SpanContext implements DDTrace\\Contracts\\SpanContext",
+    "DDTrace\\OpenTelemetry\\API\\Trace\\SpanContext implements OpenTelemetry\\API\\Trace\\SpanContextInterface",
+    "DDTrace\\Scope implements DDTrace\\Contracts\\Scope",
+    "DDTrace\\ScopeManager implements DDTrace\\Contracts\\ScopeManager",
+    "DDTrace\\Tracer holds Propagator[] keyed by format string (TEXT_MAP, HTTP_HEADERS, BINARY)",
+    "OpenTelemetry\\Context\\Context implements OpenTelemetry\\Context\\ContextInterface",
+    "OpenTelemetry\\SDK\\Trace\\Span extends OpenTelemetry\\API\\Trace\\Span implements ReadWriteSpanInterface",
+    "Context::activate() returns OpenTelemetry\\Context\\ScopeInterface (OTel scope, distinct from DDTrace\\Scope)",
+    "DDTrace\\Tracer depends_on DDTrace\\ScopeManager",
+    "DDTrace\\Tracer depends_on DDTrace\\Propagator[] (injected via constructor)",
+    "TextMap depends_on DDTrace\\Contracts\\Tracer (constructor injection)",
+    "DDTrace\\Data\\SpanContext fields: traceId, spanId, parentId, isDistributedTracingActivationContext, propagatedPrioritySampling, origin, parentContext"
+  ],
+
+  "important_notes": [
+    "Two distinct propagation layers: DDTrace (OpenTracing-style) and OpenTelemetry. Both coexist in the stubs.",
+    "DDTrace\\Propagator headers: x-datadog-trace-id, x-datadog-parent-id, x-datadog-sampling-priority, x-datadog-origin, ot-baggage-* prefix.",
+    "Formats class defines: TEXT_MAP (array/ArrayObject), HTTP_HEADERS (array/ArrayObject), BINARY (string). Tracer dispatches inject/extract by format key.",
+    "TextMap::extract sets isDistributedTracingActivationContext=true to signal distributed (remote) context.",
+    "OTel Context is immutable — with()/withContextValue() return new instances; activate() is the mutation point (via storage).",
+    "Context::resolve() coerces false/null → getCurrent(), allowing callers to pass optional parent contexts safely.",
+    "DDTrace\\ScopeManager maintains an explicit active-span stack; deactivate()/close() pops it.",
+    "OTel ScopeInterface (from Context::activate()) is separate from DDTrace\\Scope (from ScopeManager::activate()).",
+    "Convention::defaultOperationName() maps DDTrace SpanData to OTel operation name conventions.",
+    "SpanContext::createFromLocalSpan() bridges DDTrace\\SpanData internal span to OTel SpanContextInterface.",
+    "startRootSpan() saves the root Scope for later retrieval via getRootScope(), unlike startActiveSpan()."
+  ],
+
+  "propagation_headers": {
+    "x-datadog-trace-id": "64-bit trace identifier",
+    "x-datadog-parent-id": "64-bit parent span identifier",
+    "x-datadog-sampling-priority": "integer sampling priority",
+    "x-datadog-origin": "trace origin (e.g. synthetics)",
+    "ot-baggage-{key}": "baggage key-value pairs (DEFAULT_BAGGAGE_HEADER_PREFIX)"
+  },
+
+  "formats": {
+    "TEXT_MAP": "array|ArrayObject, no URL encoding",
+    "HTTP_HEADERS": "array|ArrayObject, URL-safe headers",
+    "BINARY": "arbitrary binary string blob"
+  },
+
+  "source_files_analyzed": [
+    "src/ddtrace_php_api.stubs.php",
+    "src/DDTrace/Propagator.php"
+  ]
+}

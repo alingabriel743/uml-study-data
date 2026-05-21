@@ -1,0 +1,234 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceLifeLineBorderColor #495057
+skinparam sequenceGroupBorderColor #6C757D
+skinparam sequenceGroupBodyBackgroundColor #E9ECEF20
+skinparam noteBorderColor #6C757D
+skinparam noteBackgroundColor #FFF9E6
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam actor {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam database {
+    BackgroundColor #E3F2FD
+    BorderColor #1565C0
+    FontColor #212529
+}
+
+title Rate Limiting and Redis SLA Flow
+
+actor        "DriverService"              as driver
+participant  "RateLimitService"           as rls
+participant  "Context"                    as ctx
+participant  "runRedis\n(closure)"        as runRedis
+participant  "redisClient"               as redis
+database     "DB\nrl_usage_fixed_window" as db
+participant  "APIError"                  as err
+
+== Initiate Rate Limit Check ==
+
+driver -> rls : check_and_increment(\n  "V1:svc:iface:method", max, period)
+activate rls
+
+rls -> ctx : Context.get().get('user')
+activate ctx
+ctx --> rls  : user (or null)
+deactivate ctx
+
+note right of rls
+  consumerId    = user ? "user:{id}" : "missing"
+  rateLimitKey  = "{consumerId}:{key}"
+  windowStartKey = "rate-limit:{rateLimitKey}:window_start"
+  countKey      = "rate-limit:{rateLimitKey}:count"
+  dbKey         = "{server_id}:{rateLimitKey}"  (unless global)
+  Defines runRedis closure — wraps each op with withTimeout(200ms)
+end note
+
+== Step 1: Read Window Start from Redis ==
+
+rls -> runRedis : ('window-start-read', redisClient.get(windowStartKey))
+activate runRedis
+runRedis -> redis : GET windowStartKey
+activate redis
+redis --> runRedis : value  (or error / timeout)
+deactivate redis
+
+alt Redis operation fails or times out
+    runRedis --> rls : { ok: false }
+    deactivate runRedis
+
+    note right of rls #FFE0E0 : Redis unavailable — fall back to DB
+
+    group DB Fallback: #checkAndIncrementInDb
+        rls -> db : SELECT * FROM rl_usage_fixed_window\nWHERE key = ?
+        activate db
+        db --> rls : rows
+        deactivate db
+
+        alt No row exists in DB
+            rls -> db : INSERT (key, window_start=now, count=0)
+        else Row exists, window expired\n(windowStart + period < now)
+            rls -> db : UPDATE SET window_start=now, count=0 WHERE key=?
+        end
+
+        alt DB count >= max
+            rls -> err : APIError.create('rate_limit_exceeded',\n  { method_name, max, period })
+            activate err
+            err --> rls : APIError [HTTP 429]
+            deactivate err
+            rls --> driver : throw APIError  ❌ REQUEST DENIED
+        else DB count < max
+            rls -> db : UPDATE SET count=count+1 WHERE key=?
+            rls --> driver : (void)  ✅ REQUEST ALLOWED
+        end
+    end
+
+else Redis OK — window start value retrieved
+    runRedis --> rls : { ok: true, value: windowStart }
+    deactivate runRedis
+
+    == Step 2: Seed Redis from DB (if windowStart == 0) ==
+
+    alt windowStart == 0  (no Redis data cached yet)
+        rls -> db : SELECT * FROM rl_usage_fixed_window WHERE key = ?
+        activate db
+        db --> rls : rows
+        deactivate db
+
+        alt DB row found — seed Redis
+            rls -> runRedis : ('window-start-seed',\n  redisClient.set(windowStartKey, windowStart))
+            activate runRedis
+            runRedis -> redis : SET windowStartKey windowStart
+            activate redis
+            redis --> runRedis : OK
+            deactivate redis
+            runRedis --> rls : { ok: true }
+            deactivate runRedis
+
+            rls -> runRedis : ('count-seed',\n  redisClient.set(countKey, count))
+            activate runRedis
+            runRedis -> redis : SET countKey count
+            activate redis
+            redis --> runRedis : OK
+            deactivate redis
+            runRedis --> rls : { ok: true }
+            deactivate runRedis
+
+        else No DB row — initialize new window
+            rls -> runRedis : ('window-start-init',\n  redisClient.set(windowStartKey, now))
+            activate runRedis
+            runRedis -> redis : SET windowStartKey now
+            activate redis
+            redis --> runRedis : OK
+            deactivate redis
+            runRedis --> rls : { ok: true }
+            deactivate runRedis
+
+            rls -> runRedis : ('count-init',\n  redisClient.set(countKey, 0))
+            activate runRedis
+            runRedis -> redis : SET countKey 0
+            activate redis
+            redis --> runRedis : OK
+            deactivate redis
+            runRedis --> rls : { ok: true }
+            deactivate runRedis
+
+            rls -> db : INSERT (key, window_start=now, count=0)
+            note right of db : Persistent record created
+        end
+    end
+
+    == Step 3: Window Expiry Reset ==
+
+    opt windowStart + period < now  (fixed window expired)
+        rls -> runRedis : ('window-start-reset',\n  redisClient.set(windowStartKey, now))
+        activate runRedis
+        runRedis -> redis : SET windowStartKey now
+        activate redis
+        redis --> runRedis : OK
+        deactivate redis
+        runRedis --> rls : { ok: true }
+        deactivate runRedis
+
+        rls -> runRedis : ('count-reset',\n  redisClient.set(countKey, 0))
+        activate runRedis
+        runRedis -> redis : SET countKey 0
+        activate redis
+        redis --> runRedis : OK
+        deactivate redis
+        runRedis --> rls : { ok: true }
+        deactivate runRedis
+
+        rls -> db : UPDATE SET window_start=now, count=0 WHERE key=?
+        note right of db : Window reset — counter cleared
+    end
+
+    == Step 4: Read Current Count from Redis ==
+
+    rls -> runRedis : ('count-read', redisClient.get(countKey))
+    activate runRedis
+    runRedis -> redis : GET countKey
+    activate redis
+    redis --> runRedis : value  (or error / timeout)
+    deactivate redis
+
+    alt Redis count-read fails or times out
+        runRedis --> rls : { ok: false }
+        deactivate runRedis
+
+        note right of rls #FFE0E0 : Redis unavailable — fall back to DB
+
+        group DB Fallback: #checkAndIncrementInDb
+            rls -> db : SELECT / INSERT / UPDATE\n(same DB fallback logic as above)
+            activate db
+            db --> rls : result
+            deactivate db
+            rls --> driver : ALLOWED or throw DENIED
+        end
+
+    else Redis count-read OK
+
+        runRedis --> rls : { ok: true, value: current }
+        deactivate runRedis
+
+        == Step 5: Allow / Deny Decision ==
+
+        alt current >= max  (rate limit exceeded)
+            rls -> err : APIError.create('rate_limit_exceeded',\n  { method_name, max, period })
+            activate err
+            err --> rls : APIError [HTTP 429]
+            deactivate err
+            rls --> driver : throw APIError  ❌ REQUEST DENIED
+
+        else current < max  (within limit)
+            rls -> runRedis : ('count-incr', redisClient.incr(countKey))
+            activate runRedis
+            runRedis -> redis : INCR countKey
+            activate redis
+            redis --> runRedis : newCount
+            deactivate redis
+            runRedis --> rls : { ok: true, value: newCount }
+            deactivate runRedis
+
+            rls -> db : UPDATE SET count=count+1 WHERE key=?
+            note right of db : Redis primary, DB stays in sync
+            rls --> driver : (void)  ✅ REQUEST ALLOWED
+        end
+    end
+end
+
+deactivate rls
+
+@enduml

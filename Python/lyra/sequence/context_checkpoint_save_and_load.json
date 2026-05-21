@@ -1,0 +1,158 @@
+{
+  "scope": "checkpoint_save_and_load",
+  "title": "Checkpoint Save and Load Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Trainer",
+    "AbstractCheckpointer",
+    "DDPCheckpointer",
+    "FSDPCheckpointer",
+    "PEFTCheckpointer",
+    "Model",
+    "easy_io",
+    "broadcast_object",
+    "FSDP",
+    "CallBackGroup",
+    "Filesystem"
+  ],
+  "class_hierarchy": [
+    "AbstractCheckpointer (ABC) <- DDPCheckpointer (cosmos_predict1/checkpointer/ddp.py)",
+    "DDPCheckpointer <- PEFTCheckpointer (cosmos_predict1/checkpointer/peft_checkpointer.py)",
+    "FSDPCheckpointer standalone (cosmos_predict1/utils/fsdp_checkpointer.py, no ABC inheritance)"
+  ],
+
+  "save_flow_ddp": [
+    "Trainer → DDPCheckpointer.save(model, optimizer, scheduler, grad_scaler, iteration)",
+    "DDPCheckpointer → CallBackGroup.on_save_checkpoint_start(model, iteration)",
+    "DDPCheckpointer → DDPCheckpointer.format_checkpoint_filename(model, iteration) → 'iter_{iteration:09}.pt'",
+    "DDPCheckpointer → DDPCheckpointer.generate_save_state_dict(model, optimizer, scheduler, grad_scaler, iteration) [only rank_dp_w_cp==0]",
+    "  generate_save_state_dict → Model.state_dict()",
+    "  generate_save_state_dict → optimizer.state_dict()",
+    "  generate_save_state_dict → scheduler.state_dict()",
+    "  generate_save_state_dict → grad_scaler.state_dict()",
+    "  generate_save_state_dict → CallBackGroup.on_save_checkpoint(model, state_dict=trainer_state)",
+    "  generate_save_state_dict → misc.to([states], device='cpu')",
+    "DDPCheckpointer → DDPCheckpointer._map_state_dict_path_during_save(state_dict, checkpoint_file, model)",
+    "  _map_state_dict_path_during_save → add_type_postfix_to_checkpoint_path(key, checkpoint_file, model) [appends _model/_optim/_scheduler to filename]",
+    "DDPCheckpointer → threading.Thread(_save_worker, state_dict, checkpoint_file, rank).start()",
+    "  _save_worker → easy_io.dump(item.state_dict, item.save_path, fast_backend=True) [for each key]",
+    "  _save_worker → distributed.barrier() [if mp_world_size > 1]",
+    "  _save_worker → AbstractCheckpointer._write_latest_checkpoint_file(checkpoint_file) [rank 0 only]",
+    "  _save_worker → CallBackGroup.on_save_checkpoint_success(iteration)",
+    "DDPCheckpointer → CallBackGroup.on_save_checkpoint_end(model=None, iteration)"
+  ],
+
+  "save_flow_fsdp": [
+    "Trainer → FSDPCheckpointer.save(model, optimizer, scheduler, grad_scaler, iteration, async_saving=True)",
+    "FSDPCheckpointer → CallBackGroup.on_save_checkpoint_start(model, iteration)",
+    "FSDPCheckpointer → Model.state_dict_model() → {model: reg_state_dict, ema: ema_state_dict}",
+    "FSDPCheckpointer → FSDPCheckpointer.get_optim_scheduler_state(optimizer, model.model, scheduler)",
+    "  get_optim_scheduler_state → FSDP.state_dict_type(fsdp_model, FULL_STATE_DICT, FullStateDictConfig(offload_to_cpu=True, rank0_only=True))",
+    "  get_optim_scheduler_state → FSDP.full_optim_state_dict(fsdp_model, optim)",
+    "  get_optim_scheduler_state → scheduler.state_dict()",
+    "FSDPCheckpointer → CallBackGroup.on_save_checkpoint(model, state_dict={iteration})",
+    "FSDPCheckpointer → Model.get_ckpt_postfix() → (postfix, replicate_idx, shard_idx, total_ema_num)",
+    "FSDPCheckpointer → threading.Thread(_save_worker_local, model_state_dict, optim_scheduler_state_dict, state_dict, checkpoint_file, rank).start()",
+    "  _save_worker_local → torch.save(model_state_dict, path+'_reg_model.pt')",
+    "  _save_worker_local → torch.save(ema_state_dict, path+'_ema_model.pt')",
+    "  _save_worker_local → torch.save(optim_scheduler_state_dict, path+'_optim.pt')",
+    "  _save_worker_local → torch.save(state_dict, path) [trainer state]",
+    "  _save_worker_local → FSDPCheckpointer._write_latest_checkpoint_file(checkpoint_file) [rank 0]",
+    "  _save_worker_local → CallBackGroup.on_save_checkpoint_success(iteration)",
+    "FSDPCheckpointer → CallBackGroup.on_save_checkpoint_end(model=None, iteration)"
+  ],
+
+  "load_flow_ddp": [
+    "Trainer → DDPCheckpointer.load(model, optimizer, scheduler, grad_scaler)",
+    "DDPCheckpointer → CallBackGroup.on_load_checkpoint_start(model)",
+    "DDPCheckpointer → DDPCheckpointer.keys_to_resume_during_load()",
+    "  keys_to_resume_during_load → AbstractCheckpointer._read_latest_checkpoint_file() [reads latest_checkpoint.txt via easy_io]",
+    "  keys_to_resume_during_load → returns (resume_keys_set, checkpoint_path)",
+    "DDPCheckpointer → AbstractCheckpointer._check_checkpoint_exists(checkpoint_path)",
+    "DDPCheckpointer → DDPCheckpointer.load_broadcast_state_dict(checkpoint_path, model, resume_keys)",
+    "  [rank_dp_w_cp==0] load_broadcast_state_dict → add_type_postfix_to_checkpoint_path(key, checkpoint_path, model)",
+    "  [rank_dp_w_cp==0] load_broadcast_state_dict → easy_io.load(local_cache_path or ckpt_path, fast_backend=True)",
+    "  load_broadcast_state_dict → distributed.barrier() [sync all ranks]",
+    "  [broadcast_via_filesystem=False] load_broadcast_state_dict → broadcast_object(state_dict[key], min_rank, group=dp_group, device=cuda)",
+    "  [broadcast_via_filesystem=True] load_broadcast_state_dict → easy_io.load(local_cache_path) [non-rank-0 loads from FS]",
+    "DDPCheckpointer → grad_scaler.load_state_dict(trainer_state['grad_scaler'])",
+    "DDPCheckpointer → CallBackGroup.on_load_checkpoint(model, state_dict=trainer_state)",
+    "DDPCheckpointer → optimizer.load_state_dict(optimizer_state)",
+    "DDPCheckpointer → scheduler.load_state_dict(scheduler_state); scheduler.last_epoch = iteration",
+    "DDPCheckpointer → Model.load_state_dict(model_state, strict=self.strict_resume)",
+    "DDPCheckpointer → CallBackGroup.on_load_checkpoint_end(model)",
+    "DDPCheckpointer → torch.cuda.empty_cache()",
+    "DDPCheckpointer → Trainer: return iteration"
+  ],
+
+  "load_flow_fsdp": [
+    "Trainer → FSDPCheckpointer.load_model_during_init(model, is_ema=False, ema_id=0)",
+    "  → FSDPCheckpointer._load_ckpt_file_during_init() [reads latest_checkpoint.txt or uses load_path]",
+    "  → builds path: checkpoint_path.replace('.pt', '_reg_model.pt') or '_ema_model.pt'",
+    "  → torch.load(checkpoint_path, map_location=cpu, weights_only=False)",
+    "  → Model.load_state_dict(state_dict, strict=strict_resume)",
+    "  [non-strict] → non_strict_load_model(model, state_dict)",
+    "Trainer → FSDPCheckpointer.load_optim_scheduler_during_init(fsdp_model, optimizer, scheduler)",
+    "  → _load_ckpt_file_during_init() [if resume=True]",
+    "  → [rank==0] torch.load(checkpoint_path+'_optim.pt')",
+    "  → distributed.barrier()",
+    "  → scatter_full_optim_state_dict(state_dict['optimizer'], fsdp_model) [FSDP scatter]",
+    "  → optimizer.load_state_dict(sharded_optimizer_state_dict)"
+  ],
+
+  "peft_overrides": [
+    "PEFTCheckpointer extends DDPCheckpointer, requires broadcast_via_filesystem=True",
+    "PEFTCheckpointer.add_type_postfix_to_checkpoint_path: strips '_model' suffix for pre-trained model files (model_model.pt → model.pt)",
+    "PEFTCheckpointer.load_broadcast_state_dict: uses torch.load() directly (no easy_io), no network broadcast path"
+  ],
+
+  "process_state_dict_flow": [
+    "caller → process_state_dict(state_dict, device=None, dtype=None, prefix_to_remove=None)",
+    "  → filters keys containing '_extra_state' (TransformerEngine FP8 extra states)",
+    "  → optionally calls value.to(device=device, dtype=dtype)",
+    "  → optionally strips prefix from key names",
+    "  → returns cleaned dict",
+    "Used in: obtain_tensor_parallel_state_dict(), merge_tensor_parallel_state_dicts(), maybe_convert_checkpoint_to_backend()"
+  ],
+
+  "state_dict_mapping": [
+    "Keys saved by DDP: 'model' → iter_*_model.pt, 'optim' → iter_*_optim.pt, 'scheduler' → iter_*_scheduler.pt, 'trainer' → iter_*.pt",
+    "Keys saved by FSDP: 'reg_model' → iter_*_reg_model.pt, 'ema' → iter_*_ema_model.pt, 'optim' → iter_*_optim.pt, trainer → iter_*.pt",
+    "latest_checkpoint.txt tracks the most recent iter_*.pt filename",
+    "process_state_dict() used for autoregressive TP checkpoints: removes _extra_state, remaps prefixes, converts device/dtype"
+  ],
+
+  "key_relationships": [
+    "DDPCheckpointer depends_on AbstractCheckpointer (inherits)",
+    "PEFTCheckpointer depends_on DDPCheckpointer (inherits, overrides load_broadcast_state_dict)",
+    "DDPCheckpointer depends_on easy_io (file I/O abstraction)",
+    "DDPCheckpointer depends_on broadcast_object (torch distributed object broadcast)",
+    "DDPCheckpointer depends_on megatron.parallel_state (DP/MP/CP rank info)",
+    "FSDPCheckpointer depends_on FSDP (full_optim_state_dict, state_dict_type context manager)",
+    "FSDPCheckpointer depends_on scatter_full_optim_state_dict (FSDP optimizer scatter)",
+    "Both checkpointers depend_on CallBackGroup (lifecycle hooks)",
+    "Both checkpointers use threading.Thread for async saves",
+    "process_state_dict used_by obtain_tensor_parallel_state_dict, merge_tensor_parallel_state_dicts"
+  ],
+
+  "important_notes": [
+    "DDP checkpointer saves asynchronously in a separate thread; join() called before next save or at finalize()",
+    "FSDP save collects FULL_STATE_DICT (rank0_only=True, offload_to_cpu=True) before saving",
+    "FSDP load uses scatter_full_optim_state_dict to distribute optimizer state across FSDP shards",
+    "broadcast_via_filesystem=True: each rank loads from FS independently (for TP); False: rank-0 broadcasts via network",
+    "strict_resume controls whether model.load_state_dict() is strict or permissive",
+    "load_training_state flag controls whether optim/scheduler are loaded alongside model",
+    "keys_not_to_resume config allows excluding specific keys (e.g., 'optim') from checkpoint loading",
+    "FSDPInferenceCheckpointer is a stub - all save/load methods are no-ops for inference",
+    "process_state_dict strips TransformerEngine _extra_state keys (BytesIO FP8 metadata)"
+  ],
+
+  "source_files_analyzed": [
+    "Lyra-1/cosmos_predict1/checkpointer/base.py",
+    "Lyra-1/cosmos_predict1/checkpointer/ddp.py",
+    "Lyra-1/cosmos_predict1/utils/fsdp_checkpointer.py",
+    "Lyra-1/cosmos_predict1/checkpointer/peft_checkpointer.py",
+    "Lyra-1/cosmos_predict1/autoregressive/utils/checkpoint.py",
+    "Lyra-1/cosmos_predict1/utils/ddp_checkpointer.py (mirrors ddp.py, same logic)"
+  ]
+}

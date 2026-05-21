@@ -1,0 +1,221 @@
+@startuml activity_order_processing_and_payment
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #212529
+    EndColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam NoteBackgroundColor #FFF8E1
+skinparam NoteBorderColor #E6AC00
+
+title Order Processing & Payment
+
+|User (Browser)|
+|OrderServlet|
+|OrderServiceImpl|
+|Support Services|
+|Database|
+|MailMessage|
+
+' ─────────────────────────────────────────────
+' FLOW 1: Payment & Order Placement
+' ─────────────────────────────────────────────
+
+|User (Browser)|
+start
+:Submit payment\n(GET/POST /OrderServlet?amount=<paidAmount>);
+
+|OrderServlet|
+if (Session valid?\n(userName, password)) then (yes)
+    :Parse paidAmount\nfrom request param;
+    :Call OrderServiceImpl\n.paymentSuccess(userName, paidAmount);
+else (no)
+    :Redirect to login.jsp;
+    stop
+endif
+
+|OrderServiceImpl|
+:Fetch all cart items\n(CartServiceImpl.getAllCartItems(userName));
+
+|Database|
+:SELECT * FROM cart\nWHERE userId = userName;
+:Return CartBean list;
+
+|OrderServiceImpl|
+if (Cart is empty?\n(cartItems.size() == 0)) then (yes)
+    :status = "Order Placement Failed!"\n(empty cart);
+    |OrderServlet|
+    :Forward to orderDetails.jsp\nwith failure message;
+    stop
+else (no)
+    :Create TransactionBean\n(userName, paidAmount)\n→ auto-generate transactionId + timestamp;
+    :ordered = true;
+    repeat
+        :Get next CartBean item\n(prodId, quantity);
+
+        |Support Services|
+        :ProductServiceImpl\n.getProductPrice(prodId);
+
+        |Database|
+        :SELECT price FROM product\nWHERE pid = prodId;
+        :Return unit price;
+
+        |OrderServiceImpl|
+        :Compute amount =\nunit price × quantity;
+        :Create OrderBean\n(transactionId, prodId, quantity, amount);
+
+        |Support Services|
+        :addOrder(OrderBean);
+
+        |Database|
+        :INSERT INTO orders\n(transid, prodid, qty, amount, shipped=0);
+
+        |OrderServiceImpl|
+        if (addOrder\nsucceeded?) then (yes)
+            |Support Services|
+            :CartServiceImpl\n.removeAProduct(userId, prodId);
+
+            |Database|
+            :DELETE FROM cart\nWHERE userId=? AND prodId=?;
+
+            |OrderServiceImpl|
+            if (removeAProduct\nsucceeded?) then (yes)
+                |Support Services|
+                :ProductServiceImpl\n.sellNProduct(prodId, quantity);
+
+                |Database|
+                :UPDATE product SET quantity\n= quantity - N WHERE pid=?;
+
+                |OrderServiceImpl|
+                if (sellNProduct\nsucceeded?) then (no)
+                    :ordered = false;
+                    :break loop;
+                else (yes)
+                endif
+            else (no)
+                :ordered = false;
+                :break loop;
+            endif
+        else (no)
+            :ordered = false;
+            :break loop;
+        endif
+    repeat while (More cart items?) is (yes)
+    ->no (all items processed);
+
+    if (ordered == true?) then (yes)
+        |Support Services|
+        :addTransaction(TransactionBean);
+
+        |Database|
+        :INSERT INTO transactions\n(transid, username, time, amount);
+
+        |OrderServiceImpl|
+        if (addTransaction\nsucceeded?) then (yes)
+            :Get user first name\n(UserServiceImpl.getFName);
+
+            |MailMessage|
+            :transactionSuccess(\nuserName, firstName,\ntransId, amount)\n→ Send confirmation email;
+
+            |OrderServiceImpl|
+            :status = "Order Placed Successfully!";
+        else (no)
+            :status = "Order Placement Failed!"\n(transaction insert error);
+        endif
+    else (no)
+        :status = "Order Placement Failed!"\n(item processing error);
+    endif
+endif
+
+note right
+  <b>⚠ No DB transaction wrapping:</b>
+  Partial failures can leave
+  orphaned order records.
+end note
+
+|OrderServlet|
+:Forward to orderDetails.jsp\nInject status message via JS;
+
+' ─────────────────────────────────────────────
+' FLOW 2: Shipment Processing
+' ─────────────────────────────────────────────
+
+|User (Browser)|
+:Admin triggers shipment\n(GET/POST /ShipmentServlet\n?orderid=&prodid=&userid=&amount=);
+
+|ShipmentServlet|
+if (Session valid?\n(usertype present)) then (yes)
+    :Parse orderId, prodId,\nuserName, amount\nfrom request params;
+    :Call OrderServiceImpl\n.shipNow(orderId, prodId);
+else (no)
+    :Redirect to login.jsp\nwith "Access Denied";
+    stop
+endif
+
+|OrderServiceImpl|
+|Database|
+:UPDATE orders SET shipped=1\nWHERE orderid=? AND prodid=?\nAND shipped=0;
+:Return rows updated;
+
+|OrderServiceImpl|
+if (rows updated > 0?) then (yes)
+    :status = "Order Has been\nshipped successfully!!";
+
+    |Support Services|
+    :UserServiceImpl.getFName(userName);
+
+    |Database|
+    :SELECT fname FROM users\nWHERE username=?;
+
+    |MailMessage|
+    :orderShipped(\nuserName, firstName,\norderId, amount)\n→ Send shipment email;
+
+    |ShipmentServlet|
+    :pagename = "shippedItems.jsp";
+else (no)
+    :status = "FAILURE"\n(already shipped or not found);
+    |ShipmentServlet|
+    :pagename = "unshippedItems.jsp";
+endif
+
+note right
+  <b>Idempotent guard:</b>
+  shipped=0 condition prevents
+  double-shipping the same order.
+end note
+
+|ShipmentServlet|
+:Forward to pagename JSP\nInject status message via JS;
+
+|User (Browser)|
+:View order/shipment result;
+stop
+
+@enduml

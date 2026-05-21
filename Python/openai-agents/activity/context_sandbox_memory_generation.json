@@ -1,0 +1,154 @@
+{
+  "scope": "sandbox_memory_generation",
+  "title": "Sandbox Memory Generation Pipeline",
+  "diagram_type": "activity",
+  "main_class": "SandboxMemoryGenerationManager",
+  "source_files_analyzed": [
+    "src/agents/sandbox/memory/manager.py",
+    "src/agents/sandbox/memory/phase_one.py",
+    "src/agents/sandbox/memory/phase_two.py",
+    "src/agents/sandbox/memory/storage.py",
+    "src/agents/sandbox/memory/rollouts.py",
+    "docs/sandbox/memory.md"
+  ],
+
+  "activity_flows": [
+    {
+      "flow": "enqueue_result",
+      "trigger": "Called after each Runner.run() completes within a sandbox session",
+      "steps": [
+        "RECEIVE result, exception, input_override, rollout_id",
+        "CALL build_rollout_payload_from_result(result, exception, input_override) → payload dict",
+        "CALL enqueue_rollout_payload(payload, rollout_id=rollout_id)"
+      ]
+    },
+    {
+      "flow": "enqueue_rollout_payload",
+      "trigger": "Direct payload enqueue (or called from enqueue_result)",
+      "steps": [
+        "ACQUIRE _flush_lock",
+        "CHECK _stopped → if True: return early (no-op)",
+        "CALL storage.ensure_layout() — creates sessions/memories dirs if absent",
+        "CALL _validate_rollout_id(rollout_id) → normalized rollout_id (regex: ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$)",
+        "CALL _rollout_file_name_for_rollout_id(rollout_id) → '{rollout_id}.jsonl'",
+        "BUILD ordered_payload: reorder keys so updated_at first, rollout_id second",
+        "CALL write_rollout(session, dump_rollout_json(ordered_payload), rollouts_path=sessions_dir, file_name) → rollout_file",
+        "STORE rollout_file.name in _rollout_files_by_rollout_id[rollout_id]",
+        "RELEASE _flush_lock"
+      ]
+    },
+    {
+      "flow": "flush",
+      "trigger": "BaseSandboxSession pre-stop hook (registered in __init__); called when session closes",
+      "steps": [
+        "ACQUIRE _flush_lock",
+        "CHECK _stopped → if True: return early",
+        "SET _stopped = True",
+        "COMPUTE rollout_files = sorted(set(_rollout_files_by_rollout_id.values()))",
+        "CHECK rollout_files empty → if empty: return early",
+        "CALL storage.ensure_layout()",
+        "CALL _ensure_worker() → if worker_task is None or done: create asyncio.Task(_worker())",
+        "FOR EACH rollout_file: queue.put_nowait(rollout_file)",
+        "AWAIT queue.join() — blocks until all items processed by _worker",
+        "PUT _STOP sentinel → queue.put_nowait(_STOP)",
+        "AWAIT worker_task (worker exits on _STOP)",
+        "SET worker_task = None",
+        "CALL _run_phase_two()",
+        "FINALLY: _unregister_memory_generation_manager(session, self)"
+      ]
+    },
+    {
+      "flow": "_worker",
+      "trigger": "asyncio.Task created by _ensure_worker(); runs concurrently during flush",
+      "steps": [
+        "LOOP:",
+        "  AWAIT queue.get() → queue_item",
+        "  CHECK queue_item is _STOP → if True: return (task ends)",
+        "  TRY: AWAIT _process_rollout_file(str(queue_item))",
+        "  EXCEPT Exception: logger.exception('Sandbox memory worker failed') [does NOT re-raise]",
+        "  FINALLY: queue.task_done()"
+      ]
+    },
+    {
+      "flow": "_process_rollout_file",
+      "trigger": "Called per rollout JSONL file by _worker",
+      "steps": [
+        "CALL storage.read_text(sessions_dir / rollout_file_name) → rollout_contents (JSONL text)",
+        "CALL render_phase_one_prompt(rollout_contents=rollout_contents) → phase_one_prompt",
+        "CALL run_phase_one(config, prompt, run_config) → artifacts (RolloutExtractionArtifacts: rollout_slug, rollout_summary, raw_memory)",
+        "CALL validate_rollout_artifacts(artifacts) → if INVALID: return early (skip this rollout)",
+        "PARSE payloads = [json.loads(line) for non-empty lines in rollout_contents]",
+        "CHECK payloads empty → if empty: return early",
+        "EXTRACT last payload for metadata: updated_at, terminal_state (from terminal_metadata dict)",
+        "CALL rollout_id_from_rollout_path(rollout_file_name) → rollout_id",
+        "CALL normalize_rollout_slug(artifacts.rollout_slug) → rollout_slug",
+        "BUILD paths: raw_memories/{rollout_id}.md, rollout_summaries/{rollout_id}_{rollout_slug}.md",
+        "CONCURRENTLY (asyncio.gather):",
+        "  WRITE memories_dir/raw_memories/{rollout_id}.md with _format_raw_memory(...)",
+        "  WRITE memories_dir/rollout_summaries/{rollout_id}_{slug}.md with _format_rollout_summary(...)",
+        "APPEND rollout_id to _pending_phase_two_rollout_ids"
+      ]
+    },
+    {
+      "flow": "_run_phase_two",
+      "trigger": "Called after all _worker items are drained in flush()",
+      "steps": [
+        "CHECK _pending_phase_two_rollout_ids empty → if empty: return early",
+        "DEDUPLICATE rollout_ids = list(dict.fromkeys(_pending_phase_two_rollout_ids))",
+        "CALL storage.build_phase_two_input_selection(max_raw_memories_for_consolidation) → PhaseTwoInputSelection (selects raw memories, applies recency-based forgetting if > max)",
+        "CALL storage.rebuild_raw_memories(selected_items=selection.selected) → bool",
+        "CHECK rebuild returned False → if False: return early",
+        "TRY: CALL run_phase_two(config, memory_root, selection, run_config) [LLM consolidation → writes MEMORY.md, memory_summary.md]",
+        "EXCEPT Exception: logger.exception('Sandbox memory phase 2 failed') → return",
+        "CALL storage.write_phase_two_selection(selected_items=selection.selected)",
+        "REMOVE processed rollout_ids from _pending_phase_two_rollout_ids"
+      ]
+    }
+  ],
+
+  "key_conditions": [
+    "_stopped flag: prevents re-entrant flush and post-flush enqueues",
+    "Empty rollout_files in flush: skips all processing",
+    "validate_rollout_artifacts fails: phase-1 output discarded, rollout not promoted to phase-2",
+    "Empty JSONL payloads: _process_rollout_file returns early without writing",
+    "Empty _pending_phase_two_rollout_ids: phase-2 is skipped entirely",
+    "rebuild_raw_memories returns False: phase-2 consolidation is skipped",
+    "Phase-2 exception: logged, write_phase_two_selection not called, pending IDs not cleared"
+  ],
+
+  "key_data_structures": {
+    "_rollout_files_by_rollout_id": "dict[str, str] — maps rollout_id → JSONL filename in sessions_dir",
+    "_pending_phase_two_rollout_ids": "list[str] — rollout IDs that completed phase-1 and await phase-2",
+    "_queue": "asyncio.Queue[str | object] — holds rollout filenames + _STOP sentinel",
+    "_flush_lock": "asyncio.Lock — serializes enqueue and flush, prevents double-flush",
+    "_worker_task": "asyncio.Task | None — single background worker task"
+  },
+
+  "filesystem_layout": {
+    "sessions_dir": "sessions/ — JSONL rollout conversation files ({rollout_id}.jsonl)",
+    "raw_memories_dir": "memories/raw_memories/ — intermediate per-rollout extracts ({rollout_id}.md)",
+    "rollout_summaries_dir": "memories/rollout_summaries/ — per-rollout summaries ({rollout_id}_{slug}.md)",
+    "MEMORY.md": "memories/MEMORY.md — consolidated memory index (written by phase-2)",
+    "memory_summary.md": "memories/memory_summary.md — injected into agent prompt (written by phase-2)",
+    "phase_two_selection.json": "memories/phase_two_selection.json — records which raw memories were used",
+    "raw_memories.md": "memories/raw_memories.md — intermediate concatenation for phase-2 LLM"
+  },
+
+  "external_dependencies": {
+    "run_phase_one": "phase_one.py — LLM call (MemoryGenerateConfig model) that extracts rollout_slug, rollout_summary, raw_memory from JSONL",
+    "run_phase_two": "phase_two.py — LLM consolidation agent that synthesizes MEMORY.md + memory_summary.md from raw memories",
+    "SandboxMemoryStorage": "storage.py — file I/O wrapper: ensure_layout, read_text, write_text, build_phase_two_input_selection, rebuild_raw_memories, write_phase_two_selection",
+    "write_rollout": "rollouts.py — appends ordered_payload JSON line to sessions_dir JSONL file",
+    "build_rollout_payload_from_result": "rollouts.py — serializes RunResult + exception + input_override into dict payload",
+    "BaseSandboxSession": "session/base_sandbox_session.py — provides register_pre_stop_hook, state.session_id"
+  },
+
+  "concurrency_notes": [
+    "_flush_lock guards both enqueue_rollout_payload and flush — enqueues are blocked during flush startup",
+    "_worker runs as a single asyncio Task; queue serializes rollout file processing",
+    "asyncio.gather in _process_rollout_file writes raw_memories and rollout_summary concurrently",
+    "Workers are created lazily in _ensure_worker() only when flush is triggered"
+  ],
+
+  "important_notes": "Two-phase memory generation: Phase-1 per-rollout extraction (conversation→raw_memory+summary), Phase-2 global consolidation (raw_memories→MEMORY.md+memory_summary.md). Memory generation is triggered automatically on session close via pre-stop hook. MemoryGenerateConfig.max_raw_memories_for_consolidation (default 256) controls forgetting — newer memories kept. Multiple Memory capabilities on same session allowed if layouts differ. WeakKeyDictionary registry (module-level) manages manager lifecycle tied to session lifetime."
+}

@@ -1,0 +1,128 @@
+{
+  "scope": "browser_extension_popup",
+  "title": "Browser Extension: Popup Scan & Overlay Controls",
+  "diagram_type": "use_case",
+  "actors": [
+    {
+      "name": "Extension User",
+      "type": "primary",
+      "description": "Human user interacting with the popup UI"
+    },
+    {
+      "name": "service-worker.js",
+      "type": "system/secondary",
+      "description": "Background service worker routing messages, managing per-tab state, updating badge"
+    },
+    {
+      "name": "content-script.js",
+      "type": "system/secondary",
+      "description": "Isolated-world bridge injected into the active tab; forwards commands to page-context detector"
+    },
+    {
+      "name": "detector (detect.js)",
+      "type": "system/secondary",
+      "description": "Page-context script that detects CSS/DOM anti-patterns and posts results back"
+    }
+  ],
+  "system_boundary": "Browser Extension Popup (popup.js)",
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Scan Page",
+      "trigger": "User clicks 'Scan page' button (btn-scan)",
+      "actor": "Extension User",
+      "steps": [
+        "popup.js: getActiveTabId() → chrome.tabs.query()",
+        "popup.js: chrome.runtime.sendMessage({ action: 'scan', tabId })",
+        "service-worker.js: sendScanToTab(tabId) → ensureContentScriptInjected(tabId) + buildScanConfig()",
+        "service-worker.js: chrome.tabs.sendMessage(tabId, { action: 'scan', config })",
+        "content-script.js: injectAndScan() → injects detector/detect.js script tag into page",
+        "detector: posts { source: 'impeccable-ready' } → content-script triggers sendScanCommand()",
+        "detector: posts { source: 'impeccable-results', findings, count }",
+        "content-script.js: chrome.runtime.sendMessage({ action: 'findings', findings })",
+        "service-worker.js: updateBadge(tabId) + broadcasts { action: 'findings-updated' }",
+        "popup.js: receives 'findings-updated' → updateFromState() displays count"
+      ],
+      "ui_feedback": "Button text changes to 'Scanning...' and is disabled; on completion count badge updates"
+    },
+    {
+      "id": "UC2",
+      "name": "View Findings Count",
+      "trigger": "Popup opens OR findings-updated broadcast received",
+      "actor": "Extension User",
+      "steps": [
+        "popup.js: loadState() → chrome.runtime.sendMessage({ action: 'get-state', tabId })",
+        "service-worker.js: getState(tabId) → sendResponse(state)",
+        "popup.js: updateFromState(state) → reduces findings array to total count",
+        "popup.js: sets countNumber.textContent and countLabel ('anti-pattern' / 'anti-patterns')"
+      ],
+      "ui_feedback": "Numeric badge showing total anti-patterns; label is singular/plural; 'has-findings' CSS class applied when count > 0"
+    },
+    {
+      "id": "UC3",
+      "name": "Toggle Overlays",
+      "trigger": "User clicks 'Hide overlays' / 'Show overlays' button (btn-toggle)",
+      "actor": "Extension User",
+      "steps": [
+        "popup.js: getActiveTabId() → chrome.tabs.query()",
+        "popup.js: chrome.runtime.sendMessage({ action: 'toggle-overlays', tabId })",
+        "service-worker.js: chrome.tabs.sendMessage(tabId, { action: 'toggle-overlays' })",
+        "content-script.js: window.postMessage({ source: 'impeccable-command', action: 'toggle-overlays' }, '*')",
+        "detector: toggles overlay visibility, posts { source: 'impeccable-overlays-toggled', visible }",
+        "content-script.js: chrome.runtime.sendMessage({ action: 'overlays-toggled', visible })",
+        "service-worker.js: updates state.overlaysVisible + broadcasts { action: 'overlays-toggled-broadcast' }",
+        "popup.js: receives broadcast → updates btnToggle.textContent"
+      ],
+      "ui_feedback": "Button label toggles between 'Hide overlays' and 'Show overlays'"
+    },
+    {
+      "id": "UC4",
+      "name": "Load Popup State on Open",
+      "trigger": "Popup DOM loaded (auto-invoked at bottom of popup.js)",
+      "actor": "Extension User (implicit)",
+      "steps": [
+        "popup.js: loadState() called immediately on script load",
+        "popup.js: getActiveTabId() + sendMessage({ action: 'get-state', tabId })",
+        "service-worker.js: getState(tabId) → returns { findings, overlaysVisible, injected, csInjected }",
+        "popup.js: updateFromState(state) → syncs count display and toggle button label"
+      ],
+      "ui_feedback": "Popup opens showing accurate current findings count and overlay visibility state"
+    }
+  ],
+  "include_extend_relationships": [
+    "UC1 <<include>> Inject Content Script (ensureContentScriptInjected — only injects if csInjected=false)",
+    "UC1 <<include>> Load Scan Config (buildScanConfig — reads chrome.storage.sync for disabledRules, lineLengthMode, spotlightBlur)",
+    "UC1 <<extend>> UC2 (scan completion triggers findings-updated broadcast → count display refreshes)",
+    "UC3 <<extend>> UC4 (overlay toggle broadcasts back to popup, syncing button state)"
+  ],
+  "key_messages": [
+    "popup → SW: { action: 'scan', tabId }",
+    "popup → SW: { action: 'toggle-overlays', tabId }",
+    "popup → SW: { action: 'get-state', tabId }",
+    "SW → content-script: { action: 'scan', config }",
+    "SW → content-script: { action: 'toggle-overlays' }",
+    "content-script → page (postMessage): { source: 'impeccable-command', action: 'scan'|'toggle-overlays' }",
+    "page → content-script (postMessage): { source: 'impeccable-results', findings }",
+    "page → content-script (postMessage): { source: 'impeccable-overlays-toggled', visible }",
+    "content-script → SW: { action: 'findings', findings }",
+    "content-script → SW: { action: 'overlays-toggled', visible }",
+    "SW → popup (broadcast): { action: 'findings-updated', findings }",
+    "SW → popup (broadcast): { action: 'overlays-toggled-broadcast', visible }"
+  ],
+  "key_state": {
+    "tabState_per_tab": "{ findings[], overlaysVisible: bool, injected: bool, csInjected: bool }",
+    "popup_local": "overlaysVisible (bool), DOM: countNumber, countLabel, btnScan, btnToggle"
+  },
+  "important_notes": [
+    "Content script is injected ON DEMAND (not statically) — only when user engages via popup or DevTools",
+    "Idempotency guard: content-script uses window.__IMPECCABLE_CS_LOADED__ flag to prevent double-injection",
+    "CSP fallback: if script tag injection fails, content-script sends 'inject-fallback' → SW uses chrome.scripting.executeScript in MAIN world",
+    "Real-time updates: popup listens via chrome.runtime.onMessage for 'findings-updated' and 'overlays-toggled-broadcast'",
+    "Badge text on extension icon reflects findings count (service-worker updateBadge, color #d6336c)"
+  ],
+  "source_files_analyzed": [
+    "extension/popup/popup.js",
+    "extension/background/service-worker.js",
+    "extension/content/content-script.js"
+  ]
+}

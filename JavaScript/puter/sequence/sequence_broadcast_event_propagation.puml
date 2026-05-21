@@ -1,0 +1,174 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipant underline
+skinparam sequenceBoxBackgroundColor #E9ECEF
+skinparam sequenceBoxBorderColor #6C757D
+skinparam sequenceLifeLineBorderColor #495057
+skinparam sequenceGroupBackgroundColor #F8F9FA
+skinparam sequenceGroupBorderColor #6C757D
+skinparam noteBorderColor #ADB5BD
+skinparam noteBackgroundColor #FFF3CD
+
+title Broadcast Event Propagation Flow
+
+' ─── Participants ─────────────────────────────────────────────────────────────
+actor       "Event Source"              as EventSource
+participant "EventService"              as EventSvc
+participant "BroadcastService\n(backend)" as BcastBE
+participant "Redis\n(pub/sub)"          as Redis
+participant "Webhook Peer"              as WebhookPeer
+participant "BroadcastService\n(GUI)"   as BcastGUI
+participant "App Iframe"                as AppIframe
+
+' ══════════════════════════════════════════════════════════════════════════════
+' SECTION 1 — Outbound event path
+' ══════════════════════════════════════════════════════════════════════════════
+== Outbound Event Emission ==
+
+EventSource -> EventSvc : emit('outer.*', data, meta)
+activate EventSvc
+
+EventSvc -> EventSvc : match listeners\nby prefix (outer.*)
+note right of EventSvc
+  EmitterFeature resolves wildcard
+  'outer.*' against registered handlers
+end note
+
+EventSvc -> BcastBE : outBroadcastEventHandler(key, data, meta)
+deactivate EventSvc
+activate BcastBE
+
+BcastBE -> BcastBE : guard — if meta.from_outside\nreturn early (loop-break)
+note right of BcastBE
+  Prevents re-broadcast of events
+  already received from outside
+end note
+
+BcastBE -> BcastBE : #normalizeMeta(meta) → safeMeta
+
+' ── Redis pub/sub fanout (outer.pub events only) ──────────────────────────────
+opt key matches 'outer.pub' or 'outer.pub.*'
+    BcastBE -> Redis : #publishWebhookEventsToRedis\n([{key, data, safeMeta}])
+    activate Redis
+    Redis -> Redis : publish('broadcast.webhook.events',\n{sourceId, events})
+    note right of Redis
+      sourceId prevents self-echo
+      on same-cluster replicas
+    end note
+    deactivate Redis
+end opt
+
+' ── Dedup & batching ─────────────────────────────────────────────────────────
+BcastBE -> BcastBE : #enqueueOutboundEvent({key, data, safeMeta})
+BcastBE -> BcastBE : #createDedupKey(event)\n→ JSON.stringify(event)
+BcastBE -> BcastBE : outboundEventsByDedupKey.set(dedupKey, event)
+BcastBE -> BcastBE : #scheduleOutboundFlush()\n→ setTimeout(#flushOutboundEvents,\noutboundFlushMs [2000–5000 ms])
+
+note over BcastBE
+  Events are batched; duplicates within
+  the flush window are collapsed by dedup key
+end note
+
+' ── Flush & webhook delivery ─────────────────────────────────────────────────
+BcastBE -> BcastBE : #flushOutboundEvents()\n— collect events, clear map
+activate BcastBE
+
+loop for each webhookPeer in #webhookPeers
+    BcastBE -> BcastBE : #sendWebhookToPeer(peer_config, events)
+    BcastBE -> BcastBE : sign payload\nHMAC-SHA256(timestamp.nonce.rawBody)
+    BcastBE -> WebhookPeer : POST /broadcast/webhook\n[X-Broadcast-Peer-Id, X-Broadcast-Timestamp,\nX-Broadcast-Nonce, X-Broadcast-Signature]
+    activate WebhookPeer
+    WebhookPeer --> BcastBE : HTTP 200 {ok: true}
+    deactivate WebhookPeer
+end loop
+
+deactivate BcastBE
+deactivate BcastBE
+
+' ══════════════════════════════════════════════════════════════════════════════
+' SECTION 2 — Incoming webhook path
+' ══════════════════════════════════════════════════════════════════════════════
+== Incoming Webhook Path ==
+
+WebhookPeer -> BcastBE : POST /broadcast/webhook\n(incoming from remote peer)
+activate BcastBE
+
+BcastBE -> BcastBE : #handleWebhookRequest(req, res)
+BcastBE -> BcastBE : validate timestamp window\n(±300 s / 60 s)
+BcastBE -> BcastBE : #isNonceReplayForPeer\n({timestamp, nonce, peerId})
+BcastBE -> BcastBE : verify HMAC signature\n(timingSafeEqual)
+
+BcastBE -> Redis : #publishWebhookEventsToRedis(incomingEvents)
+activate Redis
+Redis --> BcastBE : ack
+deactivate Redis
+
+BcastBE -> EventSvc : #emitIncomingEventsSequentially(events)\n→ svcEvent.emit(key, data, {from_outside: true})
+activate EventSvc
+EventSvc --> BcastBE : events dispatched
+deactivate EventSvc
+
+deactivate BcastBE
+
+' ══════════════════════════════════════════════════════════════════════════════
+' SECTION 3 — Redis pub/sub (same-cluster replica fanout)
+' ══════════════════════════════════════════════════════════════════════════════
+== Redis Pub/Sub Replica Fanout ==
+
+Redis -> BcastBE : message on\n'broadcast.webhook.events' channel
+activate BcastBE
+
+BcastBE -> BcastBE : #handleRedisPubSubMessage\n— skip if sourceId == self
+
+BcastBE -> EventSvc : #emitIncomingEventsSequentially(events)\n→ svcEvent.emit(key, data, {from_outside: true})
+activate EventSvc
+EventSvc --> BcastBE : events dispatched
+deactivate EventSvc
+
+deactivate BcastBE
+
+' ══════════════════════════════════════════════════════════════════════════════
+' SECTION 4 — GUI broadcast path
+' ══════════════════════════════════════════════════════════════════════════════
+== GUI Broadcast Path (postMessage) ==
+
+EventSource -> BcastGUI : sendBroadcast(name, data,\n{sendToNewAppInstances})
+activate BcastGUI
+
+BcastGUI -> AppIframe : postMessage({msg:'broadcast', name, data}, '*')\n[each .window-app-iframe[data-appUsesSDK=true]]
+activate AppIframe
+AppIframe --> BcastGUI : (message received)
+deactivate AppIframe
+
+opt sendToNewAppInstances == true
+    BcastGUI -> BcastGUI : broadcastsToSendToNewAppInstances\n.set(name, data)
+    note right of BcastGUI
+      Persisted so new app instances
+      receive the broadcast on launch
+    end note
+end opt
+
+BcastGUI -> AppIframe : sendSavedBroadcastsTo(appInstanceID)\n→ postMessage each saved broadcast\nto specific iframe
+activate AppIframe
+AppIframe --> BcastGUI : (messages received)
+deactivate AppIframe
+
+deactivate BcastGUI
+
+@enduml

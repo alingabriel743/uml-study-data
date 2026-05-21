@@ -1,0 +1,206 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 2
+skinparam sequenceParticipantBorderColor #495057
+skinparam sequenceParticipantBackgroundColor #F8F9FA
+skinparam sequenceParticipantFontColor #212529
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceGroupBorderColor #6C757D
+skinparam sequenceGroupBackgroundColor #E9ECEF
+skinparam noteBorderColor #6C757D
+skinparam noteBackgroundColor #FFF9C4
+
+title Diffusion Model Training Step
+
+actor Trainer as trainer
+participant "DiffusionModel\n(video / model.py)" as vidmodel
+participant "ImageDiffusionModel\n(model_image.py)" as imgmodel
+participant "VAE" as vae
+participant "Conditioner" as cond
+participant "SDE" as sde
+participant "EDMScaling" as edm
+participant "DiTNet" as dit
+participant "GradScaler /\nOptimizer" as optim
+
+== Training Step Entry ==
+
+trainer -> vidmodel : training_step(data_batch, iteration)
+activate vidmodel
+
+note right of vidmodel
+  Updates trained_data_record
+  (image/video count, iteration)
+end note
+
+vidmodel -> imgmodel : super().training_step(data_batch, iteration)
+activate imgmodel
+
+== Get Data and Condition ==
+
+imgmodel -> vidmodel : get_data_and_condition(data_batch)
+activate vidmodel
+
+note right of vidmodel
+  _normalize_video_databatch_inplace()\n  uint8 → float32, scale to [-1, 1]
+  _augment_image_dim_inplace()\n  image: B,C,H,W → B,C,1,H,W
+  _broadcast() data keys across TP/CP groups
+end note
+
+vidmodel -> vae : encode(raw_state)
+activate vae
+vae --> vidmodel : latent z
+deactivate vae
+note right of vidmodel : latent_state = z * sigma_data  [no_grad]
+
+vidmodel -> cond : conditioner(data_batch)
+activate cond
+cond --> vidmodel : CosmosCondition\n(crossattn_emb, crossattn_mask,\n padding_mask, scalar_feature)
+deactivate cond
+
+note right of vidmodel
+  condition.data_type = IMAGE | VIDEO
+  Broadcast latent_state & condition
+  across TP/CP groups
+end note
+
+vidmodel --> imgmodel : (raw_state, latent_state, condition)
+deactivate vidmodel
+
+== Draw Noise: Sigma and Epsilon ==
+
+imgmodel -> vidmodel : draw_training_sigma_and_epsilon(x0.size(), condition)
+activate vidmodel
+
+vidmodel -> imgmodel : super().draw_training_sigma_and_epsilon(size, condition)
+activate imgmodel
+
+imgmodel -> sde : sde.sample_t(batch_size)
+activate sde
+sde --> imgmodel : sigma_B
+deactivate sde
+
+note right of imgmodel : epsilon = torch.randn(x0_size)  [N(0,1)]
+
+imgmodel --> vidmodel : (sigma_B, epsilon)
+deactivate imgmodel
+
+note right of vidmodel
+  sigma_B *= sqrt(num_frames)  [if video]
+  _broadcast(sigma_B, epsilon) across TP/CP
+end note
+
+vidmodel --> imgmodel : (sigma_B, epsilon)
+deactivate vidmodel
+
+== Compute Loss ==
+
+imgmodel -> vidmodel : compute_loss_with_epsilon_and_sigma(\n  data_batch, x0_from_data_batch, x0,\n  condition, epsilon, sigma)
+activate vidmodel
+
+note right of vidmodel
+  Disable/enable CP on net (image vs video)
+  split_inputs_cp(x0, epsilon)  [if CP enabled]
+end note
+
+vidmodel -> imgmodel : super().compute_loss_with_epsilon_and_sigma(...)
+activate imgmodel
+
+imgmodel -> sde : sde.marginal_prob(x0, sigma)
+activate sde
+sde --> imgmodel : (mean, std)
+deactivate sde
+
+note right of imgmodel : xt = mean + batch_mul(std, epsilon)  [noisy obs]
+
+imgmodel -> imgmodel : denoise(xt, sigma, condition)
+activate imgmodel
+
+imgmodel -> edm : scaling(sigma)
+activate edm
+edm --> imgmodel : (c_skip, c_out, c_in, c_noise)
+deactivate edm
+
+imgmodel -> dit : net(x=batch_mul(c_in, xt),\n  timesteps=c_noise,\n  **condition.to_dict())
+activate dit
+dit --> imgmodel : net_output
+deactivate dit
+
+imgmodel -> imgmodel : logvar_net(c_noise)
+
+note right of imgmodel
+  x0_pred = batch_mul(c_skip, xt)\n           + batch_mul(c_out, net_output)
+end note
+
+imgmodel --> imgmodel : DenoisePrediction\n(x0_pred, eps_pred, logvar)
+deactivate imgmodel
+
+note right of imgmodel
+  weights_per_sigma = (σ²+σ_data²) / (σ·σ_data)²
+  weights_per_sample = get_per_sample_weight(...)
+  loss_mask = get_per_sample_loss_mask(...)
+  pred_mse = (x0 − x0_pred)² * loss_mask
+  edm_loss = pred_mse * weights_per_sigma * weights_per_sample
+  kendall_loss = edm_loss  [± logvar uncertainty term]
+end note
+
+imgmodel --> vidmodel : (output_batch, kendall_loss, pred_mse, edm_loss)
+deactivate imgmodel
+
+note right of vidmodel : Scale kendall_loss by CP world size if sum-reduce & CP > 1
+
+vidmodel --> imgmodel : (output_batch, kendall_loss, pred_mse, edm_loss)
+deactivate vidmodel
+
+note right of imgmodel : reduce kendall_loss (mean|sum) * loss_scale
+
+imgmodel --> trainer : (output_batch, kendall_loss)
+deactivate imgmodel
+deactivate vidmodel
+
+== Backward Pass & Optimizer Step ==
+
+trainer -> optim : scale(loss / grad_accum_iter).backward()
+activate optim
+optim --> trainer : gradients computed
+deactivate optim
+
+trainer -> vidmodel : on_after_backward()
+activate vidmodel
+note right of vidmodel : finalize_model_grads()\n→ allreduce layernorm grads
+vidmodel --> trainer
+deactivate vidmodel
+
+trainer -> optim : grad_scaler.step(optimizer)
+activate optim
+optim --> trainer : weights updated
+deactivate optim
+
+note right of trainer
+  grad_scaler.update()
+  scheduler.step()
+end note
+
+trainer -> vidmodel : on_before_zero_grad()
+activate vidmodel
+note right of vidmodel : Update EMA model
+vidmodel --> trainer
+deactivate vidmodel
+
+note right of trainer : optimizer.zero_grad(set_to_none=True)
+
+@enduml

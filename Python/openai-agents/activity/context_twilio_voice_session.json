@@ -1,0 +1,116 @@
+{
+  "scope": "twilio_voice_session",
+  "title": "Twilio Voice Session Setup",
+  "diagram_type": "activity",
+  "description": "Twilio WebSocket connection arrival, new session creation, and linking to the realtime voice pipeline (RealtimeRunner/RealtimeSession). Note: VoicePipeline (STT+TTS) is NOT used here; the Twilio path uses RealtimeRunner/RealtimeSession directly for OpenAI Realtime API.",
+
+  "key_participants": [
+    "Twilio (phone network)",
+    "FastAPI app (server.py)",
+    "TwilioWebSocketManager",
+    "TwilioHandler",
+    "RealtimeAgent",
+    "RealtimeRunner",
+    "RealtimeSession",
+    "RealtimePlaybackTracker",
+    "OpenAI Realtime API"
+  ],
+
+  "activity_flow": [
+    "START: Incoming Twilio phone call",
+    "FastAPI GET/POST /incoming-call → return TwiML Response with <Connect><Stream url='wss://{host}/media-stream'/></Connect>",
+    "Twilio dials /media-stream WebSocket endpoint",
+    "FastAPI @app.websocket('/media-stream') fires media_stream_endpoint(websocket)",
+    "Call manager.new_session(websocket) → TwilioWebSocketManager instantiates TwilioHandler(websocket) and returns it",
+    "TwilioHandler.__init__: set playback_tracker=RealtimePlaybackTracker(), audio buffers, STARTUP_BUFFER_CHUNKS (env, default=3), STARTUP_DELAY_S (env, default=0.0)",
+    "Call handler.start():",
+    "  └─ Create RealtimeAgent(name='Twilio Assistant', tools=[get_weather, get_current_time])",
+    "  └─ Create RealtimeRunner(agent)",
+    "  └─ DECISION: OPENAI_API_KEY present? No → raise ValueError and abort",
+    "  └─ Yes → await runner.run(model_config={api_key, initial_model_settings: {model='gpt-realtime-1.5', input/output_audio_format='g711_ulaw', turn_detection=semantic_vad}}) → self.session (RealtimeSession)",
+    "  └─ await session.enter() → activates OpenAI Realtime WebSocket connection",
+    "  └─ await twilio_websocket.accept() → WebSocket handshake complete",
+    "  └─ DECISION: STARTUP_DELAY_S > 0? Yes → asyncio.sleep(STARTUP_DELAY_S)",
+    "  └─ Spawn 3 concurrent async tasks:",
+    "       [Task A] _realtime_session_loop",
+    "       [Task B] _twilio_message_loop",
+    "       [Task C] _buffer_flush_loop",
+    "await handler.wait_until_done() → waits on _message_loop_task (_twilio_message_loop)",
+
+    "--- [Task A] _realtime_session_loop (concurrent) ---",
+    "  Loop: async for event in self.session:",
+    "    DECISION event.type == 'audio'?",
+    "      → base64-encode audio bytes",
+    "      → send 'media' JSON to Twilio WS (streamSid, payload)",
+    "      → increment _mark_counter, store _mark_data[mark_id]=(item_id, content_index, byte_count)",
+    "      → send 'mark' JSON to Twilio WS (mark_id)",
+    "    DECISION event.type == 'audio_interrupted'?",
+    "      → send 'clear' JSON to Twilio WS (streamSid)",
+    "    DECISION event.type == 'audio_end'? → log",
+    "    else → no-op",
+
+    "--- [Task B] _twilio_message_loop (concurrent) ---",
+    "  Loop: receive_text from Twilio WS → parse JSON:",
+    "    DECISION event == 'connected' → log",
+    "    DECISION event == 'start' → capture self._stream_sid from start.streamSid",
+    "    DECISION event == 'media' → _handle_media_event:",
+    "        decode base64 µ-law payload",
+    "        extend _audio_buffer",
+    "        DECISION len(_audio_buffer) >= BUFFER_SIZE_BYTES (~400 bytes/50ms)?",
+    "          Yes → _flush_audio_buffer()",
+    "    DECISION event == 'mark' → _handle_mark_event:",
+    "        lookup mark_id in _mark_data",
+    "        call playback_tracker.on_play_bytes(item_id, content_index, placeholder_bytes)",
+    "        delete entry from _mark_data",
+    "    DECISION event == 'stop' → log",
+
+    "--- [Task C] _buffer_flush_loop (concurrent) ---",
+    "  Loop every 50ms:",
+    "    DECISION buffer has data AND time since last send > 100ms?",
+    "      Yes → _flush_audio_buffer()",
+
+    "--- _flush_audio_buffer logic ---",
+    "    DECISION _startup_warmed == False?",
+    "      → accumulate into _startup_buffer",
+    "      DECISION startup_buffer >= target_bytes (N_chunks * BUFFER_SIZE_BYTES)?",
+    "        Yes → send all startup_buffer via session.send_audio(), mark _startup_warmed=True",
+    "        No  → return (keep buffering)",
+    "      Already warmed → session.send_audio(buffer_data) immediately",
+
+    "Termination: WebSocketDisconnect or Exception → log and exit"
+  ],
+
+  "key_decisions": [
+    "OPENAI_API_KEY present → proceed or raise ValueError",
+    "STARTUP_DELAY_S > 0 → optional sleep before loops start",
+    "STARTUP_BUFFER_CHUNKS (default 3) → warm-up phase: buffer N chunks before first send_audio to OpenAI",
+    "Twilio event type routing: connected / start / media / mark / stop",
+    "RealtimeSession event type routing: audio / audio_interrupted / audio_end",
+    "Audio buffer >= BUFFER_SIZE_BYTES → flush immediately vs. periodic flush loop fallback"
+  ],
+
+  "key_relationships": [
+    "TwilioWebSocketManager creates TwilioHandler",
+    "TwilioHandler owns RealtimeSession (via RealtimeRunner.run())",
+    "TwilioHandler owns RealtimePlaybackTracker (for interruption accuracy in telephony)",
+    "TwilioHandler bridges Twilio WS ↔ OpenAI Realtime API bidirectionally",
+    "RealtimeRunner wraps RealtimeAgent → produces RealtimeSession",
+    "VoicePipeline (STT+TTS batch) is NOT used here — Realtime API handles audio natively"
+  ],
+
+  "important_notes": [
+    "Audio format: g711_ulaw (µ-law) at 8kHz — Twilio's native telephony codec; passed straight through to OpenAI",
+    "Turn detection: semantic_vad with interrupt_response=True — model manages turn boundaries",
+    "Playback tracking: RealtimePlaybackTracker.on_play_bytes() called when Twilio sends back 'mark' events, ensuring accurate interruption truncation for telephony delay",
+    "Three concurrent async tasks run simultaneously after start(); session ends when _twilio_message_loop exits",
+    "TwilioWebSocketManager.active_handlers dict exists but cleanup/close not implemented in example",
+    "RealtimeAgent has tools: get_weather(city), get_current_time() — function tools auto-executed during session"
+  ],
+
+  "source_files_analyzed": [
+    "examples/realtime/twilio/server.py",
+    "examples/realtime/twilio/twilio_handler.py",
+    "src/agents/voice/pipeline.py",
+    "docs/realtime/guide.md"
+  ]
+}

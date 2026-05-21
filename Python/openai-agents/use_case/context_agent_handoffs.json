@@ -1,0 +1,164 @@
+{
+  "scope": "agent_handoffs",
+  "title": "Agent Handoffs and Routing",
+  "diagram_type": "use_case",
+  "description": "One agent hands off control to another agent; handoff prompts are generated and validated",
+
+  "actors": [
+    "Developer (configures handoffs, agents, filters)",
+    "LLM (decides which handoff tool to call at runtime)",
+    "AgentRunner (orchestrates run loop, executes handoffs)",
+    "SourceAgent (currently active agent that triggers handoff)",
+    "TargetAgent (specialist agent receiving the conversation)"
+  ],
+
+  "use_cases": [
+    "Create Handoff — developer calls handoff(agent, ...) to wrap target Agent into a Handoff object",
+    "Register Handoff on Agent — developer assigns Handoff objects to Agent.handoffs list (plain Agent or Handoff)",
+    "Resolve Enabled Handoffs — AgentRunner calls get_handoffs(agent, context_wrapper) which filters by is_enabled",
+    "Expose Handoff as Tool — AgentRunner exposes each enabled Handoff as an LLM tool named transfer_to_<agent_name>",
+    "LLM Invokes Handoff Tool — LLM selects and calls a handoff tool (e.g. transfer_to_refund_agent) with optional JSON args",
+    "Validate Handoff Input — on_invoke_handoff() validates tool-call JSON args against input_json_schema via TypeAdapter",
+    "Execute on_handoff Callback — _invoke_handoff() calls user-supplied on_handoff(ctx) or on_handoff(ctx, input_data)",
+    "Execute Handoffs Step — AgentRunner calls execute_handoffs() which invokes on_invoke_handoff and gets new_agent",
+    "Apply Input Filter — HandoffInputFilter function transforms HandoffInputData before next agent receives history",
+    "Apply Nest Handoff History — nest_handoff_history() collapses prior transcript into <CONVERSATION HISTORY> summary block",
+    "Remove All Tools from History — handoff_filters.remove_all_tools(HandoffInputData) strips tool-call items from history",
+    "Inject Handoff Prompt Prefix — developer calls prompt_with_handoff_instructions(prompt) or uses RECOMMENDED_PROMPT_PREFIX",
+    "Emit Handoff Hooks — execute_handoffs() calls hooks.on_handoff(ctx, from_agent, to_agent) and agent.hooks.on_handoff()",
+    "Switch Active Agent — run loop sets current_agent = NextStepHandoff.new_agent and continues iteration",
+    "Override Tool Name/Description — developer provides tool_name_override / tool_description_override to handoff()",
+    "Dynamically Enable/Disable Handoff — is_enabled callable checked per-turn via check_handoff_enabled()",
+    "Configure Conversation History Wrappers — set_conversation_history_wrappers(start, end) / reset_conversation_history_wrappers()",
+    "Override Nest History Per-Handoff — handoff(nest_handoff_history=True/False) overrides RunConfig-level flag"
+  ],
+
+  "key_classes": {
+    "Handoff": {
+      "module": "src/agents/handoffs/__init__.py",
+      "type": "frozen dataclass, Generic[TContext, TAgent]",
+      "key_fields": [
+        "tool_name: str",
+        "tool_description: str",
+        "input_json_schema: dict",
+        "on_invoke_handoff: Callable[[RunContextWrapper, str], Awaitable[TAgent]]",
+        "agent_name: str",
+        "input_filter: HandoffInputFilter | None",
+        "nest_handoff_history: bool | None",
+        "is_enabled: bool | Callable",
+        "_agent_ref: weakref to target Agent"
+      ],
+      "key_methods": [
+        "get_transfer_message(agent) -> str  # returns {\"assistant\": agent.name}",
+        "default_tool_name(agent) -> str  # transfer_to_<agent_name>",
+        "default_tool_description(agent) -> str"
+      ]
+    },
+    "HandoffInputData": {
+      "module": "src/agents/handoffs/__init__.py",
+      "type": "frozen dataclass",
+      "key_fields": [
+        "input_history: str | tuple[TResponseInputItem, ...]",
+        "pre_handoff_items: tuple[RunItem, ...]",
+        "new_items: tuple[RunItem, ...]",
+        "run_context: RunContextWrapper | None",
+        "input_items: tuple[RunItem, ...] | None  # overrides new_items for next agent input"
+      ],
+      "key_methods": ["clone(**kwargs) -> HandoffInputData"]
+    },
+    "HandoffInputFilter": {
+      "module": "src/agents/handoffs/__init__.py",
+      "type": "TypeAlias = Callable[[HandoffInputData], MaybeAwaitable[HandoffInputData]]"
+    },
+    "HandoffHistoryMapper": {
+      "module": "src/agents/handoffs/__init__.py",
+      "type": "TypeAlias = Callable[[list[TResponseInputItem]], list[TResponseInputItem]]"
+    }
+  },
+
+  "key_functions": {
+    "handoff()": {
+      "module": "src/agents/handoffs/__init__.py",
+      "signature": "handoff(agent, tool_name_override=None, tool_description_override=None, on_handoff=None, input_type=None, input_filter=None, nest_handoff_history=None, is_enabled=True) -> Handoff",
+      "behavior": "Builds Handoff object; validates on_handoff signature; creates _invoke_handoff async closure that validates JSON input, calls on_handoff, returns agent"
+    },
+    "get_handoffs()": {
+      "module": "src/agents/run_internal/turn_preparation.py",
+      "signature": "async get_handoffs(agent, context_wrapper) -> list[Handoff]",
+      "behavior": "Iterates agent.handoffs; auto-wraps plain Agent via handoff(); filters by is_enabled check"
+    },
+    "execute_handoffs()": {
+      "module": "src/agents/run_internal/turn_resolution.py",
+      "signature": "async execute_handoffs(*, public_agent, original_input, pre_step_items, new_step_items, new_response, run_handoffs, hooks, context_wrapper, run_config, ...) -> SingleStepResult",
+      "behavior": "Takes first handoff (ignores duplicates); opens handoff_span; calls on_invoke_handoff(); appends HandoffOutputItem; fires hooks.on_handoff + agent.hooks.on_handoff; resolves input_filter (per-handoff takes precedence over RunConfig); applies nest_handoff_history if enabled"
+    },
+    "nest_handoff_history()": {
+      "module": "src/agents/handoffs/history.py",
+      "signature": "nest_handoff_history(handoff_input_data, *, history_mapper=None) -> HandoffInputData",
+      "behavior": "Normalizes + flattens nested history; passes transcript through mapper (default: default_handoff_history_mapper); returns clone with collapsed input_history and filtered input_items"
+    },
+    "default_handoff_history_mapper()": {
+      "module": "src/agents/handoffs/history.py",
+      "behavior": "Summarizes entire transcript as single assistant message wrapped in <CONVERSATION HISTORY>...</CONVERSATION HISTORY>"
+    },
+    "remove_all_tools()": {
+      "module": "src/agents/extensions/handoff_filters.py",
+      "signature": "remove_all_tools(handoff_input_data) -> HandoffInputData",
+      "behavior": "Removes all HandoffCallItem, HandoffOutputItem, ToolCallItem, ToolCallOutputItem, ToolSearchCallItem, ReasoningItem, MCP items, ToolApprovalItem from history and new_items"
+    },
+    "prompt_with_handoff_instructions()": {
+      "module": "src/agents/extensions/handoff_prompt.py",
+      "behavior": "Prepends RECOMMENDED_PROMPT_PREFIX to agent instructions so LLM understands handoff mechanics"
+    }
+  },
+
+  "run_loop_integration": [
+    "AgentRunner calls get_handoffs(agent, ctx) each turn to collect enabled Handoff list",
+    "Enabled handoffs exposed as tools to LLM alongside regular tools",
+    "LLM returns tool_call for a transfer_to_X tool → detected as ToolRunHandoff in ProcessedResponse",
+    "execute_handoffs() called → invokes on_invoke_handoff → returns new_agent",
+    "Input filter / nest_history applied to produce new HandoffInputData for next agent",
+    "run_loop sets current_agent = NextStepHandoff.new_agent and continues loop",
+    "Multiple simultaneous handoffs: only first is executed, rest get 'Multiple handoffs detected' output message",
+    "Guardrails: input guardrails apply only to first agent; output guardrails only to agent producing final output"
+  ],
+
+  "relationships": [
+    "Agent has_many Handoff (via Agent.handoffs: list[Agent | Handoff])",
+    "Handoff wraps Agent (weak ref _agent_ref; on_invoke_handoff closure captures agent)",
+    "Handoff uses HandoffInputFilter (optional input_filter field)",
+    "HandoffInputFilter transforms HandoffInputData",
+    "AgentRunner (run_loop) calls get_handoffs → execute_handoffs",
+    "execute_handoffs creates HandoffInputData and applies filter/nesting",
+    "handoff_filters.remove_all_tools implements HandoffInputFilter interface",
+    "handoff_filters.nest_handoff_history implements HandoffInputFilter interface (re-exported)",
+    "HandoffPrompt (RECOMMENDED_PROMPT_PREFIX) injected into Agent.instructions by developer",
+    "RunConfig.handoff_input_filter is fallback when Handoff.input_filter is None",
+    "RunConfig.nest_handoff_history is fallback when Handoff.nest_handoff_history is None"
+  ],
+
+  "business_rules": [
+    "Handoff stays within a single Runner.run() call — not cross-run",
+    "Only first handoff is honored when LLM requests multiple simultaneously",
+    "Disabled handoffs (is_enabled=False) are hidden from LLM tool list at runtime",
+    "Per-handoff input_filter takes precedence over RunConfig.handoff_input_filter",
+    "Per-handoff nest_handoff_history takes precedence over RunConfig.nest_handoff_history",
+    "Server-managed conversations (conversation_id / previous_response_id) disallow input_filter and nest_handoff_history",
+    "input_type / on_handoff must both be provided or neither",
+    "input_json_schema is always enforced in strict mode (ensure_strict_json_schema)",
+    "Nest handoff history is opt-in beta (disabled by default)",
+    "input_items field on HandoffInputData: when set, used for next agent input instead of new_items (preserves session history)"
+  ],
+
+  "source_files_analyzed": [
+    "src/agents/handoffs/__init__.py",
+    "src/agents/handoffs/history.py",
+    "src/agents/extensions/handoff_filters.py",
+    "src/agents/extensions/handoff_prompt.py",
+    "src/agents/run_internal/turn_preparation.py (get_handoffs)",
+    "src/agents/run_internal/turn_resolution.py (execute_handoffs)",
+    "src/agents/run_internal/run_loop.py (NextStepHandoff handling)",
+    "docs/handoffs.md",
+    "docs/multi_agent.md"
+  ]
+}

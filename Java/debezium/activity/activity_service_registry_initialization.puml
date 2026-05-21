@@ -1,0 +1,199 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+}
+
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #DEE2E6
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #F9A825
+    FontColor #212529
+}
+
+title Service Registry Initialization\n<size:11>io.debezium.service.DefaultServiceRegistry — Full Lifecycle</size>
+
+|Caller|
+start
+:new DefaultServiceRegistry\n(Configuration, BeanRegistry);
+
+|DefaultServiceRegistry|
+:Store configuration field;
+:Create ServiceRegistration\n(BeanRegistry — pre-initialized instance);
+:registerService(registration, beanRegistry)\n→ add to serviceRegistrations map\n  + add to ordered registrations list;
+
+|Caller|
+:registerServiceProvider(ServiceProvider<T>);
+
+|DefaultServiceRegistry|
+:Create ServiceRegistration\n(serviceProvider set, service = null — lazy);
+:Put in serviceRegistrations map\nkeyed by serviceProvider.getServiceClass();
+note right
+  registrations list is NOT updated yet
+  Entry is deferred until first getService() call
+end note
+
+|Caller|
+:getService(serviceClass);
+
+|DefaultServiceRegistry|
+if (initializedServices\ncache hit?) then (yes — fast path, no lock)
+  :Return cached service instance;
+  detach
+else (no)
+endif
+
+:Enter synchronized block\n(double-checked locking on initializedServices);
+
+if (initializedServices\ncache hit?) then (yes — concurrent init race)
+  :Return cached service instance;
+  detach
+else (no)
+endif
+
+:findRegistration(serviceClass)\n→ lookup serviceRegistrations map;
+
+if (registration\nfound?) then (no)
+  #FFB3B3:Throw UnknownServiceException\n(no registration for serviceClass);
+  detach
+else (yes)
+endif
+
+if (registration.getService()\nnot null?) then (yes — pre-initialized)
+  :Put service in initializedServices;
+  :Return pre-initialized service;
+  detach
+else (no — lazy init required)
+endif
+
+note right: ══ initializeService(registration) ══
+
+:createService(registration);
+
+if (registration.getServiceProvider()\n== null?) then (yes)
+  #FFB3B3:Throw UnknownServiceException\n(ServiceProvider not set);
+  detach
+else (no)
+endif
+
+|ServiceProvider|
+:serviceProvider.createService\n(configuration, serviceRegistry)\n→ factory instantiates service;
+
+|DefaultServiceRegistry|
+if (created service\n== null?) then (yes)
+  :Return null — abort initialization;
+  detach
+else (no)
+endif
+
+:registerService(registration, service)\n→ registration.setService(service)\n  + append to registrations list\n  + update serviceRegistrations map;
+
+note right: ══ doMultiPhaseInitialization(registration) ══
+
+' ─── Phase 1: Inject Dependencies ───────────────────────────────────────
+
+note right: Phase 1 — Inject Dependencies
+
+:doInjections(service)\nIterate all public methods via reflection;
+
+repeat
+  if (method has\n@InjectService annotation?) then (yes)
+    if (method has exactly\n1 parameter?) then (no)
+      #FFB3B3:Throw ServiceDependencyException\n(incorrect parameter count);
+      detach
+    else (yes)
+      :Resolve requestedServiceType\n(from @InjectService.service() or param type);
+      :getService(requestedServiceType)\n— RECURSIVE call\n  (may trigger nested lazy initialization);
+      if (resolved service null\nAND required = true?) then (yes)
+        #FFB3B3:Throw ServiceDependencyException\n(missing required dependency);
+        detach
+      else (no — optional or resolved)
+      endif
+      |Service|
+      :method.invoke(service, resolvedService)\nInject dependency via setter;
+      |DefaultServiceRegistry|
+    endif
+  else (no — skip non-annotated method)
+  endif
+repeat while (more public methods\nto inspect?) is (yes)
+->no;
+
+if (service instanceof\nServiceRegistryAware?) then (yes)
+  |Service|
+  :injectServiceRegistry(registry);
+  |DefaultServiceRegistry|
+else (no — skip)
+endif
+
+' ─── Phase 2: Configure ─────────────────────────────────────────────────
+
+note right: Phase 2 — Configure
+
+if (service instanceof\nConfigurable?) then (yes)
+  |Service|
+  :configure(configuration);
+  |DefaultServiceRegistry|
+else (no — skip)
+endif
+
+' ─── Phase 3: Start ─────────────────────────────────────────────────────
+
+note right: Phase 3 — Start
+
+if (service instanceof\nStartable?) then (yes)
+  |Service|
+  :start();
+  |DefaultServiceRegistry|
+else (no — skip)
+endif
+
+:Put fully-initialized service\ninto initializedServices map;
+
+|Caller|
+:Receives initialized service\n(ready for use);
+
+:Trigger close() — Graceful Shutdown;
+
+|DefaultServiceRegistry|
+:initializedServices.clear();
+:Acquire lock on registrations list;
+:Create ListIterator positioned\nat END of registrations list\n(LIFO — last-in, first-out stop order);
+
+repeat
+  :stopService(registration);
+  if (service instanceof\nCloseable?) then (yes)
+    |Service|
+    :close();
+    |DefaultServiceRegistry|
+    if (IOException thrown?) then (yes)
+      :Log IOException\n(non-fatal — shutdown continues);
+    else (no)
+    endif
+  else (no — skip)
+  endif
+repeat while (more registrations\nin reverse order?) is (yes)
+->no;
+
+:registrations.clear();
+:serviceRegistrations.clear();
+:Log "Debezium ServiceRegistry stopped.";
+
+stop
+
+@enduml

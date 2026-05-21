@@ -1,0 +1,241 @@
+{
+  "scope": "code_and_tool_execution",
+  "title": "Code Execution & General Agent Actions",
+  "diagram_type": "use_case",
+  "system_boundary": "Generic Agent Tool Layer (ga.py + simphtml.py)",
+
+  "actors": [
+    {
+      "name": "Agent",
+      "type": "primary",
+      "description": "AI agent driving all tool calls via GenericAgentHandler methods"
+    },
+    {
+      "name": "User",
+      "type": "primary",
+      "description": "Human who receives output, answers ask_user interrupts, and can trigger stop signals"
+    },
+    {
+      "name": "Browser (TMWebDriver)",
+      "type": "external_system",
+      "description": "Headless/CDP-connected browser; accessed via driver.execute_js / driver.get_all_sessions"
+    },
+    {
+      "name": "File System",
+      "type": "external_system",
+      "description": "Local disk; read and written by file_read / file_write / file_patch"
+    },
+    {
+      "name": "OS Process (subprocess)",
+      "type": "external_system",
+      "description": "Child processes spawned by code_run for python/bash/powershell execution"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC01",
+      "name": "Execute Python Script",
+      "actor": "Agent",
+      "entry_point": "do_code_run(args={type:'python', code:..., timeout, cwd, inline_eval})",
+      "flow": [
+        "Write code_run_header.py + user code to temp .ai.py file",
+        "Launch subprocess: python -X utf8 -u <tmp_path>",
+        "Stream stdout via background thread (stream_reader)",
+        "Kill on timeout or stop_signal",
+        "Cleanup temp file in finally block",
+        "Return {status, stdout, exit_code}"
+      ],
+      "includes": ["UC09_PrependHeader", "UC10_StreamOutput"],
+      "extends": ["UC01a_InlineEval"]
+    },
+    {
+      "id": "UC01a",
+      "name": "Inline Eval (Python)",
+      "actor": "Agent",
+      "note": "<<extend>> of UC01 when inline_eval=True; runs eval/exec in-process with handler/parent in namespace"
+    },
+    {
+      "id": "UC02",
+      "name": "Execute Shell Command",
+      "actor": "Agent",
+      "entry_point": "do_code_run(args={type:'bash'|'powershell', code:...})",
+      "flow": [
+        "Build cmd: ['bash','-c',code] on Unix or ['powershell','-Command',code] on Windows",
+        "Launch subprocess with STARTF_USESHOWWINDOW on Windows",
+        "Stream stdout; enforce timeout / stop_signal",
+        "Return {status, stdout, exit_code}"
+      ]
+    },
+    {
+      "id": "UC03",
+      "name": "Read File",
+      "actor": "Agent",
+      "entry_point": "do_file_read(args={path, start, count, keyword, show_linenos})",
+      "flow": [
+        "Resolve absolute path via _get_abs_path",
+        "file_read: stream lines with itertools; dropwhile < start",
+        "If keyword: scan with sliding deque window, return surrounding lines",
+        "Track _read_dirs for fuzzy file suggestions on FileNotFoundError",
+        "log_memory_access(path) to memory/file_access_stats.json if 'memory' in path",
+        "smart_format result to max 20000 chars",
+        "Return StepOutcome with next_prompt including WORKING MEMORY"
+      ]
+    },
+    {
+      "id": "UC04",
+      "name": "Write File",
+      "actor": "Agent",
+      "entry_point": "do_file_write(args={path, mode:'overwrite'|'append'|'prepend'})",
+      "flow": [
+        "Extract content from <file_content>...</file_content> tag or ```code block in response body",
+        "expand_file_refs: substitute {{file:path:start:end}} references with actual file slices",
+        "Write to file (open with 'w'/'a', or prepend by reading existing + rewriting)",
+        "Return {status:'success', writed_bytes:N}"
+      ]
+    },
+    {
+      "id": "UC05",
+      "name": "Patch File",
+      "actor": "Agent",
+      "entry_point": "do_file_patch(args={path, old_content, new_content})",
+      "flow": [
+        "Resolve absolute path",
+        "expand_file_refs on new_content",
+        "file_patch: assert old_content appears exactly once",
+        "Replace old_content with new_content and write back",
+        "Error if 0 matches or >1 matches (with guidance)"
+      ]
+    },
+    {
+      "id": "UC06",
+      "name": "Scan Web Page",
+      "actor": "Agent",
+      "entry_point": "do_web_scan(args={tabs_only, switch_tab_id, text_only})",
+      "flow": [
+        "Lazy-init TMWebDriver via first_init_driver()",
+        "Collect tabs metadata from driver.get_all_sessions()",
+        "Optionally switch active tab via driver.default_session_id",
+        "If not tabs_only: call simphtml.get_html(driver, cutlist=True, maxchars=35000)",
+        "Return metadata + HTML/text content"
+      ],
+      "includes": ["UC11_OptimiseHTML", "UC12_CutList"]
+    },
+    {
+      "id": "UC07",
+      "name": "Execute JavaScript in Browser",
+      "actor": "Agent",
+      "entry_point": "do_web_execute_js(args={script, switch_tab_id, save_to_file, no_monitor})",
+      "flow": [
+        "Load script from arg, ```javascript block, or file path",
+        "Optionally switch active tab",
+        "Call simphtml.execute_js_rich(script, driver, no_monitor)",
+        "execute_js_rich: optionally capture baseline HTML + start temp text monitor",
+        "driver.execute_js(script) -> result",
+        "Detect new tabs opened during execution",
+        "If not no_monitor: collect transient texts, compute DOM diff via find_changed_elements",
+        "If save_to_file: write js_return to disk, truncate in-memory copy",
+        "Return {status, js_return, tab_id, transients, diff, newTabs}"
+      ],
+      "includes": ["UC13_MonitorDOMChanges"],
+      "extends": ["UC07a_SaveResultToFile"]
+    },
+    {
+      "id": "UC07a",
+      "name": "Save JS Result to File",
+      "actor": "Agent",
+      "note": "<<extend>> of UC07 when save_to_file arg provided"
+    },
+    {
+      "id": "UC08",
+      "name": "Ask User for Input",
+      "actor": "Agent",
+      "entry_point": "do_ask_user(args={question, candidates:[]})",
+      "flow": [
+        "Return StepOutcome with status=INTERRUPT, intent=HUMAN_INTERVENTION",
+        "should_exit=True — halts agent loop until user replies"
+      ],
+      "actor_response": "User provides answer; agent loop resumes"
+    },
+    {
+      "id": "UC09",
+      "name": "Prepend Code Run Header",
+      "actor": "OS Process",
+      "note": "<<include>> of UC01 — assets/code_run_header.py injected before user Python code; patches subprocess.run for encoding, installs ImportError/AttributeError hint hook"
+    },
+    {
+      "id": "UC10",
+      "name": "Stream Subprocess Output",
+      "actor": "OS Process",
+      "note": "<<include>> of UC01/UC02 — background daemon thread reads stdout lines; main thread polls for timeout/stop_signal every 1s"
+    },
+    {
+      "id": "UC11",
+      "name": "Optimise HTML for Tokens",
+      "actor": "Agent",
+      "note": "<<include>> of UC06 — optimize_html_for_tokens strips style attrs, truncates long src/href, removes non-semantic attributes; uses BeautifulSoup"
+    },
+    {
+      "id": "UC12",
+      "name": "Cut Repetitive List Items",
+      "actor": "Agent",
+      "note": "<<include>> of UC06 when cutlist=True — js_findMainList scores candidate containers, keeps 3 representative items, inserts [FAKE ELEMENT] hint; smart_truncate reduces to maxchars"
+    },
+    {
+      "id": "UC13",
+      "name": "Monitor DOM Changes",
+      "actor": "Browser (TMWebDriver)",
+      "note": "<<include>> of UC07 unless no_monitor=True — captures baseline HTML + installs interval text monitor (450ms tick); after execution computes diff via find_changed_elements and collects transient strings"
+    },
+    {
+      "id": "UC14",
+      "name": "Update Working Checkpoint",
+      "actor": "Agent",
+      "entry_point": "do_update_working_checkpoint(args={key_info, related_sop})",
+      "flow": [
+        "Persist key_info / related_sop in self.working dict",
+        "Injected into next_prompt via _get_anchor_prompt as <key_info> block"
+      ]
+    },
+    {
+      "id": "UC15",
+      "name": "Trigger Long-Term Memory Update",
+      "actor": "Agent",
+      "entry_point": "do_start_long_term_update(args)",
+      "flow": [
+        "Read memory/memory_management_sop.md",
+        "Return detailed prompt instructing agent to file_patch L1/L2/L3 memory files",
+        "Agent subsequently calls file_read + file_patch to commit distilled facts"
+      ]
+    }
+  ],
+
+  "key_relationships": [
+    "GenericAgentHandler extends BaseHandler (agent_loop module)",
+    "GenericAgentHandler aggregates TMWebDriver via module-level driver singleton",
+    "GenericAgentHandler delegates to module-level functions: code_run, web_scan, web_execute_js, file_read, file_patch, ask_user",
+    "web_scan depends_on simphtml.get_html",
+    "web_execute_js depends_on simphtml.execute_js_rich",
+    "simphtml.get_html calls get_main_block (js_optHTML) + js_findMainList + optimize_html_for_tokens + smart_truncate",
+    "simphtml.execute_js_rich calls get_html, start_temp_monitor, driver.execute_js, get_temp_texts, find_changed_elements",
+    "code_run (python mode) includes assets/code_run_header.py as script preamble",
+    "file_write / file_patch both call expand_file_refs for {{file:}} reference expansion"
+  ],
+
+  "important_notes": [
+    "code_run streams output in real-time; temp .ai.py files cleaned up in finally",
+    "Timeout default=60s; stop_signal list allows external kill",
+    "web_scan/web_execute_js lazy-init driver; require at least one open browser tab",
+    "simphtml js_optHTML runs entirely in-browser JS, filters hidden/overlay elements, shadow DOM, iframes",
+    "execute_js_rich returns transients (appeared-then-disappeared text), DOM diff, and newTabs detection",
+    "smart_format caps output length before returning to LLM context",
+    "Memory access logging tracks read frequency per file in memory/file_access_stats.json",
+    "turn_end_callback injects turn-count warnings and plan-mode hints into next_prompt every N turns"
+  ],
+
+  "source_files_analyzed": [
+    "ga.py",
+    "simphtml.py",
+    "assets/code_run_header.py"
+  ]
+}

@@ -1,0 +1,291 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #495057
+    StartColor #212529
+    EndColor #212529
+    BarColor #495057
+}
+
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title Incremental Snapshot Execution
+
+|SignalProcessor|
+start
+:scheduleAtFixedRate(process(), pollInterval);
+
+repeat
+  :acquireSemaphore (10s timeout);
+  :Read all enabled SignalChannelReaders;
+  :processSignal(record, partition);
+  :Lookup SignalAction by type;
+  :Parse JSON data payload;
+  :getOffsets(partition, data);
+  :Build SignalPayload(id, type, data, offsetCtx);
+  :action.arrived(SignalPayload);
+
+  |SnapshotExecution|
+  if (Signal type?) then (execute-snapshot)
+    :addDataCollectionNamesToSnapshot();
+    :expandAndDedupeDataCollectionIds()\n— expand regex patterns against schema;
+    :context.addDataCollectionNamesToSnapshot\n(correlationId, expandedIds, conditions, surrogateKey);
+    :validateSignalTableConfiguration();
+
+    |Notifications|
+    :notifyStarted(context, partition, offsetContext)\n[state: STARTED];
+
+    |SnapshotExecution|
+    :progressListener.snapshotStarted(partition);
+    :progressListener.monitoredDataCollectionsDetermined();
+    :readChunk(partition, offsetContext);
+
+  elseif (Signal type?) then (pause-snapshot)
+    if (snapshotRunning && !paused?) then (yes)
+      :context.pauseSnapshot();
+      :progressListener.snapshotPaused(partition);
+
+      |Notifications|
+      :notifyPaused(context, partition, offsetContext)\n[state: PAUSED];
+    else (no)
+      :Ignore — snapshot not running or already paused;
+    endif
+
+  elseif (Signal type?) then (resume-snapshot)
+    if (snapshotRunning && paused?) then (yes)
+      :context.resumeSnapshot();
+      :progressListener.snapshotResumed(partition);
+
+      |Notifications|
+      :notifyResumed(context, partition, offsetContext)\n[state: RESUMED];
+
+      |SnapshotExecution|
+      :readChunk(partition, offsetContext);
+    else (no)
+      :Ignore — snapshot not running or not paused;
+    endif
+
+  elseif (Signal type?) then (stop-snapshot)
+    :context.requestSnapshotStop(dataCollectionIds);
+    note right: Stop flag processed\non next readChunk()
+
+  elseif (Signal type?) then (snapshot-window-open)
+    :context.openWindow(signalPayload.id);
+
+  else (snapshot-window-close)
+    :context.closeWindow(id);
+    if (Window ID matches?) then (yes)
+      :sendWindowEvents(partition, offsetContext);
+      :offsetContext.incrementalSnapshotEvents();
+      fork
+        :dispatcher.dispatchSnapshotEvent()\nfor each row in window buffer;
+      fork again
+        :context.sendEvent(key)\n— mark events sent;
+      end fork
+      :offsetContext.postSnapshotCompletion();
+      :window.clear();
+      :readChunk(partition, offsetContext);
+    else (no — mismatch)
+      :Return — ignore stale close signal;
+    endif
+  endif
+
+|SignalProcessor|
+repeat while (Connector running?) is (yes)
+->no;
+
+:stop() — close channels, shutdown executor;
+stop
+
+|SnapshotExecution|
+
+partition "readChunk(partition, offsetContext)" {
+  :checkAndProcessStopFlag();
+
+  if (Stop requested?) then (yes)
+    :expandAndDedupeDataCollectionIds(stoppedIds);
+    if (Current table in stop list?) then (yes)
+      :tableScanCompleted();
+    else (no)
+      :context.removeDataCollectionFromSnapshot(id);
+    endif
+
+    |Notifications|
+    :notifyAborted(context, partition, offsetContext)\n[state: ABORTED];
+
+    |SnapshotExecution|
+  else (no)
+  endif
+
+  if (!context.snapshotRunning()?) then (true)
+    :postIncrementalSnapshotCompleted();
+    detach
+  endif
+
+  if (context.isSnapshotPaused()?) then (true)
+    :Return — await resume signal;
+    detach
+  endif
+
+  :preReadChunk(context)\n— validate / reconnect JDBC;
+  :jdbcConnection.commit();
+  :context.startNewChunk();
+
+  |WatermarkManagement|
+  :emitWindowOpen(partition, offsetContext)\n— write low watermark row to signaling table;
+
+  |SnapshotExecution|
+  while (context.snapshotRunning()?) is (yes)
+
+    if (Table schema null?) then (yes)
+      :retrieveAndRefreshSchema();
+      if (Schema still null?) then (yes)
+        :warnAndSkip(UNKNOWN_SCHEMA);
+
+        |Notifications|
+        :notifyTableScanCompleted\n[status: UNKNOWN_SCHEMA];
+
+        |SnapshotExecution|
+        :nextDataCollection();
+        (A)
+        detach
+      endif
+    endif
+
+    if (No primary key columns?) then (yes)
+      :warnAndSkip(NO_PRIMARY_KEY);
+
+      |Notifications|
+      :notifyTableScanCompleted\n[status: NO_PRIMARY_KEY];
+
+      |SnapshotExecution|
+      :nextDataCollection();
+      (A)
+      detach
+    endif
+
+    if (schemaChangesEnabled &&\n!schemaHistoryUpToDate?) then (yes)
+      :Break — recheck schema in next window;
+      break
+    endif
+
+    if (context.maximumKey().isEmpty()?) then (yes)
+      :chunkQueryBuilder.buildMaxPrimaryKeyQuery();
+      :Execute MAX PK query via JdbcConnection;
+      if (SQLException?) then (yes)
+
+        |Notifications|
+        :notifyTableScanCompleted\n[status: SQL_EXCEPTION];
+
+        |SnapshotExecution|
+        :nextDataCollection();
+        (A)
+        detach
+      elseif (Result null / empty table?) then (yes)
+
+        |Notifications|
+        :notifyTableScanCompleted\n[status: EMPTY];
+
+        |SnapshotExecution|
+        :nextDataCollection();
+        (A)
+        detach
+      else (found)
+        :context.maximumKey(maximumKey);
+      endif
+    endif
+
+    :chunkQueryBuilder.buildChunkQuery()\n— SQL SELECT with PK range bounds;
+    :Execute PreparedStatement via JdbcConnection;
+    :Iterate ResultSet → fill window\n{keyStruct → row};
+    :context.nextChunkPosition(lastKey);
+
+    if (Schema changed mid-chunk?) then (yes)
+      :context.revertChunk();
+      break
+    elseif (Window empty — table fully scanned?) then (yes)
+
+      |Notifications|
+      :notifyTableScanCompleted\n[status: SUCCEEDED];
+
+      |SnapshotExecution|
+      :tableScanCompleted();
+      :nextDataCollection();
+      (A)
+      detach
+    elseif (SQLException during scan?) then (yes)
+
+      |Notifications|
+      :notifyTableScanCompleted\n[status: SQL_EXCEPTION];
+
+      |SnapshotExecution|
+      :nextDataCollection();
+      (A)
+      detach
+    else (window not empty)
+
+      |Notifications|
+      :notifyInProgress(context, partition, offsetContext)\n[state: IN_PROGRESS\npayload: current_collection, max_key, last_key];
+
+      |SnapshotExecution|
+      break
+    endif
+
+  endwhile (no)
+
+  |WatermarkManagement|
+  :emitWindowClose(partition, offsetContext)\n— write high watermark row to signaling table;
+
+  |SnapshotExecution|
+  :postReadChunk(context);
+
+  if (!snapshotRunning after chunk?) then (yes)
+    :postIncrementalSnapshotCompleted();
+  endif
+}
+
+(A)
+partition "nextDataCollection / Completion" {
+  :context.nextDataCollection();
+  if (!context.snapshotRunning()?) then (yes)
+    :progressListener.snapshotCompleted(partition);
+
+    |Notifications|
+    :notifyCompleted(context, partition, offsetContext)\n[state: COMPLETED];
+
+    |SnapshotExecution|
+    :context.unsetCorrelationId();
+    stop
+  else (no — more collections)
+    :Continue with next data collection;
+    detach
+  endif
+}
+
+@enduml

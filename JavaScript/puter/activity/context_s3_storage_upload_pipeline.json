@@ -1,0 +1,153 @@
+{
+  "scope": "s3_storage_upload_pipeline",
+  "title": "S3 Storage Upload Pipeline",
+  "diagram_type": "activity",
+  "description": "Initialization, file upload (buffer & streaming multipart), and object copy (simple & multipart) operations in S3StorageController",
+  "main_actor": "S3StorageController",
+  "dependencies": [
+    "s3ClientProvider (extension:data) — provides regional S3 clients",
+    "chunk_stream (core.util.streamutil) — splits Readable stream into fixed-size byte arrays",
+    "simple_retry (core.util.retryutil) — wraps async calls with N retries + delay",
+    "EWMA (core.util.opmath) — exponentially weighted moving average for part-upload timing",
+    "TeePromise (teepromise) — resolvable promise used as a backpressure gate",
+    "AWS SDK commands: PutObject, CreateMultipartUpload, UploadPart, CompleteMultipartUpload, AbortMultipartUpload, CopyObject, UploadPartCopy, DeleteObject, GetObject"
+  ],
+
+  "activities": {
+
+    "init": {
+      "signature": "async init()",
+      "steps": [
+        "Set this.clients_ = {}",
+        "Set this.config = global_config",
+        "Create this.global_average_S3_part_time = new EWMA({ initial: 4000ms, alpha: 0.1 })"
+      ]
+    },
+
+    "upload": {
+      "signature": "async upload({ uid, file, storage_meta, storage_api })",
+      "inputs": ["uid (S3 key)", "file { buffer? | stream, size }", "storage_meta { bucket, bucket_region }", "storage_api { progress_tracker }"],
+      "steps": [
+        "Extract progress_tracker from storage_api",
+        "Extract bucket, bucket_region from storage_meta",
+        "Call #get_client(bucket_region) → client",
+        "[DECISION] file.buffer exists?",
+        "  [YES – Buffer path]",
+        "    simple_retry(PutObjectCommand({ Bucket, Key:uid, Body:file.buffer }), retries=3, delay=200ms)",
+        "    [DECISION] retry succeeded?",
+        "      [NO] throw s3_error",
+        "      [YES] progress_tracker.set_total(file.size); progress_tracker.set(file.size)",
+        "      return",
+        "  [NO – Stream path]",
+        "    simple_retry(#upload_stream({ bucket_region, bucket, key:uid, stream:file.stream, on_progress }), retries=3, delay=200ms)",
+        "    on_progress sets progress_tracker.set_total(file.size) and progress_tracker.set(evt.uploaded)",
+        "    [DECISION] retry succeeded?",
+        "      [NO] throw s3_error",
+        "      [YES] return"
+      ]
+    },
+
+    "upload_stream_private": {
+      "signature": "async #upload_stream({ bucket_region, bucket, key, stream, on_progress })",
+      "note": "Internal multipart streaming upload; called by upload() for stream-based files",
+      "steps": [
+        "Call #get_client(bucket_region) → client",
+        "Send CreateMultipartUploadCommand({ Bucket, Key }) → get UploadId",
+        "Set part_size = 5 MiB",
+        "Create chunk_iterator = chunk_stream(stream, part_size, global_average_S3_part_time)",
+        "[LOOP] for await each chunk from chunk_iterator:",
+        "  call upload_part(chunk):",
+        "    [DECISION] count_parts_being_uploaded >= 4?",
+        "      [YES] create TeePromise tp; await tp  ← backpressure gate",
+        "    Increment part_number; increment count_parts_being_uploaded",
+        "    simple_retry(UploadPartCommand({ Bucket, Key, PartNumber, UploadId, Body:part }), retries=3, delay=50ms)",
+        "    [DECISION] error or !success? → throw err",
+        "    Record elapsed time; update global_average_S3_part_time via EWMA.put(elapsed_per_part_size)",
+        "    uploaded_bytes += part.length; call on_progress({ uploaded: uploaded_bytes })",
+        "    Decrement count_parts_being_uploaded",
+        "    If TeePromise pending: resolve it (unblocks backpressure gate)",
+        "    call check_queue() to drain part_queue",
+        "[DECISION] i === 0 (empty file)?",
+        "  [YES] simple_retry(UploadPartCommand({ PartNumber:1, Body:Buffer.alloc(0) }), retries=3, delay=50ms)",
+        "        call on_progress; push result",
+        "[DECISION] part_queue non-empty?",
+        "  [YES] await queue_empty_promise (TeePromise resolved when queue drains)",
+        "await Promise.all(upload_promises) → upload_results[]",
+        "Send CompleteMultipartUploadCommand({ Bucket, Key, UploadId, Parts:[{PartNumber, ETag}] })",
+        "[CATCH] on any error:",
+        "  Send AbortMultipartUploadCommand({ Bucket, Key, UploadId })",
+        "  re-throw error"
+      ]
+    },
+
+    "copy": {
+      "signature": "async copy({ src_node, dst_storage, storage_api })",
+      "inputs": ["src_node (node with s3:location and size getters)", "dst_storage { key, bucket, bucket_region }", "storage_api { progress_tracker }"],
+      "steps": [
+        "Extract progress_tracker from storage_api",
+        "src_storage = await src_node.get('s3:location')  → { key, bucket }",
+        "size = await src_node.get('size')",
+        "[DECISION] size < 4 GB - 100 bytes (i.e. < ~3.99 GiB)?",
+        "  [YES – Simple copy]",
+        "    call #copy_simple({ src_key, src_bucket, dst_key, dst_bucket_region, dst_bucket })",
+        "    progress_tracker.set_total(size); progress_tracker.set(size)",
+        "    return result",
+        "  [NO – Large multipart copy]",
+        "    call #copy_multipart({ src_key, src_bucket, dst_key, dst_bucket_region, dst_bucket, size, on_progress })",
+        "    on_progress sets progress_tracker.set_total(size) and progress_tracker.set(evt.uploaded)",
+        "    return result"
+      ]
+    },
+
+    "copy_simple_private": {
+      "signature": "async #copy_simple({ dst_bucket_region, dst_bucket, src_bucket, src_key, dst_key })",
+      "steps": [
+        "Call #get_client(dst_bucket_region) → client",
+        "Send CopyObjectCommand({ Bucket:dst_bucket, Key:dst_key, CopySource:'src_bucket/src_key' })",
+        "Return result"
+      ]
+    },
+
+    "copy_multipart_private": {
+      "signature": "async #copy_multipart({ dst_bucket_region, dst_bucket, src_bucket, src_key, dst_key, on_progress, size })",
+      "steps": [
+        "Call #get_client(dst_bucket_region) → client",
+        "Send CreateMultipartUploadCommand({ Bucket:dst_bucket, Key:dst_key }) → get UploadId",
+        "Set part_size = 4 GiB",
+        "[LOOP] byte_start from 0 to size, step part_size:",
+        "  Compute byte_end = min(byte_start + part_size, size) - 1",
+        "  simple_retry(UploadPartCopyCommand({ Bucket, Key, PartNumber, UploadId, CopySource, CopySourceRange:'bytes=start-end' }), retries=3, delay=50ms)",
+        "  [DECISION] error or !success? → throw err",
+        "  Push result; call on_progress({ uploaded: byte_end + 1 })",
+        "Send CompleteMultipartUploadCommand({ Bucket, Key, UploadId, Parts:[{PartNumber, ETag:CopyPartResult.ETag}] })",
+        "Return result"
+      ]
+    }
+  },
+
+  "key_decisions": [
+    "upload: file.buffer present → PutObject (single request) vs. stream → multipart upload",
+    "upload_stream: concurrent part limit of 4 enforced via TeePromise backpressure gate",
+    "upload_stream: empty file handled separately with a single empty-body UploadPart",
+    "copy: file size < ~4 GB → CopyObject (single request) vs. ≥ 4 GB → multipart copy with 4 GiB parts"
+  ],
+
+  "retry_policy": {
+    "PutObjectCommand": "3 retries, 200 ms delay",
+    "upload_stream (outer)": "3 retries, 200 ms delay",
+    "UploadPartCommand": "3 retries, 50 ms delay per part",
+    "UploadPartCopyCommand": "3 retries, 50 ms delay per part"
+  },
+
+  "progress_tracking": "progress_tracker.set_total(size) + progress_tracker.set(bytesUploaded) called after each buffer upload, each multipart part, and each copy part",
+
+  "error_handling": [
+    "Buffer upload: simple_retry exhausted → throw s3_error",
+    "Stream upload: AbortMultipartUploadCommand sent on any error, then re-throw",
+    "Copy parts: throw err immediately if retry exhausted (no explicit abort)"
+  ],
+
+  "source_files_analyzed": [
+    "extensions/legacyFileSystem/storage/S3StorageController.js"
+  ]
+}

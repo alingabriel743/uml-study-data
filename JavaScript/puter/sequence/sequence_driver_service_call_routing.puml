@@ -1,0 +1,241 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipant underline
+skinparam sequenceBoxBackgroundColor #E9ECEF
+skinparam sequenceBoxBorderColor #6C757D
+skinparam sequenceLifeLineBorderColor #495057
+skinparam sequenceGroupBorderColor #868E96
+skinparam sequenceGroupBackgroundColor #F1F3F5
+skinparam noteBorderColor #868E96
+skinparam noteBackgroundColor #FFF9DB
+
+title Driver Service Call Routing Flow
+
+' ─── CLIENT SIDE ───
+box "Client (puter-js)" #EDF2FF
+    actor Caller as caller
+    participant "make_driver_method()" as factory
+    participant "driverCall()" as driverCall
+    participant "driverCall_()" as driverCall_
+end box
+
+' ─── NETWORK ───
+participant "POST /drivers/call" as xhr #D3F9D8
+
+' ─── SERVER SIDE ───
+box "Server (DriverService)" #FFF4E6
+    participant "DriverService.call()" as dsCall
+    participant "DriverService._call()" as dsInner
+    participant "_process_args()" as processArgs
+    participant "get_service_or_throw_()" as getService
+    participant "call_new_()" as callNew
+end box
+
+box "Supporting Services" #F8F0FC
+    participant "PermissionService" as permSvc
+    participant "RateLimitService" as rateSvc
+    participant "Invoker" as invoker
+    participant "TargetService (impl)" as targetSvc
+end box
+
+' ══════════════════════════════════════
+'  PHASE 1 — Method factory & arg mapping
+' ══════════════════════════════════════
+caller -> factory : make_driver_method(\n  arg_defs, driverInterface,\n  driverName, driverMethod, settings)
+activate factory
+factory --> caller : async fn(…args)
+deactivate factory
+
+caller -> driverCall : fn(…args)\n→ maps positional args → driverArgs
+activate driverCall
+note right of driverCall
+  Creates {promise, resolve, reject}
+  via createDeferred()
+end note
+
+driverCall -> driverCall_ : driverCall_(\n  options, resolve, reject,\n  driverInterface, driverName,\n  driverMethod, driverArgs,\n  contentType, settings)
+activate driverCall_
+
+' ─── optional auth ───
+opt No authToken && env = "web"
+    driverCall_ -> caller : puter.ui.authenticateWithPuter()
+    caller --> driverCall_ : authToken  (or cancel → reject)
+end
+
+driverCall_ -> driverCall_ : initXhr('/drivers/call',\n  APIOrigin, 'POST', contentType)
+note right : XHR object prepared
+
+' ══════════════════════════════════════
+'  PHASE 2 — HTTP call & response handling
+' ══════════════════════════════════════
+driverCall_ -> xhr : xhr.send({\n  interface, driver, test_mode,\n  method, args, auth_token})
+activate xhr
+
+' ─── streaming path ───
+alt Content-Type: application/x-ndjson  (streaming)
+    xhr --> driverCall_ : readyState 2 → is_stream=true
+    note right of driverCall_
+      Async generator Stream created;
+      promise resolved immediately
+      with stream object
+    end note
+    loop NDJSON chunks arrive
+        xhr --> driverCall_ : onprogress → buffer lines,\nsignal_stream_update()
+    end
+    xhr --> driverCall_ : readyState 4 → response_complete=true
+else Non-streaming response
+    xhr --> driverCall_ : onload → parseResponse(response)
+    alt HTTP 401 / token_auth_failed
+        driverCall_ -> caller : puter.ui.authenticateWithPuter() (retry)
+        caller --> driverCall_ : new authToken
+        driverCall_ -> xhr : retry driverCall_()
+    else resp.success=false && code=permission_denied
+        driverCall_ -> caller : puter.ui.requestPermission()
+        caller --> driverCall_ : granted / denied
+        alt Permission granted
+            driverCall_ -> xhr : retry driverCall_()
+        else Permission denied
+            driverCall_ --> driverCall : reject(permissionDenied)
+        end
+    else resp.success=false (other error)
+        driverCall_ --> driverCall : error_cb(); reject(resp)
+    else Success
+        note right of driverCall_
+          Apply settings.transform(result)
+          if transformer is defined
+        end note
+        driverCall_ --> driverCall : resolve(result)
+    end
+end
+
+deactivate driverCall_
+deactivate xhr
+driverCall --> caller : await deferred.promise → result
+deactivate driverCall
+
+' ══════════════════════════════════════
+'  PHASE 3 — Server-side routing
+' ══════════════════════════════════════
+== Server-side: DriverService routing ==
+
+xhr -> dsCall : HTTP POST /drivers/call\n{interface, driver, method, args, test_mode}
+activate dsCall
+dsCall -> dsInner : _call({driver, iface, method, args})
+activate dsInner
+
+' ─── arg processing ───
+dsInner -> processArgs : _process_args(iface, method, args)
+activate processArgs
+processArgs -> processArgs : svc_registry.get('interfaces')\n→ lookup interface_
+note right of processArgs
+  Throws interface_not_found (404)
+  if interface unknown
+end note
+processArgs -> processArgs : interface_.methods[method_name]
+note right of processArgs
+  Throws method_not_found (404)
+  if method absent
+end note
+loop For each parameter
+    processArgs -> processArgs : c_types.get(arg_descriptor.type)\n→ arg_behaviour.consolidate(ctx, value)
+    note right
+      Throws missing_required_argument (400)
+      or argument_consolidation_failed (400)
+    end note
+end
+processArgs --> dsInner : processed_args
+deactivate processArgs
+
+' ─── alias & iface resolution ───
+dsInner -> dsInner : iface_to_driver[iface] ?? iface\n(static legacy alias map → driver name)
+dsInner -> dsInner : iface_to_iface[iface] ?? iface\n(e.g. puter-apps/subdomains → crud-q)
+
+opt test_mode && interface_to_test_service[iface] exists
+    dsInner -> dsInner : driver = test service name
+end
+
+dsInner -> dsInner : interface_service_aliases[iface][driver]\n  ?? service_aliases[driver]\n  (resolve service alias)
+
+' ─── service lookup ───
+dsInner -> getService : get_service_or_throw_(driver, iface)
+activate getService
+alt Live service found (has trait iface)
+    getService --> dsInner : service (live instance)
+else Registered plain driver object
+    getService -> getService : svc_registry.get('drivers')\n  .get(iface + ':' + name)\n  → wrap as AdvancedBase subclass
+    getService --> dsInner : wrapped service
+else No implementation found
+    getService --> dsInner : throw no_implementation_available (502)
+end
+deactivate getService
+
+' ─── call context ───
+dsInner -> dsInner : svc_event.emit('driver.create-call-context')\n→ build call context (actor, etc.)
+
+' ─── call_new_ ───
+dsInner -> callNew : span(driver:iface:method)\n→ context.arun\n→ call_new_({actor, service, iface,\n  method, args, skip_usage})
+activate callNew
+
+callNew -> permSvc : svc_permission.scan(\n  actor, 'service:'+name+':ii:'+iface)
+activate permSvc
+permSvc --> callNew : reading (permission entries)
+deactivate permSvc
+
+callNew -> callNew : PermissionUtil.reading_to_options(reading)\n→ options []
+alt No options (forbidden)
+    callNew --> dsInner : throw forbidden
+end
+
+callNew -> callNew : select_best_option_(options) → option\nget_policies_for_option_(option) → policies\nfind effective_policy (first with .holder)
+callNew -> callNew : svc_su.sudo → svc_systemData\n  .interpret(policy.data)
+
+' ─── Invoker decorator chain ───
+callNew -> invoker : Invoker.create({\n  decorators: [rate-limit, add-metadata,\n    result-coercion],\n  delegate })
+activate invoker
+
+invoker -> rateSvc : [on_call] svc_su.sudo(policy_holder)\n→ svc_rateLimit.check_and_increment(\n  'V1:service:iface:method', max, period)
+activate rateSvc
+rateSvc --> invoker : ok / rate-limit exceeded
+deactivate rateSvc
+
+invoker -> targetSvc : service.as(iface)[method](args)
+activate targetSvc
+targetSvc --> invoker : raw result
+deactivate targetSvc
+
+invoker -> invoker : [on_return] result-coercion:\n  if TypedValue → svc_coercion.coerce(\n    desired_type, result)
+invoker -> invoker : [on_return, outermost]\nadd-metadata:\n  {success:true,\n   service:{name, version?},\n   result, metadata}
+
+invoker --> callNew : {success, service, result, metadata}
+deactivate invoker
+
+callNew --> dsInner : invoker.run(args) result
+deactivate callNew
+
+dsInner --> dsCall : response object
+deactivate dsInner
+
+alt Error during _call
+    dsCall -> dsCall : _driver_response_from_error(e)\n→ {success:false, error: serialized}
+end
+
+dsCall --> xhr : HTTP response (JSON or NDJSON stream)
+deactivate dsCall
+
+@enduml

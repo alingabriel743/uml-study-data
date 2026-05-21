@@ -1,0 +1,161 @@
+{
+  "scope": "wp_rest_themes_and_blocks",
+  "title": "WordPress REST Themes & Reusable Blocks Flow",
+  "diagram_type": "activity",
+  "version": "WP 6.1",
+
+  "controllers": [
+    {
+      "class": "WP_REST_Themes_Controller",
+      "extends": "WP_REST_Controller",
+      "namespace": "wp/v2",
+      "rest_base": "themes",
+      "routes": [
+        "GET /wp/v2/themes  → get_items",
+        "GET /wp/v2/themes/<stylesheet>  → get_item"
+      ]
+    },
+    {
+      "class": "WP_REST_Blocks_Controller",
+      "extends": "WP_REST_Posts_Controller",
+      "post_type": "wp_block",
+      "note": "Reusable blocks stored as posts; inherits full CRUD from WP_REST_Posts_Controller"
+    }
+  ],
+
+  "activity_flows": {
+
+    "themes_get_items": {
+      "entry": "GET /wp/v2/themes",
+      "steps": [
+        "1. get_items_permissions_check(request)",
+        "  → has switch_themes OR manage_network_themes cap? → ALLOW",
+        "  → status filter == ['active'] only? → check_read_active_theme_permission()",
+        "    → has edit_posts cap? → ALLOW",
+        "    → loops REST-exposed post types: any cap match? → ALLOW",
+        "    → else → WP_Error rest_cannot_view_active_theme (403)",
+        "  → else → WP_Error rest_cannot_view_themes (403)",
+        "2. get_items(request)",
+        "  → wp_get_themes() → all installed themes",
+        "  → wp_get_theme() → current active theme",
+        "  → foreach theme: is_same_theme() → derive status ('active'|'inactive')",
+        "  → status filter applied: skip non-matching themes",
+        "  → prepare_item_for_response(theme, request)",
+        "  → prepare_response_for_collection(prepared)",
+        "3. rest_ensure_response(themes[])",
+        "  → set X-WP-Total header",
+        "  → set X-WP-TotalPages = 1",
+        "4. Return WP_REST_Response"
+      ]
+    },
+
+    "themes_get_item": {
+      "entry": "GET /wp/v2/themes/<stylesheet>",
+      "steps": [
+        "1. _sanitize_stylesheet_callback(stylesheet) → urldecode(stylesheet)",
+        "2. get_item_permissions_check(request)",
+        "  → has switch_themes OR manage_network_themes cap? → ALLOW",
+        "  → wp_get_theme(stylesheet) + wp_get_theme() (current)",
+        "  → is_same_theme()? → check_read_active_theme_permission()",
+        "  → else → WP_Error rest_cannot_view_themes (403)",
+        "3. get_item(request)",
+        "  → wp_get_theme(stylesheet)",
+        "  → theme->exists()? NO → WP_Error rest_theme_not_found (404)",
+        "  → prepare_item_for_response(theme, request)",
+        "4. rest_ensure_response(data) → Return WP_REST_Response"
+      ]
+    },
+
+    "themes_prepare_item_for_response": {
+      "steps": [
+        "get_fields_for_response(request) → field list",
+        "Conditionally build data[]:",
+        "  → stylesheet: theme->get_stylesheet()",
+        "  → template: theme->get_template()",
+        "  → plain fields (requires_php, requires_wp, textdomain, version): theme->get(header)",
+        "  → screenshot: theme->get_screenshot() or ''",
+        "  → rich fields (author, author_uri, description, name, tags, theme_uri):",
+        "    → .raw  → theme->display(header, false, true)",
+        "    → .rendered → theme->display(header)",
+        "  → status: is_same_theme() → 'active' | 'inactive'",
+        "  → theme_supports (active theme only):",
+        "    → get_registered_theme_features() loop",
+        "    → current_theme_supports(feature)?",
+        "    → prepare_callback or prepare_theme_support(support, config, feature, request)",
+        "    → rest_sanitize_value_from_schema(support, schema)",
+        "add_additional_fields_to_object(data, request)",
+        "rest_ensure_response(data)",
+        "prepare_links(theme) → add self + collection + optional global-styles link",
+        "apply_filters('rest_prepare_theme', response, theme, request)",
+        "Return WP_REST_Response"
+      ]
+    },
+
+    "blocks_check_read_permission": {
+      "entry": "Any read request for wp_block post",
+      "steps": [
+        "1. current_user_can('read_post', post->ID)?  NO → return false",
+        "2. parent::check_read_permission(post)  (WP_REST_Posts_Controller)",
+        "3. Return bool"
+      ]
+    },
+
+    "blocks_filter_response_by_context": {
+      "entry": "Response assembly for reusable block",
+      "steps": [
+        "1. parent::filter_response_by_context(data, context)",
+        "2. unset(data['title']['rendered'])",
+        "3. unset(data['content']['rendered'])",
+        "   Reason: rendering a block requires it to be inside a post/page",
+        "4. Return filtered data[]"
+      ]
+    },
+
+    "blocks_get_item_schema": {
+      "steps": [
+        "1. schema = parent::get_item_schema()  (WP_REST_Posts_Controller)",
+        "2. Override context for title.raw and content.raw → ['view','edit']",
+        "   Reason: clients always need raw markup to parse/edit reusable blocks",
+        "3. unset schema['title']['rendered']",
+        "4. unset schema['content']['rendered']",
+        "5. Return modified schema (NOT cached)"
+      ]
+    }
+  },
+
+  "key_conditions": [
+    "Permission gate: switch_themes | manage_network_themes → full themes access",
+    "Permission gate: status=['active'] only → check_read_active_theme_permission (edit_posts or REST post type cap)",
+    "Status derivation: is_same_theme() compares get_stylesheet() strings",
+    "theme_supports only populated for the ACTIVE theme",
+    "Blocks: read_post cap checked BEFORE parent permission (extra gate)",
+    "Blocks schema: rendered fields deliberately stripped (context-filter override)",
+    "sanitize_theme_status() is @deprecated since 5.7.0 — not part of active flow"
+  ],
+
+  "key_relationships": [
+    "WP_REST_Themes_Controller extends WP_REST_Controller",
+    "WP_REST_Blocks_Controller extends WP_REST_Posts_Controller extends WP_REST_Controller",
+    "WP_REST_Themes_Controller uses WP_Theme (wp_get_theme, wp_get_themes)",
+    "WP_REST_Themes_Controller uses WP_Theme_JSON_Resolver (prepare_links global-styles)",
+    "WP_REST_Blocks_Controller delegates to WP_REST_Posts_Controller for CRUD + base schema",
+    "Both emit WP_REST_Response / WP_Error"
+  ],
+
+  "schema_highlights": {
+    "theme_status_enum": ["active", "inactive"],
+    "theme_rich_fields": ["author", "author_uri", "description", "name", "tags", "theme_uri"],
+    "theme_plain_fields": ["stylesheet", "template", "requires_php", "requires_wp", "textdomain", "version", "screenshot"],
+    "block_schema_changes": "title.raw + content.raw context widened to view+edit; rendered variants removed"
+  },
+
+  "filters_and_hooks": [
+    "apply_filters('rest_prepare_theme', response, theme, request) — output filter on theme response",
+    "apply_filters('rest_themes_collection_params', query_params) — extend collection params"
+  ],
+
+  "source_files_analyzed": [
+    "tests/Frameworks/WordPress/Version_6_1/wp-includes/rest-api/endpoints/class-wp-rest-themes-controller.php",
+    "tests/Frameworks/WordPress/Version_6_1/wp-includes/rest-api/endpoints/class-wp-rest-blocks-controller.php"
+  ]
+}

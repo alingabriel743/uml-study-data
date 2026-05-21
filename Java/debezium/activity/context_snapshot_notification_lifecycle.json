@@ -1,0 +1,85 @@
+{
+  "scope": "snapshot_notification_lifecycle",
+  "title": "Snapshot Notification Lifecycle",
+  "diagram_type": "activity",
+  "key_participants": [
+    "NotificationService",
+    "InitialSnapshotNotificationService",
+    "IncrementalSnapshotNotificationService",
+    "NotificationChannel",
+    "ConnectChannel",
+    "Notification"
+  ],
+  "snapshot_statuses": {
+    "shared_enum_SnapshotStatus": ["STARTED", "PAUSED", "RESUMED", "ABORTED", "IN_PROGRESS", "TABLE_CHUNK_IN_PROGRESS", "TABLE_CHUNK_COMPLETED", "TABLE_SCAN_COMPLETED", "COMPLETED"],
+    "SnapshotResultStatus_used_by_Initial": ["STARTED", "ABORTED", "COMPLETED", "SKIPPED"],
+    "TableScanCompletionStatus_Initial": ["SQL_EXCEPTION", "SUCCEEDED"],
+    "TableScanCompletionStatus_Incremental": ["EMPTY", "NO_PRIMARY_KEY", "SKIPPED", "SQL_EXCEPTION", "SUCCEEDED", "UNKNOWN_SCHEMA"]
+  },
+  "initial_snapshot_lifecycle": {
+    "trigger": "Snapshot process begins",
+    "flow": [
+      "START → notifyStarted() → status=STARTED, aggregateType='Initial Snapshot'",
+      "STARTED → begin scanning tables",
+      "For each table: notifyTableInProgress() → status=IN_PROGRESS, current_collection_in_progress=<table>",
+      "  [Optional chunked scan]: notifyTableChunkInProgress() → status=TABLE_CHUNK_IN_PROGRESS, chunk_index, total_chunks, total_rows_scanned",
+      "  [Chunk done]: notifyCompletedTableChunkSuccessfully() → status=TABLE_CHUNK_COMPLETED, scanned_collection, chunk_index, total_chunks",
+      "  [Table scan succeeded]: notifyCompletedTableSuccessfully() → status=TABLE_SCAN_COMPLETED, status=SUCCEEDED",
+      "  [Table scan error]: notifyCompletedTableWithError() → status=TABLE_SCAN_COMPLETED, status=SQL_EXCEPTION",
+      "All tables done → notifyCompleted() → status=COMPLETED",
+      "[At any point, error path]: notifyAborted() → status=ABORTED",
+      "[Not needed]: notifySkipped() → status=SKIPPED"
+    ],
+    "notification_payload_keys": ["connector_name", "status", "current_collection_in_progress", "scanned_collection", "data_collections", "total_rows_scanned", "chunk_index", "total_chunks"],
+    "aggregate_type": "Initial Snapshot"
+  },
+  "incremental_snapshot_lifecycle": {
+    "trigger": "Incremental snapshot request (ad-hoc or signal)",
+    "flow": [
+      "START → notifyStarted() → status=STARTED, data_collections=<csv list>",
+      "STARTED → begin processing data collections",
+      "For each collection: notifyInProgress() → status=IN_PROGRESS, current_collection_in_progress, maximum_key, last_processed_key, data_collections",
+      "  [Paused by signal/DDL]: notifyPaused() → status=PAUSED, data_collections",
+      "  [Resumed after pause]: notifyResumed() → status=RESUMED, data_collections",
+      "  [Collection scan done]: notifyTableScanCompleted() → status=TABLE_SCAN_COMPLETED, scanned_collection, total_rows_scanned, status=<TableScanCompletionStatus>",
+      "All collections done → notifyCompleted() → status=COMPLETED",
+      "[Abort - full]: notifyAborted(context) → status=ABORTED",
+      "[Abort - specific collections]: notifyAborted(context, dataCollectionIds) → status=ABORTED, data_collections=<csv>"
+    ],
+    "notification_payload_keys": ["connector_name", "data_collections", "current_collection_in_progress", "maximum_key", "last_processed_key", "scanned_collection", "total_rows_scanned", "status"],
+    "id_source": "correlationId from IncrementalSnapshotContext (or random UUID fallback)",
+    "aggregate_type": "Incremental Snapshot"
+  },
+  "notification_dispatch_flow": [
+    "notify(notification, offsets) called on NotificationService",
+    "Filter channels by enabledChannels list",
+    "Non-ConnectChannel channels: channel.send(notification)",
+    "ConnectChannel channels: channel.send(notification, offsets) — includes Partition+Offset in SourceRecord",
+    "notify(notification) [no offsets]: all enabled channels receive channel.send(notification) — ConnectChannel gets empty partition/offset"
+  ],
+  "key_relationships": [
+    "NotificationService composes InitialSnapshotNotificationService (creates internally)",
+    "NotificationService composes IncrementalSnapshotNotificationService (creates internally)",
+    "InitialSnapshotNotificationService depends_on NotificationService (calls notify())",
+    "IncrementalSnapshotNotificationService depends_on NotificationService (calls notify())",
+    "NotificationService aggregates List<NotificationChannel>",
+    "ConnectChannel extends/implements NotificationChannel",
+    "Notification built via Notification.Builder with: id, aggregateType, type(status), additionalData, timestamp"
+  ],
+  "activity_branching_logic": [
+    "Initial: chunked vs non-chunked path (chunk methods only called when connector splits tables into chunks)",
+    "Initial: success vs error path per table (notifyCompletedTableSuccessfully vs notifyCompletedTableWithError)",
+    "Initial: normal completion vs abort vs skip",
+    "Incremental: pause/resume cycle can happen mid-snapshot",
+    "Incremental: abort can target all collections or specific subset",
+    "Incremental: TABLE_SCAN_COMPLETED status carries TableScanCompletionStatus (EMPTY, NO_PRIMARY_KEY, SKIPPED, SQL_EXCEPTION, SUCCEEDED, UNKNOWN_SCHEMA)",
+    "Channel dispatch: ConnectChannel vs plain NotificationChannel branching in notify()"
+  ],
+  "important_notes": "NotificationService.stop() closes all enabled channels. Both sub-services are instantiated with Clock.systemUTC(). Channels initialized via channel.init(config); ConnectChannels additionally via initConnectChannel(schemaFactory, consumer). enabledChannels controls which channels are active at runtime.",
+  "source_files_analyzed": [
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/notification/NotificationService.java",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/notification/InitialSnapshotNotificationService.java",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/notification/IncrementalSnapshotNotificationService.java",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/notification/SnapshotStatus.java"
+  ]
+}

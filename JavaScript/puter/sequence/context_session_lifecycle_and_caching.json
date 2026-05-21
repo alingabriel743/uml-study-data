@@ -1,0 +1,141 @@
+{
+  "scope": "session_lifecycle_and_caching",
+  "title": "Session Lifecycle and Cache Management",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Caller",
+    "SessionService",
+    "Redis (redisClient)",
+    "Database (db)",
+    "UserRedisCacheSpace"
+  ],
+  "constants": {
+    "SESSION_CACHE_TTL_SECONDS": 300,
+    "SESSION_FLUSH_LOCK_TTL_SECONDS": 30,
+    "SESSION_CACHE_KEY_PREFIX": "session-cache",
+    "SESSION_FLUSH_PENDING_SET_KEY": "session-cache:flush-pending",
+    "SESSION_USER_SESSIONS_KEY_PREFIX": "session-cache:user-sessions",
+    "SESSION_FLUSH_LOCK_KEY_PREFIX": "session-cache:flush-lock",
+    "FLUSH_INTERVAL": "5–60 seconds (randomised steps)"
+  },
+  "key_methods": [
+    "create_session(user, meta): Promise<Session>",
+    "getSession(uuid): Promise<Session|undefined>",
+    "#getSession(uuid): Promise<Session|undefined>  [private]",
+    "cacheSession(session, options={flushState}): Promise<void>",
+    "getCachedSession(uuid): Promise<Session|null>",
+    "invalidateCachedSession(uuid, userId?): Promise<void>",
+    "get_user_sessions(user): Promise<Session[]>",
+    "remove_session(uuid): Promise<void>",
+    "#updateSessions(): Promise<void>  [private flush loop]",
+    "#scheduleSessionFlushLoop(): void  [private timer]",
+    "getSessionCacheKey(uuid): string",
+    "getSessionUserSetKey(userId): string",
+    "getSessionFlushLockKey(uuid): string"
+  ],
+  "interaction_flow": {
+    "create_session": [
+      "Caller → SessionService: create_session(user, meta)",
+      "SessionService → Database: INSERT INTO sessions (uuid, user_id, meta, last_activity, created_at)",
+      "SessionService → SessionService: cacheSession(session, {flushState: 'unchanged'})",
+      "SessionService → Redis: SET session-cache:{uuid} JSON EX 300",
+      "SessionService → Redis: SADD session-cache:user-sessions:{user_id} {uuid}",
+      "SessionService → Redis: EXPIRE session-cache:user-sessions:{user_id} 300",
+      "SessionService → Caller: return session"
+    ],
+    "getSession": [
+      "Caller → SessionService: getSession(uuid)",
+      "SessionService → SessionService: #getSession(uuid)",
+      "SessionService → SessionService: getCachedSession(uuid)",
+      "SessionService → Redis: GET session-cache:{uuid}",
+      "alt [cache hit] Redis → SessionService: JSON string → parse → return session",
+      "alt [cache miss] SessionService → Database: SELECT * FROM sessions WHERE uuid = ? LIMIT 1",
+      "Database → SessionService: session row",
+      "SessionService → Database: get_user({ id: session.user_id }) [for user_uid]",
+      "SessionService → SessionService: cacheSession(session, {flushState: 'pending'})",
+      "SessionService → Redis: SET session-cache:{uuid} JSON EX 300",
+      "SessionService → Redis: SADD session-cache:user-sessions:{user_id} {uuid}",
+      "SessionService → Redis: SADD session-cache:flush-pending {uuid}",
+      "SessionService → Caller: return session (internal values stripped)"
+    ],
+    "cacheSession": [
+      "SessionService → Redis: SET session-cache:{uuid} JSON EX 300",
+      "if user_id → Redis: SADD session-cache:user-sessions:{user_id} {uuid}",
+      "if user_id → Redis: EXPIRE session-cache:user-sessions:{user_id} 300",
+      "if flushState=pending → Redis: SADD session-cache:flush-pending {uuid}",
+      "if flushState=flushed → Redis: SREM session-cache:flush-pending {uuid}"
+    ],
+    "getCachedSession": [
+      "SessionService → Redis: GET session-cache:{uuid}",
+      "alt [no data] → return null",
+      "alt [parse error / uuid mismatch] → invalidateCachedSession(uuid) → return null",
+      "alt [valid] → return parsedSession"
+    ],
+    "invalidateCachedSession": [
+      "SessionService → Redis: DEL session-cache:{uuid}",
+      "SessionService → Redis: SREM session-cache:flush-pending {uuid}",
+      "if userId → Redis: SREM session-cache:user-sessions:{userId} {uuid}"
+    ],
+    "remove_session": [
+      "Caller → SessionService: remove_session(uuid)",
+      "SessionService → SessionService: getCachedSession(uuid)  [to get user_id]",
+      "SessionService → Database: SELECT user_id FROM sessions WHERE uuid = ? LIMIT 1",
+      "SessionService → SessionService: invalidateCachedSession(uuid, userId)",
+      "SessionService → Database: DELETE FROM sessions WHERE uuid = ?",
+      "SessionService → Caller: return db result"
+    ],
+    "get_user_sessions": [
+      "Caller → SessionService: get_user_sessions(user)",
+      "SessionService → Redis: SMEMBERS session-cache:user-sessions:{user.id}",
+      "for each sessionUuid → SessionService: getCachedSession(sessionUuid)",
+      "if session invalid or user_id mismatch → Redis: SREM user-sessions-set {uuid}  [skip]",
+      "SessionService → Caller: return sessions (internal values stripped)"
+    ],
+    "flush_loop_updateSessions": [
+      "SessionService [timer] → SessionService: #scheduleSessionFlushLoop (random 5–60s interval)",
+      "SessionService → Redis: SMEMBERS session-cache:flush-pending",
+      "for each pendingUuid:",
+      "  SessionService → Redis: SET flush-lock:{uuid} 1 EX 30 NX  [acquire lock]",
+      "  if lock acquired → SessionService: getCachedSession(uuid)",
+      "  if session missing or not flushPending → Redis: SREM flush-pending {uuid}  [skip]",
+      "  SessionService → Database: UPDATE sessions SET meta=?, last_activity=? WHERE uuid=? AND last_activity < ?",
+      "  if no rows affected → Database: SELECT uuid to check existence → if gone: invalidateCachedSession",
+      "  SessionService → SessionService: cacheSession(session, {flushState: 'flushed'})",
+      "  SessionService → Redis: DEL flush-lock:{uuid}  [release lock]",
+      "after loop: for each updated user_id:",
+      "  SessionService → Database: UPDATE user SET last_activity_ts=? WHERE id=?",
+      "  SessionService → Redis: GET UserRedisCacheSpace key for user",
+      "  if cached user outdated → UserRedisCacheSpace: setUser(updatedUser)"
+    ]
+  },
+  "key_relationships": [
+    "SessionService extends BaseService",
+    "SessionService depends_on redisClient (Redis singleton)",
+    "SessionService depends_on Database (via services.get('database'))",
+    "SessionService depends_on UserRedisCacheSpace (for user cache invalidation during flush)",
+    "SessionService depends_on get_user helper (for user_uid resolution on DB fallback)",
+    "SessionService depends_on uuidv4 (session UUID generation)"
+  ],
+  "session_object_shape": {
+    "uuid": "string (uuidv4)",
+    "user_id": "number",
+    "user_uid": "string (user.uuid)",
+    "meta": "object (created, created_unix, last_activity)",
+    "last_touch": "number (Date.now())",
+    "last_store": "number (Date.now())",
+    "flushPending": "boolean"
+  },
+  "important_notes": [
+    "Cache TTL is 5 minutes (300s). Sessions expire from Redis automatically.",
+    "Flush loop runs every 5–60 seconds (randomised) to batch-write activity timestamps to DB.",
+    "Distributed lock (NX flag, 30s TTL) prevents concurrent flush of the same session.",
+    "getSession always marks session as flushPending to trigger a DB write on the next flush cycle.",
+    "create_session writes to DB first, then caches (flushState 'unchanged', no flush pending).",
+    "remove_session reads both Redis and DB to obtain user_id before full invalidation.",
+    "get_user_sessions is fully Redis-backed; stale UUIDs are cleaned up on read.",
+    "getCachedSession validates uuid field in parsed JSON to prevent cache poisoning."
+  ],
+  "source_files_analyzed": [
+    "src/backend/src/services/SessionService.js"
+  ]
+}

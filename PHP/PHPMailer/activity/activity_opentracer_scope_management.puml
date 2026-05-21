@@ -1,0 +1,186 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #DEE2E6
+    TitleFontColor #212529
+    TitleFontSize 12
+}
+
+title OpenTracer Scope Management\n<size:11><color:#6C757D>OpenTracer1 / OpenTracer adapters: activating spans, retrieving active scope, unwrapping to DDTrace native scope</color></size>
+
+|Caller|
+start
+
+fork
+  ' ─────────────────────────────────────────────
+  ' FLOW 1 — activate()
+  ' ─────────────────────────────────────────────
+  :invoke **ScopeManager::activate**(OTSpan $span, $finishSpanOnClose);
+  note right
+    OT1 adapter: strict **bool** type hint (PHP 7.1+)
+    OT  adapter: untyped param (PHP 5/7 compatible)
+    Both adapters are **final** classes
+  end note
+
+  |OpenTracer Adapter\n(OT1 / OT ScopeManager)|
+
+  if (Is $span an instance of\nadapter **Span** class?) then (yes)
+    :Call **$span->unwrapped()**\nto obtain native DDTrace\\Span;
+  else (no)
+    :Call **Span::toDDSpan($span)**\nto convert foreign OTSpan\nto native DDTrace\\Span;
+  endif
+
+  :Call **$this->scopeManager->activate**(nativeSpan, $finishSpanOnClose)\non underlying DDTrace\\ScopeManager;
+
+  |DDTrace ScopeManager\n(Native)|
+
+  :Create new **DDTrace\\Scope**\n($this, $nativeSpan, $finishSpanOnClose);
+
+  if (Is $span a DDTrace\\Span AND\n**ObjectKVStore** key\n'ddtrace_scope_activated' present?) then (yes)
+    :ObjectKVStore::put($span->internalSpan,\n'ddtrace_scope_activated', true);
+    note right
+      Cross-layer sync flag —\ntracks spans activated\nfrom userland
+    end note
+  else (no / skip)
+  endif
+
+  :Push new **DDTrace\\Scope** onto **$scopes[]** stack\n<size:10>(LIFO order)</size>;
+
+  if (Does $span->getContext()->**isHostRoot()**?) then (yes)
+    :Also push scope to **$hostRootScopes[]**;
+    note right
+      Tracks distributed-tracing\nroot spans — all host root\nscopes closed on ScopeManager::close()
+    end note
+  else (no)
+  endif
+
+  :Return **DDTrace\\Scope** instance;
+
+  |OpenTracer Adapter\n(OT1 / OT ScopeManager)|
+
+  :Wrap DDTrace\\Scope in new\n**OpenTracer1\\Scope** / **OpenTracer\\Scope**\n(OT wrapper);
+
+  |Caller|
+
+  :Receive **OTScope wrapper**;
+
+fork again
+  ' ─────────────────────────────────────────────
+  ' FLOW 2 — getActive()
+  ' ─────────────────────────────────────────────
+  :invoke **ScopeManager::getActive()**;
+
+  |OpenTracer Adapter\n(OT1 / OT ScopeManager)|
+
+  :Forward to **$this->scopeManager->getActive()**\non underlying DDTrace\\ScopeManager;
+
+  |DDTrace ScopeManager\n(Native)|
+
+  :Call **reconcileInternalAndUserland()**;
+
+  note right
+    Reconciles PHP userland scope stack\nwith C-extension internal span stack\non every getActive() call
+  end note
+
+  :Walk **$scopes[]** from top downward;
+
+  repeat
+    if (Scope's span is **finished**?) then (yes)
+      :Remove scope from **$scopes[]**\n<size:10>(sync userland with C-extension engine)</size>;
+    else (no — span still active)
+      :Set as **$topScope**;
+      break
+    endif
+  repeat while (More scopes in stack?) is (yes)
+
+  if (**$scopes[]** is now empty?) then (yes)
+    |DDTrace C-Extension\n(root_span / active_span)|
+
+    :Call **root_span()**\n<size:10>(DDTrace C-extension global function)</size>;
+
+    if (Root span exists?) then (yes)
+      :Build new **DDTrace\\Scope**\nwrapping root span;
+      :Push to **$scopes[0]**;
+    else (no)
+      |DDTrace ScopeManager\n(Native)|
+      :Return **null**;
+    endif
+
+    |DDTrace C-Extension\n(root_span / active_span)|
+
+    :Call **active_span()**\n<size:10>(DDTrace C-extension global function)</size>\nto discover internally-activated spans;
+
+    |DDTrace ScopeManager\n(Native)|
+
+    :FOR each internal span\n**not yet in userland scopes**:\ncreate new DDTrace\\Scope, prepend to stack;
+  else (scopes remain)
+  endif
+
+  :Walk reconciled **$scopes[]** from top downward;
+
+  repeat
+    if ($span is NOT DDTrace\\Span\nOR ObjectKVStore\n'ddtrace_scope_activated' is truthy?) then (yes)
+      :Return this **DDTrace\\Scope** as active;
+      break
+    endif
+  repeat while (More scopes?) is (yes)
+
+  |OpenTracer Adapter\n(OT1 / OT ScopeManager)|
+
+  if (Returned DDTrace\\Scope is **null**?) then (yes)
+    |Caller|
+    :Return **null** to caller;
+  else (no — scope found)
+    :Wrap DDTrace\\Scope in new\n**OpenTracer1\\Scope** / **OpenTracer\\Scope**\n(OT wrapper);
+
+    |Caller|
+    :Receive **OTScope wrapper**;
+  endif
+
+fork again
+  ' ─────────────────────────────────────────────
+  ' FLOW 3 — unwrapped()
+  ' ─────────────────────────────────────────────
+  :invoke **ScopeManager::unwrapped()**;
+
+  |OpenTracer Adapter\n(OT1 / OT ScopeManager)|
+
+  :Return **$this->scopeManager**\n(the DDTrace\\Contracts\\ScopeManager instance);
+
+  note right
+    Bypasses the OT adapter entirely —\ncaller receives the native\nDDTrace ScopeManager directly
+  end note
+
+  |Caller|
+
+  :Hold native **DDTrace\\ScopeManager**\nand call DDTrace-specific APIs directly;
+
+end fork
+
+stop
+
+@enduml

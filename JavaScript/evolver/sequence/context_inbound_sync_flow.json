@@ -1,0 +1,86 @@
+{
+  "scope": "inbound_sync_flow",
+  "title": "Inbound Message Sync Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "SyncEngine",
+    "InboundSync",
+    "MailboxStore",
+    "Hub (HTTP)",
+    "onInboundReceived (callback)"
+  ],
+  "interaction_flow": [
+    "SyncEngine.start() → SyncEngine._scheduleInbound(1000ms initial delay)",
+    "SyncEngine._scheduleInbound(delayMs): sets setTimeout, then invokes inbound.pull()",
+    "InboundSync.pull(channel='evomap-hub', limit=50) → MailboxStore.getCursor('evomap-hub:inbound_cursor')",
+    "InboundSync.pull() → MailboxStore.getState('node_id') [get sender_id]",
+    "InboundSync.pull() → Hub: POST /a2a/mailbox/inbound  body={sender_id, proxy_protocol_version, cursor, limit}  timeout=35s",
+    "Hub → InboundSync: 200 JSON {messages:[], next_cursor}  [or 401/403 → AuthError]",
+    "InboundSync.pull() → MailboxStore.writeInboundBatch(messages[])  [if messages.length > 0]",
+    "MailboxStore.writeInboundBatch() loops → writeInbound({id,type,payload,channel,priority,refId,expiresAt}) per message",
+    "MailboxStore.writeInbound() → _appendMessage(msg)  [status='pending', direction='inbound', persists to messages.jsonl]",
+    "InboundSync.pull() → MailboxStore.setCursor('evomap-hub:inbound_cursor', next_cursor)  [if next_cursor present, persists to state.json]",
+    "InboundSync.pull() → returns {received: N, cursor}",
+    "SyncEngine._scheduleInbound: if result.received > 0 → updates _lastActivity, calls onInboundReceived(result.received)",
+    "SyncEngine._scheduleInbound() → InboundSync.ackDelivered(channel='evomap-hub')",
+    "InboundSync.ackDelivered() → MailboxStore.list({type:'%', direction:'inbound', status:'delivered', limit:100}) filtered by channel",
+    "InboundSync.ackDelivered(): if delivered.length > 0 → MailboxStore.getState('node_id'), POST /a2a/mailbox/ack  body={sender_id, message_ids:[]}  timeout=10s",
+    "Hub → InboundSync.ackDelivered(): 200 OK → returns {acked: N}",
+    "SyncEngine._scheduleInbound(): reschedules — IDLE (>5min no activity) → 60s interval, ACTIVE → 10s interval"
+  ],
+  "auth_error_flow": [
+    "Hub returns 401 or 403 → InboundSync.pull() throws AuthError",
+    "SyncEngine._scheduleInbound catches AuthError → calls _handleAuthError('inbound')",
+    "SyncEngine._handleAuthError() → invokes onAuthError() callback (lifecycle re-authentication)"
+  ],
+  "key_relationships": [
+    "SyncEngine composes InboundSync (instantiated in constructor)",
+    "SyncEngine composes OutboundSync (instantiated in constructor, not in this flow)",
+    "SyncEngine depends_on MailboxStore (passed via constructor, shared with InboundSync)",
+    "InboundSync depends_on MailboxStore (read cursor/state, write inbound batch, list delivered)",
+    "InboundSync depends_on Hub HTTP API (POST /a2a/mailbox/inbound, POST /a2a/mailbox/ack)",
+    "InboundSync imports PROXY_PROTOCOL_VERSION from MailboxStore",
+    "SyncEngine imports AuthError from lifecycle/manager",
+    "InboundSync imports AuthError from lifecycle/manager"
+  ],
+  "method_signatures": {
+    "SyncEngine": {
+      "constructor": "({ store, hubUrl, getHeaders, logger, onInboundReceived, onAuthError })",
+      "start": "() → void",
+      "stop": "() → void",
+      "_scheduleInbound": "(delayMs: number) → void [async inner]",
+      "_isIdle": "() → boolean [threshold: 5 min]",
+      "_handleAuthError": "async (source: string) → void"
+    },
+    "InboundSync": {
+      "constructor": "({ store, hubUrl, getHeaders, logger })",
+      "pull": "async (channel='evomap-hub', limit=50) → { received: number, cursor: string } | { received: 0, error: string }",
+      "ackDelivered": "async (channel='evomap-hub') → { acked: number } | { acked: 0, error: string }"
+    },
+    "MailboxStore": {
+      "getCursor": "(key: string) → string | null",
+      "setCursor": "(key: string, value: string) → void [persists state.json]",
+      "getState": "(key: string) → string | null",
+      "writeInbound": "({ id, type, payload, channel, priority, refId, expiresAt }) → msgId: string",
+      "writeInboundBatch": "(messages: object[]) → ids: string[]",
+      "list": "({ type, direction, status, limit, offset }) → message[]",
+      "ack": "(messageIds: string[]) → count: number [sets status='delivered', evicts from index]"
+    }
+  },
+  "important_notes": [
+    "Polling interval: 10s when active, 60s when idle (no activity for >5 min)",
+    "Initial inbound poll fires after 1000ms from start()",
+    "Pull uses cursor-based pagination; cursor persisted in state.json",
+    "Messages written to JSONL (messages.jsonl) with status='pending' on arrival",
+    "ackDelivered() only ACKs messages already in 'delivered' status — consumer must call store.ack() separately to promote pending→delivered before ackDelivered runs",
+    "Hub endpoint: POST {hubUrl}/a2a/mailbox/inbound (fetch) and POST {hubUrl}/a2a/mailbox/ack",
+    "PROXY_PROTOCOL_VERSION = '0.1.0' sent in pull request body",
+    "AbortSignal timeouts: pull=35s, ack=10s",
+    "onInboundReceived callback is fired with count of newly received messages — used by upstream to trigger processing"
+  ],
+  "source_files_analyzed": [
+    "src/proxy/sync/engine.js",
+    "src/proxy/sync/inbound.js",
+    "src/proxy/mailbox/store.js"
+  ]
+}

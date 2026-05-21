@@ -1,0 +1,145 @@
+{
+  "scope": "proxy_sync_engine",
+  "title": "Proxy Sync Engine",
+  "diagram_type": "use_case",
+  "description": "Inbound and outbound sync operations keep local proxy state consistent with the hub via timer-driven polling and flushing.",
+
+  "actors": [
+    {
+      "name": "ProxyNode",
+      "type": "primary",
+      "description": "The local proxy instance that owns the SyncEngine; initiates start/stop and notifies of new outbound messages"
+    },
+    {
+      "name": "Hub",
+      "type": "external_system",
+      "description": "Remote hub server exposing /a2a/mailbox/inbound, /a2a/mailbox/outbound, /a2a/mailbox/ack endpoints"
+    },
+    {
+      "name": "LifecycleManager",
+      "type": "secondary",
+      "description": "Provides AuthError and triggers re-authentication via onAuthError callback"
+    },
+    {
+      "name": "MailboxStore",
+      "type": "secondary",
+      "description": "Local persistent store; provides cursors, pending queues, and message state"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Start Sync Engine",
+      "actor": "ProxyNode",
+      "description": "Initialise timers for outbound flush (500 ms initial) and inbound poll (1 s initial); set _running=true",
+      "method": "SyncEngine.start()"
+    },
+    {
+      "id": "UC2",
+      "name": "Stop Sync Engine",
+      "actor": "ProxyNode",
+      "description": "Clear both timers and set _running=false",
+      "method": "SyncEngine.stop()"
+    },
+    {
+      "id": "UC3",
+      "name": "Accelerate Outbound Flush",
+      "actor": "ProxyNode",
+      "description": "When a new outbound message is queued, reschedule the outbound timer to fire in 100 ms instead of waiting the full interval",
+      "method": "SyncEngine.notifyNewOutbound()"
+    },
+    {
+      "id": "UC4",
+      "name": "Flush Outbound Messages",
+      "actor": "SyncEngine",
+      "description": "Poll up to 50 pending outbound messages from MailboxStore and POST them to Hub /a2a/mailbox/outbound. Handle accepted, failed/rejected (with retry up to 10), and inline response messages. Update last_sync_at.",
+      "method": "OutboundSync.flush(channel='evomap-hub')",
+      "includes": ["UC6", "UC8"],
+      "next_interval_logic": "1 s if pending remain, else 5 s (DEFAULT_OUTBOUND_INTERVAL)"
+    },
+    {
+      "id": "UC5",
+      "name": "Pull Inbound Messages",
+      "actor": "SyncEngine",
+      "description": "POST to Hub /a2a/mailbox/inbound with cursor & limit=50; write received messages to MailboxStore; advance cursor.",
+      "method": "InboundSync.pull(channel='evomap-hub', limit=50)",
+      "includes": ["UC6"],
+      "next_interval_logic": "10 s active, 60 s idle (>5 min since last activity)"
+    },
+    {
+      "id": "UC6",
+      "name": "Handle Auth Error",
+      "actor": "SyncEngine",
+      "description": "On HTTP 401/403 from Hub, throw AuthError; SyncEngine catches it and invokes onAuthError callback to trigger re-authentication",
+      "method": "SyncEngine._handleAuthError(source)",
+      "extends": ["UC4", "UC5"]
+    },
+    {
+      "id": "UC7",
+      "name": "Acknowledge Delivered Messages",
+      "actor": "SyncEngine",
+      "description": "After each inbound pull cycle, list messages in 'delivered' status and POST their IDs to Hub /a2a/mailbox/ack",
+      "method": "InboundSync.ackDelivered(channel='evomap-hub')"
+    },
+    {
+      "id": "UC8",
+      "name": "Retry Failed Outbound Message",
+      "actor": "OutboundSync",
+      "description": "If Hub rejects a message and retry_count < MAX_RETRIES (10), call store.incrementRetry(); otherwise mark as 'failed'",
+      "method": "store.incrementRetry(id, reason)",
+      "extends": ["UC4"]
+    },
+    {
+      "id": "UC9",
+      "name": "Write Inline Hub Response as Inbound",
+      "actor": "OutboundSync",
+      "description": "If a flush result contains a 'response' field, write it as an inbound message to MailboxStore so the proxy can consume it",
+      "method": "store.writeInboundBatch(inboundMessages)",
+      "extends": ["UC4"]
+    },
+    {
+      "id": "UC10",
+      "name": "Detect Idle State",
+      "actor": "SyncEngine",
+      "description": "Compare Date.now() - _lastActivity against IDLE_THRESHOLD (5 min); result controls inbound poll frequency",
+      "method": "SyncEngine._isIdle()"
+    }
+  ],
+
+  "relationships": [
+    "SyncEngine composes OutboundSync (creates in constructor)",
+    "SyncEngine composes InboundSync (creates in constructor)",
+    "SyncEngine depends_on MailboxStore (via store parameter)",
+    "SyncEngine depends_on AuthError (from lifecycle/manager)",
+    "OutboundSync depends_on MailboxStore (pollOutbound, updateStatusBatch, writeInboundBatch, incrementRetry, setState)",
+    "InboundSync depends_on MailboxStore (getCursor, setCursor, getState, writeInboundBatch, list)",
+    "OutboundSync calls Hub (POST /a2a/mailbox/outbound)",
+    "InboundSync calls Hub (POST /a2a/mailbox/inbound, POST /a2a/mailbox/ack)",
+    "UC4 <<includes>> UC6 (auth error handling)",
+    "UC5 <<includes>> UC6 (auth error handling)",
+    "UC8 <<extends>> UC4 (retry on rejection)",
+    "UC9 <<extends>> UC4 (inline response ingestion)",
+    "UC3 <<extends>> UC1 (optional acceleration after start)"
+  ],
+
+  "key_constants": {
+    "DEFAULT_OUTBOUND_INTERVAL_MS": 5000,
+    "IDLE_THRESHOLD_MS": 300000,
+    "DEFAULT_POLL_INTERVAL_ACTIVE_MS": 10000,
+    "DEFAULT_POLL_INTERVAL_IDLE_MS": 60000,
+    "MAX_BATCH": 50,
+    "MAX_RETRIES": 10,
+    "OUTBOUND_FETCH_TIMEOUT_MS": 30000,
+    "INBOUND_FETCH_TIMEOUT_MS": 35000,
+    "ACK_FETCH_TIMEOUT_MS": 10000
+  },
+
+  "important_notes": "SyncEngine uses unref'd timers (Node.js pattern — won't block process exit). _lastActivity tracks both sent and received events to manage idle detection. Inline Hub responses from the outbound flush are injected directly into the inbound store, enabling request-reply patterns. Protocol version is carried on every Hub request (PROXY_PROTOCOL_VERSION from mailbox/store).",
+
+  "source_files_analyzed": [
+    "src/proxy/sync/engine.js",
+    "src/proxy/sync/inbound.js",
+    "src/proxy/sync/outbound.js"
+  ]
+}

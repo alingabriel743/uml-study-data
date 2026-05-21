@@ -1,0 +1,191 @@
+{
+  "scope": "service_registry_and_di",
+  "title": "Service Registry and Dependency Injection",
+  "diagram_type": "use_case",
+  "description": "Framework registers, configures, and injects connector services at runtime via an IoC container pattern",
+
+  "actors": [
+    "ConnectorFramework (initiates registry, registers BeanRegistry at startup)",
+    "ServiceProvider (pluggable factory registered per service type)",
+    "Service (any component implementing Service marker interface)",
+    "SnapshotterServiceProvider (concrete ServiceProvider for SnapshotterService)"
+  ],
+
+  "primary_use_cases": [
+    "Register a pre-built service instance (registerService with existing object)",
+    "Register a service provider for lazy initialization (registerServiceProvider)",
+    "Retrieve / lazily initialize a service by class type (getService)",
+    "Safely retrieve a service without exception (tryGetService → null on miss)",
+    "Create service via provider (ServiceProvider.createService)",
+    "Inject service dependencies via @InjectService annotations (doInjections)",
+    "Configure service via Configurable interface (configureService)",
+    "Start service via Startable interface (startService)",
+    "Stop / close all services in reverse registration order (close)",
+    "Throw UnknownServiceException when service not found",
+    "Throw ServiceDependencyException when required injection fails",
+    "Provide SnapshotterService with resolved Snapshotter, SnapshotQuery, SnapshotLock"
+  ],
+
+  "key_classes": [
+    {
+      "name": "ServiceRegistry",
+      "type": "interface",
+      "package": "io.debezium.service.spi",
+      "extends": "Closeable",
+      "methods": [
+        "<T> T getService(Class<T> serviceClass) throws UnknownServiceException",
+        "default <T> T tryGetService(Class<T> serviceClass) — swallows UnknownServiceException",
+        "<T> void registerServiceProvider(ServiceProvider<T> serviceProvider)",
+        "void close()"
+      ]
+    },
+    {
+      "name": "DefaultServiceRegistry",
+      "type": "class",
+      "package": "io.debezium.service",
+      "implements": "ServiceRegistry",
+      "annotations": ["@ThreadSafe", "@Incubating"],
+      "fields": [
+        "ConcurrentMap<Class<?>, ServiceRegistration<?>> serviceRegistrations",
+        "ConcurrentMap<Class<?>, Service> initializedServices",
+        "List<ServiceRegistration<?>> registrations",
+        "Configuration configuration"
+      ],
+      "constructor": "DefaultServiceRegistry(Configuration, BeanRegistry) — pre-registers BeanRegistry",
+      "key_methods": [
+        "getService(Class<T>) — double-checked locking, lazy init via initializeService",
+        "registerServiceProvider(ServiceProvider<T>) — stores registration by serviceClass key",
+        "close() — clears caches, iterates registrations in reverse, calls stopService",
+        "initializeService(registration) — calls createService then doMultiPhaseInitialization",
+        "doMultiPhaseInitialization — injectDependencies → configureService → startService",
+        "injectDependencies — doInjections + ServiceRegistryAware.injectServiceRegistry",
+        "doInjections — reflects on @InjectService methods, calls doInjection per method",
+        "doInjection — resolves service type, calls getService recursively, invokes setter via reflection",
+        "configureService — if Configurable → configure(configuration)",
+        "startService — if Startable → start()",
+        "stopService — if Closeable → close()",
+        "createService(registration) — delegates to ServiceProvider.createService(config, registry)"
+      ]
+    },
+    {
+      "name": "ServiceRegistration<T>",
+      "type": "class",
+      "package": "io.debezium.service",
+      "fields": [
+        "Class<T> serviceClass",
+        "ServiceProvider<T> serviceProvider (nullable — null for pre-built instances)",
+        "volatile T service"
+      ],
+      "constructors": [
+        "ServiceRegistration(Class<T>, T service) — wraps existing instance",
+        "ServiceRegistration(ServiceProvider<T>) — lazy, serviceClass from provider"
+      ],
+      "methods": ["getServiceClass()", "getServiceProvider()", "getService()", "setService(T)"]
+    },
+    {
+      "name": "ServiceProvider<T>",
+      "type": "interface",
+      "package": "io.debezium.service.spi",
+      "methods": [
+        "Class<T> getServiceClass()",
+        "T createService(Configuration, ServiceRegistry)"
+      ]
+    },
+    {
+      "name": "SnapshotterServiceProvider",
+      "type": "class",
+      "package": "io.debezium.snapshot",
+      "implements": "ServiceProvider<SnapshotterService>",
+      "createService_flow": [
+        "1. serviceRegistry.tryGetService(BeanRegistry.class)",
+        "2. beanRegistry.lookupByName(CONNECTOR_CONFIG, CommonConnectorConfig.class)",
+        "3. Resolve snapshotMode: check 'custom' + customName override",
+        "4. ServiceLoader.load(Snapshotter.class) → filter by name match → exactly one required",
+        "5. serviceRegistry.tryGetService(SnapshotQuery.class)",
+        "6. serviceRegistry.tryGetService(SnapshotLock.class)",
+        "7. If BeanRegistryAware: snapshotter.injectBeanRegistry(beanRegistry)",
+        "8. snapshotter.configure(configuration.asMap())",
+        "9. return new SnapshotterService(snapshotter, snapshotQueryService, snapshotLockService)"
+      ],
+      "methods": [
+        "getServiceClass() → SnapshotterService.class",
+        "snapshotMode(CommonConnectorConfig) → connector-specific snapshot mode string"
+      ]
+    },
+    {
+      "name": "UnknownServiceException",
+      "type": "class",
+      "package": "io.debezium.service",
+      "extends": "DebeziumException",
+      "trigger": "thrown by getService() when no registration found for serviceClass"
+    },
+    {
+      "name": "ServiceDependencyException",
+      "type": "class",
+      "package": "io.debezium.service",
+      "extends": "DebeziumException",
+      "trigger": "thrown by doInjection() when @InjectService(required=true) service missing, or method invocation fails"
+    }
+  ],
+
+  "spi_interfaces": [
+    "Configurable — configure(Configuration): called post-injection",
+    "Startable — start(): called after configure",
+    "Closeable — close(): called during registry shutdown",
+    "ServiceRegistryAware — injectServiceRegistry(ServiceRegistry): injected before configure",
+    "InjectService — method annotation: service() class, required() flag (default true)",
+    "BeanRegistryAware — injectBeanRegistry(BeanRegistry): used by custom Snapshotter impls"
+  ],
+
+  "key_relationships": [
+    "DefaultServiceRegistry implements ServiceRegistry",
+    "DefaultServiceRegistry composes List<ServiceRegistration<?>> (ordered for teardown)",
+    "DefaultServiceRegistry composes ConcurrentMap<Class, ServiceRegistration> (lookup index)",
+    "ServiceRegistration holds ServiceProvider<T> OR pre-built Service instance",
+    "SnapshotterServiceProvider implements ServiceProvider<SnapshotterService>",
+    "SnapshotterServiceProvider depends_on BeanRegistry, SnapshotQuery, SnapshotLock (via registry)",
+    "UnknownServiceException extends DebeziumException",
+    "ServiceDependencyException extends DebeziumException",
+    "Service initialization order enforced by recursive getService calls during doInjection"
+  ],
+
+  "service_lifecycle_phases": [
+    "1. REGISTER — registerServiceProvider() stores ServiceRegistration (no instantiation yet)",
+    "2. LAZY INIT (on first getService) — createService via provider → registerService",
+    "3. INJECT — reflect @InjectService methods, recursively resolve + inject dependencies",
+    "4. CONFIGURE — if Configurable → configure(configuration)",
+    "5. START — if Startable → start()",
+    "6. CLOSE (registry.close()) — reverse-order, if Closeable → close()"
+  ],
+
+  "exception_scenarios": [
+    "getService() with no registration → UnknownServiceException",
+    "createService() with null ServiceProvider (pre-built instance registration) → UnknownServiceException",
+    "doInjection() with required=true and missing service → ServiceDependencyException",
+    "doInjection() with unexpected param count → ServiceDependencyException",
+    "doInjection() method.invoke failure → ServiceDependencyException",
+    "SnapshotterServiceProvider: 0 Snapshotter implementations found → DebeziumException",
+    "SnapshotterServiceProvider: >1 Snapshotter implementations found → DebeziumException"
+  ],
+
+  "important_notes": [
+    "@ThreadSafe: DefaultServiceRegistry uses ConcurrentHashMap + synchronized blocks for lazy init (double-checked locking pattern)",
+    "BeanRegistry is the only service pre-registered at construction time",
+    "ServiceProvider pattern decouples registration from instantiation — supports lazy init",
+    "tryGetService is the null-safe variant; callers use it when a service is optional",
+    "SnapshotterServiceProvider uses Java ServiceLoader for Snapshotter discovery (SPI)",
+    "Snapshot mode 'custom' + customName allows user-provided Snapshotter class names",
+    "All SPI interfaces (Configurable, Startable, Closeable, ServiceRegistryAware) are opt-in — checked via instanceof"
+  ],
+
+  "source_files_analyzed": [
+    "debezium-connector-common/src/main/java/io/debezium/service/DefaultServiceRegistry.java",
+    "debezium-connector-common/src/main/java/io/debezium/service/ServiceRegistration.java",
+    "debezium-connector-common/src/main/java/io/debezium/snapshot/SnapshotterServiceProvider.java",
+    "debezium-connector-common/src/main/java/io/debezium/service/UnknownServiceException.java",
+    "debezium-connector-common/src/main/java/io/debezium/service/ServiceDependencyException.java",
+    "debezium-connector-common/src/main/java/io/debezium/service/spi/ServiceRegistry.java",
+    "debezium-connector-common/src/main/java/io/debezium/service/spi/ServiceProvider.java",
+    "debezium-connector-common/src/main/java/io/debezium/service/spi/InjectService.java"
+  ]
+}

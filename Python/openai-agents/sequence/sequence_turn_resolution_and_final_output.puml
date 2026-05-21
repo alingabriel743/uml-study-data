@@ -1,0 +1,202 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    GroupBorderColor #6C757D
+    GroupHeaderFontColor #212529
+    GroupBackgroundColor #E9ECEF
+    DividerBorderColor #6C757D
+    DividerBackgroundColor #DEE2E6
+    NoteBackgroundColor #FFF3CD
+    NoteBorderColor #FFC107
+}
+
+title Turn Resolution & Final Output
+
+participant "RunLoop\n(run_loop.py)" as RunLoop
+participant "get_single_step_result\n_from_response" as GetStepResult
+participant "process_model\n_response" as ProcessModelResponse
+participant "ToolUseTracker" as Tracker
+participant "execute_tools\n_and_side_effects" as ExecTools
+participant "_maybe_finalize\n_from_tool_results" as MaybeFinalize
+participant "check_for_final_output\n_from_tools" as CheckFinalOutput
+participant "execute_final\n_output_step" as ExecFinalStep
+participant "run_final\n_output_hooks" as RunHooksFn
+participant "RunHooks" as RunHooks
+participant "AgentHooks" as AgentHooks
+participant "_finalize_streamed\n_final_output" as FinalizeStreamed
+
+== Step Result Orchestration ==
+
+RunLoop -> GetStepResult : get_single_step_result_from_response(\n  bindings, all_tools, original_input,\n  pre_step_items, new_response,\n  output_schema, handoffs, hooks,\n  context_wrapper, run_config, tool_use_tracker)
+activate GetStepResult
+
+GetStepResult -> ProcessModelResponse : process_model_response(\n  agent, all_tools, response,\n  output_schema, handoffs, existing_items)
+activate ProcessModelResponse
+ProcessModelResponse --> GetStepResult : ProcessedResponse\n(new_items, handoffs, functions,\ncomputer_actions, tools_used, ...)
+deactivate ProcessModelResponse
+
+GetStepResult -> Tracker : record_processed_response(agent, processed_response)
+activate Tracker
+Tracker --> GetStepResult : (recorded)
+deactivate Tracker
+
+GetStepResult -> ExecTools : execute_tools_and_side_effects(\n  bindings, original_input, pre_step_items,\n  new_response, processed_response,\n  output_schema, hooks, context_wrapper,\n  run_config)
+activate ExecTools
+
+note right of ExecTools
+  Builds TurnPlan from processed_response,
+  then executes all tool types:
+  function, computer, shell, MCP, etc.
+end note
+
+ExecTools -> ExecTools : _build_plan_for_fresh_turn(\n  processed_response, agent,\n  context_wrapper,\n  approval_items_by_call_id)
+ExecTools -> ExecTools : _execute_tool_plan(plan, bindings, hooks,\n  context_wrapper, run_config)
+ExecTools -> ExecTools : _collect_tool_interruptions(function_results, ...)
+
+== Branching: Determine Next Step ==
+
+alt Pending tool approvals exist (interruptions)
+    ExecTools --> GetStepResult : SingleStepResult(\n  next_step=NextStepInterruption(interruptions))
+    note right of ExecTools
+      Pauses run — caller exposes interruptions
+      via RunResult.interruptions + to_state()
+      for human-in-the-loop approval flows
+    end note
+
+else Handoff detected in processed_response
+    ExecTools -> ExecTools : execute_handoffs(...)
+    ExecTools --> GetStepResult : SingleStepResult(\n  next_step=NextStepHandoff(new_agent))
+
+else Tools executed — check tool_use_behavior policy
+    ExecTools -> MaybeFinalize : _maybe_finalize_from_tool_results(\n  public_agent, original_input, new_response,\n  pre_step_items, new_step_items,\n  function_results, hooks, context_wrapper,\n  tool_input_guardrail_results,\n  tool_output_guardrail_results)
+    activate MaybeFinalize
+
+    MaybeFinalize -> CheckFinalOutput : check_for_final_output_from_tools(\n  agent, function_results, context_wrapper)
+    activate CheckFinalOutput
+
+    alt tool_use_behavior = 'stop_on_first_tool'
+        CheckFinalOutput --> MaybeFinalize : ToolsToFinalOutputResult(\n  is_final_output=True,\n  final_output=<first tool result>)
+    else tool_use_behavior = {stop_at_tool_names: [...]} — matching tool name
+        CheckFinalOutput --> MaybeFinalize : ToolsToFinalOutputResult(\n  is_final_output=True,\n  final_output=<matched tool result>)
+    else tool_use_behavior = callable (custom async/sync function)
+        CheckFinalOutput -> CheckFinalOutput : await agent.tool_use_behavior(\n  context_wrapper, tool_results)
+        CheckFinalOutput --> MaybeFinalize : ToolsToFinalOutputResult(is_final_output=?, ...)
+    else tool_use_behavior = 'run_llm_again' (default)
+        CheckFinalOutput --> MaybeFinalize : ToolsToFinalOutputResult(\n  is_final_output=False)
+    end
+    deactivate CheckFinalOutput
+
+    alt ToolsToFinalOutputResult.is_final_output = True
+        MaybeFinalize -> ExecFinalStep : execute_final_output(\n  public_agent, original_input, new_response,\n  pre_step_items, new_step_items,\n  final_output, hooks, context_wrapper,\n  tool_input_guardrail_results,\n  tool_output_guardrail_results)
+        activate ExecFinalStep
+    else is_final_output = False — return to run loop
+        MaybeFinalize --> ExecTools : (no final output from tools)
+        deactivate MaybeFinalize
+        ExecTools --> GetStepResult : SingleStepResult(\n  next_step=NextStepRunAgain())
+    end
+
+else No tools/approvals pending — model returned message output
+    alt Structured output_schema defined
+        ExecTools -> ExecTools : output_schema.validate_json(\n  potential_final_output_text)
+        note right of ExecTools
+          AgentOutputSchemaBase.validate_json
+          converts text → typed output object
+        end note
+    end
+    ExecTools -> ExecFinalStep : execute_final_output(\n  ..., final_output=validated_or_plain_text)
+    activate ExecFinalStep
+end
+
+== Final Output Execution & Hook Lifecycle ==
+
+ExecFinalStep -> RunHooksFn : run_final_output_hooks(\n  agent, hooks, context_wrapper, final_output)
+activate RunHooksFn
+
+RunHooksFn -> RunHooksFn : create AgentHookContext(\n  context, usage, _approvals, turn_input)
+
+RunHooksFn -> RunHooks : on_agent_end(agent_hook_context, agent, final_output)
+activate RunHooks
+note right of RunHooks
+  Fired concurrently via asyncio.gather
+  with AgentHooks.on_end (if defined)
+end note
+
+RunHooksFn -> AgentHooks : on_end(agent_hook_context, agent, final_output)\n[only if agent.hooks is set]
+activate AgentHooks
+AgentHooks --> RunHooksFn : (hook completed)
+deactivate AgentHooks
+
+RunHooks --> RunHooksFn : (hook completed)
+deactivate RunHooks
+deactivate RunHooksFn
+
+ExecFinalStep --> ExecTools : SingleStepResult(\n  original_input, model_response,\n  pre_step_items, new_step_items,\n  next_step=NextStepFinalOutput(final_output),\n  tool_input_guardrail_results,\n  tool_output_guardrail_results,\n  output_guardrail_results=[])
+deactivate ExecFinalStep
+
+note right of ExecFinalStep
+  output_guardrail_results is always []
+  here — output guardrails run later
+  in _finalize_streamed_final_output
+end note
+
+ExecTools --> GetStepResult : SingleStepResult(next_step=NextStepFinalOutput)
+deactivate ExecTools
+
+GetStepResult --> RunLoop : SingleStepResult(next_step=NextStepFinalOutput)
+deactivate GetStepResult
+
+== Streaming Teardown & Result Delivery ==
+
+RunLoop -> FinalizeStreamed : _finalize_streamed_final_output(\n  streamed_result, agent, run_config, output,\n  context_wrapper, save_items,\n  items, response_id, store_setting)
+activate FinalizeStreamed
+
+FinalizeStreamed -> FinalizeStreamed : _run_output_guardrails_for_stream(\n  agent, run_config, output,\n  context_wrapper, streamed_result)
+note right of FinalizeStreamed
+  Output guardrails evaluated here —
+  after final text is known
+end note
+
+FinalizeStreamed -> FinalizeStreamed : streamed_result.output_guardrail_results\n  = output_guardrail_results
+FinalizeStreamed -> FinalizeStreamed : streamed_result.final_output = output
+FinalizeStreamed -> FinalizeStreamed : streamed_result.is_complete = True
+
+FinalizeStreamed -> FinalizeStreamed : save_items(items, response_id, store_setting)
+note right of FinalizeStreamed
+  Session persistence: items written
+  to configured session store here
+end note
+
+FinalizeStreamed -> FinalizeStreamed : event_queue.put_nowait(QueueCompleteSentinel())
+note right of FinalizeStreamed
+  Signals stream_events() consumers
+  that the run is fully complete —
+  final_output is now safe to read
+end note
+
+FinalizeStreamed --> RunLoop : (stream complete, RunResultStreaming settled)
+deactivate FinalizeStreamed
+
+@enduml

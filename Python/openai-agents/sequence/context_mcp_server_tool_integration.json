@@ -1,0 +1,139 @@
+{
+  "scope": "mcp_server_tool_integration",
+  "title": "MCP Server Tool Integration",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Agent/Runner",
+    "MCPServerManager",
+    "_ServerWorker",
+    "MCPServer (abstract)",
+    "_MCPServerWithClientSession",
+    "MCPServerStdio / MCPServerSse / MCPServerStreamableHttp",
+    "ClientSession (mcp lib)",
+    "ToolFilter / ToolFilterContext"
+  ],
+  "class_hierarchy": [
+    "MCPServer (abstract ABC) — defines connect(), cleanup(), list_tools(), call_tool()",
+    "_MCPServerWithClientSession(MCPServer, ABC) — adds ClientSession, caching, filtering, retries",
+    "MCPServerStdio(_MCPServerWithClientSession) — stdio transport via npx/subprocess",
+    "MCPServerSse(_MCPServerWithClientSession) — HTTP+SSE transport (deprecated)",
+    "MCPServerStreamableHttp(_MCPServerWithClientSession) — Streamable HTTP transport"
+  ],
+  "key_attributes": {
+    "_MCPServerWithClientSession": [
+      "session: ClientSession | None",
+      "cache_tools_list: bool",
+      "_cache_dirty: bool",
+      "_tools_list: list[MCPTool] | None",
+      "tool_filter: ToolFilter",
+      "max_retry_attempts: int",
+      "retry_backoff_seconds_base: float",
+      "exit_stack: AsyncExitStack",
+      "_cleanup_lock, _request_lock: asyncio.Lock",
+      "tool_meta_resolver: MCPToolMetaResolver | None",
+      "_needs_approval_policy (from MCPServer)",
+      "_failure_error_function (from MCPServer)"
+    ],
+    "MCPServerManager": [
+      "_all_servers: list[MCPServer]",
+      "_active_servers: list[MCPServer]",
+      "failed_servers: list[MCPServer]",
+      "errors: dict[MCPServer, BaseException]",
+      "_connected_servers: set[MCPServer]",
+      "_workers: dict[MCPServer, _ServerWorker]",
+      "connect_timeout_seconds, cleanup_timeout_seconds: float | None",
+      "drop_failed_servers: bool",
+      "strict: bool",
+      "connect_in_parallel: bool"
+    ]
+  },
+  "interaction_flow": [
+    "=== Manager Lifecycle (connect phase) ===",
+    "User/App → MCPServerManager: async with MCPServerManager(servers) as manager",
+    "MCPServerManager.__aenter__ → MCPServerManager.connect_all()",
+    "connect_all: compute servers_to_connect (skip already-connected)",
+    "connect_all [parallel=False]: for each server → _attempt_connect(server)",
+    "connect_all [parallel=True]: gather tasks → _connect_all_parallel(servers)",
+    "_connect_all_parallel: asyncio.gather(_attempt_connect per server, raise_on_error=False) → check strict",
+    "_attempt_connect → _run_connect(server)",
+    "_run_connect [parallel=False]: _run_with_timeout(server.connect, connect_timeout_seconds)",
+    "_run_connect [parallel=True]: _get_worker(server) → worker.connect() via _ServerWorker._submit('connect')",
+    "_ServerWorker._run loop: dequeues _ServerCommand → calls server.connect() or server.cleanup() with timeout",
+    "_attempt_connect: on success → _connected_servers.add(server); on error → _record_failure(server, exc)",
+    "connect_all → _refresh_active_servers(): drop failed if drop_failed_servers=True",
+    "MCPServerManager.__aenter__ returns self with .active_servers populated",
+
+    "=== Server connect() internals ===",
+    "_MCPServerWithClientSession.connect(): create_streams() via exit_stack → transport (read, write, rest)",
+    "connect: ClientSession(read, write, timeout) via exit_stack",
+    "connect: await session.initialize() → stores server_initialize_result + self.session",
+
+    "=== Agent run: list_tools ===",
+    "Agent/Runner → MCPServer.list_tools(run_context, agent)",
+    "list_tools: check cache → if cache_tools_list and not _cache_dirty and _tools_list: return cached",
+    "list_tools (cache miss): _run_with_retries(lambda: _maybe_serialize_request(lambda: session.list_tools()))",
+    "_run_with_retries: retry loop up to max_retry_attempts with exponential backoff",
+    "_maybe_serialize_request: if _serialize_session_requests → acquire _request_lock; else direct call",
+    "session.list_tools() → result.tools stored in _tools_list; _cache_dirty = False",
+    "list_tools: if tool_filter → _apply_tool_filter(tools, run_context, agent) → filtered_tools",
+    "_apply_tool_filter: static dict → _apply_static_tool_filter (allowed_tool_names allowlist then blocked_tool_names blocklist)",
+    "_apply_tool_filter: callable → _apply_dynamic_tool_filter(tools, run_context, agent)",
+    "_apply_dynamic_tool_filter: builds ToolFilterContext(run_context, agent, server_name); for each tool calls tool_filter_func(context, tool); awaits if coroutine",
+    "list_tools → return filtered_tools to Agent/Runner",
+
+    "=== Agent run: call_tool ===",
+    "Agent/Runner → MCPServer.call_tool(tool_name, arguments, meta=None)",
+    "call_tool: _validate_required_parameters(tool_name, arguments) — checks required fields from cached schema",
+    "call_tool: if meta is None → _run_with_retries(session.call_tool(tool_name, arguments))",
+    "call_tool: if meta present → _run_with_retries(session.call_tool(tool_name, arguments, meta=meta))",
+    "Note: tool_meta_resolver is invoked by the Agents SDK (MCPUtil layer) BEFORE calling call_tool to inject _meta",
+    "call_tool → CallToolResult returned to Agent/Runner",
+
+    "=== Approval flow (needs_approval) ===",
+    "MCPServer._get_needs_approval_for_tool(tool, agent) → bool | Callable",
+    "Policy forms: bool, dict[tool_name→bool], callable(run_context, agent, tool)→bool",
+    "MCPUtil wraps each MCPTool as FunctionTool with needs_approval from _get_needs_approval_for_tool",
+    "Runner checks needs_approval before invoking call_tool; may pause for human approval",
+
+    "=== Manager cleanup ===",
+    "MCPServerManager.__aexit__ → cleanup_all()",
+    "cleanup_all: reversed(_all_servers) → _cleanup_server(server) per server",
+    "_cleanup_server [parallel]: worker.cleanup() via _ServerWorker._submit('cleanup') → exits worker loop",
+    "_cleanup_server [serial]: _run_with_timeout(server.cleanup, cleanup_timeout_seconds)",
+    "_MCPServerWithClientSession.cleanup(): async with _cleanup_lock → exit_stack.aclose()"
+  ],
+  "key_relationships": [
+    "MCPServerManager composes list[MCPServer]",
+    "MCPServerManager creates _ServerWorker per server (parallel mode only)",
+    "_ServerWorker wraps MCPServer with asyncio.Queue-based command dispatch",
+    "_MCPServerWithClientSession composes ClientSession (from mcp lib)",
+    "_MCPServerWithClientSession uses AsyncExitStack for transport/session lifecycle",
+    "MCPServer (base) holds tool_meta_resolver, _needs_approval_policy, _failure_error_function",
+    "list_tools() calls _apply_tool_filter() which uses ToolFilterContext with run_context + agent",
+    "call_tool() uses session.call_tool() with optional _meta dict from tool_meta_resolver"
+  ],
+  "tool_filter_types": {
+    "None": "no filtering, all tools returned",
+    "ToolFilterStatic (dict)": "allowed_tool_names (allowlist) and/or blocked_tool_names (blocklist)",
+    "Callable": "dynamic filter: fn(ToolFilterContext, MCPTool) -> bool | Awaitable[bool]"
+  },
+  "transport_differences": {
+    "MCPServerStdio": "create_streams() uses stdio_client(StdioServerParameters); spawns subprocess",
+    "MCPServerSse": "create_streams() uses sse_client(url, headers); HTTP+SSE (deprecated)",
+    "MCPServerStreamableHttp": "create_streams() uses streamablehttp_client; supports session isolation, _serialize_session_requests, GetSessionIdCallback"
+  },
+  "important_notes": [
+    "cache_tools_list=True avoids per-run list_tools() round-trips; invalidate via invalidate_tools_cache()",
+    "connect_in_parallel=True uses _ServerWorker tasks to maintain task-affinity for AnyIO cancel scopes",
+    "drop_failed_servers=True (default): active_servers excludes failed ones; strict=True raises on first failure",
+    "tool_meta_resolver injects per-call _meta (tenant IDs, trace context) before session.call_tool()",
+    "failure_error_function controls whether MCP tool errors become model-visible text or raised exceptions",
+    "_run_with_retries uses exponential backoff: delay = retry_backoff_seconds_base * 2^(attempt-1)",
+    "MCPServerStreamableHttp supports shared vs isolated sessions (_serialize_session_requests)"
+  ],
+  "source_files_analyzed": [
+    "src/agents/mcp/server.py",
+    "src/agents/mcp/manager.py",
+    "docs/mcp.md"
+  ]
+}

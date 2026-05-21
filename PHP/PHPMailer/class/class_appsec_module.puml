@@ -1,0 +1,513 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #F9A825
+}
+
+title Application Security (AppSec) Module\n<size:11>Bilingual: PHP C Extension (client) ↔ Rust Helper (server) via Unix socket + msgpack</size>
+
+' ─────────────────────────────────────────────
+' PHP C EXTENSION LAYER
+' ─────────────────────────────────────────────
+package "PHP C Extension" {
+
+    class ddappsec_globals <<module_globals>> {
+        +enabled : enabled_configuration [2 bits]
+        +active : bool [1 bit]
+        +to_be_configured : bool [1 bit]
+        +skip_rshutdown : bool [1 bit]
+        +during_request_shutdown : bool [1 bit]
+        --
+        +dd_appsec_rinit_once(): void
+        +dd_appsec_rshutdown(ignore_verdict: bool): void
+    }
+
+    enum enabled_configuration <<enum>> {
+        APPSEC_UNSET_STATE = 0
+        APPSEC_ENABLED_VIA_REMCFG
+        APPSEC_FULLY_ENABLED
+        APPSEC_FULLY_DISABLED
+    }
+
+    enum dd_result <<enum>> {
+        dd_success = 0
+        dd_network
+        dd_should_block
+        dd_should_redirect
+        dd_should_record
+        dd_error
+        dd_try_later
+        dd_helper_error
+    }
+
+    enum dd_response_type <<enum>> {
+        response_type_auto = 0
+        response_type_html = 1
+        response_type_json = 2
+    }
+
+    enum request_stage <<enum>> {
+        REQUEST_STAGE_REQUEST_BEGIN
+        REQUEST_STAGE_MID_REQUEST
+        REQUEST_STAGE_REQUEST_END
+    }
+
+    class dd_conn <<struct>> {
+        +addr: sockaddr_un
+        +socket: int
+        --
+        +dd_conn_init(path, path_len): int
+        +dd_conn_destroy(): int
+        +dd_conn_check_credentials(): dd_result
+        +dd_conn_sendv(iovecs): dd_result
+        +dd_conn_recv(data, data_len): dd_result
+        +dd_conn_set_timeout(comm_type, ms): dd_result
+        +dd_conn_connected(): bool
+    }
+
+    class dd_command_spec <<struct>> {
+        +name: const char*
+        +name_len: size_t
+        +num_args: size_t
+        +outgoing_cb: fn(mpack_writer_t*, void*) -> dd_result
+        +incoming_cb: fn(mpack_node_t, void*) -> dd_result
+        +config_features_cb: fn(mpack_node_t, void*) -> dd_result
+        --
+        +dd_command_exec(conn, ctx): dd_result
+        +dd_command_exec_req_info(conn, req_info): dd_result
+        +dd_command_proc_resp_verd_span_data(root, ctx): dd_result
+        +dd_command_process_meta(root, span): void
+        +dd_command_process_metrics(root, span): bool
+    }
+
+    class block_params <<struct>> {
+        +security_response_id: zend_string*
+        +response_type: dd_response_type
+        +response_code: int
+        +redirection_location: zend_string*
+        ..constants..
+        DEFAULT_BLOCKING_RESPONSE_CODE = 403
+        DEFAULT_REDIRECTION_RESPONSE_CODE = 303
+        DEFAULT_RESPONSE_TYPE = response_type_auto
+    }
+
+    class req_info <<struct>> {
+        +command_name: const char*
+        +root_span: zend_object*
+        +client_ip: zend_string*
+        +block_params: block_params
+    }
+
+    class req_info_init <<struct>> {
+        +req_info: req_info
+        +superglob_equiv: zend_array*
+        +entity: zend_string*
+        --
+        +dd_request_init(conn, req_info_init): dd_result
+    }
+
+    class req_exec_opts <<struct>> {
+        +rasp_rule: zend_string*
+        +subctx_id: zend_string*
+        +subctx_last_call: bool
+        --
+        +dd_request_exec(conn, data, opts, block_params): dd_result
+    }
+
+    class RequestLifecycle <<module>> {
+        +dd_req_lifecycle_startup(): void
+        +dd_req_lifecycle_rinit(force: bool): void
+        +dd_req_lifecycle_rshutdown(ignore_verdict, force): void
+        +dd_req_lifecycle_set_blocked(): void
+        +dd_req_lifecycle_is_blocked(): bool
+        +dd_req_lifecycle_abort(stage, result, block_params): zend_array*
+        +dd_req_lifecycle_get_cur_span(): zend_object*
+        +dd_req_lifecycle_get_client_ip(): zend_string*
+    }
+
+    class RequestAbort <<module>> {
+        +dd_request_abort_startup(): void
+        +dd_request_abort_shutdown(): void
+        +dd_request_abort_static_page(block_params): void
+        +dd_request_abort_static_page_spec(block_params, server): zend_array*
+        +dd_request_abort_redirect(block_params): void
+        +dd_request_abort_redirect_spec(block_params, server): zend_array*
+        +dd_request_abort_destroy_block_params(block_params): void
+    }
+
+    class HelperManager <<module>> {
+        +dd_helper_startup(): void
+        +dd_helper_shutdown(): void
+        +dd_helper_gshutdown(): void
+        +dd_helper_get_runtime(): helper_runtime
+        +dd_helper_is_rust(): bool
+        +dd_helper_mgr_acquire_conn(client_init_func, ctx): dd_conn*
+        +dd_helper_mgr_cur_conn(): dd_conn*
+        +dd_helper_close_conn(): void
+        +dd_appsec_maybe_enable_helper(enable, activation, conf): bool
+    }
+
+    class Tags <<module>> {
+        +dd_tags_startup(): void
+        +dd_tags_shutdown(): void
+        +dd_tags_rinit(): void
+        +dd_tags_rshutdown(): void
+        +dd_tags_add_tags(span, superglob_equiv): void
+        +dd_tags_set_user_event_triggered(): void
+        +dd_tags_set_event_user_id(zstr): void
+        +dd_tags_add_appsec_json_frag(zstr): void
+    }
+
+    class Rasp <<module>> {
+        +dd_rasp_startup(): void
+        +dd_rasp_shutdown(): void
+        +dd_rasp_account_duration_us(duration_us: double): void
+        +dd_rasp_reset_globals(): void
+        +dd_rasp_req_finish(): void
+    }
+}
+
+' ─────────────────────────────────────────────
+' MSGPACK PROTOCOL (shared boundary)
+' ─────────────────────────────────────────────
+package "Protocol (msgpack / Unix Socket)" {
+
+    enum Command <<enum>> {
+        ClientInit(Box<ClientInitArgs>)
+        ConfigSync(Box<ConfigSyncArgs>)
+        RequestInit(Box<RequestInitArgs>)
+        RequestExec(Box<RequestExecArgs>)
+        RequestShutdown(Box<RequestShutdownArgs>)
+    }
+
+    enum CommandResponse <<enum>> {
+        FatalError
+        ClientInit(ClientInitResp)
+        ConfigSync
+        ConfigFeatures(ConfigFeaturesResp)
+        RequestInit(RequestInitResp)
+        RequestExec(RequestExecResp)
+        RequestShutdown(RequestShutdownResp)
+    }
+
+    class CommandCodec <<codec>> {
+        ' msgpack framing: 'dds\0' + uint32 size LE + payload
+        ' Max frame size: 4 MB
+        ..implements..
+        +decode() -> Command
+        +encode(CommandResponse): void
+    }
+
+    class ActionInstance {
+        +action: &str
+        +parameters: HashMap<String, String>
+    }
+
+    enum WafRunType <<enum>> {
+        NonRasp
+        RaspRule(String)
+    }
+
+    class RequestExecOptions {
+        +run_type: WafRunType
+        +subctx_id: Option<String>
+        +subctx_last_call: bool
+        --
+        +regular(): Self
+    }
+}
+
+' ─────────────────────────────────────────────
+' RUST HELPER — SERVICE & WAF
+' ─────────────────────────────────────────────
+package "Rust Helper: Service & WAF" {
+
+    class ServiceManager {
+        -inner: Mutex<ServiceManagerInner>
+        ' inner: services: HashMap<ServiceFixedConfig, Weak<Service>>
+        ' inner: last_service: Option<Arc<Service>>
+        --
+        +new(): ServiceManager
+        +get_service(config, tel_collector): Arc<Service>
+        +notify_of_rc_updates(shmem_path): void
+        +service_count(): usize
+    }
+
+    class Service {
+        +fixed_config: ServiceFixedConfig
+        -limiter: Limiter
+        -schema_sampler: Option<SchemaSampler>
+        -rc_update_lock: Mutex<RcUpdateState>
+        -waf: UpdateableWafInstance
+        -config_snapshot: ArcSwap<ConfigSnapshot>
+        -logs_collector: TelemetryLogsCollector
+        -worker_count: WorkerCountState
+        --
+        +new(fixed_config, tel_submitter): Service
+        +new_context(): libddwaf::Context
+        +config_snapshot(): Guard<Arc<ConfigSnapshot>>
+        +poll_and_apply_rc(): Result<()>
+        +apply_config(state, cfg_dir): Result<()>
+        +waf_version(): &str
+        +should_extract_schema(api_sec_samp_key): bool
+        +should_force_keep(): bool
+        +increment_worker_count(): void
+        +decrement_worker_count(): void
+        ..implements..
+        TelemetryLogsGenerator
+        TelemetryMetricsGenerator
+    }
+
+    class ServiceFixedConfig {
+        +always_enabled: bool
+        +waf_settings: WafSettings
+        +rem_cfg_settings: RemoteConfigSettings
+        +telemetry_settings: TelemetrySettings
+        --
+        +new(always_enabled, waf_settings, rem_cfg_settings, tel): Self
+        +new_from_config_sync(args): Option<Self>
+        ..implements..
+        Eq, PartialEq, Hash, Clone
+    }
+
+    class ConfigSnapshot {
+        +asm_enabled: bool
+        +auto_user_instrum: AutoUserInstrumMode
+        +rules_version: Option<String>
+        --
+        +new(asm_always_enabled, rules_version): Self
+        +with_asm_features(asm_always_enabled, asm_enabled, mode): Self
+        +with_new_rules_version(rules_version): Self
+    }
+
+    enum AutoUserInstrumMode <<enum>> {
+        Undefined (default)
+        Unknown
+        Disabled
+        Identification
+        Anonymization
+    }
+
+    class UpdateableWafInstance {
+        ' Thread-safe: ArcSwap<Handle> for lock-free reads
+        ' Mutex<Builder> for serialized config writes
+        -inner: Arc<UpdateableWafInstanceInner>
+        ' inner: prot_state: Mutex<ProtectedState>
+        ' inner: waf_handle: ArcSwap<Handle>
+        ' inner: initial_ruleset: WafObject
+        --
+        +new(ruleset, config, diagnostics): Result<Self>
+        +current(): Arc<Handle>
+        +add_or_update_config(path, ruleset, diagnostics): Result<()>
+        +remove_config(path): Result<bool>
+        +update(): Result<Arc<Handle>>
+        +config_paths(filter): WafArray
+        ..implements..
+        Clone
+    }
+
+    class WafRuleset {
+        +doc: WafObject
+        +rules_version: Option<String>
+        --
+        +new(doc, rules_version): Self
+        +from_file(path): Result<WafRuleset>
+        +from_default_file(): Result<WafRuleset>
+        +from_slice(slice): Result<WafRuleset>
+        +rules_version(): Option<&str>
+        ..implements..
+        From<WafRuleset> for WafObject
+    }
+
+    class WafSettings {
+        +rules_file: Option<String>
+        +waf_timeout_us: Option<u64>
+        +trace_rate_limit: u32
+        +obfuscator_key_regex: Option<String>
+        +obfuscator_value_regex: Option<String>
+        +schema_extraction: SchemaExtraction
+    }
+
+    class RemoteConfigSettings {
+        +enabled: bool
+        +shmem_path: PathBuf
+        --
+        +new(enabled, shmem_path): Self
+        +shmem_path(): Option<&Path>
+    }
+
+    class TelemetrySettings {
+        +service_name: String
+        +env_name: String
+    }
+
+    class InitDiagnosticsLegacy {
+        +rules_loaded: u32
+        +rules_failed: u32
+        +rules_errors: String
+        --
+        +merge(other): void
+        ..implements..
+        SpanMetricsGenerator
+    }
+}
+
+' ─────────────────────────────────────────────
+' RUST HELPER — SERVER & CLIENT
+' ─────────────────────────────────────────────
+package "Rust Helper: Server & Client" {
+
+    class Server <<module>> {
+        ' Binds Unix socket
+        ' Creates ServiceManager (leaked as 'static)
+        ' Registers RC callbacks
+        ' Spawns Client per accepted connection
+        --
+        +run_server(config, cancel_token): Result<()> [async]
+    }
+
+    class Client {
+        +id: u64
+        -service_manager: &'static ServiceManager
+        -service: Option<TrackedService>
+        -sidecar_settings: Option<SidecarSettings>
+        -metrics_last_registered: Cell<Option<Instant>>
+        --
+        +new(service_manager): Client
+        +entrypoint(stream, sidecar_ready, cancel_token) [async]
+        +get_service(): &Service
+    }
+
+    class TrackedService {
+        ' RAII wrapper: increments worker_count on new/clone
+        ' Decrements worker_count on drop
+        ' Deref to Service
+        -service: Arc<Service>
+    }
+}
+
+' ─────────────────────────────────────────────
+' RELATIONSHIPS — PHP C EXTENSION
+' ─────────────────────────────────────────────
+
+ddappsec_globals --> enabled_configuration : uses >
+
+req_info_init *-- req_info : embeds >
+req_info *-- block_params : embeds >
+block_params --> dd_response_type : uses >
+
+RequestLifecycle ..> HelperManager : acquires conn >
+RequestLifecycle ..> RequestAbort : on block/redirect >
+RequestLifecycle --> request_stage : tracks >
+RequestLifecycle ..> dd_result : acts on >
+
+HelperManager ..> dd_conn : manages lifecycle >
+dd_command_spec ..> dd_conn : sends via >
+dd_command_spec ..> dd_result : returns >
+
+Rasp ..> RequestLifecycle : reports RASP duration >
+Tags ..> RequestLifecycle : annotates spans >
+
+' ─────────────────────────────────────────────
+' RELATIONSHIPS — RUST HELPER
+' ─────────────────────────────────────────────
+
+Server ..> ServiceManager : creates (static) >
+Server ..> Client : spawns per connection >
+
+Client o-- ServiceManager : references (static) >
+Client *-- TrackedService : holds >
+TrackedService o-- Service : wraps Arc<Service> >
+
+ServiceManager o-- Service : caches (Weak<Service>) >
+ServiceManager ..> ServiceFixedConfig : keyed by >
+
+Service *-- UpdateableWafInstance : owns >
+Service *-- ServiceFixedConfig : owns >
+Service *-- ConfigSnapshot : owns (ArcSwap) >
+Service ..> InitDiagnosticsLegacy : emits >
+
+ServiceFixedConfig *-- WafSettings : owns >
+ServiceFixedConfig *-- RemoteConfigSettings : owns >
+ServiceFixedConfig *-- TelemetrySettings : owns >
+
+ConfigSnapshot --> AutoUserInstrumMode : uses >
+
+UpdateableWafInstance ..> WafRuleset : builds from >
+WafSettings *-- SchemaExtraction : owns >
+
+' ─────────────────────────────────────────────
+' RELATIONSHIPS — PROTOCOL
+' ─────────────────────────────────────────────
+
+CommandCodec ..> Command : decodes >
+CommandCodec ..> CommandResponse : encodes >
+
+Command ..> ActionInstance : results carry >
+CommandResponse ..> ActionInstance : contains >
+
+RequestExecOptions --> WafRunType : uses >
+Command ..> RequestExecOptions : RequestExec carries >
+
+' ─────────────────────────────────────────────
+' CROSS-LAYER RELATIONSHIPS
+' ─────────────────────────────────────────────
+
+HelperManager ..> Command : sends via dd_conn >
+Client ..> Command : receives & dispatches >
+Client ..> Service : invokes WAF via >
+
+' ─────────────────────────────────────────────
+' NOTES
+' ─────────────────────────────────────────────
+
+note bottom of UpdateableWafInstance
+  Thread safety: ArcSwap<Handle> provides
+  lock-free concurrent reads.
+  Mutex<Builder> serializes config writes.
+  Initial ruleset auto-restored when all
+  ASM_DD remote configs are removed.
+end note
+
+note bottom of CommandCodec
+  Protocol framing:
+  'dds\0' + uint32 size (LE) + msgpack payload
+  Maximum frame size: 4 MB
+  RC products: ASM_DD, ASM, ASM_DATA, ASM_FEATURES
+end note
+
+note right of RequestLifecycle
+  Key flow:
+  rinit → acquire conn → request_init
+  → WAF runs → if dd_should_block
+  → RequestAbort (HTTP 403 / 303)
+end note
+
+note right of TrackedService
+  RAII: increments Service.worker_count
+  on creation/clone; decrements on drop.
+  Used for telemetry metrics tracking.
+end note
+
+class SchemaExtraction {
+    +enabled: bool
+    +sampling_period: f64
+}
+
+@enduml

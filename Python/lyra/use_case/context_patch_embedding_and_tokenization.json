@@ -1,0 +1,245 @@
+{
+  "scope": "patch_embedding_and_tokenization",
+  "title": "Patch Embedding & Tokenization",
+  "diagram_type": "use_case",
+  "description": "System splits image/video frames into spatial or spatio-temporal patches and embeds them into transformer-ready token sequences, with optional multiview and trajectory conditioning.",
+
+  "system_boundary": "Patch Embedding & Tokenization Subsystem",
+
+  "actors": [
+    {
+      "name": "DiffusionPipeline",
+      "type": "primary",
+      "description": "Top-level diffusion model that drives the forward pass — supplies (B, C, T, H, W) latent tensors, timesteps, FPS, padding masks"
+    },
+    {
+      "name": "MultiviewInputSource",
+      "type": "primary",
+      "description": "Provides interleaved multi-camera frames packed as (B, C, V*T, H, W) and per-view trajectory tensors"
+    },
+    {
+      "name": "TransformerBlocks",
+      "type": "secondary",
+      "description": "Downstream GeneralDITTransformerBlock modules that consume the patch token sequence (B, T, H, W, D) or (T, H, W, B, D)"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Tokenize Spatial Patches (2D/3D)",
+      "actor": "DiffusionPipeline",
+      "description": "PatchEmbed divides input tensor (B, C, T, H, W) into non-overlapping patches of size (temporal_patch_size × spatial_patch_size²) and projects each to a D-dimensional embedding vector, producing (B, T', H', W', D).",
+      "realizing_class": "PatchEmbed (diffusion/module/blocks.py)",
+      "key_logic": [
+        "Mode A (default/inference): Rearrange 'b c (t r) (h m) (w n) -> b t h w (c r m n)' then nn.Linear(C*r*m*n, D)",
+        "Mode B (legacy_patch_emb=True, training): nn.Conv3d(C, D, kernel=(t_patch, s_patch, s_patch)) then Rearrange 'b c t h w -> b t h w c'",
+        "Output shape: (B, T/patch_t, H/patch_s, W/patch_s, model_channels)"
+      ]
+    },
+    {
+      "id": "UC2",
+      "name": "Build Patch Embedder (Base)",
+      "actor": "DiffusionPipeline",
+      "description": "GeneralDIT.build_patch_embed() instantiates PatchEmbed as self.x_embedder with optional +1 channel for padding mask.",
+      "realizing_class": "GeneralDIT (diffusion/networks/general_dit.py)",
+      "key_logic": [
+        "in_channels += 1 if concat_padding_mask",
+        "self.x_embedder = PatchEmbed(spatial_patch_size, temporal_patch_size, in_channels, model_channels, bias=False)"
+      ]
+    },
+    {
+      "id": "UC3",
+      "name": "Build Patch Embedder (Multiview)",
+      "actor": "MultiviewInputSource",
+      "description": "MultiviewGeneralDIT.build_patch_embed() overrides the base to expand in_channels by view_condition_dim (and optionally traj_condition_dim) before constructing PatchEmbed.",
+      "realizing_class": "MultiviewGeneralDIT (diffusion/networks/general_dit_multiview.py)",
+      "key_logic": [
+        "if concat_view_embedding: in_channels += view_condition_dim",
+        "if concat_traj_embedding: in_channels += traj_condition_dim",
+        "in_channels += 1 if concat_padding_mask",
+        "self.x_embedder = PatchEmbed(spatial_patch_size, temporal_patch_size, in_channels, model_channels, bias=False, keep_spatio=True, legacy_patch_emb=self.legacy_patch_emb)"
+      ]
+    },
+    {
+      "id": "UC4",
+      "name": "Concatenate Padding Mask Channel",
+      "actor": "DiffusionPipeline",
+      "description": "Before tokenization, the binary padding mask is resized to match spatial dims (H, W) and appended as an extra channel along dim=1.",
+      "realizing_class": "MultiviewGeneralDIT.prepare_embedded_sequence()",
+      "key_logic": [
+        "transforms.functional.resize(padding_mask, [H, W], NEAREST)",
+        "x = torch.cat([x, padding_mask.unsqueeze(1).repeat(1,1,T,1,1)], dim=1)"
+      ]
+    },
+    {
+      "id": "UC5",
+      "name": "Embed Per-View Camera Conditioning",
+      "actor": "MultiviewInputSource",
+      "description": "Learnable per-view embeddings (nn.Embedding) are generated for each of the n_views cameras and concatenated spatially to the input tensor.",
+      "realizing_class": "MultiviewGeneralDIT.prepare_embedded_sequence()",
+      "key_logic": [
+        "view_indices = arange(n_views)",
+        "view_embedding = self.view_embeddings(view_indices)  # [V, view_condition_dim]",
+        "Rearrange & broadcast to [B, view_condition_dim, V, T, H, W]",
+        "x = rearrange(x, 'B C (V T) H W -> B C V T H W')",
+        "x = cat([x, view_embedding], dim=1)",
+        "x = rearrange back to 'B C (V T) H W'"
+      ]
+    },
+    {
+      "id": "UC6",
+      "name": "Embed Repeat-Frame Conditioning",
+      "actor": "MultiviewInputSource",
+      "description": "Optional per-view frame-repeat scalar is projected via nn.Linear(1 → view_condition_dim) and added to view_embedding to signal repeated/static frames.",
+      "realizing_class": "MultiviewGeneralDIT.prepare_embedded_sequence()",
+      "key_logic": [
+        "frame_repeat_embedding = self.repeat_frame_embedding(frame_repeat.unsqueeze(-1))  # [B, V, D]",
+        "view_embedding = view_embedding + frame_repeat_embedding (broadcast)"
+      ]
+    },
+    {
+      "id": "UC7",
+      "name": "Embed Trajectory Conditioning",
+      "actor": "MultiviewInputSource",
+      "description": "Optional camera trajectory vectors (dim=192) are projected via nn.Linear(192 → traj_condition_dim) and concatenated alongside view embeddings before patch projection.",
+      "realizing_class": "MultiviewGeneralDIT.prepare_embedded_sequence()",
+      "key_logic": [
+        "traj_emb = self.traj_embeddings(trajectory)  # [B, traj_condition_dim]",
+        "Broadcast to [B, traj_condition_dim, V, T, H, W]",
+        "x = cat([x, view_embedding, traj_emb], dim=1)"
+      ]
+    },
+    {
+      "id": "UC8",
+      "name": "Apply Rotary Positional Embedding (RoPE 3D)",
+      "actor": "DiffusionPipeline",
+      "description": "MultiviewVideoRopePosition3DEmb generates per-head rotary frequency tensors keyed to (T, H, W) grid — returned as rope_emb_L_1_1_D to be applied inside attention layers.",
+      "realizing_class": "MultiviewGeneralDIT.build_pos_embed() / prepare_embedded_sequence()",
+      "key_logic": [
+        "Only used when pos_emb_cls == 'rope3d'",
+        "len_h = max_img_h // patch_spatial; len_w = max_img_w // patch_spatial; len_t = max_frames // patch_temporal",
+        "rope_emb = self.pos_embedder(x_B_T_H_W_D, fps=fps)  # shape [L, 1, 1, D]",
+        "Passed through to transformer blocks; NOT added to x directly"
+      ]
+    },
+    {
+      "id": "UC9",
+      "name": "Apply Absolute Sincos Positional Embedding (per-block)",
+      "actor": "DiffusionPipeline",
+      "description": "MultiviewSinCosPosEmbAxis generates extra absolute positional embeddings added to each transformer block input (extra_per_block_abs_pos_emb path).",
+      "realizing_class": "MultiviewGeneralDIT.build_pos_embed() / prepare_embedded_sequence()",
+      "key_logic": [
+        "extra_pos_emb = self.extra_pos_embedder(x_B_T_H_W_D, fps=fps)",
+        "Output shape: (B, T, H, W, D) or (T, H, W, B, D) depending on block format",
+        "Added inside each GeneralDITTransformerBlock rather than once at input"
+      ]
+    },
+    {
+      "id": "UC10",
+      "name": "Prepare Full Embedded Sequence",
+      "actor": "DiffusionPipeline",
+      "description": "Orchestrates the full tokenization pipeline: mask concat → view embed → traj embed → patch project → positional embed. Returns (x_B_T_H_W_D, rope_emb, extra_pos_emb).",
+      "realizing_class": "MultiviewGeneralDIT.prepare_embedded_sequence()",
+      "key_logic": [
+        "Called from forward_before_blocks()",
+        "Returns Tuple[Tensor(B,T,H,W,D), Optional rope Tensor, Optional extra_pos Tensor]",
+        "Downstream: x reformatted to BTHWD or THWBD for transformer blocks"
+      ]
+    },
+    {
+      "id": "UC11",
+      "name": "Tokenize Video Extension with Condition Mask",
+      "actor": "DiffusionPipeline",
+      "description": "VideoExtendGeneralDIT adds a video condition mask channel (in_channels+1) and concatenates condition_video_input_mask (and optional pose) to x before calling the multiview tokenization pipeline.",
+      "realizing_class": "VideoExtendGeneralDIT (diffusion/training/networks/general_dit_multiview.py)",
+      "key_logic": [
+        "super().__init__(in_channels=in_channels+1)",
+        "In forward(): x = cat([x, condition_video_input_mask, condition_video_pose?], dim=1)",
+        "Handles cp_group context-parallel split: rearrange -> split_inputs_cp -> rearrange back",
+        "Then delegates to MultiviewGeneralDIT.forward()"
+      ]
+    }
+  ],
+
+  "key_classes": [
+    {
+      "name": "PatchEmbed",
+      "module": "cosmos_predict1.diffusion.module.blocks",
+      "inherits": "nn.Module",
+      "key_attrs": ["spatial_patch_size", "temporal_patch_size", "proj (Rearrange+Linear or Conv3d)", "out (Identity or Rearrange)"],
+      "forward_in": "(B, C, T, H, W)",
+      "forward_out": "(B, T', H', W', D)"
+    },
+    {
+      "name": "GeneralDIT",
+      "module": "cosmos_predict1.diffusion.networks.general_dit",
+      "inherits": "nn.Module",
+      "key_attrs": ["x_embedder: PatchEmbed", "pos_embedder", "t_embedder", "blocks: ModuleDict", "final_layer: FinalLayer"],
+      "key_methods": ["build_patch_embed()", "build_pos_embed()", "forward_before_blocks()", "prepare_embedded_sequence()"]
+    },
+    {
+      "name": "MultiviewGeneralDIT",
+      "module": "cosmos_predict1.diffusion.networks.general_dit_multiview",
+      "inherits": "GeneralDIT",
+      "key_attrs": [
+        "n_views: int",
+        "view_condition_dim: int",
+        "view_embeddings: nn.Embedding(n_views, view_condition_dim)",
+        "traj_embeddings: nn.Linear(192, traj_condition_dim) [optional]",
+        "repeat_frame_embedding: nn.Linear(1, view_condition_dim) [optional]",
+        "pos_embedder: MultiviewVideoRopePosition3DEmb",
+        "extra_pos_embedder: MultiviewSinCosPosEmbAxis"
+      ],
+      "overrides": ["build_patch_embed()", "build_pos_embed()", "forward_before_blocks()", "prepare_embedded_sequence()"]
+    },
+    {
+      "name": "VideoExtendGeneralDIT",
+      "module": "cosmos_predict1.diffusion.training.networks.general_dit_multiview",
+      "inherits": "MultiviewGeneralDIT",
+      "key_attrs": ["in_channels = in_channels + 1 (for condition mask)"],
+      "key_methods": ["forward() — prepends condition_video_input_mask and optional pose to x"]
+    }
+  ],
+
+  "key_relationships": [
+    "VideoExtendGeneralDIT extends MultiviewGeneralDIT extends GeneralDIT",
+    "MultiviewGeneralDIT overrides build_patch_embed() to widen in_channels with view/traj dims",
+    "MultiviewGeneralDIT.x_embedder IS-A PatchEmbed",
+    "MultiviewGeneralDIT.view_embeddings composes nn.Embedding",
+    "MultiviewGeneralDIT.pos_embedder IS-A MultiviewVideoRopePosition3DEmb",
+    "MultiviewGeneralDIT.extra_pos_embedder IS-A MultiviewSinCosPosEmbAxis",
+    "GeneralDIT.build_patch_embed() creates PatchEmbed (inference/base variant)",
+    "Training PatchEmbed supports legacy Conv3D mode OR modern Rearrange+Linear mode"
+  ],
+
+  "tokenization_flow": [
+    "1. Input: (B, C, V*T, H, W) multiview video latent",
+    "2. [Optional] Concatenate padding mask channel → (B, C+1, V*T, H, W)",
+    "3. Generate view embeddings [V, view_condition_dim] via nn.Embedding, broadcast to (B, D_v, V, T, H, W)",
+    "4. [Optional] Add repeat_frame_embedding (nn.Linear) to view embeddings",
+    "5. [Optional] Concatenate trajectory embeddings (nn.Linear 192→D_t) per view",
+    "6. Rearrange & cat: (B, C+D_v[+D_t], V*T, H, W)",
+    "7. PatchEmbed.forward() → (B, V*T/patch_t, H/patch_s, W/patch_s, model_channels)",
+    "8. MultiviewVideoRopePosition3DEmb → rope_emb [L, 1, 1, D] (for attention RoPE)",
+    "9. MultiviewSinCosPosEmbAxis → extra_pos_emb (B, T, H, W, D) for per-block injection",
+    "10. Output: (x_tokens, rope_emb, extra_pos_emb) passed to TransformerBlocks"
+  ],
+
+  "important_notes": [
+    "patch_spatial is a tuple (or int) — spatial patch size applied equally to H and W",
+    "patch_temporal is int — temporal patch stride",
+    "Training PatchEmbed (blocks.py in training/) differs from inference: supports legacy Conv3D + keep_spatio=True required",
+    "MultiviewGeneralDIT only supports pos_emb_cls='rope3d' — sincos raises ValueError",
+    "VideoExtendGeneralDIT auto-increments in_channels by 1 for condition mask; no PatchEmbed rebuild needed",
+    "Context-parallel (cp_group) splitting for condition mask is handled in VideoExtendGeneralDIT.forward() before patching"
+  ],
+
+  "source_files_analyzed": [
+    "Lyra-1/cosmos_predict1/diffusion/networks/general_dit_multiview.py",
+    "Lyra-1/cosmos_predict1/diffusion/training/networks/general_dit_multiview.py",
+    "Lyra-1/cosmos_predict1/diffusion/module/blocks.py (PatchEmbed class)",
+    "Lyra-1/cosmos_predict1/diffusion/training/module/blocks.py (PatchEmbed training variant)",
+    "Lyra-1/cosmos_predict1/diffusion/networks/general_dit.py (GeneralDIT base)"
+  ]
+}

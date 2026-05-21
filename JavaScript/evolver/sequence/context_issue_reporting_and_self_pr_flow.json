@@ -1,0 +1,117 @@
+{
+  "scope": "issue_reporting_and_self_pr_flow",
+  "title": "Issue Reporting and Self-PR Creation Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Caller (evolver)",
+    "issueReporter",
+    "selfPR",
+    "sanitize",
+    "envFingerprint",
+    "GitHubAPI",
+    "ghCLI",
+    "FileSystem",
+    "GitCLI"
+  ],
+  "interaction_flow_issue_reporter": [
+    "Caller → issueReporter: maybeReportIssue({ signals, recentEvents, sessionLog, envFingerprint })",
+    "issueReporter → issueReporter: getConfig() — reads EVOLVER_AUTO_ISSUE, EVOLVER_ISSUE_REPO env vars",
+    "issueReporter → issueReporter: shouldReport(signals, config) — checks failure_loop_detected OR (recurring_error AND high_failure_ratio), streak >= minStreak, cooldown, dedup by errorKey",
+    "issueReporter → issueReporter: getGithubToken() — reads GITHUB_TOKEN / GH_TOKEN / GITHUB_PAT",
+    "issueReporter → envFingerprint: captureEnvFingerprint()",
+    "issueReporter → issueReporter: extractErrorSignature(signals) → title string (max 80 chars)",
+    "issueReporter → issueReporter: buildIssueBody(opts) — calls extractStreakCount(), extractErrorSignature(), formatRecentEvents(), redactString(sessionLog)",
+    "issueReporter → GitHubAPI: GET /search/issues?q=repo:{repo}+is:issue+is:open+in:title+\"{titleSig}\" (findExistingIssue)",
+    "GitHubAPI → issueReporter: return { number, url, title } or null",
+    "alt Existing issue found",
+    "  issueReporter → FileSystem: writeState({ lastReportedAt, recentIssueKeys, lastIssueUrl, lastSkippedAt })",
+    "  issueReporter → Caller: return (skip duplicate)",
+    "else No existing issue",
+    "  issueReporter → GitHubAPI: POST /repos/{repo}/issues { title, body } (createGithubIssue, timeout 15s)",
+    "  GitHubAPI → issueReporter: return { number, url }",
+    "  issueReporter → FileSystem: writeState({ lastReportedAt, recentIssueKeys, lastIssueUrl, lastIssueNumber })",
+    "  issueReporter → Caller: return"
+  ],
+  "interaction_flow_self_pr": [
+    "Caller → selfPR: maybeCreatePR({ capsule, event, mutation, gene, blastRadius })",
+    "selfPR → selfPR: guard checks — EVOLVER_SELF_PR=true, score>=SELF_PR_MIN_SCORE, streak>=SELF_PR_MIN_STREAK, mutation.category==='optimize', mutation.risk==='low', blastRadius.files/lines within limits, all changedFiles isPublicNonObfuscated()",
+    "selfPR → selfPR: isInCooldown() — reads self_pr_state.json, checks elapsed < SELF_PR_COOLDOWN_MS",
+    "selfPR → selfPR: computeDiffHash(changedFiles, repoRoot) — SHA256 of file contents",
+    "selfPR → selfPR: isDuplicateDiff(diffHash) — checks recentDiffHashes in state",
+    "selfPR → GitCLI: git diff HEAD -- {file} (getGitDiff for each changedFile, execSync)",
+    "selfPR → sanitize: fullLeakCheck(diffContent) — detects secrets/tokens in diff",
+    "selfPR → selfPR: buildPRTitle(mutation) — '[Auto-Mutation] ' + rationale.slice(0,80)",
+    "selfPR → selfPR: buildPRBody({ capsule, mutation, gene, blastRadius }) — markdown with score, streak, files, rationale",
+    "selfPR → ghCLI: runGh('repo view {repo}') — verify repo access (timeout 15s)",
+    "selfPR → FileSystem: mkdir self_pr_workdir (tmpDir)",
+    "selfPR → ghCLI: runGh('repo clone {repo} {tmpDir} -- --depth 1') (timeout 60s)",
+    "selfPR → GitCLI: execSync('git checkout -b evolver-bot/mutation-{capsuleIdShort}', { cwd: tmpDir })",
+    "selfPR → FileSystem: copyFileSync each changedFile from repoRoot → tmpDir",
+    "selfPR → GitCLI: execSync('git add -A') then execSync('git status --porcelain') then execSync('git commit -m {title}', { env: evolver-bot author })",
+    "selfPR → GitCLI: execSync('git push origin {branch}', { cwd: tmpDir, timeout 30s })",
+    "selfPR → FileSystem: writeFileSync('.pr_body.md', body)",
+    "selfPR → ghCLI: runGh('pr create --repo {repo} --head {branch} --title {title} --body-file .pr_body.md --label auto-mutation') (timeout 30s)",
+    "selfPR → FileSystem: rmSync(tmpDir, recursive)",
+    "selfPR → selfPR: recordPR(diffHash) → writeState({ lastPRAt, recentDiffHashes })",
+    "selfPR → Caller: return { attempted, ok, pr_url, branch, diff_hash }"
+  ],
+  "key_relationships": [
+    "issueReporter depends_on envFingerprint (captureEnvFingerprint)",
+    "issueReporter depends_on sanitize (redactString)",
+    "issueReporter depends_on a2aProtocol (getNodeId)",
+    "issueReporter depends_on paths (getEvolutionDir)",
+    "issueReporter reads/writes FileSystem (issue_reporter_state.json via getEvolutionDir())",
+    "issueReporter calls GitHubAPI directly via fetch()",
+    "selfPR depends_on sanitize (fullLeakCheck, redactString)",
+    "selfPR depends_on paths (getEvolutionDir, getRepoRoot)",
+    "selfPR depends_on config (SELF_PR_MIN_SCORE, SELF_PR_MIN_STREAK, SELF_PR_MAX_FILES, SELF_PR_MAX_LINES, SELF_PR_COOLDOWN_MS, SELF_PR_REPO, SELF_PR_TIMEOUT_MS)",
+    "selfPR calls ghCLI via runGh() — wraps execSync('gh ' + args)",
+    "selfPR calls GitCLI directly via execSync for checkout/add/commit/push",
+    "selfPR reads/writes FileSystem (self_pr_state.json, tmpDir workdir)",
+    "gitOps provides runCmd/tryRunCmd/rollback utilities — used by solidify, NOT directly called by selfPR or issueReporter in this flow"
+  ],
+  "guard_conditions": {
+    "maybeReportIssue": [
+      "EVOLVER_AUTO_ISSUE != false/0",
+      "signals includes failure_loop_detected OR (recurring_error AND high_failure_ratio)",
+      "streak >= minStreak (default 5) if streak > 0",
+      "cooldown not active OR errorKey not in recentIssueKeys (24h default)",
+      "GITHUB_TOKEN present"
+    ],
+    "maybeCreatePR": [
+      "EVOLVER_SELF_PR=true",
+      "capsule.outcome.score >= SELF_PR_MIN_SCORE",
+      "capsule.success_streak >= SELF_PR_MIN_STREAK",
+      "mutation.category === 'optimize'",
+      "mutation.risk === 'low'",
+      "blastRadius.files in (0, SELF_PR_MAX_FILES]",
+      "blastRadius.lines in (0, SELF_PR_MAX_LINES]",
+      "all changedFiles are public non-obfuscated (not in OBFUSCATED_FILES set)",
+      "not in 24h cooldown",
+      "not a duplicate diff hash",
+      "git diff produces non-empty content",
+      "no secrets/leaks in diff"
+    ]
+  },
+  "data_objects": {
+    "issueReporter_state": "{ lastReportedAt, recentIssueKeys[], lastIssueUrl, lastIssueNumber, lastSkippedAt }",
+    "selfPR_state": "{ lastPRAt, recentDiffHashes[] }",
+    "buildIssueBody_input": "{ signals[], recentEvents[], sessionLog, envFingerprint }",
+    "buildPRBody_input": "{ capsule: {id, outcome.score, success_streak, trigger[]}, mutation: {category, risk, rationale}, gene: {id}, blastRadius: {files, lines, all_changed_files[]} }"
+  },
+  "important_notes": [
+    "runGh() is defined inside selfPR.js (not imported from gitOps.js); gitOps.js is separate utility for rollback/git operations",
+    "selfPR clones into a temp workdir (self_pr_workdir) inside getEvolutionDir(), copies mutated files, commits as 'evolver-bot', pushes, then opens PR via gh CLI",
+    "Issue title format: '[Auto] Recurring failure: {errorSig.slice(0,80)}'",
+    "PR branch format: 'evolver-bot/mutation-{capsuleId.slice(0,8)}'",
+    "PR title format: '[Auto-Mutation] {mutation.rationale.slice(0,80)}'",
+    "Both flows are non-fatal: errors are caught and logged, not re-thrown",
+    "Dedup in issueReporter: SHA256 of sorted relevant signals, 16-char hex key stored in state",
+    "Dedup in selfPR: SHA256 of file contents of changedFiles, 16-char hex hash stored in state"
+  ],
+  "source_files_analyzed": [
+    "src/gep/issueReporter.js",
+    "src/gep/selfPR.js",
+    "src/gep/gitOps.js"
+  ]
+}

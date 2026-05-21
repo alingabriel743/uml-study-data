@@ -1,0 +1,200 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Datadog Tracer Uninstall Flow
+
+actor "Operator" as CLI
+participant "main()" as main
+participant "parse_validate_\nuser_options()" as parseOpts
+participant "uninstall(\n$options)" as uninstall
+participant "require_binaries_\nor_exit($options)" as requireBins
+participant "search_php_\nbinaries()" as searchBins
+participant "pick_binaries_\ninteractive()" as pickBins
+participant "resolve_command_\nfull_path()" as resolvePath
+participant "ini_values(\n$binary)" as iniValues
+participant "modify_ini_\nfile($path, $cb)" as modifyIni
+participant "Filesystem" as fs
+
+== Entry Point ==
+
+CLI -> main: php datadog-setup.php\n--uninstall --php-bin <binary>
+activate main
+
+main -> parseOpts: parse_validate_user_options()
+activate parseOpts
+parseOpts --> main: [$cmd, $options]
+deactivate parseOpts
+
+note over main: Detects OPT_UNINSTALL = true\nin $options
+
+main -> uninstall: uninstall($options)
+activate uninstall
+
+== Locate PHP Binaries ==
+
+uninstall -> requireBins: require_binaries_or_exit($options)
+activate requireBins
+
+alt OPT_PHP_BIN not set (interactive)
+    requireBins -> searchBins: search_php_binaries()
+    activate searchBins
+    searchBins --> requireBins: $discovered_binaries
+    deactivate searchBins
+    requireBins -> pickBins: pick_binaries_interactive($options, $binaries)
+    activate pickBins
+    pickBins --> requireBins: [command => fullPath]
+    deactivate pickBins
+
+else OPT_PHP_BIN = 'all'
+    requireBins -> searchBins: search_php_binaries()
+    activate searchBins
+    note right of searchBins: Scans standard paths;\nexcludes shebang scripts
+    searchBins --> requireBins: [command => fullPath] (all non-shebang)
+    deactivate searchBins
+
+else OPT_PHP_BIN = <explicit path>
+    requireBins -> resolvePath: resolve_command_full_path($command)
+    activate resolvePath
+    resolvePath --> requireBins: $fullPath
+    deactivate resolvePath
+
+else No binaries found
+    requireBins -> CLI: print_error_and_exit(\n'At least one binary must be specified')
+    note right: Fatal — exits immediately
+end
+
+requireBins --> uninstall: [command => fullPath] map
+deactivate requireBins
+
+== Per-Binary Uninstall Loop ==
+
+loop foreach $binary => $fullPath
+
+    uninstall -> iniValues: ini_values($fullPath)
+    activate iniValues
+    note right of iniValues: Runs 'php -i' on binary;\nparses extension_dir,\nINI_SCANDIR, INI_MAIN
+    iniValues --> uninstall: $phpProperties\n(extension_dir, INI_SCANDIR, INI_MAIN)
+    deactivate iniValues
+
+    note over uninstall
+        Compute extensionDestinations:
+        • {extension_dir}/ddtrace.so
+        • {extension_dir}/datadog-profiling.so
+        • {extension_dir}/ddappsec.so
+        (OPT_EXTENSION_DIR overrides extension_dir)
+    end note
+
+    alt INI_SCANDIR is set
+        note over uninstall: Build iniFilePaths:\n[INI_SCANDIR/98-ddtrace.ini]
+        opt Debian-based (INI_SCANDIR contains /cli/conf.d)
+            note over uninstall: Also target:\n[/apache2/conf.d/98-ddtrace.ini]\nfor SAPI-split distributions
+        end
+    else INI_SCANDIR not set AND INI_MAIN not set
+        uninstall -> CLI: print_error_and_exit(\n'no scan directory and\nno configuration file')
+        note right: Fatal — exits immediately
+    else INI_SCANDIR not set but INI_MAIN present
+        note over uninstall: iniFilePaths = [INI_MAIN]
+    end
+
+    == Revert INI Settings ==
+
+    loop foreach $iniFilePath
+
+        note over uninstall: Resolve symlink via readlink()\nif is_link($iniFilePath)
+
+        opt file_exists($iniFilePath)
+            uninstall -> modifyIni: modify_ini_file($iniFilePath, $callback)
+            activate modifyIni
+
+            modifyIni -> fs: file_get_contents($iniFilePath)
+            activate fs
+            fs --> modifyIni: $currentContent
+            deactivate fs
+
+            note over modifyIni
+                Apply $callback (preg_replace):
+                • 98-ddtrace.ini (isDatadogIni):
+                  comment ALL extension= and
+                  zend_extension= lines → prepend '; '
+                • Third-party INI:
+                  comment only ddtrace /
+                  datadog-profiling / ddappsec lines
+                INI file is preserved — never deleted
+            end note
+
+            alt content changed
+                modifyIni -> fs: file_put_contents($iniFilePath,\n$newContent)
+                activate fs
+                fs --> modifyIni: result
+                deactivate fs
+
+                alt write failure
+                    modifyIni -> CLI: print_error_and_exit(\n'Cannot change the settings\nof the INI file')
+                    note right: Fatal — exits immediately
+                end
+            end
+
+            modifyIni --> uninstall: done
+            deactivate modifyIni
+        end
+
+    end
+
+    == Remove Extension Files ==
+
+    loop foreach $extensionDestination (.so / .dll)
+        uninstall -> fs: unlink($extensionDestination)
+        activate fs
+        fs --> uninstall: result
+        deactivate fs
+
+        alt unlink failure
+            uninstall -> CLI: print_warning(\n'Error while removing ...')
+            note right: Non-fatal — continues\nwith next extension
+        end
+    end
+
+end
+
+== Completion ==
+
+uninstall --> main: done (per-binary results)
+deactivate uninstall
+
+alt all binaries completed without warnings
+    main -> CLI: echo success message
+else completed with warnings
+    main -> CLI: echo 'completed with warnings'
+end
+
+deactivate main
+
+@enduml

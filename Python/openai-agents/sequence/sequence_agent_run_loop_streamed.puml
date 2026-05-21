@@ -1,0 +1,225 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #F1F3F5
+    GroupBorderColor #495057
+    GroupBackgroundColor #DEE2E6
+    DividerBackgroundColor #CED4DA
+    DividerBorderColor #6C757D
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F0C040
+}
+
+title Agent Run Loop (Streamed)
+
+actor       "Caller"                    as caller
+participant "Runner"                    as runner
+participant "RunResultStreaming"         as result
+participant "start_streaming\n(bg Task)" as bg      #D0E8FF
+participant "run_single_turn_streamed"  as single
+participant "Model"                     as model
+participant "InputGuardrailRunner"      as iguard
+participant "OutputGuardrailRunner"     as oguard
+participant "Session"                   as session
+
+' ─────────────────────────────────────────────────────────
+' 1. Initiation
+' ─────────────────────────────────────────────────────────
+caller -> runner : run_streamed(agent, input, run_config, context)
+activate runner
+
+runner -> result : create(current_agent, max_turns,\n_event_queue, run_loop_task=None)
+activate result
+
+runner -> bg : asyncio.create_task(\n  start_streaming(starting_input, streamed_result, ...))
+note right of runner
+  Background task is launched immediately.
+  Caller receives RunResultStreaming before
+  any turn has executed.
+end note
+
+runner --> caller : RunResultStreaming (not yet consumed)
+deactivate runner
+
+' ─────────────────────────────────────────────────────────
+' 2. Caller begins consuming the stream
+' ─────────────────────────────────────────────────────────
+caller -> result : async for event in stream_events()
+activate caller
+note left of caller
+  Caller iterates stream_events().
+  The run is NOT complete until
+  this iterator exits.
+end note
+
+' ─────────────────────────────────────────────────────────
+' 3. Background task: startup
+' ─────────────────────────────────────────────────────────
+activate bg #D0E8FF
+bg -> bg : Trace.start(mark_as_current=True)
+bg -> bg : create RunState(context, original_input,\n  starting_agent, max_turns)
+bg -> result : put AgentUpdatedStreamEvent(new_agent=starting_agent)
+result --> caller : AgentUpdatedStreamEvent
+bg -> session : save_result_to_session(\n  input_items, [], run_state)\n[persist input before first LLM call]
+
+' ─────────────────────────────────────────────────────────
+' 4. Input guardrails (turn 1 only)
+' ─────────────────────────────────────────────────────────
+bg -> iguard : run_input_guardrails_with_queue(\n  sequential_guardrails, ...) [blocking]
+activate iguard
+iguard -> result : put result → _input_guardrail_queue
+deactivate iguard
+
+bg -> bg : asyncio.create_task(\n  run_input_guardrails_with_queue(\n    parallel_guardrails, ...)) [concurrent]
+note right of bg
+  Sequential guardrails block before
+  the first LLM call.
+  Parallel guardrails run concurrently
+  alongside the LLM stream.
+end note
+
+' ─────────────────────────────────────────────────────────
+' 5. Multi-turn loop
+' ─────────────────────────────────────────────────────────
+loop while turns remain (max_turns not exceeded)
+
+  bg -> bg : current_turn++; start turn_span
+
+  ' ── 5a. run_single_turn_streamed ──────────────────────
+  bg -> single : run_single_turn_streamed(\n  streamed_result, bindings, hooks,\n  all_tools, server_conversation_tracker, ...)
+  activate single
+
+  single -> single : hooks.on_agent_start(context, agent)\n[if should_run_agent_start_hooks]
+  single -> single : agent.get_system_prompt() +\nget_prompt() [parallel]
+  single -> single : agent.get_handoffs(context_wrapper)
+  single -> single : model.resolve() +\nmaybe_reset_tool_choice()
+  single -> single : hooks.on_llm_start(...) [parallel]
+
+  single -> model : stream_response(instructions, input,\n  model_settings, tools, output_schema,\n  handoffs, ...) via stream_response_with_retry
+  activate model
+
+  loop for each streamed response event
+    model --> single : response event (token / item)
+    single -> result : put RawResponsesStreamEvent(data=event)
+    result --> caller : RawResponsesStreamEvent
+  end
+
+  group on ResponseOutputItemDoneEvent
+    single -> result : put RunItemStreamEvent\n(tool_search_called | tool_search_output_created\n | tool_called | reasoning_item_created)
+    result --> caller : RunItemStreamEvent
+  end
+
+  model --> single : ResponseCompletedEvent → build ModelResponse
+  deactivate model
+
+  single -> single : hooks.on_llm_end(context_wrapper, agent,\n  final_response) [parallel]
+
+  single -> single : get_single_step_result_from_response(\n  bindings, input, pre_step_items, final_response,\n  tools, handoffs, ...) → SingleStepResult
+  note right of single
+    Tool calls are executed here.
+    SingleStepResult carries:
+    next_step, new_step_items,
+    model_response, processed_response
+  end note
+
+  single -> result : stream_step_result_to_queue(filtered_result,\n  _event_queue) → emits RunItemStreamEvents:\n  message_output_created, tool_output,\n  handoff_requested, handoff_occured
+  result --> caller : RunItemStreamEvent(s)
+
+  single --> bg : SingleStepResult
+  deactivate single
+
+  ' ── 5b. update streamed_result state ─────────────────
+  bg -> result : update raw_responses, .input,\n  ._model_input_items, .new_items
+
+  ' ── 5c. branch on next_step ──────────────────────────
+  alt NextStepRunAgain (tool turn – more LLM calls needed)
+    bg -> session : _save_stream_items_with_count(\n  turn_session_items, response_id, store_setting)
+    alt cancel_mode == "after_turn"
+      bg -> result : put QueueCompleteSentinel()
+      bg -> bg : break loop
+    else continue
+      bg -> bg : continue loop (next turn)
+    end
+
+  else NextStepHandoff (agent handoff)
+    bg -> session : _save_stream_items_without_count(\n  turn_session_items, ...)
+    bg -> bg : current_agent = new_agent;\nshould_run_agent_start_hooks = True
+    bg -> result : put AgentUpdatedStreamEvent(new_agent)
+    result --> caller : AgentUpdatedStreamEvent
+    bg -> bg : continue loop
+
+  else NextStepFinalOutput (run complete)
+    bg -> oguard : run_output_guardrails(\n  guardrails, agent, output, context)
+    activate oguard
+    oguard --> bg : guardrail results
+    deactivate oguard
+    bg -> result : set .final_output, .is_complete=True,\n  .output_guardrail_results
+    bg -> session : _save_stream_items_with_count(\n  items, response_id, store_setting)
+    bg -> result : put QueueCompleteSentinel()
+    bg -> bg : break loop
+
+  else NextStepInterruption (tool approval required)
+    bg -> bg : update RunState._last_processed_response,\n  ._generated_items, ._current_step, ._current_turn
+    bg -> session : _save_stream_items_with_count(\n  items, response_id, store_setting)
+    bg -> result : set .interruptions list, .is_complete=True
+    bg -> result : put QueueCompleteSentinel()
+    bg -> bg : break loop
+  end
+
+end
+deactivate bg
+
+' ─────────────────────────────────────────────────────────
+' 6. stream_events() finalization
+' ─────────────────────────────────────────────────────────
+result -> result : on QueueCompleteSentinel →\n  await input_guardrails_task;\n  _check_errors(); break iterator
+
+alt _stored_exception present
+  result --> caller : raise (MaxTurnsExceeded |\n  GuardrailTripwireTriggered | ...)
+else stream ended cleanly
+  result --> caller : iterator exhausted\n(is_complete = True)
+end
+
+result -> result : finally → await run_loop_task;\n  _cleanup_tasks();\n  _drain_event_queue()
+deactivate result
+
+' ─────────────────────────────────────────────────────────
+' 7. Post-stream caller patterns
+' ─────────────────────────────────────────────────────────
+note over caller
+  **Post-stream patterns:**
+  • Interruption resume:
+      state = result.to_state()
+      state.approve(interruption)
+      Runner.run_streamed(agent, state)
+  • Early cancellation:
+      result.cancel(mode="immediate"|"after_turn")
+end note
+
+deactivate caller
+
+@enduml

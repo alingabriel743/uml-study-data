@@ -1,0 +1,173 @@
+{
+  "scope": "tool_registration_and_invocation",
+  "title": "Tool Registration and Invocation",
+  "diagram_type": "use_case",
+  "description": "Developer registers tools; agent invokes them during runs and handles results",
+
+  "actors": [
+    "Developer",
+    "Agent (Runner)",
+    "LLM (OpenAI Model)",
+    "BaseSandboxSession"
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Define Function Tool via Decorator",
+      "actor": "Developer",
+      "description": "Apply @function_tool decorator to a Python function. SDK auto-extracts name, description (docstring), and params_json_schema via inspect + griffe + pydantic.",
+      "options": "name_override, description_override, docstring_style, use_docstring_info, strict_mode, defer_loading, timeout, timeout_behavior, needs_approval, is_enabled, tool_input_guardrails, tool_output_guardrails, failure_error_function"
+    },
+    {
+      "id": "UC2",
+      "name": "Create FunctionTool Manually",
+      "actor": "Developer",
+      "description": "Directly instantiate FunctionTool(name, description, params_json_schema, on_invoke_tool). on_invoke_tool is async Callable[[ToolContext, str], Any].",
+      "example_subclass": "ViewImageTool extends FunctionTool, overrides __init__ to inject BaseSandboxSession, sets on_invoke_tool=self._invoke"
+    },
+    {
+      "id": "UC3",
+      "name": "Register Tools on Agent",
+      "actor": "Developer",
+      "description": "Pass tools list to Agent(tools=[...]). No separate ToolRegistry class — Agent holds the list directly. Tools can be FunctionTool, hosted tools (WebSearchTool, FileSearchTool, etc.), ComputerTool, or agent-as-tool."
+    },
+    {
+      "id": "UC4",
+      "name": "Group Tools into Namespace",
+      "actor": "Developer",
+      "description": "Call tool_namespace(name, description, tools=[FunctionTool...]) to attach _tool_namespace and _tool_namespace_description metadata to each FunctionTool. Required when using ToolSearchTool for deferred loading.",
+      "constraint": "Requires non-empty name+description; only FunctionTool instances; each tool name validated via validate_function_tool_namespace_shape()"
+    },
+    {
+      "id": "UC5",
+      "name": "Enable Deferred Tool Loading",
+      "actor": "Developer",
+      "description": "Set @function_tool(defer_loading=True) to hide tool until ToolSearchTool loads it at runtime. Must pair with ToolSearchTool() in agent tools list.",
+      "availability": "OpenAI Responses models only (openai>=2.25.0)"
+    },
+    {
+      "id": "UC6",
+      "name": "Invoke Tool During Agent Run",
+      "actor": "Agent (Runner)",
+      "description": "Runner executes on_invoke_tool(ctx: ToolContext, json_args: str) -> Any when LLM emits a tool_call. ctx provides run context, tool_name, call_id.",
+      "flow": [
+        "LLM emits tool call with tool name + JSON args",
+        "Runner resolves FunctionTool by name (qualified_name property)",
+        "Runner checks is_enabled(ctx, agent) -> bool",
+        "Runner checks needs_approval(ctx, params, call_id) -> bool",
+        "If approval needed: pause run, emit ToolApprovalItem as interruption",
+        "Else: call on_invoke_tool(ctx, json_args)",
+        "Return FunctionToolResult(tool, output, run_item)"
+      ]
+    },
+    {
+      "id": "UC7",
+      "name": "Handle Tool Output",
+      "actor": "Agent (Runner)",
+      "description": "Tool returns ToolOutputText | ToolOutputImage | ToolOutputFileContent | str | list. Runner wraps in FunctionToolResult and feeds back to LLM as tool output.",
+      "result_struct": "FunctionToolResult(tool: FunctionTool, output: Any, run_item: RunItem | None, interruptions: list[ToolApprovalItem], agent_run_result: RunResult | None)"
+    },
+    {
+      "id": "UC8",
+      "name": "Handle Tool Errors",
+      "actor": "Agent (Runner)",
+      "description": "On exception: invoke failure_error_function(ctx, error) -> str if set (default: default_tool_error_function). Send error string back to LLM. If failure_error_function=None, re-raise exception and fail run."
+    },
+    {
+      "id": "UC9",
+      "name": "Handle Tool Timeout",
+      "actor": "Agent (Runner)",
+      "description": "If timeout_seconds set and tool exceeds it: timeout_behavior='error_as_result' returns message to LLM (e.g. 'Tool X timed out after N seconds'); timeout_behavior='raise_exception' raises ToolTimeoutError.",
+      "note": "Only supported for async function tools"
+    },
+    {
+      "id": "UC10",
+      "name": "Approve or Reject Tool Call",
+      "actor": "Developer",
+      "description": "When needs_approval=True/callable returns True: run pauses, interruptions appear in RunResult. Developer calls state.approve(call_id) or state.reject(call_id) to resume.",
+      "human_in_loop": true
+    },
+    {
+      "id": "UC11",
+      "name": "View Image from Sandbox",
+      "actor": "Agent (Runner)",
+      "description": "ViewImageTool._invoke(ctx, raw_input) -> calls self.run(ViewImageArgs). Reads file via BaseSandboxSession.read(resolved_path), detects MIME type, base64-encodes payload, returns ToolOutputImage(image_url=data:mime;base64,...) or error string.",
+      "max_size": "10MB",
+      "supported_formats": "PNG, JPEG, GIF, WEBP, BMP, TIFF, SVG"
+    },
+    {
+      "id": "UC12",
+      "name": "Expose Agent as Tool",
+      "actor": "Developer",
+      "description": "Call agent.as_tool(tool_name, tool_description, ...) to create a FunctionTool with _is_agent_tool=True. When invoked, runs nested Runner.run(sub_agent). Supports custom_output_extractor, on_stream, needs_approval, parameters (structured input)."
+    }
+  ],
+
+  "key_classes": {
+    "FunctionTool": {
+      "type": "dataclass",
+      "fields": ["name: str", "description: str", "params_json_schema: dict", "on_invoke_tool: Callable[[ToolContext, str], Awaitable[Any]]", "strict_json_schema: bool=True", "is_enabled: bool|Callable=True", "needs_approval: bool|Callable=False", "timeout_seconds: float|None", "timeout_behavior: Literal['error_as_result','raise_exception']", "defer_loading: bool=False", "_tool_namespace: str|None", "_tool_origin: ToolOrigin|None", "_is_agent_tool: bool", "_is_codex_tool: bool"],
+      "properties": ["qualified_name -> str (namespace.name or name)"]
+    },
+    "FunctionToolResult": {
+      "type": "dataclass",
+      "fields": ["tool: FunctionTool", "output: Any", "run_item: RunItem|None", "interruptions: list[ToolApprovalItem]", "agent_run_result: RunResult|None"]
+    },
+    "ViewImageTool": {
+      "type": "dataclass(init=False), extends FunctionTool",
+      "class_vars": ["tool_name='view_image'", "args_model=ViewImageArgs", "tool_description: str"],
+      "init": "__init__(session: BaseSandboxSession, user: str|User|None, needs_approval) -> super().__init__(..., on_invoke_tool=self._invoke)",
+      "methods": ["_invoke(_, raw_input: str) -> ToolOutputImage|str", "run(args: ViewImageArgs) -> ToolOutputImage|str"]
+    },
+    "MCPToolMetadata": {
+      "type": "frozen dataclass (in _mcp_tool_metadata.py)",
+      "fields": ["description: str|None", "title: str|None"],
+      "note": "Used for hosted MCP tools, not FunctionTool directly"
+    },
+    "ToolOrigin": {
+      "type": "frozen dataclass",
+      "fields": ["type: ToolOriginType", "mcp_server_name: str|None", "agent_name: str|None", "agent_tool_name: str|None"],
+      "enum": "ToolOriginType: FUNCTION | MCP | AGENT"
+    },
+    "ToolOutputImage": {
+      "type": "BaseModel",
+      "fields": ["type='image'", "image_url: str|None", "file_id: str|None", "detail: 'low'|'high'|'auto'|None"]
+    },
+    "ToolOutputText": {"type": "BaseModel", "fields": ["type='text'", "text: str"]},
+    "ToolOutputFileContent": {"type": "BaseModel", "fields": ["type='file'", "file_data: str|None", "file_url: str|None", "file_id: str|None", "filename: str|None"]}
+  },
+
+  "key_relationships": [
+    "ViewImageTool extends FunctionTool (inheritance, dataclass(init=False))",
+    "FunctionTool contains ToolOrigin (composition, optional)",
+    "FunctionToolResult contains FunctionTool (composition)",
+    "FunctionToolResult contains RunItem and list[ToolApprovalItem]",
+    "ViewImageTool depends_on BaseSandboxSession (injected via constructor)",
+    "ViewImageTool returns ToolOutputImage (composition)",
+    "function_tool() decorator produces FunctionTool",
+    "tool_namespace() mutates FunctionTool copies (sets _tool_namespace metadata)",
+    "Agent holds list[Tool] — no separate ToolRegistry class exists",
+    "Runner resolves and invokes FunctionTool.on_invoke_tool during agent run"
+  ],
+
+  "important_notes": [
+    "No ToolRegistry class exists — Agent.tools list IS the registry",
+    "tool_metadata.py not found; nearest is _mcp_tool_metadata.py (MCPToolMetadata for MCP tools only)",
+    "ToolCallResult is not a named class — represented as FunctionToolResult",
+    "function_tool decorator uses function_schema() (inspect+griffe+pydantic) for auto schema",
+    "Sync functions wrapped in thread executor; async functions called directly",
+    "Tool is_enabled checked before invocation — disabled tools hidden from LLM",
+    "needs_approval can be bool or async callable(ctx, params, call_id) -> bool",
+    "ViewImageTool is in sandbox/capabilities/tools/view_image.py, not top-level",
+    "ToolSearchTool enables deferred loading: model loads only needed tools per turn",
+    "Tool guardrails (ToolInputGuardrail, ToolOutputGuardrail) run before/after invocation"
+  ],
+
+  "source_files_analyzed": [
+    "src/agents/tool.py",
+    "src/agents/_mcp_tool_metadata.py",
+    "src/agents/sandbox/capabilities/tools/view_image.py",
+    "docs/tools.md"
+  ]
+}

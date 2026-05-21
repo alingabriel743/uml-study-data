@@ -1,0 +1,172 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    GroupBackgroundColor #E9ECEF
+    GroupBorderColor #6C757D
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #ADB5BD
+}
+
+title Streamlit Web Chat Flow
+
+actor User as user
+participant "StreamlitUI\n(stapp / stapp2)" as ui
+participant "init()\n[@st.cache_resource]" as init_fn
+participant "GeneraticAgent" as agent
+participant "agent.run()\n[daemon thread]" as daemon
+participant "display_queue\n[queue.Queue]" as queue
+participant "st.session_state" as state
+
+== App Startup (once per session) ==
+
+ui -> init_fn : init()
+activate init_fn
+init_fn -> agent : GeneraticAgent()
+activate agent
+agent --> init_fn : agent instance
+deactivate agent
+init_fn -> daemon : threading.Thread(target=agent.run,\ndaemon=True).start()
+activate daemon
+note right of daemon : Background loop\nruns continuously
+init_fn --> ui : agent
+deactivate init_fn
+
+ui -> state : init_session_state()\nstreaming=False, display_queue=None,\npartial_response='', messages=[]
+
+== History Render (every Streamlit rerun) ==
+
+ui -> state : read messages[]
+activate state
+state --> ui : stored messages
+deactivate state
+loop for each stored message
+    ui -> ui : render_message(role, content, ts)\nor render_segments() [stapp]
+end
+
+== User Submits Message ==
+
+user -> ui : st.chat_input(prompt)
+activate ui
+ui -> state : messages.append({role:'user', content:prompt})
+
+alt stapp path — Python generator streaming
+
+    ui -> ui : agent_backend_stream(prompt)
+    activate ui
+    ui -> agent : put_task(prompt, source='user')
+    activate agent
+    agent -> queue : create / return display_queue
+    agent --> ui : display_queue
+    deactivate agent
+
+    loop poll loop (blocking generator)
+        ui -> queue : display_queue.get(timeout=1)
+        activate queue
+        daemon -> queue : put({'next': partial_text})
+        queue --> ui : {'next': partial_text}
+        deactivate queue
+        ui -> ui : fold_turns(partial_text)\n→ segments list
+        ui -> ui : render_segments([segs[-1]], suffix=' ▌')\n(live segment with cursor)
+        note right of ui : Promote completed\nturns to frozen slots\n(st.expander)
+    end
+
+    queue -> ui : {'done': final_text}
+    activate queue
+    daemon -> queue : put({'done': final_text})
+    deactivate queue
+    ui -> ui : render_segments(all_segs)\n(finalize, no cursor)
+    ui -> state : messages.append({role:'assistant', content:response})
+    ui -> state : last_reply_time = int(time.time())
+    deactivate ui
+
+else stapp2 path — rerun-loop streaming
+
+    ui -> ui : start_agent_task(prompt)
+    activate ui
+    ui -> agent : put_task(prompt, source='user')
+    activate agent
+    agent -> queue : create / return display_queue
+    agent --> ui : display_queue
+    deactivate agent
+    ui -> state : display_queue=queue, streaming=True,\nstopping=False, partial_response='',\nreply_ts=now
+    deactivate ui
+    ui -> ui : st.rerun()
+
+    loop streaming rerun loop (while streaming=True)
+        ui -> ui : render_streaming_area()
+        activate ui
+        ui -> state : read partial_response
+        ui -> ui : _get_response_segments(partial_response)\n→ segment strings
+        ui -> ui : render_message('assistant',\nseg + '▌', ts=reply_ts)
+
+        ui -> ui : poll_agent_output(max_items=20)
+        activate ui
+        loop drain up to 20 queue items (non-blocking)
+            ui -> queue : display_queue.get_nowait()
+            activate queue
+            alt {'next': text}
+                queue --> ui : partial text
+                ui -> state : partial_response = text
+            else {'done': text}
+                queue --> ui : final text
+                ui -> state : partial_response = text;\nstreaming=False, display_queue=None
+            end
+            deactivate queue
+        end
+        ui --> ui : done (bool)
+        deactivate ui
+
+        alt done == True
+            ui -> ui : finish_streaming_message()
+            activate ui
+            ui -> ui : _get_response_segments(partial_response)\n→ final segments
+            ui -> state : messages.extend([{role:'assistant',\ncontent:seg} ...])
+            ui -> state : last_reply_time = int(time.time())\nclear partial_response, reply_ts, current_prompt
+            deactivate ui
+        else not done
+            ui -> ui : time.sleep(0.2)
+            ui -> ui : st.rerun()
+        end
+        deactivate ui
+    end
+
+end
+
+deactivate ui
+
+== Agent Processing (background) ==
+
+note over daemon, queue
+  GeneraticAgent.run() continuously processes tasks:
+  • Receives task from internal task queue (put_task)
+  • Calls LLM via agent_loop → llmcore
+  • Streams partial results: display_queue.put({'next': text})
+  • On completion: display_queue.put({'done': final_text})
+end note
+
+@enduml

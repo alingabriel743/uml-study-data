@@ -1,0 +1,196 @@
+{
+  "scope": "cache_management",
+  "title": "Cache Management",
+  "diagram_type": "use_case",
+  "description": "Managing the Composer download and metadata cache lifecycle",
+
+  "actors": [
+    {
+      "name": "Developer",
+      "type": "primary",
+      "description": "CLI user invoking cache commands"
+    },
+    {
+      "name": "FileDownloader",
+      "type": "secondary",
+      "description": "Downloads package archives; reads/writes the files cache (cache-files-dir)"
+    },
+    {
+      "name": "ComposerRepository",
+      "type": "secondary",
+      "description": "Reads/writes repository metadata to cache-repo-dir"
+    }
+  ],
+
+  "system_boundary": "Composer Cache System (Cache + ClearCacheCommand)",
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Clear All Caches",
+      "actor": "Developer",
+      "trigger": "composer clear-cache | clearcache | cc (no --gc flag)",
+      "steps": [
+        "ClearCacheCommand.execute() resolves config (tryComposer or Factory::createConfig)",
+        "Iterates cache-vcs-dir, cache-repo-dir, cache-files-dir, cache-dir",
+        "For each: new Cache($io, $cachePath), cache.setReadOnly(config.get('cache-read-only'))",
+        "Checks cache.isEnabled(); skips if disabled",
+        "Calls cache.clear() → filesystem.emptyDirectory(root)"
+      ],
+      "result": "All four cache directories emptied"
+    },
+    {
+      "id": "UC2",
+      "name": "Run Garbage Collection",
+      "actor": "Developer",
+      "trigger": "composer clear-cache --gc",
+      "steps": [
+        "Same config resolution as UC1; skips top-level cache-dir (GC only on sub-dirs)",
+        "cache-files-dir → cache.gc(cache-files-ttl, cache-files-maxsize): deletes expired files, then LRU eviction until under maxSize",
+        "cache-repo-dir  → cache.gc(cache-ttl, 1GB): deletes expired metadata files",
+        "cache-vcs-dir   → cache.gcVcsCache(cache-ttl): removes old VCS directories (depth=0)"
+      ],
+      "result": "Stale/oversized cache entries removed; self::$cacheCollected = true"
+    },
+    {
+      "id": "UC3",
+      "name": "Read Package from Cache",
+      "actor": "FileDownloader",
+      "trigger": "FileDownloader.download() — checks cache before HTTP fetch",
+      "steps": [
+        "cache.copyTo(cacheKey, fileName): checks file_exists, touches mtime, filesystem.copy to target",
+        "If hit: skips HTTP download entirely",
+        "If miss: proceeds to HTTP download"
+      ],
+      "result": "Package file served from cache (cache hit) or downloaded (cache miss)"
+    },
+    {
+      "id": "UC4",
+      "name": "Write Package to Cache",
+      "actor": "FileDownloader",
+      "trigger": "After successful HTTP download",
+      "steps": [
+        "cache.copyFrom(cacheKey, fileName): filesystem.ensureDirectoryExists, filesystem.copy source→cache",
+        "If !readOnly and cache enabled"
+      ],
+      "result": "Downloaded archive stored in cache-files-dir for future reuse"
+    },
+    {
+      "id": "UC5",
+      "name": "Remove Cache Entry on Error",
+      "actor": "FileDownloader",
+      "trigger": "Download/install failure detected",
+      "steps": [
+        "cache.remove(lastCacheWrites[package.getName()])",
+        "filesystem.unlink(root + sanitized file)"
+      ],
+      "result": "Corrupt/incomplete cache entry deleted"
+    },
+    {
+      "id": "UC6",
+      "name": "Cache Repository Metadata",
+      "actor": "ComposerRepository",
+      "trigger": "Fetching package metadata (v2 protocol startCachedAsyncDownload)",
+      "steps": [
+        "Cache constructed with cache-repo-dir/sanitized-url, allowlist='a-z0-9.$~_'",
+        "cache.read(filename) for metadata hit",
+        "cache.write(filename, contents) after fetch"
+      ],
+      "result": "Package metadata JSON cached to avoid repeated HTTP calls"
+    },
+    {
+      "id": "UC7",
+      "name": "Automatic Garbage Collection",
+      "actor": "FileDownloader",
+      "trigger": "FileDownloader constructor (probabilistic: ~1/51 chance)",
+      "steps": [
+        "cache.gcIsNecessary(): returns !random_int(0,50); skips in test suite / completion process",
+        "If true: cache.gc(cache-files-ttl, cache-files-maxsize)"
+      ],
+      "result": "Background GC triggered automatically without developer intervention"
+    },
+    {
+      "id": "UC8",
+      "name": "Check Cache Availability",
+      "actor": "FileDownloader",
+      "trigger": "Before any cache read/write",
+      "steps": [
+        "cache.isEnabled(): tries mkdir(root, 0777, true) if not exists; checks is_writable",
+        "cache.isReadOnly(): returns readOnly flag",
+        "Warns via IO if not writable; sets enabled=false"
+      ],
+      "result": "Cache operations gated; graceful degradation if filesystem unavailable"
+    }
+  ],
+
+  "include_relationships": [
+    "UC1 includes UC8 (Clear All Caches includes Check Cache Availability)",
+    "UC2 includes UC8 (Run GC includes Check Cache Availability)",
+    "UC3 includes UC8 (Read from Cache includes Check Cache Availability)",
+    "UC4 includes UC8 (Write to Cache includes Check Cache Availability)",
+    "UC7 includes UC2 (Auto GC includes Run Garbage Collection logic)"
+  ],
+
+  "extend_relationships": [
+    "UC2 extends UC1 (--gc option changes clear to GC)",
+    "UC7 extends UC3 (auto-GC may trigger during download)"
+  ],
+
+  "key_classes": {
+    "ClearCacheCommand": {
+      "extends": "BaseCommand",
+      "namespace": "Composer\\Command",
+      "command_names": ["clear-cache", "clearcache", "cc"],
+      "options": ["--gc (VALUE_NONE)"],
+      "key_method": "execute(InputInterface, OutputInterface): int"
+    },
+    "Cache": {
+      "namespace": "Composer",
+      "constructor": "__construct(IOInterface, string $cacheDir, string $allowlist='a-z0-9._', ?Filesystem, bool $readOnly=false)",
+      "state_fields": ["root: string", "enabled: ?bool", "allowlist: string", "readOnly: bool", "static cacheCollected: ?bool"],
+      "public_methods": [
+        "isEnabled(): bool",
+        "isReadOnly(): bool",
+        "setReadOnly(bool): void",
+        "read(string $file): string|false",
+        "write(string $file, string $contents): bool",
+        "copyFrom(string $file, string $source): bool",
+        "copyTo(string $file, string $target): bool",
+        "remove(string $file): bool",
+        "clear(): bool",
+        "gc(int $ttl, int $maxSize): bool",
+        "gcVcsCache(int $ttl): bool",
+        "gcIsNecessary(): bool",
+        "getAge(string $file): int|false",
+        "sha1(string $file): string|false",
+        "sha256(string $file): string|false",
+        "static isUsable(string $path): bool"
+      ],
+      "dependencies": ["IOInterface", "Filesystem", "Finder", "Preg", "Platform", "Silencer"]
+    }
+  },
+
+  "cache_directories": {
+    "cache-vcs-dir": "VCS checkouts; GC removes old directories by age",
+    "cache-repo-dir": "Repository metadata JSON; GC by TTL + 1GB cap",
+    "cache-files-dir": "Downloaded package archives; GC by cache-files-ttl + cache-files-maxsize",
+    "cache-dir": "Top-level; only cleared by full clear, not GC"
+  },
+
+  "important_notes": [
+    "Cache.clear() requires !readOnly; cache-read-only config flag propagates via setReadOnly()",
+    "gc() uses two-pass: first delete by TTL expiry (DateTime), then LRU eviction by access time until under maxSize",
+    "gcVcsCache() removes entire directories (depth=0) not individual files",
+    "File names sanitized with allowlist regex before filesystem ops to prevent path traversal",
+    "write() uses atomic rename via temp file (bin2hex random suffix .tmp) to avoid partial writes",
+    "static $cacheCollected prevents multiple GC runs per process",
+    "FileDownloader touches atime on copyTo() to update LRU order for future GC"
+  ],
+
+  "source_files_analyzed": [
+    "src/Composer/Command/ClearCacheCommand.php",
+    "src/Composer/Cache.php",
+    "src/Composer/Repository/ComposerRepository.php (lines 29,71,188,1158)",
+    "src/Composer/Downloader/FileDownloader.php (lines 92-107,179-240,385-386)"
+  ]
+}

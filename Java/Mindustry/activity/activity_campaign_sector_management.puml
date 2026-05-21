@@ -1,0 +1,231 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 11
+skinparam backgroundColor #FEFEFE
+skinparam activityBackgroundColor #F8F9FA
+skinparam activityBorderColor #495057
+skinparam activityArrowColor #495057
+skinparam activityFontColor #212529
+skinparam swimlane {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleFontSize 12
+}
+skinparam noteBackgroundColor #FFF9C4
+skinparam noteBorderColor #F9A825
+
+title Campaign & Sector Progression
+
+|SectorSubmissions|
+start
+:registerSectors() invoked during content load;
+repeat
+  :registerSerpuloSector(id, author, mapLink, captureWave, difficulty);
+  :new SectorPreset("sector-serpulo-N", planet, id)\npreset.requireUnlock = false;
+  if (captureWave > 0?) then (yes)
+    :preset.captureWave = captureWave\n<b>Win condition: survive N waves</b>;
+  else (no)
+    :preset.generateEnemyBase = true\n<b>Win condition: destroy all enemy cores</b>;
+  endif
+  if (difficulty > 0?) then (yes)
+    :preset.difficulty = difficulty;
+  endif
+  :threadMap.put(sector, MapSubmission{author, mapLink, threadLink});
+repeat while (more sectors to register?) is (yes) not (done)
+note right
+  Special named presets (inline):
+  • fallenVessel      (difficulty = 9)
+  • geothermalStronghold (difficulty = 10)
+  • cruxscape         (difficulty = 10)
+  Sector 27 shieldSectors = [246, 244, 242]
+  (all must be captured before landing)
+end note
+
+|Universe / Logic|
+:Logic.update() → universe.update() called each game frame;
+note right: Background loop — runs continuously during gameplay
+repeat
+  if (turnCounter >= turnDuration?) then (yes)
+    :universe.runTurn()  —  turn++;
+    :For each planet sector where hasBase():;
+    if (isAttacked()?) then (yes — under attack)
+      :minutesCaptured = 0\n<i>sector is time-frozen, no production</i>;
+    else (no — stable)
+      :minutesCaptured += turnDuration / 3600;
+      if (!isBeingPlayed()?) then (yes — offline)
+        :Accumulate production stats → items\n(capped at sector.storageCapacity);
+        :sector.saveInfo();
+      endif
+      if (invasionEnabled && minutesCaptured > invasionGracePeriod\n&& sector hasSpawns?) then (eligible)
+        :count = nearby sectors with\nhasEnemyBase() && !hasBase();
+        if (count > 0 &&\nMathf.chance(baseInvasionChance * (0.8 + (count-1)*0.3))?) then (yes)
+          :waveMax = max(info.winWave, currentWave) + rand(2,4) * 5;
+          if (sector isBeingPlayed()?) then (live session)
+            :state.rules.winWave = waveMax\nwaves = true, attackMode = false;
+          else (offline)
+            :info.winWave = waveMax\ninfo.waves = true, info.attack = false\nsector.saveInfo();
+          endif
+          :fire SectorInvasionEvent(sector);
+        endif
+      endif
+    endif
+    :fire TurnEvent();
+    :universe.save();
+  endif
+repeat while (game running?) is (yes)
+
+|Control|
+:Player selects a sector to land on;
+if (sector.isShielded()?\nshieldSectors contains un-captured sector) then (yes — blocked)
+  :Landing denied\n<i>All shield sectors must be captured first</i>;
+  stop
+else (no — landable)
+  :Control.playSector(origin, sector);
+  :Load existing save slot (slot.load());
+endif
+
+|Universe / Logic|
+:Player plays sector — waves or attack mode active;
+if (Win condition met?\ncaptureWave reached OR all enemy cores destroyed) then (captured)
+  :Logic.sectorCapture()  [@Remote — server only];
+  :state.rules.waves = false\nstate.rules.attackMode = false\nstate.rules.disableWorldProcessors = true;
+  :Call.clearObjectives();
+  if (sector != null?) then (yes)
+    :initial = !sector.info.wasCaptured\nsector.info.wasCaptured = true;
+    :fire SectorCaptureEvent(sector, initial);
+    fork
+      :Logic listener:\n- waveTeam.destroyToDerelict()\n- apply planet.sectorCaptureReplacements\n- planet.generator.onSectorCaptured(sector)\n- planet.stats().sectorsCaptured++;
+    fork again
+      :Universe listener:\nplanet.updateBaseCoverage();
+    fork again
+      |GameService|
+      :SStat.attacksWon.add()  [if attackMode];
+      if (initial capture & isLastSector?) then (yes)
+        :Fire completeSerpulo / completeErekir\nplanet completion achievement;
+      endif
+      :Check captureAllSectors, captureNoBlocksBroken\ndefeatAttack5Waves achievements;
+      :SStat.sectorsControlled.set(\n  count of sectors with hasBase());
+    end fork
+    |Universe / Logic|
+    :control.saves.saveSector(sector);
+  endif
+
+  |TechTree / GameService|
+  note right
+    TechNode auto-inserts SectorComplete(preset)
+    at objectives[0] when parent content is SectorPreset.
+    content.getDependencies() → Research(dep) objectives appended.
+  end note
+  :Player opens ResearchDialog;
+  :Evaluate all TechNode objectives;
+  if (SectorComplete.complete()?\nsave != null && isCaptured() && hasBase()) then (yes)
+    if (All item requirements fulfilled?) then (yes)
+      :fire ResearchEvent(content) → UnlockEvent(content);
+      :GameService: check researchRouter,\nresearchLogic, researchAll achievements;
+      :TechNode.save() → persist finishedRequirements to settings\n("req-<content>-<item>");
+    else (no — resources missing)
+      :ResearchDialog shows\nmissing item requirements;
+    endif
+  else (no — sector incomplete)
+    :Objective blocked\n<i>sector not yet captured or base lost</i>;
+  endif
+
+else (lost — all player cores destroyed)
+
+  |Control|
+  :gameOver event fired;
+  :Player selects lost sector to re-land;
+  :Control.playSector(origin, sector);
+  :Load existing save slot;
+  if (cores empty || !info.hasCore\n(sector has no surviving core)?) then (yes)
+    if (clearSave || info.spawnPosition == 0\n|| !sectorDataMatches?) then (yes — no valid spawn)
+      :playNewSector() — fresh generated map\n<i>No damage simulation applied</i>;
+    else (no — has saved spawn position)
+      :Place defaultCore at tile(info.spawnPosition);
+
+      |SectorDamage|
+      :<b>SectorDamage.apply(fraction = 1.0)</b>;
+
+      :Phase 1 — Path-based structural damage;
+      :Collect all waveTeam CoreBlocks + spawn overlay tiles → frontier;
+      if (player core != null && frontier not empty?) then (yes)
+        :For each spawner in frontier:;
+        :A* pathfind(spawner → player core tile);
+        note right
+          cost(tile) = 1
+            + (static && solid  ? 200 : 0)
+            + (build.health / size² / 20)
+            + (liquid           ?  10 : 0)
+        end note
+        if (fraction >= 1.0?) then (yes — total destruction)
+          :totalHealth = 1\n(remove every building on path);
+        else (partial)
+          :Sum health of all buildings in\nradius-3 circle along path;
+          :targetHealth = totalHealth * fraction;
+        endif
+        :Sweep radius-3 circle along each path tile;
+        repeat
+          if (building exists && team == defaultTeam && !CoreBlock?) then (yes)
+            :healthCount += build.health;
+            if (is rubble && !floor.solid && !floor.liquid\n&& Mathf.chance(0.4)?) then (yes)
+              :Effect.rubble() at tile;
+            endif
+            :removal.add(build);
+          endif
+        repeat while (healthCount < targetHealth && fraction < 0.999?) is (yes) not (target reached)
+        :For each removal: build.addPlan(false) → tile.remove();
+      endif
+      if (fraction >= 1.0?) then (yes)
+        :Remove all player team CoreBlocks;
+      endif
+
+      if (fraction > 0.15?) then (yes — BFS phase enabled)
+        :Phase 2 — BFS damage propagation;
+        :falloff = fraction / (max(mapWidth, mapHeight) × √2);
+        :Initialize BFS queue from all frontier tiles;
+        repeat
+          :currDamage = values[tile] − falloff;
+          :Inspect each 4-directional neighbour;
+          if (in bounds && values[cx][cy] < currDamage?) then (yes)
+            if (building exists && team == defaultTeam?) then (yes)
+              :build.health −= currDamage;
+              if (build instanceof CoreBlock?) then (yes)
+                :Clamp build.health ≥ 1\n<i>(core cannot be killed by BFS)</i>;
+              else (no)
+                if (build.health < 0?) then (yes)
+                  :40% chance: Effect.rubble()\nbuild.addPlan(false), tile.remove();
+                else (no)
+                  :indexer.notifyHealthChanged(build);
+                endif
+              endif
+            endif
+            if (tile is solid && !synthetic?) then (wall — blocks spread)
+              :Skip neighbour\nno damage propagation through walls;
+            else (open)
+              if (resultDamage > 0?) then (yes)
+                :Update values[cx][cy]\nEnqueue neighbour into BFS frontier;
+              endif
+            endif
+          endif
+        repeat while (BFS frontier not empty?) is (yes) not (propagation complete)
+      else (no — fraction ≤ 0.15)
+        :BFS phase skipped\n<i>(damage too low to propagate)</i>;
+      endif
+
+      |Control|
+      :Capture previousPlans, previousBuildings\npreviousDerelicts from pre-damage state;
+      :logic.reset();
+      :playNewSector(corePositionOverride = spawnPosition);
+      :Post-load callback:\n  • Remove auto-generated derelicts\n  • Restore derelicts from previous save\n  • Copy prior player buildings as derelict-team tiles;
+    endif
+  else (no — core still intact)
+    :Resume sector with existing save state\n<i>(no damage simulation needed)</i>;
+  endif
+
+endif
+
+stop
+@enduml

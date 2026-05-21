@@ -1,0 +1,296 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #ADB5BD
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+
+title Streaming Metrics Collection Flow
+
+'──────────────────────────────────────────────
+' Participants
+'──────────────────────────────────────────────
+actor       "Monitoring Tool"                                  as jmxClient
+participant "ConnectorTask"                                    as task
+participant "Metrics\n(base)"                                  as metricsBase
+participant "PipelineMetrics<P>"                               as pipeline
+participant "DefaultStreaming\nChangeEventSourceMetrics<P>"    as defStreaming
+participant "BinlogStreaming\nChangeEventSourceMetrics"        as binlogMetrics
+participant "LogMinerStreaming\nChangeEventSourceMetrics"      as lmMetrics
+participant "BatchMetrics\n(inner)"                            as batchMetrics
+participant "CommonEventMeter"                                 as commonMeter
+participant "StreamingMeter"                                   as streamMeter
+participant "BinaryLog\nClientStatistics"                      as blcStats
+participant "BinaryLogClient"                                  as blc
+participant "JmxUtils"                                         as jmxUtils
+participant "MBeanServer\n(JMX)"                               as mbean
+
+'══════════════════════════════════════════════
+' PHASE 1 — JMX MBean Registration (startup)
+'══════════════════════════════════════════════
+== Phase 1: JMX MBean Registration (Connector Startup) ==
+
+task -> metricsBase : register()
+activate metricsBase
+
+metricsBase -> jmxUtils : registerMXBean(objectName, this)
+activate jmxUtils
+
+note right of jmxUtils
+  ObjectName pattern:
+  debezium.<connectorType>:
+    type=connector-metrics,
+    context=<streaming|snapshot>,
+    server=<logicalName>[,task=<taskId>]
+end note
+
+jmxUtils -> mbean : registerMBean(metricsInstance, objectName)
+activate mbean
+mbean --> jmxUtils : ObjectInstance
+deactivate mbean
+
+jmxUtils --> metricsBase : (registered)
+deactivate jmxUtils
+
+metricsBase --> task : (ready)
+deactivate metricsBase
+
+'══════════════════════════════════════════════
+' PHASE 2 — Binlog Streaming: Per-event updates
+'══════════════════════════════════════════════
+== Phase 2: Binlog Streaming — Per-Event Metrics Update ==
+
+participant "BinlogEventReader" as binlogReader
+
+binlogReader -> binlogMetrics : onEvent(partition, source, offset,\n        key, value, operation)
+activate binlogMetrics
+
+binlogMetrics -> defStreaming : super.onEvent(...)
+activate defStreaming
+
+defStreaming -> pipeline : super.onEvent(...)
+activate pipeline
+
+pipeline -> commonMeter : onEvent(source, offset, key, value, operation)
+activate commonMeter
+note right of commonMeter
+  Updates:
+  • lastEvent (timestamp)
+  • millisSinceLastEvent
+  • totalEventsSeen
+  • filteredEvents
+end note
+commonMeter --> pipeline : (updated)
+deactivate commonMeter
+
+pipeline --> defStreaming : (returned)
+deactivate pipeline
+
+defStreaming -> streamMeter : onEvent(source, offset, key, value)
+activate streamMeter
+note right of streamMeter
+  Updates:
+  • sourceEventPosition
+  • millisBehindSource (lag)
+  • lastTransactionId
+  • capturedTables
+end note
+streamMeter --> defStreaming : (updated)
+deactivate streamMeter
+
+defStreaming --> binlogMetrics : (returned)
+deactivate defStreaming
+
+binlogMetrics --> binlogReader : (returned)
+deactivate binlogMetrics
+
+binlogReader -> binlogMetrics : setMilliSecondsBehindSource(lag)
+note right : Per-event lag update\n(direct AtomicLong write)
+
+binlogReader -> binlogMetrics : onCommittedTransaction()
+note right : increments\nnumberOfCommittedTransactions
+
+binlogReader -> binlogMetrics : onGtidChange(gtid)
+note right : updates lastTransactionId\nAtomicReference
+
+binlogReader -> binlogMetrics : onRolledBackTransaction() /\nonNotWellFormedTransaction() /\nonLargeTransaction()
+
+'──── Connection state + position delegated to BinaryLogClient ────
+binlogReader -> blc : [query] isConnected()
+activate blc
+blc --> binlogReader : boolean
+deactivate blc
+
+binlogReader -> blcStats : [query] getTotalNumberOfEventsSeen() /\ngetNumberOfSkippedEvents() /\ngetNumberOfDisconnects()
+activate blcStats
+blcStats --> binlogReader : counters
+deactivate blcStats
+
+'══════════════════════════════════════════════
+' PHASE 3 — LogMiner: SCN & Batch Metrics
+'══════════════════════════════════════════════
+== Phase 3: LogMiner Streaming — SCN Tracking & Batch Aggregation ==
+
+participant "LogMiner\nEventProcessor" as lmProc
+
+group SCN Position Updates [per mining iteration]
+    lmProc -> lmMetrics : setCurrentScn(currentScn)
+    note right : DB's current SCN\n(read each query cycle)
+
+    lmProc -> lmMetrics : setOffsetScn(lowWatermark)
+    note right : restart point\n(scn from offset)
+
+    lmProc -> lmMetrics : setCommitScn(highWatermark)
+    note right : commit_scn from offset
+
+    lmProc -> lmMetrics : setOldestScnDetails(oldestScn, timestamp)
+    note right : oldest in-flight txn SCN\n+ its timestamp
+end group
+
+group Mining Session Metadata [per session]
+    lmProc -> lmMetrics : setCurrentLogFileNames(logFiles)
+    lmProc -> lmMetrics : setMinedLogFileNames(minedFiles)
+    lmProc -> lmMetrics : setRedoLogStatuses(file → status map)
+    lmProc -> lmMetrics : setSwitchCount(dailySwitches)
+    lmProc -> lmMetrics : setLastMiningSessionRange(lower, upper)
+    lmProc -> lmMetrics : setLastMiningFetchRange(lower, upper)
+end group
+
+group Per-Row Batch Accumulation [each row in result-set]
+    lmProc -> batchMetrics : dataChangeEventObserved(INSERT|UPDATE|DELETE)
+    lmProc -> batchMetrics : rowObserved() / rowProcessed()
+    lmProc -> batchMetrics : commitObserved() / rollbackObserved()
+    lmProc -> batchMetrics : schemaChangeObserved()
+end group
+
+group Batch Flush [end of mining iteration]
+    lmProc -> batchMetrics : updateStreamingMetrics()
+    activate batchMetrics
+    batchMetrics -> lmMetrics : setLastCapturedDmlCount(dmlCount)
+    batchMetrics -> lmMetrics : setLastProcessedRowsCount(rows)
+    batchMetrics -> lmMetrics : setLastBatchJdbcRows(jdbcRows)
+    batchMetrics --> lmProc : (flushed)
+    deactivate batchMetrics
+end group
+
+group Duration & Throughput Histograms [per iteration]
+    lmProc -> lmMetrics : setLastDurationOfFetchQuery(duration)
+    note right : also increments\nlogMinerQueryCount
+    lmProc -> lmMetrics : setLastBatchProcessingDuration(duration)
+    note right : updates batchProcessing\nhistogram + maxThroughput
+    lmProc -> lmMetrics : setLastCommitDuration(duration)
+    lmProc -> lmMetrics : setLastMiningSessionStartDuration(duration)
+    lmProc -> lmMetrics : setLastParseTimeDuration(duration) /\nsetLastResultSetNextDuration(duration)
+end group
+
+group Lag Calculation [per change record]
+    lmProc -> lmMetrics : calculateLagFromSource(changeTime)
+    activate lmMetrics
+    note right of lmMetrics
+      lagFromSourceDuration =
+        Duration.between(
+          adjustedChangeTime,
+          clock.instant()
+        )
+    end note
+    lmMetrics --> lmProc : (lag stored)
+    deactivate lmMetrics
+end group
+
+group Memory & Transaction Tracking
+    lmProc -> lmMetrics : setUserGlobalAreaMemory(uga, maxUga)
+    lmProc -> lmMetrics : setProcessGlobalAreaMemory(pga, maxPga)
+    lmProc -> lmMetrics : setActiveTransactionCount(count)
+    lmProc -> lmMetrics : setBufferedEventCount(count)
+    lmProc -> lmMetrics : addAbandonedTransactionId(txId)
+    note right : LRUSet capacity=10\nfor JMX exposure
+    lmProc -> lmMetrics : addRolledBackTransactionId(txId)
+    lmProc -> lmMetrics : incrementScnFreezeCount()
+    note right : SCN did not advance\nbetween iterations
+end group
+
+'══════════════════════════════════════════════
+' PHASE 4 — JMX Metric Reads by Monitoring Tool
+'══════════════════════════════════════════════
+== Phase 4: JMX Metric Exposure (Read by Monitoring Tool) ==
+
+jmxClient -> mbean : getAttribute(objectName, "CurrentScn")
+activate mbean
+mbean -> lmMetrics : getCurrentScn()
+activate lmMetrics
+lmMetrics --> mbean : Scn value
+deactivate lmMetrics
+mbean --> jmxClient : Scn
+deactivate mbean
+
+jmxClient -> mbean : getAttribute(objectName, "MilliSecondsBehindSource")
+activate mbean
+mbean -> binlogMetrics : getMilliSecondsBehindSource()
+activate binlogMetrics
+binlogMetrics -> blc : [delegate] current lag
+blc --> binlogMetrics : lag ms
+binlogMetrics --> mbean : lag ms
+deactivate binlogMetrics
+mbean --> jmxClient : lag ms
+deactivate mbean
+
+jmxClient -> mbean : getAttribute(objectName, "TotalNumberOfEventsSeen")
+activate mbean
+mbean -> binlogMetrics : getTotalNumberOfEventsSeen()
+activate binlogMetrics
+binlogMetrics -> blcStats : getTotalNumberOfEventsSeen()
+activate blcStats
+blcStats --> binlogMetrics : count
+deactivate blcStats
+binlogMetrics --> mbean : count
+deactivate binlogMetrics
+mbean --> jmxClient : count
+deactivate mbean
+
+'══════════════════════════════════════════════
+' PHASE 5 — Metrics Reset & Unregister (shutdown)
+'══════════════════════════════════════════════
+== Phase 5: Connector Shutdown — Unregister MBean ==
+
+task -> binlogMetrics : reset()
+activate binlogMetrics
+binlogMetrics -> blcStats : reset()
+note right : zeroes all AtomicLong/\nAtomicBoolean fields
+binlogMetrics --> task : (reset complete)
+deactivate binlogMetrics
+
+task -> metricsBase : unregister()
+activate metricsBase
+metricsBase -> jmxUtils : unregisterMXBean(objectName)
+activate jmxUtils
+jmxUtils -> mbean : unregisterMBean(objectName)
+activate mbean
+mbean --> jmxUtils : (removed)
+deactivate mbean
+jmxUtils --> metricsBase : (unregistered)
+deactivate jmxUtils
+metricsBase --> task : (done)
+deactivate metricsBase
+
+@enduml

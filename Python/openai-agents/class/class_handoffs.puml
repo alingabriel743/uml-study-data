@@ -1,0 +1,213 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF9E6
+    BorderColor #C9A227
+    FontColor #212529
+}
+
+title Handoffs
+
+' ─────────────────────────────────────────────
+'  External / shared types (referenced in scope)
+' ─────────────────────────────────────────────
+package "agents (external)" #EEF2FF {
+
+    abstract class AgentBase<TContext> {
+        +name: str
+        +handoff_description: str | None
+    }
+
+    class RunContextWrapper<TContext> {
+        +context: TContext
+    }
+
+    abstract class RunItem {
+    }
+
+    class TResponseInputItem <<type>> {
+    }
+}
+
+' ─────────────────────────────────────────────
+'  Core handoff types
+' ─────────────────────────────────────────────
+package "agents.handoffs" {
+
+    class HandoffInputData <<frozen dataclass>> {
+        +input_history: str | tuple[TResponseInputItem, ...]
+        +pre_handoff_items: tuple[RunItem, ...]
+        +new_items: tuple[RunItem, ...]
+        +run_context: RunContextWrapper[Any] | None
+        +input_items: tuple[RunItem, ...] | None
+        +clone(**kwargs): HandoffInputData
+    }
+
+    interface HandoffInputFilter <<callable type>> {
+        (HandoffInputData) -> MaybeAwaitable[HandoffInputData]
+    }
+
+    interface HandoffHistoryMapper <<callable type>> {
+        (list[TResponseInputItem]) -> list[TResponseInputItem]
+    }
+
+    interface OnHandoffWithInput <<callable type>> {
+        (RunContextWrapper[Any], THandoffInput) -> Any
+    }
+
+    interface OnHandoffWithoutInput <<callable type>> {
+        (RunContextWrapper[Any]) -> Any
+    }
+
+    class Handoff<TContext, TAgent> <<dataclass>> {
+        +tool_name: str
+        +tool_description: str
+        +input_json_schema: dict[str, Any]
+        +on_invoke_handoff: Callable[[RunContextWrapper[Any], str], Awaitable[TAgent]]
+        +agent_name: str
+        +input_filter: HandoffInputFilter | None
+        +nest_handoff_history: bool | None
+        +strict_json_schema: bool
+        +is_enabled: bool | Callable[[RunContextWrapper, AgentBase], MaybeAwaitable[bool]]
+        -{field} _agent_ref: weakref[AgentBase[Any]] | None
+        +get_transfer_message(agent: AgentBase): str
+        +{static} default_tool_name(agent: AgentBase): str
+        +{static} default_tool_description(agent: AgentBase): str
+    }
+
+    class HandoffsModule <<module>> {
+        +handoff(agent, tool_name_override, tool_description_override,\n  on_handoff, input_type, input_filter,\n  nest_handoff_history, is_enabled): Handoff
+        +nest_handoff_history(data, history_mapper): HandoffInputData
+        +default_handoff_history_mapper(transcript): list[TResponseInputItem]
+        +set_conversation_history_wrappers(start, end): None
+        +reset_conversation_history_wrappers(): None
+        +get_conversation_history_wrappers(): tuple[str, str]
+    }
+}
+
+' ─────────────────────────────────────────────
+'  Extension utilities
+' ─────────────────────────────────────────────
+package "agents.extensions" {
+
+    class HandoffFilters <<module>> {
+        +remove_all_tools(data: HandoffInputData): HandoffInputData
+        +nest_handoff_history(data, history_mapper): HandoffInputData
+        +default_handoff_history_mapper(transcript): list[TResponseInputItem]
+    }
+
+    class HandoffPrompt <<module>> {
+        +RECOMMENDED_PROMPT_PREFIX: str
+        +prompt_with_handoff_instructions(prompt: str): str
+    }
+}
+
+' ─────────────────────────────────────────────
+'  History processing (private helpers exposed
+'  only through the public API)
+' ─────────────────────────────────────────────
+package "agents.handoffs.history" {
+
+    class HistoryProcessor <<internal>> {
+        -{field} _DEFAULT_CONVERSATION_HISTORY_START: str
+        -{field} _DEFAULT_CONVERSATION_HISTORY_END: str
+        -{field} _SUMMARY_ONLY_INPUT_TYPES: set[str]
+        -_normalize_input_history(input_history): list[TResponseInputItem]
+        -_flatten_nested_history_messages(items): list[TResponseInputItem]
+        -_extract_nested_history_transcript(item): list[TResponseInputItem] | None
+        -_build_summary_message(transcript): TResponseInputItem
+        -_format_transcript_item(item): str
+        -_stringify_content(content): str
+        -_should_forward_pre_item(input_item): bool
+        -_should_forward_new_item(input_item): bool
+        -_remove_tools_from_items(items): tuple[RunItem]
+        -_remove_tool_types_from_input(items): tuple[TResponseInputItem]
+    }
+}
+
+' ─────────────────────────────────────────────
+'  Relationships
+' ─────────────────────────────────────────────
+
+' Handoff generics bound on AgentBase
+Handoff ..|> AgentBase : "TAgent bound to\nAgentBase[Any]"
+
+' Handoff holds weak reference to target agent
+Handoff "0..1" o-- AgentBase : "_agent_ref\n(weakref)"
+
+' Handoff carries optional input filter
+Handoff o-- HandoffInputFilter : "input_filter\n(optional)"
+
+' HandoffInputData composition
+HandoffInputData o-- RunItem       : "pre_handoff_items\nnew_items"
+HandoffInputData o-- RunContextWrapper : "run_context\n(optional)"
+HandoffInputData ..> TResponseInputItem : "input_history"
+
+' Factory function creates Handoff
+HandoffsModule ..> Handoff          : "<<creates>>"
+HandoffsModule ..> HandoffInputData : "<<transforms>>"
+HandoffsModule ..> HandoffHistoryMapper : "<<uses>>"
+
+' Extension filters depend on HandoffInputData
+HandoffFilters ..> HandoffInputData : "<<transforms>>"
+
+' history module implements the public history API
+HandoffsModule ..> HistoryProcessor : "<<delegates>>"
+
+' handoff_filters re-exports history functions
+HandoffFilters ..> HandoffsModule : "<<re-exports>>\nnest_handoff_history,\ndefault_handoff_history_mapper"
+
+' ─────────────────────────────────────────────
+'  Notes on important business rules
+' ─────────────────────────────────────────────
+
+note bottom of Handoff
+  Exposed to LLM as tool named
+  **transfer_to_<agent_name>**.
+  Per-handoff input_filter takes precedence
+  over RunConfig.handoff_input_filter.
+  is_enabled supports dynamic
+  runtime evaluation.
+end note
+
+note bottom of HandoffInputData
+  clone() uses dataclasses.replace()
+  to produce a filtered copy without
+  mutating the original.
+  input_items overrides new_items for
+  what the next agent receives.
+end note
+
+note right of HistoryProcessor
+  nest_handoff_history is opt-in beta
+  (disabled by default). Collapses prior
+  transcript into a single assistant
+  summary wrapped in
+  <CONVERSATION HISTORY> tags.
+  Server-managed conversations disable
+  nested history.
+end note
+
+note right of HandoffPrompt
+  RECOMMENDED_PROMPT_PREFIX explains
+  multi-agent system and
+  transfer_to_<agent_name> convention
+  to the LLM.
+end note
+
+@enduml

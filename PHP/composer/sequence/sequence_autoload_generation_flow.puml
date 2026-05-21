@@ -1,0 +1,188 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #E9ECEF
+}
+
+title Autoload Generation
+
+actor Caller as caller
+participant "AutoloadGenerator" as ag
+participant "EventDispatcher" as ed
+participant "InstalledRepository" as repo
+participant "InstallationManager" as im
+participant "ClassMapGenerator" as cmg
+participant "Locker" as locker
+participant "Filesystem" as fs
+participant "ClassMap" as cm
+
+== Initialization ==
+
+caller -> ag: dump(config, localRepo, rootPackage,\ninstallationManager, targetDir, suffix, locker)
+activate ag
+
+ag -> fs: new Filesystem()
+activate fs
+ag -> fs: ensureDirectoryExists(vendorDir)
+ag -> fs: ensureDirectoryExists(targetDir)
+deactivate fs
+
+alt runScripts
+    ag -> ed: dispatchScript(PRE_AUTOLOAD_DUMP, devMode, opts)
+    activate ed
+    ed --> ag: (scripts executed)
+    deactivate ed
+end
+
+== Build Package Map ==
+
+ag -> cmg: new ClassMapGenerator(['php','inc','hh'])
+activate cmg
+
+ag -> repo: getDevPackageNames()
+activate repo
+repo --> ag: devPackageNames[]
+ag -> repo: getCanonicalPackages()
+repo --> ag: packages[]
+deactivate repo
+
+ag -> ag: buildPackageMap(installationManager, rootPackage, packages)
+activate ag
+loop for each package (skip AliasPackage)
+    ag -> im: getInstallPath(package)
+    activate im
+    im --> ag: installPath
+    deactivate im
+    ag -> ag: validatePackage(package)\n[PSR-4 namespace / target-dir compat]
+end
+ag --> ag: packageMap[]
+deactivate ag
+
+== Parse Autoloads ==
+
+ag -> ag: parseAutoloads(packageMap, rootPackage, filteredDevPackages)
+activate ag
+ag -> ag: filterPackageMap(packageMap, rootPackage) [if !devMode]
+ag -> ag: sortPackageMap(packageMap) → sortedPackageMap
+ag -> ag: parseAutoloadsType(map, 'psr-0', rootPackage)
+ag -> ag: parseAutoloadsType(map, 'psr-4', rootPackage)
+ag -> ag: parseAutoloadsType(map, 'classmap', rootPackage)
+ag -> ag: parseAutoloadsType(map, 'files', rootPackage)
+ag -> ag: parseAutoloadsType(map, 'exclude-from-classmap', rootPackage)
+ag --> ag: autoloads{psr-0, psr-4, classmap, files, exclude}
+deactivate ag
+
+== Class Map Scanning ==
+
+loop for each classmap directory
+    ag -> cmg: scanPaths(dir, exclusionRegex)
+end
+
+opt scanPsrPackages == true
+    loop for each PSR-0/PSR-4 directory
+        ag -> cmg: scanPaths(dir, exclusionRegex, psrType, namespace)
+    end
+end
+
+ag -> cmg: getClassMap()
+cmg --> ag: ClassMap
+deactivate cmg
+activate cm
+
+ag -> cm: getAmbiguousClasses() → report warnings
+ag -> cm: clearPsrViolationsByPath(vendorPath)
+ag -> cm: getPsrViolations() → report warnings
+ag -> cm: addClass('Composer\\InstalledVersions',\nvendorPath.'/composer/InstalledVersions.php')
+ag -> cm: sort()
+
+== Resolve Suffix ==
+
+opt suffix is null and locker is locked
+    ag -> locker: getLockData()['content-hash']
+    activate locker
+    locker --> ag: contentHash (used as suffix)
+    deactivate locker
+end
+
+== Write Autoload Files ==
+
+ag -> cm: getMap() → iterate for classmapFile
+deactivate cm
+
+ag -> fs: filePutContentsIfModified(targetDir/autoload_namespaces.php, psr0Content)
+activate fs
+ag -> fs: filePutContentsIfModified(targetDir/autoload_psr4.php, psr4Content)
+ag -> fs: filePutContentsIfModified(targetDir/autoload_classmap.php, classmapContent)
+deactivate fs
+
+opt packages with include paths
+    ag -> ag: getIncludePathsFile(packageMap)
+    ag -> fs: filePutContentsIfModified(targetDir/include_paths.php, content)
+end
+
+opt 'files' autoload entries exist
+    ag -> ag: getIncludeFilesFile(autoloads['files'])
+    ag -> fs: filePutContentsIfModified(targetDir/autoload_files.php, content)
+end
+
+opt platform check needed
+    ag -> ag: getPlatformCheck(packageMap, checkPlatform, devPackageNames)
+    ag -> fs: filePutContentsIfModified(targetDir/platform_check.php, content)
+end
+
+== Generate Bootstrap Files ==
+
+ag -> ag: getStaticFile(suffix, targetDir, vendorPath, basePath)
+note right of ag
+  Generates ComposerStaticInit{suffix}
+  with static PSR-0, PSR-4, classmap
+  arrays + getInitializer() closure
+end note
+ag -> fs: filePutContentsIfModified(targetDir/autoload_static.php, staticContent)
+activate fs
+
+ag -> ag: getAutoloadRealFile(suffix, ...)\n→ ComposerAutoloaderInit{suffix}::getLoader()\n  [spl_autoload_register + ClassLoader bootstrap]
+ag -> fs: filePutContentsIfModified(targetDir/autoload_real.php, content)
+
+ag -> ag: getAutoloadFile(vendorPathCode, suffix)\n→ vendor/autoload.php entry point
+ag -> fs: filePutContentsIfModified(vendorPath/autoload.php, content)
+
+ag -> fs: safeCopy(ClassLoader.php → targetDir/ClassLoader.php)
+deactivate fs
+
+== Post-Processing ==
+
+alt runScripts
+    ag -> ed: dispatchScript(POST_AUTOLOAD_DUMP, devMode, opts)
+    activate ed
+    ed --> ag: (scripts executed)
+    deactivate ed
+end
+
+ag --> caller: return ClassMap
+deactivate ag
+
+@enduml

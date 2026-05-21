@@ -1,0 +1,175 @@
+{
+  "scope": "package_installation",
+  "title": "Package Installation",
+  "diagram_type": "use_case",
+  "description": "Installing dependencies from composer.json/lock or adding new ones via the require command",
+
+  "actors": [
+    {
+      "name": "Developer",
+      "type": "primary",
+      "description": "Human user invoking CLI commands"
+    },
+    {
+      "name": "EventDispatcher",
+      "type": "secondary_system",
+      "description": "Fires PRE_INSTALL_CMD, PRE_UPDATE_CMD, PRE_OPERATIONS_EXEC script hooks"
+    },
+    {
+      "name": "DependencySolver",
+      "type": "secondary_system",
+      "description": "Composer\\DependencyResolver\\Solver — resolves the dependency graph"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Install from lock/composer.json",
+      "actor": "Developer",
+      "entry_point": "InstallCommand::execute()",
+      "description": "Developer runs `composer install`; reads composer.lock (or composer.json fallback) and installs all dependencies",
+      "key_steps": [
+        "Validate no package arguments passed (redirect to require)",
+        "requireComposer() to load composer.json + lock",
+        "Installer::create($io, $composer)",
+        "Configure install options (dry-run, prefer-source/dist, dev-mode, optimize-autoloader, audit)",
+        "InstallationManager::setOutputProgress()",
+        "Installer::run() → doInstall(localRepo)"
+      ],
+      "options": ["--dry-run", "--no-dev", "--no-autoloader", "--prefer-source", "--prefer-dist", "--audit", "--optimize-autoloader", "--classmap-authoritative", "--apcu-autoloader", "--download-only", "--ignore-platform-reqs"]
+    },
+    {
+      "id": "UC2",
+      "name": "Add new dependency",
+      "actor": "Developer",
+      "entry_point": "RequireCommand::execute()",
+      "description": "Developer runs `composer require vendor/pkg[:version]`; updates composer.json and installs",
+      "key_steps": [
+        "Locate/create composer.json file; backup composer.json + composer.lock",
+        "Register SIGINT/SIGTERM handler → revertComposerFile() on abort",
+        "determineRequirements() — resolve package names and version constraints",
+        "formatRequirements() — normalize constraints",
+        "Optionally prompt to use --dev if package has dev/testing keywords",
+        "updateFile() via JsonManipulator — write requirement into require/require-dev key",
+        "deactivateInstalledPlugins()",
+        "doUpdate() → Installer::create() → run() with setUpdate(true)"
+      ],
+      "options": ["--dev", "--no-update", "--no-install", "--fixed", "--dry-run", "--update-with-dependencies (-w)", "--update-with-all-dependencies (-W)", "--prefer-stable", "--prefer-lowest", "--sort-packages", "--minimal-changes"]
+    },
+    {
+      "id": "UC3",
+      "name": "Resolve dependency graph",
+      "actor": "DependencySolver",
+      "entry_point": "Installer::doUpdate()",
+      "description": "Solver computes install/update/uninstall operations satisfying all constraints",
+      "key_steps": [
+        "Build RepositorySet and Pool",
+        "Run Solver::solve(Request)",
+        "Produce LockTransaction (operations list)",
+        "Write composer.lock if writeLock=true"
+      ]
+    },
+    {
+      "id": "UC4",
+      "name": "Execute package operations",
+      "actor": "InstallationManager",
+      "entry_point": "InstallationManager::execute()",
+      "description": "Performs install/update/uninstall on each package using the appropriate concrete installer",
+      "key_steps": [
+        "Route InstallOperation → LibraryInstaller/PluginInstaller/MetapackageInstaller/ProjectInstaller",
+        "install(repo, InstallOperation): ?PromiseInterface",
+        "update(repo, UpdateOperation): ?PromiseInterface",
+        "uninstall(repo, UninstallOperation): ?PromiseInterface",
+        "notifyInstalls(io) after all operations complete"
+      ]
+    },
+    {
+      "id": "UC5",
+      "name": "Generate autoloader",
+      "actor": "Developer",
+      "entry_point": "Installer::run() post-install",
+      "description": "After package operations, regenerate the autoloader",
+      "key_steps": [
+        "AutoloadGenerator::dump() invoked if dumpAutoloader=true",
+        "Supports optimize, classmap-authoritative, APCu prefix modes",
+        "Skipped when --no-autoloader, --dry-run, --download-only, or --no-install+update"
+      ]
+    },
+    {
+      "id": "UC6",
+      "name": "Run security audit",
+      "actor": "Developer",
+      "entry_point": "Installer::run() post-install",
+      "description": "Auditor checks installed packages against security advisories",
+      "key_steps": [
+        "Auditor::audit() called if audit=true",
+        "Returns ERROR_AUDIT_FAILED (5) on findings when --audit flag set",
+        "Configurable via AuditConfig (format: table/plain/json/summary)"
+      ]
+    },
+    {
+      "id": "UC7",
+      "name": "Revert on failure",
+      "actor": "RequireCommand",
+      "entry_point": "RequireCommand::revertComposerFile()",
+      "description": "On installation failure, restore composer.json and composer.lock to pre-command state",
+      "key_steps": [
+        "If newlyCreated: delete composer.json (and lock if present)",
+        "Otherwise: restore composerBackup → composer.json, lockBackup → composer.lock",
+        "Triggered on non-zero status from Installer::run() (excluding ERROR_AUDIT_FAILED)"
+      ]
+    },
+    {
+      "id": "UC8",
+      "name": "Dry-run installation",
+      "actor": "Developer",
+      "entry_point": "InstallCommand or RequireCommand with --dry-run",
+      "description": "Simulate install/require without writing files or executing operations",
+      "key_steps": [
+        "Installer: executeOperations=false, writeLock=false, dumpAutoloader=false, runScripts=false",
+        "RequireCommand: skips updateFile(), cleans up newly-created composer.json after",
+        "Outputs planned operations only"
+      ]
+    }
+  ],
+
+  "key_relationships": [
+    "InstallCommand extends BaseCommand; uses Installer",
+    "RequireCommand extends BaseCommand; uses Installer, JsonFile, JsonManipulator",
+    "Installer::create(IOInterface, Composer): self — static factory wiring all dependencies",
+    "Installer depends_on InstallationManager (executes operations)",
+    "Installer depends_on Solver (dependency resolution in doUpdate)",
+    "Installer depends_on AutoloadGenerator (autoloader dump)",
+    "Installer depends_on Auditor (security audit)",
+    "Installer depends_on EventDispatcher (script hooks)",
+    "InstallationManager routes to LibraryInstaller, PluginInstaller, MetapackageInstaller, ProjectInstaller",
+    "RequireCommand aggregates JsonFile + JsonManipulator for composer.json mutations"
+  ],
+
+  "error_codes": {
+    "0": "SUCCESS",
+    "1": "GENERIC_FAILURE",
+    "2": "DEPENDENCY_RESOLUTION_FAILED (SolverProblemsException)",
+    "3": "NO_LOCK_FILE_FOR_PARTIAL_UPDATE",
+    "4": "LOCK_FILE_INVALID",
+    "5": "AUDIT_FAILED",
+    "6": "PSR_AUTOLOAD_VIOLATION",
+    "100": "TRANSPORT_EXCEPTION"
+  },
+
+  "important_notes": [
+    "InstallCommand reads composer.lock first; falls back to composer.json if no lock present (triggers update mode)",
+    "RequireCommand always sets setUpdate(true) on Installer; partial update restricted to listed packages when lock exists",
+    "Signal handlers (SIGINT/SIGTERM/SIGHUP) in RequireCommand ensure atomic composer.json changes",
+    "GC disabled during Installer::run() for performance with large dependency trees",
+    "Plugin deactivation occurs before doUpdate() in RequireCommand to avoid stale plugin state"
+  ],
+
+  "source_files_analyzed": [
+    "src/Composer/Command/InstallCommand.php",
+    "src/Composer/Command/RequireCommand.php",
+    "src/Composer/Installer.php",
+    "src/Composer/Installer/InstallationManager.php (grep)"
+  ]
+}

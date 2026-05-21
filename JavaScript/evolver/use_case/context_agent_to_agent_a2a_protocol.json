@@ -1,0 +1,255 @@
+{
+  "scope": "agent_to_agent_a2a_protocol",
+  "title": "Agent-to-Agent (A2A) Protocol",
+  "diagram_type": "use_case",
+  "description": "Peer agents communicate, exchange assets, discover capabilities, and bridge tasks via the GEP A2A protocol (gep-a2a v1.0.0) over a central Hub (evomap.ai).",
+
+  "system_boundary": "GEP A2A Protocol System (src/gep/)",
+
+  "actors": [
+    {
+      "name": "PeerAgent",
+      "description": "Any GEP node (identified by nodeId) participating in the A2A network"
+    },
+    {
+      "name": "ConsumerAgent",
+      "description": "ATP consumer that orders services from other agents (src/atp/consumerAgent.js)"
+    },
+    {
+      "name": "MerchantAgent",
+      "description": "ATP merchant that registers services, polls for work, and submits deliveries (src/atp/merchantAgent.js)"
+    },
+    {
+      "name": "Hub",
+      "description": "Central evomap.ai hub (A2A_HUB_URL). Accepts protocol messages, routes tasks, manages directory"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC01",
+      "name": "Register with Hub (Hello)",
+      "actors": ["PeerAgent", "MerchantAgent", "ConsumerAgent"],
+      "description": "Agent sends a 'hello' message including env_fingerprint and optional name (max 32 chars). Signed with A2A_NODE_SECRET.",
+      "trigger": "sendHelloToHub() → buildHello({name?}) → POST /a2a/hello",
+      "outcome": "Hub acknowledges agent; agent marked as initialized"
+    },
+    {
+      "id": "UC02",
+      "name": "Publish Asset to Peers",
+      "actors": ["PeerAgent"],
+      "description": "Agent broadcasts a Gene or Capsule asset to the network. Asset must have type and id; message includes HMAC signature.",
+      "trigger": "buildPublish({asset}) → message_type:'publish', payload.asset_type, payload.local_id, payload.signature",
+      "preconditions": "isGeneBroadcastEligible OR isCapsuleBroadcastEligible (score>=0.7, blast_radius safe, streak>=2)",
+      "outcome": "Asset available to peer agents; other agents call lowerConfidence() on receipt"
+    },
+    {
+      "id": "UC03",
+      "name": "Fetch Tasks from Hub",
+      "actors": ["PeerAgent"],
+      "description": "Agent sends a 'fetch' protocol message to Hub to pull available tasks. Supports piggybacking proactive questions.",
+      "trigger": "taskReceiver.fetchTasks(opts) → builds gep-a2a 'fetch' message → POST /a2a/fetch",
+      "task_scoring": "Strategies: greedy (bounty 0.80), balanced (roi 0.35, capability 0.30), conservative (capability 0.45). Env: TASK_STRATEGY, TASK_MIN_CAPABILITY_MATCH",
+      "outcome": "Returns {tasks[], questions_created?}"
+    },
+    {
+      "id": "UC04",
+      "name": "Report Validation Result",
+      "actors": ["PeerAgent"],
+      "description": "Agent sends a validation report about a received asset.",
+      "trigger": "buildReport({assetId, validationReport}) → message_type:'report', payload.target_asset_id"
+    },
+    {
+      "id": "UC05",
+      "name": "Make Asset Decision",
+      "actors": ["PeerAgent"],
+      "description": "Agent accepts, rejects, or quarantines an asset.",
+      "trigger": "buildDecision({decision, assetId}) → message_type:'decision'. Valid decisions: accept | reject | quarantine"
+    },
+    {
+      "id": "UC06",
+      "name": "Revoke Asset",
+      "actors": ["PeerAgent"],
+      "description": "Agent revokes a previously published asset with a reason.",
+      "trigger": "buildRevoke({assetId, reason}) → message_type:'revoke'"
+    },
+    {
+      "id": "UC07",
+      "name": "Send Heartbeat",
+      "actors": ["PeerAgent", "MerchantAgent"],
+      "description": "Agent periodically signals liveness to Hub. On success, touches EVOLVER_LOGS_DIR/evolver_loop.log.",
+      "trigger": "sendHeartbeat() → fetch /a2a/heartbeat. MerchantAgent calls startHeartbeat() / stopHeartbeat()"
+    },
+    {
+      "id": "UC08",
+      "name": "Open Event Stream",
+      "actors": ["PeerAgent"],
+      "description": "Agent subscribes to real-time Hub events via SSE (Server-Sent Events).",
+      "trigger": "hubOpenEventStream() → EventSource at Hub"
+    },
+    {
+      "id": "UC09",
+      "name": "Discover Agents by Query",
+      "actors": ["PeerAgent"],
+      "description": "Semantic search for agents by free-text query.",
+      "trigger": "directoryClient.searchByQuery(query, {limit?}) → GET /a2a/directory/search?q=...",
+      "returns": "Array<{nodeId, score, domains, reputation}> or null"
+    },
+    {
+      "id": "UC10",
+      "name": "Discover Agents by Signals",
+      "actors": ["PeerAgent"],
+      "description": "Keyword/signal-based agent discovery.",
+      "trigger": "directoryClient.searchBySignals(signals[], {limit?}) → GET /a2a/directory/search?signals=...",
+      "returns": "Array or null"
+    },
+    {
+      "id": "UC11",
+      "name": "Discover Agents for Task",
+      "actors": ["PeerAgent"],
+      "description": "Combined semantic + signal discovery based on task.title and task.signals.",
+      "trigger": "directoryClient.discoverForTask(task, opts) → delegates to searchByQuery or searchBySignals",
+      "include": ["UC09", "UC10"]
+    },
+    {
+      "id": "UC12",
+      "name": "Get Agent Profile",
+      "actors": ["PeerAgent"],
+      "description": "Fetch a specific agent's capabilities, reputation, and load.",
+      "trigger": "directoryClient.getAgentProfile(nodeId) → GET /a2a/directory/profile/:nodeId",
+      "returns": "{nodeId, domains, modelType, reputation, completedTasks, currentLoad, online}"
+    },
+    {
+      "id": "UC13",
+      "name": "Receive & Lower-Confidence External Asset",
+      "actors": ["PeerAgent"],
+      "description": "On receiving a foreign asset, agent demotes its confidence (factor=0.6 default) and marks it as 'external_candidate'.",
+      "trigger": "a2a.lowerConfidence(asset, {factor, source, received_at}) → sets a2a.status='external_candidate'",
+      "allowed_types": "Gene | Capsule | EvolutionEvent"
+    },
+    {
+      "id": "UC14",
+      "name": "Export Eligible Capsules",
+      "actors": ["PeerAgent"],
+      "description": "Filter and stamp capsules ready for broadcast. Eligibility: outcome.score>=0.7, safe blast_radius (files<=5, lines<=200), success streak>=2.",
+      "trigger": "a2a.exportEligibleCapsules({capsules, events}) → stamps schema_version + asset_id"
+    },
+    {
+      "id": "UC15",
+      "name": "Export Eligible Genes",
+      "actors": ["PeerAgent"],
+      "description": "Filter genes ready for broadcast. Eligibility: has id, non-empty strategy[] and validation[].",
+      "trigger": "a2a.exportEligibleGenes({genes}) → stamps schema_version + asset_id"
+    },
+    {
+      "id": "UC16",
+      "name": "Parse A2A Input",
+      "actors": ["PeerAgent"],
+      "description": "Parse raw text (JSON, JSON array, NDJSON) into asset objects, unwrapping protocol messages if present.",
+      "trigger": "a2a.parseA2AInput(text) → calls unwrapAssetFromMessage() for each item"
+    },
+    {
+      "id": "UC17",
+      "name": "Spawn Sub-Agent via Bridge",
+      "actors": ["PeerAgent"],
+      "description": "Generate a sessions_spawn() call string to delegate a task to another agent session.",
+      "trigger": "bridge.renderSessionsSpawnCall({task, agentId, label, cleanup}) → sessions_spawn(JSON)"
+    },
+    {
+      "id": "UC18",
+      "name": "Write Prompt Artifact via Bridge",
+      "actors": ["PeerAgent"],
+      "description": "Persist a GEP prompt artifact (prompt text + metadata) to memoryDir for agent session hand-off.",
+      "trigger": "bridge.writePromptArtifact({memoryDir, cycleId, runId, prompt, meta}) → writes .txt + .json files"
+    },
+    {
+      "id": "UC19",
+      "name": "Order Service (ATP Consumer)",
+      "actors": ["ConsumerAgent"],
+      "description": "Consumer places an order for a service by capabilities/budget. Routing modes: fastest|cheapest|auction|swarm.",
+      "trigger": "consumerAgent.orderService({capabilities, budget, routingMode, verifyMode, question}) → placeOrder() via hubClient",
+      "include": ["UC01"]
+    },
+    {
+      "id": "UC20",
+      "name": "Verify / Settle Delivery (ATP Consumer)",
+      "actors": ["ConsumerAgent"],
+      "description": "Consumer confirms delivery, requests AI judge, or forces settlement.",
+      "trigger": "confirmDelivery(orderId) | requestAiJudge(orderId) | settle(orderId) → verifyDelivery / settleOrder via hubClient"
+    },
+    {
+      "id": "UC21",
+      "name": "Publish Service & Poll Work (ATP Merchant)",
+      "actors": ["MerchantAgent"],
+      "description": "Merchant registers services with Hub, starts heartbeat, polls every 30s for available work via consumeAvailableWork().",
+      "trigger": "merchantAgent.start({services, onOrder, pollMs}) → publishService() + startHeartbeat() + setInterval(consumeAvailableWork)",
+      "include": ["UC01", "UC07"]
+    },
+    {
+      "id": "UC22",
+      "name": "Submit Delivery Proof (ATP Merchant)",
+      "actors": ["MerchantAgent"],
+      "description": "Merchant processes an order via onOrder handler and submits proof to Hub.",
+      "trigger": "onOrder(order) → proofPayload → submitDelivery(atp_order_id, proofPayload) via hubClient"
+    }
+  ],
+
+  "key_relationships": [
+    "PeerAgent --includes--> UC16 (parseA2AInput used before UC13 on receive)",
+    "UC11 --includes--> UC09 (discoverForTask delegates to searchByQuery)",
+    "UC11 --includes--> UC10 (discoverForTask delegates to searchBySignals when no title)",
+    "UC19 --includes--> UC01 (orderService requires hub registration)",
+    "UC21 --includes--> UC01 (merchant start requires hub registration)",
+    "UC21 --includes--> UC07 (merchant start triggers heartbeat)",
+    "UC02 --extends--> UC14 (exportEligibleCapsules gates capsule publish)",
+    "UC02 --extends--> UC15 (exportEligibleGenes gates gene publish)",
+    "UC13 --extends--> UC16 (parseA2AInput unwraps before lowerConfidence)",
+    "directoryClient --depends_on--> a2aProtocol (getNodeId, buildHubHeaders)",
+    "taskReceiver --depends_on--> a2aProtocol (getNodeId, buildHubHeaders)",
+    "consumerAgent --depends_on--> a2aProtocol (getNodeId, sendHelloToHub)",
+    "merchantAgent --depends_on--> a2aProtocol (getNodeId, sendHelloToHub, startHeartbeat, stopHeartbeat, consumeAvailableWork)",
+    "a2a --depends_on--> a2aProtocol (unwrapAssetFromMessage)"
+  ],
+
+  "protocol_constants": {
+    "PROTOCOL_NAME": "gep-a2a",
+    "PROTOCOL_VERSION": "1.0.0",
+    "VALID_MESSAGE_TYPES": ["hello", "publish", "fetch", "report", "decision", "revoke"],
+    "HUB_URL": "process.env.A2A_HUB_URL || process.env.EVOMAP_HUB_URL || 'https://evomap.ai'",
+    "DIRECTORY_TIMEOUT_MS": 8000
+  },
+
+  "env_vars": [
+    "A2A_NODE_SECRET - HMAC signing key (min 64 chars)",
+    "A2A_HUB_URL / EVOMAP_HUB_URL - hub endpoint",
+    "A2A_MAX_FILES (default 5) - blast radius file limit",
+    "A2A_MAX_LINES (default 200) - blast radius line limit",
+    "A2A_DIR - default local a2a directory",
+    "TASK_STRATEGY - greedy|balanced|conservative (default balanced)",
+    "TASK_MIN_CAPABILITY_MATCH (default 0.1)",
+    "EVOLVER_LOGS_DIR - heartbeat log touch directory"
+  ],
+
+  "hub_endpoints": [
+    "POST /a2a/hello",
+    "POST /a2a/fetch",
+    "GET /a2a/heartbeat",
+    "GET /a2a/directory/search?q= or ?signals=",
+    "GET /a2a/directory/profile/:nodeId",
+    "SSE /a2a/events (hubOpenEventStream)"
+  ],
+
+  "asset_types_in_scope": ["Gene", "Capsule", "EvolutionEvent"],
+
+  "source_files_analyzed": [
+    "src/gep/a2a.js",
+    "src/gep/a2aProtocol.js (obfuscated; exports inferred from test/a2aProtocol.test.js and import sites)",
+    "src/gep/bridge.js",
+    "src/gep/directoryClient.js",
+    "src/gep/taskReceiver.js",
+    "src/atp/consumerAgent.js",
+    "src/atp/merchantAgent.js"
+  ],
+
+  "important_notes": "a2aProtocol.js is obfuscated (hex-encoded identifiers). All exported API names were recovered from test/a2aProtocol.test.js and require() statements across the codebase. bridge.js generates sessions_spawn() strings for multi-agent delegation rather than making direct network calls. directoryClient.js and taskReceiver.js both use buildHubHeaders() for auth. The ATP consumer/merchant pattern (consumerAgent/merchantAgent) sits on top of a2aProtocol for service marketplace flows."
+}

@@ -1,0 +1,189 @@
+{
+  "scope": "gitlab_bitbucket_driver_flow",
+  "title": "GitLab and Bitbucket VCS Driver Flows",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "VcsRepository",
+    "GitLabDriver",
+    "GitBitbucketDriver",
+    "VcsDriver (parent)",
+    "HttpDownloader",
+    "GitLab (Util)",
+    "Bitbucket (Util)",
+    "GitDriver (fallback)",
+    "Cache",
+    "Response"
+  ],
+  "inheritance": [
+    "GitLabDriver extends VcsDriver",
+    "GitBitbucketDriver extends VcsDriver",
+    "GitDriver extends VcsDriver"
+  ],
+  "gitlab_driver_flow": {
+    "initialize": [
+      "GitLabDriver::initialize() → Preg::isMatch(URL_REGEX, url)",
+      "→ self::determineOrigin(configuredDomains, guessedDomain, urlParts, port)",
+      "→ new Cache(io, cache-repo-dir/originUrl/namespace/repo)",
+      "→ fetchProject()"
+    ],
+    "fetchProject": [
+      "GitLabDriver::fetchProject() → getApiUrl() [scheme://originUrl/api/v4/projects/namespace%2Frepo]",
+      "→ getContents(apiUrl, fetchingRepoData=true) → parent::getContents(url) → HttpDownloader",
+      "→ Response::decodeJson() → set $this->project",
+      "→ check project['visibility'] to set isPrivate"
+    ],
+    "getComposerInformation": [
+      "GitLabDriver::getComposerInformation(identifier)",
+      "→ if gitDriver: delegate to gitDriver->getComposerInformation(identifier)",
+      "→ Cache::read(identifier) [if shouldCache]",
+      "→ else: getBaseComposerInformation(identifier) [calls getFileContent('composer.json', identifier)]",
+      "→ Cache::write(identifier, encoded)",
+      "→ enrich: getTags()/getBranches() for source URL, project['web_url'], project['archived']"
+    ],
+    "getFileContent": [
+      "GitLabDriver::getFileContent(file, identifier)",
+      "→ if gitDriver: delegate",
+      "→ getBranches() to resolve branch name → commit hash",
+      "→ getContents(apiUrl + '/repository/files/' + urlEncodeAll(file) + '/raw?ref=' + identifier)",
+      "→ Response::getBody() → return string content"
+    ],
+    "getBranches_getTags": [
+      "GitLabDriver::getBranches() → getReferences('branches')",
+      "GitLabDriver::getTags() → getReferences('tags')",
+      "getReferences(type): paginated loop",
+      "  → getContents(apiUrl + '/repository/' + type + '?per_page=100')",
+      "  → Response::decodeJson() → extract name→commit.id map",
+      "  → cache commits[] for change dates",
+      "  → getNextPage(response) [Link header rel=next] until exhausted"
+    ],
+    "getDist": [
+      "GitLabDriver::getDist(identifier)",
+      "→ return ['type'=>'zip', 'url'=> apiUrl+'/repository/archive.zip?sha='+identifier, 'reference'=>identifier, 'shasum'=>'']"
+    ],
+    "getSource": [
+      "GitLabDriver::getSource(identifier)",
+      "→ if gitDriver: delegate",
+      "→ getRepositoryUrl() [protocol? project[protocol_url_to_repo] : isPrivate? ssh_url_to_repo : http_url_to_repo]",
+      "→ return ['type'=>'git', 'url'=>repositoryUrl, 'reference'=>identifier]"
+    ],
+    "getContents_auth_flow": [
+      "GitLabDriver::getContents(url, fetchingRepoData)",
+      "→ parent::getContents(url) via HttpDownloader",
+      "on TransportException 401/404 (fetchingRepoData only):",
+      "  → new GitLab(io, config, process, httpDownloader)",
+      "  → GitLab::authorizeOAuth(originUrl) → retry parent::getContents()",
+      "  → GitLab::isOAuthExpired() + authorizeOAuthRefresh(scheme, originUrl) → retry",
+      "  → if !io->isInteractive(): attemptCloneFallback() → return dummy Response",
+      "  → GitLab::authorizeOAuthInteractively(scheme, originUrl, msg) → retry",
+      "on 403:",
+      "  → GitLab::authorizeOAuth(originUrl) → retry",
+      "  → if !interactive && fetchingRepoData: attemptCloneFallback()"
+    ],
+    "fallback": [
+      "GitLabDriver::attemptCloneFallback()",
+      "→ isPrivate? generateSshUrl() : generatePublicUrl()",
+      "→ setupGitDriver(url) → new GitDriver([url], io, config, httpDownloader, process)",
+      "→ GitDriver::initialize()"
+    ]
+  },
+  "bitbucket_driver_flow": {
+    "initialize": [
+      "GitBitbucketDriver::initialize() → Preg::isMatch(bitbucket URL regex)",
+      "→ set owner, repository, originUrl='bitbucket.org'",
+      "→ new Cache(io, cache-repo-dir/bitbucket.org/owner/repo)"
+    ],
+    "getRootIdentifier": [
+      "GitBitbucketDriver::getRootIdentifier()",
+      "→ if fallbackDriver: delegate",
+      "→ getRepoData() → fetchWithOAuthCredentials(api 2.0/repositories/owner/repo?fields=-project,-owner, fetchingRepoData=true)",
+      "  → parseCloneUrls(repoData['links']['clone']) → set cloneHttpsUrl",
+      "  → set hasIssues, branchesUrl, tagsUrl, homeUrl, website, vcsType",
+      "→ check vcsType === 'git' (throws if mercurial)",
+      "→ rootIdentifier = repoData['mainbranch']['name'] ?? 'master'"
+    ],
+    "getComposerInformation": [
+      "GitBitbucketDriver::getComposerInformation(identifier)",
+      "→ if fallbackDriver: delegate",
+      "→ Cache::read(identifier) [if shouldCache]",
+      "→ else: getBaseComposerInformation(identifier) [calls getFileContent('composer.json', identifier)]",
+      "→ Cache::write(identifier, encoded)",
+      "→ enrich: getTags()/getBranches() for source URL with hash, hasIssues, homeUrl/website"
+    ],
+    "getFileContent": [
+      "GitBitbucketDriver::getFileContent(file, identifier)",
+      "→ if fallbackDriver: delegate",
+      "→ getBranches() if identifier has '/' to resolve to hash",
+      "→ fetchWithOAuthCredentials('https://api.bitbucket.org/2.0/repositories/owner/repo/src/identifier/file')",
+      "→ Response::getBody()"
+    ],
+    "getBranches_getTags": [
+      "GitBitbucketDriver::getBranches() → paginated fetchWithOAuthCredentials(branchesUrl?pagelen=100&fields=...)",
+      "  → decodeJson() → map name→target.hash, follow 'next' URL until exhausted",
+      "GitBitbucketDriver::getTags() → paginated fetchWithOAuthCredentials(tagsUrl?pagelen=100&fields=...)",
+      "  → decodeJson() → map name→target.hash, follow 'next' URL until exhausted"
+    ],
+    "getDist": [
+      "GitBitbucketDriver::getDist(identifier)",
+      "→ if fallbackDriver: delegate",
+      "→ return ['type'=>'zip', 'url'=>'https://bitbucket.org/owner/repo/get/identifier.zip', 'reference'=>identifier, 'shasum'=>'']"
+    ],
+    "getSource": [
+      "GitBitbucketDriver::getSource(identifier)",
+      "→ if fallbackDriver: delegate",
+      "→ return ['type'=> vcsType (git/hg), 'url'=> getUrl() [cloneHttpsUrl], 'reference'=>identifier]"
+    ],
+    "fetchWithOAuthCredentials_auth_flow": [
+      "GitBitbucketDriver::fetchWithOAuthCredentials(url, fetchingRepoData)",
+      "→ parent::getContents(url) via HttpDownloader",
+      "on TransportException 401/403/404:",
+      "  → new Bitbucket(io, config, process, httpDownloader)",
+      "  → !io->hasAuthentication() + Bitbucket::authorizeOAuth(originUrl) → retry parent::getContents()",
+      "  → if !io->isInteractive() && fetchingRepoData: attemptCloneFallback() → return dummy Response"
+    ],
+    "fallback": [
+      "GitBitbucketDriver::attemptCloneFallback()",
+      "→ generateSshUrl() → 'git@bitbucket.org:owner/repo.git'",
+      "→ setupFallbackDriver(url) → new GitDriver([url], io, config, httpDownloader, process)",
+      "→ GitDriver::initialize()"
+    ]
+  },
+  "key_api_endpoints": {
+    "gitlab": [
+      "GET {scheme}://{originUrl}/api/v4/projects/{namespace}%2F{repo}  → project metadata",
+      "GET .../repository/branches?per_page=100  → branch list (paginated)",
+      "GET .../repository/tags?per_page=100  → tag list (paginated)",
+      "GET .../repository/files/{encoded_file}/raw?ref={identifier}  → file content",
+      "GET .../repository/archive.zip?sha={identifier}  → dist download"
+    ],
+    "bitbucket": [
+      "GET https://api.bitbucket.org/2.0/repositories/{owner}/{repo}?fields=-project,-owner  → repo metadata",
+      "GET {branchesUrl}?pagelen=100&fields=values.name,values.target.hash,...  → branches (paginated)",
+      "GET {tagsUrl}?pagelen=100&fields=values.name,values.target.hash,...  → tags (paginated)",
+      "GET https://api.bitbucket.org/2.0/repositories/{owner}/{repo}/src/{id}/{file}  → file content",
+      "GET https://api.bitbucket.org/2.0/repositories/{owner}/{repo}/commit/{id}?fields=date  → change date",
+      "GET https://bitbucket.org/{owner}/{repo}/get/{id}.zip  → dist download"
+    ]
+  },
+  "key_relationships": [
+    "GitLabDriver extends VcsDriver (inherits httpDownloader, io, config, cache, infoCache, getContents override)",
+    "GitBitbucketDriver extends VcsDriver (inherits httpDownloader, io, config, cache, infoCache)",
+    "Both drivers delegate to GitDriver fallback on auth failure or non-interactive mode",
+    "GitLabDriver uses GitLab util for OAuth (authorizeOAuth, authorizeOAuthRefresh, authorizeOAuthInteractively)",
+    "GitBitbucketDriver uses Bitbucket util for OAuth (authorizeOAuth)",
+    "Both: getComposerInformation → getBaseComposerInformation → getFileContent (in VcsDriver parent)",
+    "GitLabDriver::getContents overrides parent to add auth retry logic",
+    "GitBitbucketDriver::fetchWithOAuthCredentials wraps parent::getContents with auth retry"
+  ],
+  "shared_patterns": [
+    "Cache check before API call (shouldCache + cache.read/write)",
+    "Fallback to GitDriver via SSH when API auth fails in non-interactive mode",
+    "Paginated API traversal for branches/tags (Link header for GitLab, 'next' field for Bitbucket)",
+    "getComposerInformation enriches composer data with support.source, support.issues from repo metadata",
+    "getDist returns zip archive URL; getSource returns git/vcs clone URL"
+  ],
+  "important_notes": "GitLabDriver supports self-hosted instances via gitlab-domains config; origin may include port/path. GitBitbucketDriver fixed to bitbucket.org only. GitLabDriver caches commits[] during getReferences() to avoid extra API calls for getChangeDate(). GitBitbucketDriver vcsType can be 'git' or 'hg' (but hg throws an error). GitLab token with Guest/Planner access (level<20) triggers clone fallback.",
+  "source_files_analyzed": [
+    "src/Composer/Repository/Vcs/GitLabDriver.php",
+    "src/Composer/Repository/Vcs/GitBitbucketDriver.php"
+  ]
+}

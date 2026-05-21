@@ -1,0 +1,130 @@
+{
+  "scope": "incremental_snapshot_flow",
+  "title": "Incremental Snapshot Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Caller/SignalAction",
+    "BinlogReadOnlyIncrementalSnapshotChangeEventSource",
+    "AbstractIncrementalSnapshotChangeEventSource",
+    "BinlogReadOnlyIncrementalSnapshotContext",
+    "JdbcConnection/ChunkQueryBuilder",
+    "EventDispatcher",
+    "NotificationService",
+    "OffsetContext/BinlogOffsetContext"
+  ],
+  "interaction_flow": [
+    "--- SNAPSHOT INITIATION ---",
+    "Caller → AbstractIncrementalSnapshotChangeEventSource: addDataCollectionNamesToSnapshot(SignalPayload, SnapshotConfiguration)",
+    "AbstractIncrementalSnapshotChangeEventSource → BinlogReadOnlyIncrementalSnapshotContext: addDataCollectionNamesToSnapshot(correlationId, expandedIds, conditions, surrogateKey)",
+    "AbstractIncrementalSnapshotChangeEventSource → NotificationService: notifyStarted(context, partition, offsetContext)",
+    "AbstractIncrementalSnapshotChangeEventSource → ProgressListener: snapshotStarted(partition)",
+    "AbstractIncrementalSnapshotChangeEventSource → self: readChunk(partition, offsetContext)",
+
+    "--- CHUNK READING (readChunk) ---",
+    "AbstractIncrementalSnapshotChangeEventSource → self: preReadChunk(context)",
+    "AbstractIncrementalSnapshotChangeEventSource → JdbcConnection: commit()",
+    "AbstractIncrementalSnapshotChangeEventSource → BinlogReadOnlyIncrementalSnapshotContext: startNewChunk()",
+    "AbstractIncrementalSnapshotChangeEventSource → BinlogReadOnlyIncrementalSnapshotChangeEventSource: emitWindowOpen(partition, offsetContext)",
+    "BinlogReadOnlyIncrementalSnapshotChangeEventSource → self: updateLowWatermark() → getExecutedGtidSet(context::setLowWatermark)",
+    "MySqlReadOnlyIncrementalSnapshotChangeEventSource → JdbcConnection: query(SHOW MASTER STATUS) → MySqlGtidSet",
+    "MySqlReadOnlyIncrementalSnapshotChangeEventSource → BinlogReadOnlyIncrementalSnapshotContext: setLowWatermark(gtidSet)",
+
+    "AbstractIncrementalSnapshotChangeEventSource → DatabaseSchema: tableFor(currentTableId) [isTableInvalid check]",
+    "AbstractIncrementalSnapshotChangeEventSource → ChunkQueryBuilder: prepareTable(context, table)",
+    "AbstractIncrementalSnapshotChangeEventSource → JdbcConnection: queryAndMap(buildMaxPrimaryKeyQuery()) → Object[] maximumKey",
+    "AbstractIncrementalSnapshotChangeEventSource → BinlogReadOnlyIncrementalSnapshotContext: maximumKey(maximumKey)",
+
+    "AbstractIncrementalSnapshotChangeEventSource → self: createDataEventsForTable(partition)",
+    "AbstractIncrementalSnapshotChangeEventSource → ChunkQueryBuilder: buildChunkQuery(context, table, additionalCondition)",
+    "AbstractIncrementalSnapshotChangeEventSource → ChunkQueryBuilder: readTableChunkStatement(context, table, selectStatement)",
+    "AbstractIncrementalSnapshotChangeEventSource → JdbcConnection: rs.next() loop → rowToArray(table, rs, columnArray)",
+    "AbstractIncrementalSnapshotChangeEventSource → tableSchema: keyFromColumnData(row) → keyStruct",
+    "AbstractIncrementalSnapshotChangeEventSource → window: put(keyStruct, row) [buffer chunk rows]",
+    "AbstractIncrementalSnapshotChangeEventSource → BinlogReadOnlyIncrementalSnapshotContext: nextChunkPosition(lastKey)",
+
+    "alt window not empty: notificationService.notifyInProgress(), break loop",
+    "alt window empty (table done): nextDataCollection() → notifyTableScanCompleted(SUCCEEDED) → notifyCompleted()",
+
+    "AbstractIncrementalSnapshotChangeEventSource → BinlogReadOnlyIncrementalSnapshotChangeEventSource: emitWindowClose(partition, offsetContext)",
+    "BinlogReadOnlyIncrementalSnapshotChangeEventSource → self: updateHighWatermark() → getExecutedGtidSet(context::setHighWatermark)",
+    "MySqlReadOnlyIncrementalSnapshotChangeEventSource → JdbcConnection: query(SHOW MASTER STATUS) → MySqlGtidSet",
+    "MySqlReadOnlyIncrementalSnapshotChangeEventSource → BinlogReadOnlyIncrementalSnapshotContext: setHighWatermark(gtidSet)",
+    "opt hasServerIdentifierChanged: rereadChunk(partition, offsetContext) [window.clear + context.revertChunk + readChunk]",
+
+    "--- STREAMING: processMessage (binlog event received) ---",
+    "BinlogReadOnlyIncrementalSnapshotChangeEventSource → BinlogReadOnlyIncrementalSnapshotContext: updateWindowState(offsetContext) → boolean windowClosed",
+    "alt windowClosed=true: sendWindowEvents(partition, offsetContext) then readChunk(partition, offsetContext)",
+    "alt windowClosed=false AND deduplicationNeeded: deduplicateWindow(dataCollectionId, key) → window.remove(keyStruct)",
+
+    "--- STREAMING: processHeartbeat ---",
+    "BinlogReadOnlyIncrementalSnapshotChangeEventSource → self: readUntilGtidChange(partition, offsetContext)",
+    "BinlogReadOnlyIncrementalSnapshotChangeEventSource → BinlogReadOnlyIncrementalSnapshotContext: getCurrentGtid(offsetContext)",
+    "loop while snapshotRunning AND reachedHighWatermark(currentGtid):",
+    "  BinlogReadOnlyIncrementalSnapshotChangeEventSource → BinlogReadOnlyIncrementalSnapshotContext: closeWindow()",
+    "  BinlogReadOnlyIncrementalSnapshotChangeEventSource → self: sendWindowEvents(partition, offsetContext)",
+    "  BinlogReadOnlyIncrementalSnapshotChangeEventSource → self: readChunk(partition, offsetContext)",
+
+    "--- STREAMING: processFilteredEvent / processTransactionStartedEvent ---",
+    "BinlogReadOnlyIncrementalSnapshotChangeEventSource → BinlogReadOnlyIncrementalSnapshotContext: updateWindowState(offsetContext)",
+    "alt windowClosed: sendWindowEvents() then readChunk()",
+
+    "--- STREAMING: processTransactionCommittedEvent ---",
+    "BinlogReadOnlyIncrementalSnapshotChangeEventSource → self: readUntilGtidChange(partition, offsetContext)",
+
+    "--- SEND WINDOW EVENTS (sendWindowEvents) ---",
+    "AbstractIncrementalSnapshotChangeEventSource → OffsetContext: incrementalSnapshotEvents()",
+    "loop for each row in window: sendEvent(partition, dispatcher, offsetContext, row)",
+    "  AbstractIncrementalSnapshotChangeEventSource → BinlogReadOnlyIncrementalSnapshotContext: sendEvent(keyFromRow(row))",
+    "  AbstractIncrementalSnapshotChangeEventSource → OffsetContext: event(dataCollectionId, instant)",
+    "  AbstractIncrementalSnapshotChangeEventSource → EventDispatcher: dispatchSnapshotEvent(partition, tableId, SnapshotChangeRecordEmitter, receiver)",
+    "AbstractIncrementalSnapshotChangeEventSource → OffsetContext: postSnapshotCompletion()",
+    "AbstractIncrementalSnapshotChangeEventSource → window: clear()"
+  ],
+  "key_relationships": [
+    "MySqlReadOnlyIncrementalSnapshotChangeEventSource extends BinlogReadOnlyIncrementalSnapshotChangeEventSource<MySqlPartition, MySqlOffsetContext>",
+    "MariaDbReadOnlyIncrementalSnapshotChangeEventSource extends BinlogReadOnlyIncrementalSnapshotChangeEventSource (parallel concrete impl)",
+    "BinlogReadOnlyIncrementalSnapshotChangeEventSource extends AbstractIncrementalSnapshotChangeEventSource<P extends BinlogPartition, TableId>",
+    "BinlogReadOnlyIncrementalSnapshotChangeEventSource implements IncrementalSnapshotChangeEventSource<P, TableId>",
+    "BinlogReadOnlyIncrementalSnapshotContext<T> extends AbstractIncrementalSnapshotContext<T>",
+    "AbstractIncrementalSnapshotContext<T> implements IncrementalSnapshotContext<T>",
+    "AbstractIncrementalSnapshotChangeEventSource composes JdbcConnection (chunk queries)",
+    "AbstractIncrementalSnapshotChangeEventSource composes ChunkQueryBuilder (SQL generation)",
+    "AbstractIncrementalSnapshotChangeEventSource composes EventDispatcher<P, T> (event emission)",
+    "AbstractIncrementalSnapshotChangeEventSource composes NotificationService<P, OffsetContext>",
+    "AbstractIncrementalSnapshotChangeEventSource composes window: Map<Struct, Object[]> (deduplication buffer)",
+    "BinlogReadOnlyIncrementalSnapshotChangeEventSource depends on GtidSetFactory (from BinlogConnectorConfig)",
+    "BinlogReadOnlyIncrementalSnapshotContext depends on BinlogSourceInfo (GTID_KEY lookup)"
+  ],
+  "abstract_methods_binlog_override": [
+    "emitWindowOpen(P, OffsetContext): calls updateLowWatermark() → getExecutedGtidSet(context::setLowWatermark)",
+    "emitWindowClose(P, OffsetContext): calls updateHighWatermark() → getExecutedGtidSet(context::setHighWatermark); if hasServerIdentifierChanged → rereadChunk()",
+    "sendEvent(P, EventDispatcher, OffsetContext, Object[]): strips BinlogSourceInfo.query, calls super, restores query",
+    "getExecutedGtidSet(Consumer<GtidSet>): abstract in BinlogReadOnly, implemented per-connector (MySQL: SHOW MASTER STATUS col 5)"
+  ],
+  "abstract_methods_context": [
+    "setLowWatermark(GtidSet): stores gtid as low watermark",
+    "setHighWatermark(GtidSet): stores gtid as high watermark; checks server UUID uniqueness",
+    "reachedHighWatermark(String currentGtid): true if GTID is beyond high watermark range",
+    "hasServerIdentifierChanged(): true if server UUID in watermarks differs",
+    "updateWindowState(OffsetContext): uses GTID from offsetContext to determine if window should open/close",
+    "watermarksChanged(): true if low/high watermarks differ from previous",
+    "closeWindow(): clears the window-open flag in context"
+  ],
+  "key_state_fields": [
+    "window: Map<Struct, Object[]> — in-memory buffer of chunk rows keyed by PK struct; used for deduplication",
+    "context: IncrementalSnapshotContext<T> — tracks snapshot progress, chunk position, max key, paused state",
+    "chunkEndPosition: Object[] — last PK in current chunk",
+    "maximumKey: Object[] — largest PK in table at snapshot start",
+    "windowOpened: boolean — true during deduplication window",
+    "lowWatermark/highWatermark: GtidSet — GTID sets bracketing chunk select"
+  ],
+  "watermark_algorithm": "GTID-based: lowWatermark = executed_gtid_set BEFORE chunk SELECT. highWatermark = executed_gtid_set AFTER chunk SELECT minus lowWatermark. Window open: GTID not in lowWatermark. Window close: GTID not in highWatermark OR heartbeat GTID reaches max transaction in highWatermark. Deduplication removes binlog events from window buffer that occurred between watermarks. If highWatermark has >1 server UUID, chunk is redone.",
+  "important_notes": "Read-only (no signal table write). Uses GTIDs (requires gtid_mode=ON, enforce_gtid_consistency=ON). processMessage/processHeartbeat/processFilteredEvent/processTransactionStartedEvent/processTransactionCommittedEvent all check context null guard. Heartbeat drives progress when binlog rate is low. Schema change detection via schemaHistoryIsUpToDate() before each chunk.",
+  "source_files_analyzed": [
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogReadOnlyIncrementalSnapshotChangeEventSource.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogReadOnlyIncrementalSnapshotContext.java",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/source/snapshot/incremental/AbstractIncrementalSnapshotChangeEventSource.java",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/source/snapshot/incremental/AbstractIncrementalSnapshotContext.java",
+    "debezium-connector-mysql/src/main/java/io/debezium/connector/mysql/MySqlReadOnlyIncrementalSnapshotChangeEventSource.java"
+  ]
+}

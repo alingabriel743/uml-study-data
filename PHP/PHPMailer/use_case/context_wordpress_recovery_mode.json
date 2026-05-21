@@ -1,0 +1,193 @@
+{
+  "scope": "wordpress_recovery_mode",
+  "title": "WordPress Recovery Mode Workflow",
+  "diagram_type": "use_case",
+  "description": "Admin receives recovery email, follows secure link, and manages PHP error recovery sessions. Introduced in WordPress 5.2 as the Error Protection API.",
+
+  "actors": [
+    "Site Admin (receives email, clicks recovery link, manages session)",
+    "WordPress System (detects fatal errors, orchestrates recovery lifecycle)",
+    "Cron Scheduler (triggers daily key cleanup)"
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Detect Fatal Error",
+      "actor": "WordPress System",
+      "trigger": "WP_Fatal_Error_Handler detects PHP fatal error during request",
+      "handler": "WP_Recovery_Mode::handle_error(array $error)",
+      "notes": "Identifies error source (plugin/theme via file path). Skips network-activated plugins. On non-protected endpoints returns WP_Error without emailing."
+    },
+    {
+      "id": "UC2",
+      "name": "Send Recovery Mode Email",
+      "actor": "WordPress System",
+      "trigger": "Fatal error on protected endpoint, recovery mode not yet active",
+      "handler": "WP_Recovery_Mode_Email_Service::maybe_send_recovery_mode_email($rate_limit, $error, $extension)",
+      "sub_steps": [
+        "Check rate limit via option 'recovery_mode_email_last_sent' (default: 1 day)",
+        "Update rate limit timestamp",
+        "Call send_recovery_mode_email() → link_service->generate_url()",
+        "Build email with placeholders: ###LINK###, ###EXPIRES###, ###CAUSE###, ###DEBUG###",
+        "Resolve recipient: RECOVERY_MODE_EMAIL constant or admin_email option",
+        "Send via wp_mail()"
+      ],
+      "notes": "Rate-limited. Returns WP_Error 'email_sent_already' if within rate limit window."
+    },
+    {
+      "id": "UC3",
+      "name": "Generate Recovery URL",
+      "actor": "WordPress System",
+      "handler": "WP_Recovery_Mode_Link_Service::generate_url()",
+      "sub_steps": [
+        "key_service->generate_recovery_mode_token() → wp_generate_password(22)",
+        "key_service->generate_and_store_recovery_mode_key($token) → hashes key with PasswordHash, stores in DB option 'recovery_keys'",
+        "get_recovery_mode_begin_url($token, $key) → wp-login.php?action=enter_recovery_mode&rm_token=X&rm_key=Y"
+      ],
+      "notes": "Only one valid URL at a time. Key is consumed (deleted) on use. URL filtered via 'recovery_mode_begin_url'."
+    },
+    {
+      "id": "UC4",
+      "name": "Enter Recovery Mode via Link",
+      "actor": "Site Admin",
+      "trigger": "Admin visits wp-login.php?action=enter_recovery_mode&rm_token=X&rm_key=Y",
+      "handler": "WP_Recovery_Mode_Link_Service::handle_begin_link($ttl)",
+      "sub_steps": [
+        "Validate page is wp-login.php with correct GET params",
+        "key_service->validate_recovery_mode_key($token, $key, $ttl): checks existence, hash match, expiry; removes key (one-time use)",
+        "cookie_service->set_cookie(): generates base64(recovery_mode|iat|rand|hmac), sets cookie for WEEK_IN_SECONDS",
+        "Redirect to wp-login.php?action=entered_recovery_mode"
+      ]
+    },
+    {
+      "id": "UC5",
+      "name": "Validate Recovery Session Cookie",
+      "actor": "WordPress System",
+      "trigger": "Subsequent request with RECOVERY_MODE_COOKIE present",
+      "handler": "WP_Recovery_Mode::handle_cookie() → cookie_service->validate_cookie()",
+      "sub_steps": [
+        "parse_cookie(): base64_decode, split on '|' into 4 parts",
+        "Check created_at is numeric and within WEEK_IN_SECONDS",
+        "Verify HMAC signature using AUTH_KEY+AUTH_SALT (or site options fallback)",
+        "get_session_id_from_cookie(): sha1(random_part) → session_id",
+        "Set is_active=true, session_id"
+      ],
+      "notes": "Invalid/expired cookie: clear_cookie() + wp_die(403). Cookie uses recovery-mode-specific HMAC, not wp_hash(), loaded before plugins."
+    },
+    {
+      "id": "UC6",
+      "name": "Manage Error in Active Recovery Session",
+      "actor": "Site Admin",
+      "trigger": "Fatal error occurs while recovery mode is active (is_active=true)",
+      "handler": "WP_Recovery_Mode::handle_error() with is_active check",
+      "sub_steps": [
+        "store_error(): identify extension, call wp_paused_plugins()->set() or wp_paused_themes()->set()",
+        "redirect_protected(): wp_safe_redirect() to reload page with extension paused"
+      ]
+    },
+    {
+      "id": "UC7",
+      "name": "Exit Recovery Mode",
+      "actor": "Site Admin",
+      "trigger": "Admin clicks 'Exit Recovery Mode' link or logs out",
+      "handler": "WP_Recovery_Mode::handle_exit_recovery_mode() or exit_recovery_mode()",
+      "sub_steps": [
+        "Verify nonce (_wpnonce for exit_recovery_mode action)",
+        "email_service->clear_rate_limit(): delete option 'recovery_mode_email_last_sent'",
+        "cookie_service->clear_cookie(): setcookie with past expiry",
+        "wp_paused_plugins()->delete_all()",
+        "wp_paused_themes()->delete_all()",
+        "wp_safe_redirect() to referer or admin_url()"
+      ]
+    },
+    {
+      "id": "UC8",
+      "name": "Clean Expired Recovery Keys",
+      "actor": "Cron Scheduler",
+      "trigger": "Daily cron event 'recovery_mode_clean_expired_keys'",
+      "handler": "WP_Recovery_Mode::clean_expired_keys() → key_service->clean_expired_keys($ttl)",
+      "notes": "Removes keys where time() > created_at + ttl. TTL defaults to email rate limit (1 day), filterable via 'recovery_mode_email_link_ttl'."
+    }
+  ],
+
+  "key_classes": [
+    {
+      "name": "WP_Recovery_Mode",
+      "role": "Orchestrator / Facade",
+      "key_methods": ["initialize()", "handle_error(array $error)", "exit_recovery_mode()", "handle_exit_recovery_mode()", "clean_expired_keys()", "handle_cookie()", "is_active()", "get_session_id()"],
+      "composes": ["WP_Recovery_Mode_Cookie_Service", "WP_Recovery_Mode_Key_Service", "WP_Recovery_Mode_Link_Service", "WP_Recovery_Mode_Email_Service"]
+    },
+    {
+      "name": "WP_Recovery_Mode_Cookie_Service",
+      "role": "Cookie lifecycle management (final class)",
+      "key_methods": ["is_cookie_set()", "set_cookie()", "clear_cookie()", "validate_cookie($cookie)", "get_session_id_from_cookie($cookie)"],
+      "cookie_format": "base64(recovery_mode|iat|rand|hmac_sha1)",
+      "cookie_ttl": "WEEK_IN_SECONDS (filterable: recovery_mode_cookie_length)"
+    },
+    {
+      "name": "WP_Recovery_Mode_Key_Service",
+      "role": "Token/key generation and validation (final class)",
+      "key_methods": ["generate_recovery_mode_token()", "generate_and_store_recovery_mode_key($token)", "validate_recovery_mode_key($token, $key, $ttl)", "clean_expired_keys($ttl)"],
+      "storage": "DB option 'recovery_keys' → {token: {hashed_key, created_at}}",
+      "one_time_use": true
+    },
+    {
+      "name": "WP_Recovery_Mode_Link_Service",
+      "role": "URL generation and login handler",
+      "key_methods": ["generate_url()", "handle_begin_link($ttl)"],
+      "constants": ["LOGIN_ACTION_ENTER = 'enter_recovery_mode'", "LOGIN_ACTION_ENTERED = 'entered_recovery_mode'"],
+      "depends_on": ["WP_Recovery_Mode_Key_Service", "WP_Recovery_Mode_Cookie_Service"]
+    },
+    {
+      "name": "WP_Recovery_Mode_Email_Service",
+      "role": "Email delivery with rate limiting (final class)",
+      "key_methods": ["maybe_send_recovery_mode_email($rate_limit, $error, $extension)", "clear_rate_limit()"],
+      "rate_limit_option": "recovery_mode_email_last_sent",
+      "depends_on": ["WP_Recovery_Mode_Link_Service"]
+    }
+  ],
+
+  "key_relationships": [
+    "WP_Recovery_Mode composes WP_Recovery_Mode_Cookie_Service",
+    "WP_Recovery_Mode composes WP_Recovery_Mode_Key_Service",
+    "WP_Recovery_Mode composes WP_Recovery_Mode_Link_Service",
+    "WP_Recovery_Mode composes WP_Recovery_Mode_Email_Service",
+    "WP_Recovery_Mode_Link_Service depends_on WP_Recovery_Mode_Key_Service",
+    "WP_Recovery_Mode_Link_Service depends_on WP_Recovery_Mode_Cookie_Service",
+    "WP_Recovery_Mode_Email_Service depends_on WP_Recovery_Mode_Link_Service"
+  ],
+
+  "business_rules": [
+    "Recovery email rate-limited to once per day (filterable)",
+    "Recovery link TTL must be >= email rate limit; defaults to 1 day",
+    "Recovery key is single-use: deleted immediately upon validation",
+    "Cookie valid for 1 week (WEEK_IN_SECONDS), filterable via 'recovery_mode_cookie_length'",
+    "Network-activated plugins are excluded from recovery mode handling",
+    "Only errors from plugins/themes trigger recovery (not core WordPress errors)",
+    "Error must occur on a 'protected endpoint' to trigger email flow",
+    "Exiting recovery mode clears all paused plugin/theme records",
+    "Cookie HMAC uses AUTH_KEY+AUTH_SALT or auto-generated site options fallback (recovery_mode_auth_key, recovery_mode_auth_salt)"
+  ],
+
+  "wp_filters_and_actions": [
+    "Filter: recovery_mode_cookie_length — cookie validity duration",
+    "Filter: recovery_mode_email_rate_limit — email resend interval",
+    "Filter: recovery_mode_email_link_ttl — link validity duration",
+    "Filter: recovery_mode_begin_url — modify recovery begin URL",
+    "Filter: recovery_mode_email — modify email content/headers",
+    "Filter: recovery_email_support_info — support text in email",
+    "Filter: recovery_email_debug_info — debug info array in email",
+    "Action: generate_recovery_mode_key — fires when key is generated",
+    "Action: wp_logout — triggers exit_recovery_mode()",
+    "Action: recovery_mode_clean_expired_keys — daily cron cleanup"
+  ],
+
+  "source_files_analyzed": [
+    "tests/Frameworks/WordPress/Version_6_1/wp-includes/class-wp-recovery-mode.php",
+    "tests/Frameworks/WordPress/Version_6_1/wp-includes/class-wp-recovery-mode-cookie-service.php",
+    "tests/Frameworks/WordPress/Version_6_1/wp-includes/class-wp-recovery-mode-key-service.php",
+    "tests/Frameworks/WordPress/Version_6_1/wp-includes/class-wp-recovery-mode-email-service.php",
+    "tests/Frameworks/WordPress/Version_6_1/wp-includes/class-wp-recovery-mode-link-service.php"
+  ]
+}

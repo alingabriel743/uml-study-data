@@ -1,0 +1,128 @@
+@startuml
+
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #E6A817
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam noteBackgroundColor #E8F4FD
+skinparam noteBorderColor #5BA4CF
+
+title Package Removal Flow
+
+|Installer|
+start
+:Receive list of UninstallOperation(s)\nfrom Installer::run();
+:Call installationManager->execute(\n  repo, operations, devMode, runScripts);
+
+|InstallationManager|
+:Group operations into batches\n(plugin-modifying-download packages\nget their own first batch);
+
+repeat
+  :downloadAndExecuteBatch(\n  repo, batch, cleanupPromises);
+  note right
+    For each uninstall op:
+    register cleanupPromise
+    (installer->cleanup) and
+    **skip** download phase
+  end note
+  :Await all download promises\n(Loop::wait via waitOnPromises);
+
+  if (downloadOnly == true?) then (yes)
+    :runCleanup(cleanupPromises);
+    stop
+  else (no)
+  endif
+
+  :Split batch into sub-batches\n(composer-plugin / composer-installer\ntypes isolated in own sub-batches);
+
+  repeat
+    :executeBatch(repo, subBatch, cleanupPromises);
+    :Resolve installer by package->getType();
+
+    |EventDispatcher|
+    :Dispatch PRE_PACKAGE_UNINSTALL event\n(if runScripts && eventDispatcher set);
+
+    |InstallationManager|
+    :installer->prepare('uninstall', package)\n→ returns PromiseInterface;
+    :InstallationManager::uninstall(\n  repo, UninstallOperation);
+
+    |LibraryInstaller|
+    if (repo->hasPackage(package)?) then (false)
+      #FFB3B3:Throw InvalidArgumentException\n"Package not installed";
+      stop
+    else (true)
+    endif
+
+    :removeCode(package)\n→ DownloadManager::remove(\n    package, downloadPath);
+
+    |DownloadManager|
+    if (package type == 'metapackage'?) then (yes)
+      note right
+        getDownloaderForPackage()
+        returns null — no files
+        to remove from disk
+      end note
+    else (no)
+      if (installationSource?) then (dist)
+        :Resolve dist downloader\n(e.g. ZipDownloader);
+      else (source)
+        :Resolve source downloader\n(e.g. GitDownloader, SvnDownloader);
+      endif
+      :downloader->remove(package, targetDir)\n[Delete package files from filesystem];
+    endif
+
+    |BinaryInstaller|
+    :removeBinaries(package)\n[Remove symlinks / shims\nfrom configured bin-dir];
+
+    |InstalledRepository|
+    :repo->removePackage(package)\n[Remove from in-memory installed set];
+
+    |LibraryInstaller|
+    if (vendor namespace sub-dir empty\nafter file removal?) then (yes)
+      :rmdir vendor namespace sub-dir;
+    else (no)
+    endif
+
+    :Resolve cleanupPromise\n(installer->cleanup('uninstall', package));
+
+    |DownloadManager|
+    :DownloadManager::cleanup(\n  'uninstall', package, targetDir)\n→ downloader->cleanup();
+
+    |InstalledRepository|
+    :repo->write(devMode, installationManager)\n[Persist repository state after each op];
+
+  repeat while (more operations in sub-batch?) is (yes)
+  -> no;
+
+  |EventDispatcher|
+  :Dispatch POST_PACKAGE_UNINSTALL event(s)\n[one postExecCallback per operation];
+
+  |InstallationManager|
+  :Platform::workaroundFilesystemIssues();
+
+repeat while (more batches?) is (yes)
+-> no;
+
+|InstalledRepository|
+:repo->write(devMode, installationManager)\n[Final repository write after all batches];
+
+|Installer|
+:locker->setLockData(\n  newPackages, newDevPackages, platformReqs, ...)\n[Write updated composer.lock];
+
+stop
+
+@enduml

@@ -1,0 +1,214 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #F1F3F5
+    DividerBackgroundColor #DEE2E6
+    GroupBackgroundColor #E9ECEF
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Cloudflare Worker Deployment Flow
+
+actor Client
+participant "WorkerService" as ws
+participant "cloudflareDeploy" as cf
+participant "PuterFilesystem" as pfs
+participant "SubdomainEntityStore" as ses
+participant "svc_auth" as auth
+participant "svc_event" as evt
+participant "puterUtils" as pu
+participant "NotificationService" as notif
+participant "CloudflareAPI" as cfapi
+
+== Init Phase ==
+
+ws -> cf : setCloudflareKeys(config)\n[XAUTHKEY, ACCOUNTID, namespace]
+activate cf
+note right of cf
+  Builds WORKERS_BASE_URL:
+  CF_BASE_URL + 'client/v4/accounts/<ACCOUNTID>/workers'
+  (+ '/dispatch/namespaces/<namespace>' if set)
+end note
+cf --> ws : keys configured
+deactivate cf
+
+ws -> evt : on('fs.write.file', autoDeployHandler)
+note right of ws
+  Registers auto-deploy listener
+  for file-write events
+end note
+
+ws -> ws : preamble = fs.readFileSync('dist/workerPreamble.js')
+note right of ws
+  Compiled by webpack from puter-portable.js
+  (defines init_puter_portable, includes puter.js)
+end note
+ws -> ws : PREAMBLE_LENGTH = preamble.split('\\n').length - 1
+note right of ws
+  Used for V8 stack trace line-offset correction
+  so errors point to user code lines
+end note
+
+== Manual Create Flow (Driver API) ==
+
+Client -> ws : create({filePath, workerName, authorization, appId})
+activate ws
+
+ws -> ses : select(StartsWith 'workers.puter.')
+activate ses
+ses --> ws : subdomainCount
+deactivate ses
+
+alt subdomainCount > 100
+    ws --> Client : error("Worker limit reached")
+else subdomainCount <= 100
+
+    opt appId provided
+        ws -> auth : get_user_app_token(appId)
+        activate auth
+        auth --> ws : appScopedToken
+        deactivate auth
+    end
+
+    ws -> pu : getUserInfo(authorization, api_base_url)
+    activate pu
+    pu --> ws : userData (uuid, username, ...)
+    deactivate pu
+
+    ws -> pfs : readPuterFile(actor, filePath) [max 10MB]
+    activate pfs
+    pfs --> ws : fileData (stream)
+    deactivate pfs
+
+    ws -> ses : upsert({subdomain:'workers.puter.<calcName>', root_dir:filePath})
+    activate ses
+    ses --> ws : entity registered
+    deactivate ses
+
+    ws -> cf : createWorker(userData, authorization, calcName,\npreamble+fileData, PREAMBLE_LENGTH)
+    activate cf
+
+    note right of cf
+      body = preamble + userFileData
+      (concatenated before upload)
+    end note
+
+    cf -> cf : FormData.append('metadata', workerMetaData)\n  body_part: 'swCode'\n  bindings: [puter_auth, puter_endpoint]\n  compatibility_flags: ['global_fetch_strictly_public']\n  compatibility_date: '2025-07-15'
+
+    cf -> cfapi : cfFetch(WORKERS_BASE_URL+'/scripts/<workerName>/',\nPUT, formData)\n[Authorization: Bearer XAUTHKEY]
+    activate cfapi
+    cfapi --> cf : response JSON {success, errors, result}
+    deactivate cfapi
+
+    alt success
+        cf --> ws : {success:true, url:'https://<workerName>.puter.work'}
+    else failure
+        cf --> ws : {success:false, errors:[parsedErrors], body}
+    end
+
+    deactivate cf
+
+    ws --> Client : cfData {success, url}
+
+end
+
+deactivate ws
+
+== Auto-Deploy Flow (Event-Driven fs.write.file) ==
+
+pfs -> evt : emit('fs.write.file', {node, meta})
+activate evt
+evt -> ws : autoDeployHandler(data)
+deactivate evt
+activate ws
+
+alt meta.from_outside == true
+    note over ws : Skip — avoids double-deploy\non broadcast events
+else proceed with auto-deploy
+
+    ws -> ses : select(Eq root_dir == data.node)
+    activate ses
+    ses --> ws : subdomainEntity (or null)
+    deactivate ses
+
+    ws -> ws : verify subdomain starts with 'workers.puter.'
+
+    ws -> pfs : readPuterFile(actor, data.node.path)
+    activate pfs
+    pfs --> ws : updatedFileData
+    deactivate pfs
+
+    alt app-owned worker (appId present)
+        ws -> auth : get_user_app_token(appId)
+        activate auth
+        auth --> ws : appScopedToken
+        deactivate auth
+    else user-owned worker
+        ws -> auth : create_session_token(owner)
+        activate auth
+        auth --> ws : sessionToken
+        deactivate auth
+    end
+
+    ws -> cf : createWorker(ownerUserData, authToken,\nworkerName, preamble+updatedFileData, PREAMBLE_LENGTH)
+    activate cf
+    cf -> cfapi : cfFetch(WORKERS_BASE_URL+'/scripts/<workerName>/',\nPUT, formData)
+    activate cfapi
+    cfapi --> cf : response JSON {success, errors, result}
+    deactivate cfapi
+    cf --> ws : {success, url}
+    deactivate cf
+
+    alt deploy succeeded
+        ws -> notif : notify(UsernameNotifSelector,\n{title:'Deployed <url>'})
+    else deploy failed
+        ws -> notif : notify(UsernameNotifSelector,\n{title:'Failed to deploy'})
+    end
+    activate notif
+    notif --> ws : notification sent
+    deactivate notif
+
+end
+
+deactivate ws
+
+== Preamble: Portable Puter Init (Build Time) ==
+
+note over ws, cfapi
+  **puter-portable.js → dist/workerPreamble.js  (webpack build)**
+
+  init_puter_portable(auth, apiOrigin, type='userPuter'):
+    1. Patches EventTarget for Cloudflare Worker environment
+    2. Inits puter.js via C-preprocessor #include (appended by webpack)
+    3. Calls puter.setAPIOrigin(apiOrigin)   [from CF plain_text binding: puter_endpoint]
+    4. Calls puter.setAuthToken(auth)         [from CF secret_text binding: puter_auth]
+    5. Uses with() scope to create isolated context (avoids global pollution)
+
+  → Every worker upload = preamble (portable puter runtime) + user script
+end note
+
+@enduml

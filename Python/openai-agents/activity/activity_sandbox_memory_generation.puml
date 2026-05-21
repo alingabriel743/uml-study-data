@@ -1,0 +1,178 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleBackgroundColor #DEE2E6
+}
+skinparam note {
+    BackgroundColor #FFF9DB
+    BorderColor #CCA300
+    FontColor #333333
+}
+
+title Sandbox Memory Generation Pipeline
+
+' ─────────────────────────────────────────────
+'  PHASE 0 — ENQUEUE RESULT
+' ─────────────────────────────────────────────
+
+|Sandbox Session|
+start
+:Runner.run() completes\nwithin sandbox session;
+:enqueue_result(\n  result, exception,\n  input_override, rollout_id\n);
+
+|Memory Manager|
+:Acquire _flush_lock;
+if (_stopped flag set?) then (yes)
+    :Return early — no-op\n(post-flush enqueues blocked);
+    stop
+else (no)
+endif
+:build_rollout_payload_from_result()\n→ serialized payload dict\n(RunResult + exception + input_override);
+:storage.ensure_layout()\n→ create sessions/ & memories/ dirs\n(idempotent);
+:_validate_rollout_id(rollout_id)\n→ normalized rollout_id\n[regex: ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$];
+:Build ordered_payload\n(updated_at key first,\nrollout_id key second);
+:write_rollout(session, ordered_payload)\n→ append JSON line to\nsessions/{rollout_id}.jsonl;
+:Store rollout_file.name in\n_rollout_files_by_rollout_id[rollout_id];
+:Release _flush_lock;
+
+' ─────────────────────────────────────────────
+'  PHASE 1 — FLUSH INITIATION (session close)
+' ─────────────────────────────────────────────
+
+|Sandbox Session|
+:Session closes\n→ pre-stop hook fires\n(registered in __init__);
+:Trigger flush();
+
+|Memory Manager|
+:Acquire _flush_lock;
+if (Already _stopped?) then (yes)
+    :Return early\n(double-flush guard);
+    stop
+else (no)
+endif
+:Set _stopped = True;
+:Compute rollout_files =\nsorted(set(\n  _rollout_files_by_rollout_id.values()\n));
+if (rollout_files empty?) then (yes)
+    :Skip all processing\n(nothing was enqueued);
+    stop
+else (no)
+endif
+:storage.ensure_layout();
+:_ensure_worker()\n→ lazily create asyncio.Task(_worker)\nif worker_task is None or done;
+:Enqueue all rollout JSONL filenames\ninto asyncio.Queue\n(queue.put_nowait per file);
+note right
+  _flush_lock guards both
+  enqueue_rollout_payload and flush
+  to prevent concurrent mutations
+end note
+
+' ─────────────────────────────────────────────
+'  PHASE 1 — WORKER TASK (per-rollout Phase-1 extraction)
+' ─────────────────────────────────────────────
+
+|Worker Task|
+note right
+  Single asyncio.Task —
+  queue serializes rollout
+  file processing
+end note
+:await queue.get() → queue_item;
+if (queue_item is _STOP sentinel?) then (yes)
+    :Worker task exits;
+else (no)
+    :_process_rollout_file(rollout_file);
+    :storage.read_text(\n  sessions/{rollout_id}.jsonl\n) → rollout_contents (JSONL text);
+    :render_phase_one_prompt(rollout_contents)\n→ phase_one_prompt;
+    :run_phase_one() [LLM — MemoryGenerateConfig model]\n→ RolloutExtractionArtifacts\n  • rollout_slug\n  • rollout_summary\n  • raw_memory;
+    if (validate_rollout_artifacts fails?) then (yes)
+        :Discard rollout\n(not promoted to phase-2);
+        :queue.task_done();
+    else (no)
+        :Parse JSONL payloads\n[json.loads per non-empty line];
+        if (Payloads empty?) then (yes)
+            :Return early;
+            :queue.task_done();
+        else (no)
+            :Extract last-payload metadata\n(updated_at, terminal_state\nfrom terminal_metadata dict);
+            :rollout_id_from_rollout_path()\n+ normalize_rollout_slug()\n→ rollout_id + rollout_slug;
+            fork
+                :Write memories/raw_memories/\n{rollout_id}.md\n(_format_raw_memory(...));
+            fork again
+                :Write memories/rollout_summaries/\n{rollout_id}_{slug}.md\n(_format_rollout_summary(...));
+            end fork
+            note right
+              asyncio.gather writes both
+              files concurrently
+            end note
+            :Append rollout_id to\n_pending_phase_two_rollout_ids;
+            :queue.task_done();
+        endif
+    endif
+    :Await next queue item...;
+endif
+
+' ─────────────────────────────────────────────
+'  PHASE 2 — GLOBAL MEMORY CONSOLIDATION
+' ─────────────────────────────────────────────
+
+|Memory Manager|
+:Await queue.join()\n(block until all items\nprocessed by worker);
+:queue.put_nowait(_STOP sentinel);
+:Await worker_task exits;
+:Set worker_task = None;
+:_run_phase_two();
+if (_pending_phase_two_rollout_ids empty?) then (yes)
+    :Skip phase-2 synthesis\n(no valid rollouts extracted);
+    stop
+else (no)
+endif
+:Deduplicate rollout_ids\n= list(dict.fromkeys(\n  _pending_phase_two_rollout_ids\n));
+:storage.build_phase_two_input_selection(\n  max_raw_memories_for_consolidation\n) → PhaseTwoInputSelection;
+note right
+  Recency-based forgetting applied
+  when count > max (default: 256)
+  — newer raw memories are kept
+end note
+:storage.rebuild_raw_memories(selection.selected)\n→ raw_memories.md (concat)\n→ bool;
+if (rebuild_raw_memories returned False?) then (yes)
+    :Skip LLM consolidation\n(rebuild failed or no-op);
+    stop
+else (no)
+endif
+:run_phase_two() [LLM Agent]\n→ synthesize consolidated memory:\n  • memories/MEMORY.md\n  • memories/memory_summary.md;
+if (Phase-2 exception?) then (yes)
+    :Log exception\n(write_phase_two_selection NOT called;\npending IDs NOT cleared — retryable);
+    stop
+else (no)
+endif
+:storage.write_phase_two_selection()\n→ memories/phase_two_selection.json\n(records which raw memories were used);
+:Remove processed rollout_ids from\n_pending_phase_two_rollout_ids;
+:_unregister_memory_generation_manager\n(session, self)\n→ WeakKeyDictionary registry cleanup;
+stop
+
+@enduml

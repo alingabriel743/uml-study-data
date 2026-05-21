@@ -1,0 +1,128 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam actor {
+    BackgroundColor #D0E8FF
+    BorderColor #2A6496
+    FontColor #212529
+}
+skinparam usecase {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+    ArrowColor #495057
+}
+skinparam rectangle {
+    BackgroundColor #EEF2F7
+    BorderColor #6C757D
+    FontColor #212529
+}
+
+title Multiview Diffusion Model Training
+
+left to right direction
+
+' ── Primary Actors ──────────────────────────────────────────
+actor "Trainer" as Trainer
+actor "DataLoader" as DataLoader
+actor "Configuration\nSystem" as ConfigSys
+
+' ── Supporting Actors ────────────────────────────────────────
+actor "Parallel State\nManager\n(Megatron CP/TP)" as ParallelState #E8F5E9/B2DFDB
+actor "VAE\n(per-view encode/decode)" as VAE #FFF8E1/FFE0B2
+actor "Conditioner\n(CosmosCondition)" as Conditioner #FCE4EC/F8BBD0
+
+' ── System Boundary ──────────────────────────────────────────
+rectangle "Multiview Diffusion Model Training System" {
+
+    ' ── Setup & Initialisation ───────────────────────────────
+    package "Setup & Initialisation" {
+        usecase "Configure Multiview Model\n(MultiviewModelConfig, n_views=6\nsigma_data=0.5, loss_reduce='sum')" as UC1
+        usecase "Initialise\nMultiviewDiffusionModel" as UC2
+        usecase "Initialise\nMultiviewGeneralDIT Network\n(view_embeddings, RoPE3D)" as UC3
+        usecase "FSDP-Wrapped\nModel Training\n(FSDPDiffusionModel)" as UC11
+    }
+
+    ' ── Data & Latent Handling ───────────────────────────────
+    package "Data & Latent Handling" {
+        usecase "Load Training Batch\n(video / images_1024)" as UCData
+        usecase "Encode Multiview State\n(B C (V T) H W → VAE → latent)" as UC4
+        usecase "Decode Multiview Latent\n(latent / sigma_data → VAE → video)" as UC5
+    }
+
+    ' ── Training Loop ────────────────────────────────────────
+    package "Training Loop" {
+        usecase "Compute Training Loss\n(compute_loss_with_epsilon_and_sigma\nEDM loss + Kendall loss)" as UC6
+        usecase "Apply Context Parallelism\n(split_inputs_cp / cat_outputs_cp\nper-view temporal split)" as UCCP
+        usecase "Generate Training Samples\n(generate_samples_from_batch\nn_steps=35, solver='2ab', guidance=1.5)" as UC7
+        usecase "Build Denoising Function\n(get_x0_fn_from_batch\nCFG + optional inpainting)" as UC8
+    }
+
+    ' ── DIT Forward Pass ─────────────────────────────────────
+    package "DIT Forward Pass" {
+        usecase "Execute DIT Forward Pass\n(forward_before_blocks\nt_embedder + affine_norm)" as UC10
+        usecase "Prepare Embedded Sequence\n(prepare_embedded_sequence\nview_emb + PatchEmbed + RoPE3D)" as UC9
+    }
+}
+
+' ── Actor → Use-Case Associations ────────────────────────────
+ConfigSys  --> UC1
+Trainer    --> UC2
+Trainer    --> UC3
+Trainer    --> UC11
+DataLoader --> UCData
+Trainer    --> UCData
+Trainer    --> UC4
+Trainer    --> UC5
+Trainer    --> UC6
+Trainer    --> UC7
+Trainer    --> UC10
+Trainer    --> UC9
+ParallelState --> UCCP
+VAE        --> UC4
+VAE        --> UC5
+Conditioner --> UC8
+
+' ── Include / Extend Relationships ───────────────────────────
+UC2   <.. UC11  : <<extend>>\nFSDP variant
+UC7   ..> UC8   : <<include>>\nget_x0_fn_from_batch
+UC10  ..> UC9   : <<include>>\nprepare_embedded_sequence
+UC6   ..> UCCP  : <<include>>\nCP split (video batches)
+UC7   ..> UCCP  : <<include>>\nCP split / cat outputs
+UC4   ..> UC3   : <<include>>\nuses n_views rearrange
+UC1   ..> UC2   : <<include>>\nprovides config
+
+' ── Notes ────────────────────────────────────────────────────
+note bottom of UCCP
+  CP only active for video batches.
+  Image batches: CP disabled.
+  Splits temporal dim per view.
+end note
+
+note right of UC9
+  view_embeddings (nn.Embedding)
+  concatenated channel-wise before PatchEmbed.
+  pos_emb_cls = 'rope3d'
+end note
+
+note right of UC8
+  Standard CFG guidance.
+  Dual-guidance (trajectory).
+  Inpainting via guided_image/mask.
+end note
+
+@enduml

@@ -1,0 +1,156 @@
+{
+  "scope": "gtid_based_recovery_flow",
+  "title": "GTID-Based Binlog Recovery Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "BinlogStreamingChangeEventSource",
+    "BinlogConnectorConfig",
+    "BinlogConnectorConnection",
+    "BinaryLogClient",
+    "BinlogOffsetContext",
+    "BinlogReadOnlyIncrementalSnapshotContext",
+    "BinlogStreamingChangeEventSourceMetrics"
+  ],
+  "interaction_flow": [
+    "Caller → BinlogStreamingChangeEventSource: execute(context, partition, offsetContext)",
+    "BinlogStreamingChangeEventSource → BinlogStreamingChangeEventSource: register event handlers (STOP, HEARTBEAT, ROTATE, TABLE_MAP, QUERY, GTID, DML, XID)",
+    "BinlogStreamingChangeEventSource → BinlogConnectorConnection: isGtidModeEnabled() → boolean",
+    "BinlogStreamingChangeEventSource → BinlogStreamingChangeEventSourceMetrics: setIsGtidModeEnabled(isGtidModeEnabled)",
+
+    "== GTID path: isGtidModeEnabled && shouldRecoverUsingGtid() ==",
+    "BinlogStreamingChangeEventSource → BinlogConnectorConfig: shouldIgnoreGtidOnRecovery() [reads IGNORE_GTID_ON_RECOVERY config]",
+    "BinlogStreamingChangeEventSource → BinlogStreamingChangeEventSource: shouldRecoverUsingGtid() → !config.shouldIgnoreGtidOnRecovery()",
+    "BinlogStreamingChangeEventSource → BinlogStreamingChangeEventSource: register handleGtidEvent handler for GTID EventType",
+    "BinlogStreamingChangeEventSource → BinlogConnectorConnection: knownGtidSet() → GtidSet availableServerGtidSet",
+    "BinlogStreamingChangeEventSource → BinlogConnectorConnection: purgedGtidSet() → GtidSet purgedServerGtidSet",
+    "BinlogStreamingChangeEventSource → BinlogOffsetContext: gtidSet() → String offsetGtids (restartGtidSet from stored offset)",
+    "BinlogStreamingChangeEventSource → BinlogConnectorConnection: filterGtidSet(gtidSourceFilter, offsetGtids, availableServerGtidSet, purgedServerGtidSet) → GtidSet filteredGtidSet",
+
+    "alt filteredGtidSet != null (prior GTIDs exist)",
+    "BinlogStreamingChangeEventSource → BinaryLogClient: setGtidSet(filteredGtidSetStr)",
+    "BinlogStreamingChangeEventSource → BinlogOffsetContext: setCompletedGtidSet(filteredGtidSetStr) [sets both currentGtidSet and restartGtidSet]",
+    "BinlogStreamingChangeEventSource → BinlogStreamingChangeEventSource: initializeGtidSet(filteredGtidSetStr) [abstract — MySQL/MariaDB impl]",
+
+    "alt filteredGtidSet == null && purgedServerGtidSet is empty (no prior GTIDs)",
+    "BinlogStreamingChangeEventSource → BinaryLogClient: setBinlogFilename(offsetContext.getSource().binlogFilename())",
+    "BinlogStreamingChangeEventSource → BinaryLogClient: setBinlogPosition(offsetContext.getSource().binlogPosition())",
+    "BinlogStreamingChangeEventSource → BinaryLogClient: setGtidSet(\"\")",
+    "BinlogStreamingChangeEventSource → BinlogStreamingChangeEventSource: initializeGtidSet(\"\") [abstract]",
+
+    "alt filteredGtidSet == null && purgedServerGtidSet non-empty",
+    "BinlogStreamingChangeEventSource → BinaryLogClient: setBinlogFilename(offsetContext.getSource().binlogFilename())",
+    "BinlogStreamingChangeEventSource → BinaryLogClient: setBinlogPosition(offsetContext.getSource().binlogPosition())",
+    "BinlogStreamingChangeEventSource → BinaryLogClient: setGtidSet(purgedServerGtidSet.toString())",
+    "BinlogStreamingChangeEventSource → BinlogStreamingChangeEventSource: initializeGtidSet(\"\") [start from empty, purged used only for client]",
+
+    "== Fallback path: !isGtidModeEnabled OR shouldIgnoreGtidOnRecovery ==",
+    "BinlogStreamingChangeEventSource → BinaryLogClient: setBinlogFilename(offsetContext.getSource().binlogFilename())",
+    "BinlogStreamingChangeEventSource → BinaryLogClient: setBinlogPosition(offsetContext.getSource().binlogPosition())",
+    "opt isGtidModeEnabled but shouldIgnoreGtidOnRecovery",
+    "BinlogStreamingChangeEventSource → BinlogStreamingChangeEventSource: initializeGtidSet(\"\") [reset client GTID state]",
+    "BinlogStreamingChangeEventSource → BinlogStreamingChangeEventSource: prepareOffsetContextForBinlogRecovery(offsetContext)",
+    "BinlogStreamingChangeEventSource → BinlogOffsetContext: resetGtidSet() [clears currentGtidSet and restartGtidSet]",
+
+    "== Position recovery: skip already-processed events ==",
+    "BinlogStreamingChangeEventSource → BinlogOffsetContext: eventsToSkipUponRestart() → initialEventsToSkip",
+    "BinlogStreamingChangeEventSource → BinlogOffsetContext: rowsToSkipUponRestart() → startingRowNumber",
+
+    "== Connect and stream ==",
+    "BinlogStreamingChangeEventSource → BinaryLogClient: connect(timeoutMs)",
+    "BinaryLogClient → BinlogStreamingChangeEventSource: [fires events via registered EventListeners]",
+
+    "== GTID event handling during streaming ==",
+    "BinaryLogClient → BinlogStreamingChangeEventSource: handleGtidEvent(partition, offsetContext, event, gtidDmlSourceFilter) [abstract]",
+    "BinlogStreamingChangeEventSource → BinlogOffsetContext: startGtid(gtid, gtidSet) [updates currentGtidSet; restartGtidSet = prev currentGtidSet]",
+    "BinlogStreamingChangeEventSource → BinlogStreamingChangeEventSource: setGtidChanged(gtid) → metrics.onGtidChange(gtid)",
+    "BinaryLogClient → BinlogStreamingChangeEventSource: handleQueryEvent / BEGIN → startNextTransaction()",
+    "BinlogOffsetContext → BinlogOffsetContext: startNextTransaction() [saves binlogFilename+position as restart point, sets transactionId via GTID or file+pos]",
+    "BinaryLogClient → BinlogStreamingChangeEventSource: handleTransactionCompletion / XID → commitTransaction()",
+    "BinlogOffsetContext → BinlogOffsetContext: commitTransaction() [restartGtidSet = currentGtidSet, updates restartBinlogPosition]",
+    "BinlogStreamingChangeEventSource → BinlogOffsetContext: getOffset() → offsetUsingPosition() [serializes restartGtidSet under key 'gtids' + binlog filename/position]"
+  ],
+  "key_methods": {
+    "BinlogStreamingChangeEventSource": [
+      "execute(ChangeEventSourceContext, P partition, O offsetContext) throws InterruptedException",
+      "shouldRecoverUsingGtid() → !connectorConfig.shouldIgnoreGtidOnRecovery()",
+      "prepareOffsetContextForBinlogRecovery(O offsetContext) → offsetContext.resetGtidSet()",
+      "isGtidModeEnabled() → boolean",
+      "setGtidChanged(String gtid) → metrics.onGtidChange(gtid)",
+      "handleGtidEvent(P, O, Event, Predicate<String>) [abstract]",
+      "initializeGtidSet(String value) [abstract]",
+      "getGtidEventType() [abstract]"
+    ],
+    "BinlogOffsetContext": [
+      "gtidSet() → currentGtidSet",
+      "setCompletedGtidSet(String) [sets currentGtidSet and restartGtidSet]",
+      "startGtid(String gtid, String gtidSet) [restartGtidSet = prev currentGtidSet; currentGtidSet = trimmed new set]",
+      "resetGtidSet() [clears both currentGtidSet and restartGtidSet]",
+      "startNextTransaction() [saves restart binlogFilename/position; sets transactionId]",
+      "commitTransaction() [restartGtidSet = currentGtidSet; advance restartBinlogPosition]",
+      "setInitialSkips(long eventsToSkip, int rowsToSkip)",
+      "eventsToSkipUponRestart() → restartEventsToSkip",
+      "rowsToSkipUponRestart() → restartRowsToSkip",
+      "setBinlogStartPoint(String filename, long position)",
+      "setEventPosition(long pos, long sizeInBytes)",
+      "getOffset() → offsetUsingPosition() + snapshot/transactionContext/incrementalSnapshotContext"
+    ],
+    "BinlogConnectorConfig": [
+      "shouldIgnoreGtidOnRecovery() → ignoreGtidOnRecovery [from IGNORE_GTID_ON_RECOVERY field]",
+      "getGtidSourceFilter() [abstract] → Predicate<String>",
+      "getGtidSetFactory() [abstract] → GtidSetFactory"
+    ],
+    "BinlogConnectorConnection": [
+      "isGtidModeEnabled() [abstract] → boolean",
+      "knownGtidSet() [abstract] → GtidSet",
+      "purgedGtidSet() [abstract] → GtidSet",
+      "filterGtidSet(Predicate<String>, String offsetGtids, GtidSet available, GtidSet purged) [abstract] → GtidSet"
+    ],
+    "BinlogReadOnlyIncrementalSnapshotContext": [
+      "getCurrentGtid(OffsetContext) → sourceInfo.getString(BinlogSourceInfo.GTID_KEY)",
+      "setLowWatermark(GtidSet) [abstract]",
+      "setHighWatermark(GtidSet) [abstract]",
+      "reachedHighWatermark(String currentGtid) [abstract]",
+      "updateWindowState(OffsetContext) [abstract]",
+      "watermarksChanged() [abstract]",
+      "hasServerIdentifierChanged() [abstract]"
+    ]
+  },
+  "key_relationships": [
+    "BinlogStreamingChangeEventSource depends_on BinlogConnectorConnection (GTID queries)",
+    "BinlogStreamingChangeEventSource depends_on BinlogConnectorConfig (GTID config flags)",
+    "BinlogStreamingChangeEventSource depends_on BinaryLogClient (sets GTID set / binlog position)",
+    "BinlogStreamingChangeEventSource reads_and_writes BinlogOffsetContext (GTID state tracking)",
+    "BinlogOffsetContext contains IncrementalSnapshotContext<TableId> (BinlogReadOnlyIncrementalSnapshotContext impl)",
+    "BinlogOffsetContext extends CommonOffsetContext<BinlogSourceInfo>",
+    "BinlogConnectorConfig extends HistorizedRelationalDatabaseConnectorConfig",
+    "handleGtidEvent() and initializeGtidSet() are abstract — overridden by MySQL/MariaDB subclasses"
+  ],
+  "gtid_offset_keys": {
+    "GTID_SET_KEY": "'gtids' — stored in offset map as restartGtidSet",
+    "BINLOG_FILENAME_OFFSET_KEY": "binlog filename",
+    "BINLOG_POSITION_OFFSET_KEY": "binlog position",
+    "EVENTS_TO_SKIP_OFFSET_KEY": "'event' — count of events to skip after restart",
+    "BINLOG_ROW_IN_EVENT_OFFSET_KEY": "rows to skip within event"
+  },
+  "config_fields": {
+    "GTID_SOURCE_INCLUDES": "gtid.source.includes — LIST, include GTID source filter",
+    "GTID_SOURCE_EXCLUDES": "gtid.source.excludes — STRING, exclude GTID source filter (mutually exclusive with includes)",
+    "GTID_SOURCE_FILTER_DML_EVENTS": "gtid.source.filter.dml.events — BOOLEAN default true, filter DML events by GTID source",
+    "IGNORE_GTID_ON_RECOVERY": "gtid.ignore.on.recovery — BOOLEAN default false, use binlog position instead of GTID on recovery"
+  },
+  "decision_logic": {
+    "use_gtid_recovery": "isGtidModeEnabled (from server) AND !connectorConfig.shouldIgnoreGtidOnRecovery()",
+    "filtered_gtid_set_non_null": "prior GTIDs exist in offset → client.setGtidSet(filtered); offsetContext.setCompletedGtidSet(filtered)",
+    "filtered_gtid_set_null_no_purge": "no prior GTIDs, no purged → client.setGtidSet(''); initializeGtidSet('')",
+    "filtered_gtid_set_null_with_purge": "no prior GTIDs, purged exist → client.setGtidSet(purged); initializeGtidSet('')",
+    "binlog_position_fallback": "not GTID mode OR shouldIgnoreGtidOnRecovery → setBinlogFilename/Position; optionally resetGtidSet"
+  },
+  "important_notes": "handleGtidEvent() and initializeGtidSet() are abstract — MySQL connector uses GtidEventData; MariaDB uses AnnotateRowsEventData-style GTID. BinlogOffsetContext maintains TWO GTID sets: restartGtidSet (safe pre-transaction) and currentGtidSet (includes ongoing tx). On restart with GTID offset, filterGtidSet merges server-known, purged, and last-checkpoint sets. IGNORE_GTID_ON_RECOVERY allows server-side GTID mode to remain enabled while the connector uses binlog file+position for recovery.",
+  "source_files_analyzed": [
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogStreamingChangeEventSource.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogOffsetContext.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogConnectorConfig.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogReadOnlyIncrementalSnapshotContext.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/jdbc/BinlogConnectorConnection.java"
+  ]
+}

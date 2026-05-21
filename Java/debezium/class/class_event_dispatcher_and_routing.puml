@@ -1,0 +1,261 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #F9A825
+}
+skinparam interface {
+    BackgroundColor #EAF4FB
+    BorderColor #2980B9
+}
+
+title Event Dispatcher & Routing
+
+' ── io.debezium.spi.topic ─────────────────────────────────────────────────────
+package "io.debezium.spi.topic" {
+
+    interface "TopicNamingStrategy<I>" as TopicNamingStrategy <<Incubating>> {
+        +{static} MAX_NAME_LENGTH: int = 249
+        +configure(properties: Properties): void
+        +dataChangeTopic(id: I): String
+        +schemaChangeTopic(): String
+        +heartbeatTopic(): String
+        +transactionTopic(): String
+        +sanitizedTopicName(name: String): String
+        +recordSchemaPrefix(id: I): String
+        +keySchemaAugment(): TopicSchemaAugment
+        +keyValueAugment(): TopicValueAugment
+    }
+
+    interface TopicSchemaAugment<S> {
+        +augment(schemaBuilder: S): boolean
+    }
+
+    interface TopicValueAugment<I,S,R> {
+        +augment(id: I, schema: S, struct: R): boolean
+    }
+}
+
+' ── io.debezium.pipeline ──────────────────────────────────────────────────────
+package "io.debezium.pipeline" {
+
+    interface Sizeable {
+        +objectSize(): long
+    }
+
+    interface "SnapshotReceiver<P>" as SnapshotReceiver {
+        +completeSnapshot(): void
+    }
+
+    interface "InconsistentSchemaHandler<P,T>" as InconsistentSchemaHandler <<FunctionalInterface>> {
+        +handle(partition: P, id: T, emitter: ChangeRecordEmitter<P>): Optional<DataCollectionSchema>
+    }
+
+    class DataChangeEvent {
+        -record: SourceRecord
+        +DataChangeEvent(record: SourceRecord)
+        +getRecord(): SourceRecord
+        +objectSize(): long
+    }
+
+    class "EventDispatcher<P, T>" as EventDispatcher {
+        -topicNamingStrategy: TopicNamingStrategy<T>
+        -schema: DatabaseSchema<T>
+        -historizedSchema: HistorizedDatabaseSchema<T>
+        -queue: ChangeEventQueue<DataChangeEvent>
+        -filter: DataCollectionFilter<T>
+        -changeEventCreator: ChangeEventCreator
+        -debeziumHeaderProducer: DebeziumHeaderProducer
+        -heartbeat: ScheduledHeartbeat
+        -eventListener: DataChangeEventListener<P>
+        -transactionMonitor: TransactionMonitor
+        -signalProcessor: SignalProcessor<P,?>
+        -sourceSignalChannel: SourceSignalChannel
+        -skippedOperations: EnumSet<Operation>
+        -neverSkip: boolean
+        -emitTombstonesOnDelete: boolean
+        -postProcessorRegistry: PostProcessorRegistry
+        -inconsistentSchemaHandler: InconsistentSchemaHandler<P,T>
+        +dispatchDataChangeEvent(partition: P, id: T, emitter: ChangeRecordEmitter<P>): boolean
+        +dispatchSnapshotEvent(partition: P, id: T, emitter: ChangeRecordEmitter<P>, receiver: SnapshotReceiver<P>): void
+        +dispatchSchemaChangeEvent(partition: P, offset: OffsetContext, id: T, emitter: SchemaChangeEventEmitter): void
+        +dispatchTransactionStartedEvent(partition: P, txId: String, offset: OffsetContext, ts: Instant): void
+        +dispatchTransactionCommittedEvent(partition: P, offset: OffsetContext, ts: Instant): void
+        +dispatchFilteredEvent(partition: P, offset: OffsetContext): void
+        +dispatchHeartbeatEvent(partition: P, offset: OffsetContext): void
+        +dispatchConnectorEvent(partition: P, event: ConnectorEvent): void
+        +enqueueNotification(record: SourceRecord): void
+        +getSnapshotChangeEventReceiver(): SnapshotReceiver<P>
+        +getIncrementalSnapshotChangeEventReceiver(listener: DataChangeEventListener<P>): SnapshotReceiver<P>
+        +heartbeatsEnabled(): boolean
+        +close(): void
+        #doPostProcessing(key: Object, value: Struct): void
+    }
+
+    class "StreamingChangeRecordReceiver" as StreamingReceiver <<inner>> {
+        +changeRecord(partition: P, schema: DataCollectionSchema,\n  offset: OffsetContext, key: Object,\n  value: Struct, op: Operation): void
+    }
+
+    class "BufferingSnapshotChangeRecordReceiver" as BufferingSnapshotReceiver <<inner>> {
+        -buffer: AtomicReference<T>
+        +changeRecord(...): void
+        +completeSnapshot(): void
+    }
+
+    class "IncrementalSnapshotChangeRecordReceiver" as IncrementalSnapshotReceiver <<inner>> {
+        +changeRecord(...): void
+        +completeSnapshot(): void
+    }
+
+    class "SchemaChangeEventReceiver" as SchemaChangeReceiver <<inner>> {
+        +schemaChangeEvent(event: SchemaChangeEvent): void
+    }
+
+    class "BufferedDataChangeEvent" as BufferedDataChangeEvent <<inner>> {
+        -event: DataChangeEvent
+        -offsetContext: OffsetContext
+    }
+}
+
+' ── io.debezium.connector.base ────────────────────────────────────────────────
+package "io.debezium.connector.base" {
+
+    interface ChangeEventQueueMetrics {
+        +totalCapacity(): int
+        +remainingCapacity(): int
+        +maxQueueSizeInBytes(): long
+        +currentQueueSizeInBytes(): long
+    }
+
+    interface "QueueProvider<T>" as QueueProvider {
+        +enqueue(event: T): void
+        +poll(): T
+        +size(): int
+    }
+
+    class "ChangeEventQueue<T extends Sizeable>" as ChangeEventQueue <<ThreadSafe>> {
+        -pollInterval: Duration
+        -maxBatchSize: int
+        -maxQueueSize: int
+        -maxQueueSizeInBytes: long
+        -lock: ReentrantLock
+        -queue: QueueProvider<T>
+        -currentQueueSizeInBytes: long
+        -buffering: boolean
+        -bufferedEvent: AtomicReference<T>
+        -producerException: volatile RuntimeException
+        +enqueue(record: T): void
+        +poll(): List<T>
+        +flushBuffer(modifier: Function<T,T>): void
+        +enableBuffering(): void
+        +disableBuffering(): void
+        +producerException(ex: RuntimeException): void
+        +isBuffered(): boolean
+        #doEnqueue(record: T): void
+    }
+
+    class "ChangeEventQueue.Builder<T>" as ChangeEventQueueBuilder <<inner>> {
+        +pollInterval(interval: Duration): Builder<T>
+        +maxQueueSize(size: int): Builder<T>
+        +maxBatchSize(size: int): Builder<T>
+        +maxQueueSizeInBytes(bytes: long): Builder<T>
+        +buffering(enabled: boolean): Builder<T>
+        +queueProvider(provider: QueueProvider<T>): Builder<T>
+        +build(): ChangeEventQueue<T>
+    }
+}
+
+' ── io.debezium.connector.postgresql ─────────────────────────────────────────
+package "io.debezium.connector.postgresql" {
+
+    class "PostgresEventDispatcher<T>" as PostgresEventDispatcher {
+        -logicalDecodingMessageMonitor: LogicalDecodingMessageMonitor
+        -messageFilter: LogicalDecodingMessageFilter
+        +dispatchLogicalDecodingMessage(partition: PostgresPartition,\n  offset: OffsetContext, msg: LogicalDecodingMessage): void
+    }
+}
+
+' ── Inheritance & Realization ─────────────────────────────────────────────────
+PostgresEventDispatcher --|> EventDispatcher : extends
+DataChangeEvent ..|> Sizeable
+ChangeEventQueue ..|> ChangeEventQueueMetrics
+
+' EventDispatcher implements AutoCloseable (external)
+interface AutoCloseable {
+    +close(): void
+}
+EventDispatcher ..|> AutoCloseable
+
+' ── EventDispatcher compositions ─────────────────────────────────────────────
+EventDispatcher *-- "1" ChangeEventQueue : queue
+EventDispatcher *-- "1" TopicNamingStrategy : topicNamingStrategy
+EventDispatcher *-- "1" InconsistentSchemaHandler : inconsistentSchemaHandler
+
+' ── Inner class containment (EventDispatcher) ─────────────────────────────────
+EventDispatcher *-- StreamingReceiver : <<inner>>
+EventDispatcher *-- BufferingSnapshotReceiver : <<inner>>
+EventDispatcher *-- IncrementalSnapshotReceiver : <<inner>>
+EventDispatcher *-- SchemaChangeReceiver : <<inner>>
+EventDispatcher *-- BufferedDataChangeEvent : <<inner>>
+
+' ── Inner receiver interface relationships ────────────────────────────────────
+BufferingSnapshotReceiver ..|> SnapshotReceiver
+IncrementalSnapshotReceiver ..|> SnapshotReceiver
+SnapshotReceiver --|> "ChangeRecordEmitter.Receiver"
+
+' ── ChangeEventQueue internals ────────────────────────────────────────────────
+ChangeEventQueue *-- QueueProvider : queue
+ChangeEventQueue *-- ChangeEventQueueBuilder : <<inner builder>>
+
+' ── Data flow ─────────────────────────────────────────────────────────────────
+ChangeEventQueue o-- DataChangeEvent : stores (T=DataChangeEvent)
+
+' ── TopicNamingStrategy nested interfaces ─────────────────────────────────────
+TopicNamingStrategy +.. TopicSchemaAugment : <<inner>>
+TopicNamingStrategy +.. TopicValueAugment : <<inner>>
+
+' ── Topic routing note ────────────────────────────────────────────────────────
+note right of EventDispatcher
+  **Topic Routing Logic**
+  • data events   → topicNamingStrategy.dataChangeTopic(id)
+  • schema events → topicNamingStrategy.schemaChangeTopic()
+  • transactions  → topicNamingStrategy.transactionTopic()
+  • heartbeats    → topicNamingStrategy.heartbeatTopic()
+
+  **Filtering & Skip Logic**
+  filter.isIncluded(dataCollectionId) gates dispatch.
+  skippedOperations: EnumSet<Operation>;
+  neverSkip=true when op-filtering unsupported or set empty.
+  Tombstone emitted on DELETE when emitTombstonesOnDelete=true.
+end note
+
+note bottom of ChangeEventQueue
+  **Back-pressure**
+  doEnqueue() blocks on isNotFull condition when
+  queue.size >= maxQueueSize or bytes >= maxQueueSizeInBytes.
+  Signals isFull when batch/bytes threshold is reached.
+  Single-cell AtomicReference buffering enables last-event marking.
+end note
+
+note right of SchemaChangeReceiver
+  Applies DDL to historizedSchema AND
+  conditionally enqueues to schemaChangeTopic()
+  when isSchemaChangesHistoryEnabled().
+end note
+
+@enduml

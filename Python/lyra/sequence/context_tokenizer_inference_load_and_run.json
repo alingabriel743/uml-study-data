@@ -1,0 +1,121 @@
+{
+  "scope": "tokenizer_inference_load_and_run",
+  "title": "Tokenizer Inference Load and Run",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Caller",
+    "ImageTokenizer",
+    "load_model / load_encoder_model / load_decoder_model",
+    "_load_pytorch_model",
+    "load_jit_model",
+    "TokenizerModels (Enum)",
+    "torch.jit",
+    "TokenizerNetwork (CI/DI/CV/DV)",
+    "TokenizerModel"
+  ],
+  "interaction_flow": [
+    "--- MODEL LOADING (JIT path) ---",
+    "Caller → load_model(jit_filepath, tokenizer_config=None, device): entry point",
+    "load_model → load_jit_model(jit_filepath, device): no tokenizer_config",
+    "load_jit_model → torch.jit.load(jit_filepath, map_location=device): deserialize ScriptModule",
+    "load_jit_model → model.eval().to(device): return ScriptModule",
+
+    "--- MODEL LOADING (PyTorch path) ---",
+    "Caller → load_model(jit_filepath, tokenizer_config, device): with config",
+    "load_model → _load_pytorch_model(jit_filepath, tokenizer_config, device)",
+    "_load_pytorch_model → tokenizer_config['name']: extract tokenizer_name (e.g. CI, DI, CV, DV)",
+    "_load_pytorch_model → TokenizerModels[tokenizer_name].value(**tokenizer_config): instantiate network (CI→ContinuousImageTokenizer, DI→DiscreteImageTokenizer, CV→CausalContinuousVideoTokenizer, DV→CausalDiscreteVideoTokenizer)",
+    "_load_pytorch_model → torch.jit.load(jit_filepath, map_location=device): load checkpoint weights",
+    "_load_pytorch_model → return (model, ckpts)",
+    "load_model → full_model.load_state_dict(ckpts.state_dict(), strict=True): transfer weights",
+    "load_model → full_model.eval().to(device): return full model",
+
+    "--- ENCODER-ONLY LOADING ---",
+    "Caller → load_encoder_model(jit_filepath, tokenizer_config, device)",
+    "load_encoder_model → _load_pytorch_model(jit_filepath, tokenizer_config, device): same as above",
+    "load_encoder_model → full_model.encoder_jit(): extract encoder sub-module",
+    "load_encoder_model → encoder_model.load_state_dict(ckpts.state_dict(), strict=True)",
+    "load_encoder_model → encoder_model.eval().to(device): return encoder model",
+
+    "--- DECODER-ONLY LOADING ---",
+    "Caller → load_decoder_model(jit_filepath, tokenizer_config, device)",
+    "load_decoder_model → _load_pytorch_model(jit_filepath, tokenizer_config, device)",
+    "load_decoder_model → full_model.decoder_jit(): extract decoder sub-module",
+    "load_decoder_model → decoder_model.load_state_dict(ckpts.state_dict(), strict=True)",
+    "load_decoder_model → decoder_model.eval().to(device): return decoder model",
+
+    "--- IMAGE TOKENIZER INIT (image_lib.py) ---",
+    "Caller → ImageTokenizer.__init__(checkpoint, checkpoint_enc, checkpoint_dec, tokenizer_config, device, dtype)",
+    "ImageTokenizer → load_model(checkpoint, tokenizer_config, device): sets _full_model",
+    "ImageTokenizer → load_encoder_model(checkpoint_enc, tokenizer_config, device): sets _enc_model",
+    "ImageTokenizer → load_decoder_model(checkpoint_dec, tokenizer_config, device): sets _dec_model",
+
+    "--- INFERENCE: encode ---",
+    "Caller → ImageTokenizer.encode(input_tensor: Bx3xHxW, range[-1..1])",
+    "ImageTokenizer → _enc_model(input_tensor): forward pass through encoder",
+    "ImageTokenizer → return latent (CI: Bx16xhxw) or (DI: indices Bxhxw + code Bx6xhxw)",
+
+    "--- INFERENCE: decode ---",
+    "Caller → ImageTokenizer.decode(input_latent)",
+    "ImageTokenizer → _dec_model(input_latent): forward pass through decoder",
+    "ImageTokenizer → return output_tensor Bx3xHxW range[-1..1]",
+
+    "--- INFERENCE: autoencode ---",
+    "Caller → ImageTokenizer.autoencode(input_tensor)",
+    "ImageTokenizer [if _full_model] → _full_model(input_tensor): single end-to-end pass",
+    "ImageTokenizer [else] → encode(input_tensor) → decode(output_latent): two-stage path",
+    "ImageTokenizer → return reconstructed tensor Bx3xHxW",
+
+    "--- INFERENCE: forward (numpy in/out) ---",
+    "Caller → ImageTokenizer.forward(image: BxHxWxC, range[0..255])",
+    "ImageTokenizer → pad_image_batch(image): pad to _SPATIAL_ALIGN=16, get crop_region",
+    "ImageTokenizer → numpy2tensor(padded_input_image, dtype, device): convert to Bx3xHxW float",
+    "ImageTokenizer → autoencode(input_tensor)",
+    "ImageTokenizer → tensor2numpy(output_tensor): convert back to BxHxWxC uint8",
+    "ImageTokenizer → unpad_image_batch(padded_output_image, crop_region): crop to original size",
+    "ImageTokenizer → return reconstructed numpy image",
+
+    "--- TRAINING MODEL (TokenizerModel) ---",
+    "TokenizerModel.__init__(config): instantiates network, loss, metric via instantiate()",
+    "TokenizerModel.forward(data_batch) → _network_forward(data_batch) → network(tensor_batch)",
+    "TokenizerModel.training_step → _network_forward → loss(inputs, output_dict, iteration)",
+    "TokenizerModel.validation_step → _network_forward → loss + metric"
+  ],
+  "key_relationships": [
+    "load_model depends_on load_jit_model (JIT path) and _load_pytorch_model (PyTorch path)",
+    "load_encoder_model depends_on _load_pytorch_model and full_model.encoder_jit()",
+    "load_decoder_model depends_on _load_pytorch_model and full_model.decoder_jit()",
+    "_load_pytorch_model depends_on TokenizerModels enum and torch.jit.load",
+    "TokenizerModels enum maps: CI→ContinuousImageTokenizer, DI→DiscreteImageTokenizer, CV→CausalContinuousVideoTokenizer, DV→CausalDiscreteVideoTokenizer",
+    "ImageTokenizer composes load_model + load_encoder_model + load_decoder_model",
+    "ImageTokenizer.encode wraps _enc_model forward pass",
+    "ImageTokenizer.decode wraps _dec_model forward pass",
+    "ImageTokenizer.autoencode uses _full_model OR encode+decode",
+    "TokenizerModel extends Model; composes network, loss, metric, optional EMA tracker",
+    "TokenizerModel.state_dict filters out loss and patcher keys (not saved in checkpoint)"
+  ],
+  "branching_logic": [
+    "load_model: if tokenizer_config is None → JIT path; else → PyTorch path",
+    "load_encoder_model: same JIT vs PyTorch branch; PyTorch path extracts encoder_jit()",
+    "load_decoder_model: same JIT vs PyTorch branch; PyTorch path extracts decoder_jit()",
+    "ImageTokenizer.autoencode: if _full_model is not None → single pass; else → encode+decode",
+    "ImageTokenizer.encode: if output is Tensor → return as-is; else → return output[:-1] (strip last element)",
+    "TokenizerModel.get_input_key: checks image_key then video_key in data_batch"
+  ],
+  "important_notes": [
+    "Default device=cuda, dtype=bfloat16 (_DTYPE global)",
+    "Spatial alignment constant _SPATIAL_ALIGN=16, temporal _TEMPORAL_ALIGN=8",
+    "JIT path: loads pre-compiled ScriptModule directly via torch.jit.load",
+    "PyTorch path: constructs fresh network, loads weights from JIT checkpoint via state_dict transfer",
+    "encoder_jit() and decoder_jit() are methods on the tokenizer network classes",
+    "load_state_dict is overridden in TokenizerModel to filter only matching keys (avoids missing key errors for loss/patcher params)",
+    "TokenizerModel.state_dict explicitly excludes: loss.*, ema.loss-*, network.encoder.patcher.*, network.decoder.unpatcher.*",
+    "EMA (Exponential Moving Average) optional: enabled via config.ema.enabled, uses EMAModelTracker"
+  ],
+  "source_files_analyzed": [
+    "Lyra-1/cosmos_predict1/tokenizer/inference/utils.py",
+    "Lyra-1/cosmos_predict1/tokenizer/training/model.py",
+    "Lyra-1/cosmos_predict1/tokenizer/networks/__init__.py",
+    "Lyra-1/cosmos_predict1/tokenizer/inference/image_lib.py"
+  ]
+}

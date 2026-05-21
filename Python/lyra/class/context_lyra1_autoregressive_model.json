@@ -1,0 +1,400 @@
+{
+  "scope": "lyra1_autoregressive_model",
+  "title": "Lyra-1 Autoregressive Model & Transformer",
+  "diagram_type": "class",
+  "packages": {
+    "inference": "cosmos_predict1.autoregressive.model + networks/transformer.py + modules/",
+    "training": "cosmos_predict1.autoregressive.training/model.py + training/networks/transformer.py + training/modules/"
+  },
+
+  "classes": [
+    {
+      "name": "AutoRegressiveModel",
+      "file": "autoregressive/model.py",
+      "parent": "torch.nn.Module",
+      "purpose": "Inference-time AR model wrapper; handles build, generate, checkpoint loading",
+      "attributes": [
+        "model: Transformer",
+        "tokenizer: DiscreteMultimodalTokenizer",
+        "config: ModelConfig",
+        "model_parallel: ModelParallelConfig",
+        "vision_encoder: VisionTransformer (optional)",
+        "mm_projector: MultimodalProjector (optional)"
+      ],
+      "methods": [
+        "build(model_config, tokenizer_config, model_parallel, shard_checkpoint) -> AutoRegressiveModel  [staticmethod]",
+        "generate(prompt_tokens, max_gen_len, temperature, top_k, top_p, num_gen_seq, logprobs, echo, seed, context, context_mask, compile_sampling, compile_prefill, verbose, stop_tokens, images) -> (seq, None)",
+        "load_ar_model(shard_checkpoint, tokenizer_config)",
+        "load_tokenizer(tokenizer_config)",
+        "embed_vision_language_features(input_ids, images) -> Tensor",
+        "get_num_params() -> int",
+        "state_dict(*args, **kwargs)",
+        "load_state_dict(state_dict, strict, assign) -> _IncompatibleKeys",
+        "precision (property)"
+      ]
+    },
+    {
+      "name": "AutoRegressiveTrainingModel",
+      "file": "autoregressive/training/model.py",
+      "parent": "Model",
+      "purpose": "Training wrapper; computes CE + Z-loss, handles context parallel, FSDP",
+      "attributes": [
+        "model: Transformer (training version)",
+        "tokenizer: DiscreteMultimodalTokenizer",
+        "config: TrainingModelConfig",
+        "model_parallel: ModelParallelConfig",
+        "vision_encoder: VisionTransformer (optional)",
+        "mm_projector: MultimodalProjector (optional)",
+        "inference_params: InferenceParams",
+        "monitor_output_logits: bool"
+      ],
+      "methods": [
+        "training_step(data_batch: dict, iteration: int) -> (output_batch, total_loss)",
+        "validation_step(data_batch: dict, iteration: int) -> (output_batch, total_loss)",
+        "get_num_params() -> int",
+        "gather_output_logits_stats(logits, labels, output_batch, ignore_index)",
+        "embed_vision_language_features(input_ids, images) -> Tensor"
+      ],
+      "notes": "Loss = CE + Z-loss (z_loss_coeff * mean(logsumexp^2)). Labels shifted by 1 for AR training. Supports text_to_video and class_to_image training types."
+    },
+    {
+      "name": "Transformer",
+      "file": "autoregressive/networks/transformer.py",
+      "parent": "torch.nn.Module",
+      "purpose": "Inference Transformer; causal LLM backbone",
+      "attributes": [
+        "params: Namespace",
+        "vocab_size: int",
+        "n_layers: int",
+        "precision: torch.dtype",
+        "tok_embeddings: nn.Embedding | VocabParallelEmbedding",
+        "layers: nn.ModuleList[TransformerBlock]",
+        "norm: RMSNorm (or other)",
+        "rope: RotaryPositionEmbeddingPytorchV1 | RotaryPositionEmbeddingPytorchV2",
+        "causal_mask: Tensor [max_seq_len, max_seq_len]",
+        "output: nn.Linear",
+        "pos_emb: SinCosPosEmbAxisTE (optional)",
+        "abs_pos_emb: Tensor (optional)",
+        "has_cross_attention: bool"
+      ],
+      "methods": [
+        "forward(tokens, input_pos, token_embeddings, context, context_mask) -> Tensor",
+        "_create_attention_mask(input_pos) -> Optional[Tensor]",
+        "_prepare_layer_kwargs(input_pos, mask, context, context_mask) -> Dict",
+        "_create_rope_config() -> Dict",
+        "_create_token_embeddings(model_parallel, vocab_size) -> nn.Module",
+        "_create_output_projection(vocab_size) -> nn.Linear",
+        "_initialize_abs_pos_emb() -> (SinCosPosEmbAxisTE, Tensor)",
+        "_broadcast_pos_emb(pos_emb, tp_group)",
+        "apply_abs_pos_emb(x, input_pos) -> Tensor",
+        "expand_vocab(new_vocab_size, init_method, multiple_of, expand_output_layer)",
+        "state_dict() / load_state_dict(state_dict, strict, assign)"
+      ]
+    },
+    {
+      "name": "Transformer [Training]",
+      "file": "autoregressive/training/networks/transformer.py",
+      "parent": "torch.nn.Module",
+      "purpose": "Training Transformer; identical structure but uses GQA/TrainingMLP and supports FSDP, CP, TP",
+      "attributes": [
+        "tok_embeddings: nn.Embedding | VocabParallelEmbedding",
+        "layers: nn.ModuleList[TransformerBlock(training) | TransformerBlockTE]",
+        "norm: RMSNormTE | RMSNorm",
+        "rope: RotaryPositionEmbeddingPytorchV2 | RotaryPositionEmbeddingTE",
+        "output: LinearTE | nn.Linear"
+      ],
+      "methods": [
+        "forward(tokens, input_pos, token_embeddings, context, context_mask, action, total_seq_len) -> Tensor",
+        "enable_context_parallel(cp_group)",
+        "expand_vocab(...)"
+      ]
+    },
+    {
+      "name": "TransformerBlock",
+      "file": "autoregressive/networks/transformer.py",
+      "parent": "torch.nn.Module",
+      "purpose": "Single inference transformer block (pre-norm, residual, optional cross-attn)",
+      "attributes": [
+        "layer_id: int",
+        "attention: Attention (GQA-style)",
+        "feed_forward: MLP",
+        "attention_norm: RMSNorm",
+        "ffn_norm: RMSNorm",
+        "has_cross_attention: bool",
+        "cross_attention: Attention (optional)",
+        "cross_attention_norm: RMSNorm (optional)"
+      ],
+      "methods": [
+        "forward(x, rope, input_pos, mask, context, context_mask) -> Tensor",
+        "init_weights()"
+      ],
+      "forward_flow": "h = x + attention(norm(x)); if cross_attn: h = h + cross_attention(norm(h), context); out = h + feed_forward(norm(h))"
+    },
+    {
+      "name": "TransformerBlock [Training]",
+      "file": "autoregressive/training/networks/transformer.py",
+      "parent": "torch.nn.Module",
+      "purpose": "Training block; uses GQA and TrainingMLP with dropout support",
+      "attributes": [
+        "layer_id: int",
+        "attention: GQA",
+        "feed_forward: TrainingMLP",
+        "attention_norm: RMSNorm",
+        "ffn_norm: RMSNorm",
+        "weight_init_std: float",
+        "has_cross_attention: bool",
+        "cross_attention: GQA (optional)",
+        "cross_attention_norm: RMSNorm (optional)"
+      ],
+      "methods": [
+        "forward(x, rope, input_pos, mask, context, context_mask) -> Tensor",
+        "init_weights()"
+      ]
+    },
+    {
+      "name": "TransformerBlockTE",
+      "file": "autoregressive/training/networks/transformer.py",
+      "parent": "te.pytorch.TransformerLayer",
+      "purpose": "TransformerEngine-based block; FP8 capable, uses RMSNorm+SwiGLU via TE",
+      "attributes": [
+        "has_cross_attention: bool",
+        "layer_id: int",
+        "inference: bool",
+        "weight_init_std: float"
+      ],
+      "methods": [
+        "forward(x, rotary_pos_emb, mask, inference_params, context, context_mask) -> Tensor",
+        "set_inference_flag(flag: bool)"
+      ],
+      "notes": "Uses TE's native QKV fusion, RMSNorm, SwiGLU. Supports decoder/encoder layer types for cross-attn."
+    },
+    {
+      "name": "Attention",
+      "file": "autoregressive/modules/attention.py",
+      "parent": "torch.nn.Module",
+      "purpose": "GQA (Grouped Query Attention) for inference; supports self/cross/full attention types with KV cache",
+      "attributes": [
+        "n_kv_heads: int",
+        "n_local_heads: int",
+        "n_local_kv_heads: int",
+        "head_dim: int",
+        "attn_type: str (self|cross|full)",
+        "wq: nn.Linear",
+        "wk: nn.Linear",
+        "wv: nn.Linear",
+        "wo: nn.Linear",
+        "wqkv: nn.Linear (fused, optional)",
+        "cache_k: Tensor [max_batch, n_local_kv_heads, max_seq_len, head_dim]",
+        "cache_v: Tensor",
+        "q_norm: RMSNorm (optional)",
+        "k_norm: RMSNorm (optional)"
+      ],
+      "methods": [
+        "forward(x, rope, input_pos, mask, context) -> Tensor",
+        "init_kv_cache(dtype)",
+        "load_hook(state_dict, prefix)"
+      ],
+      "forward_flow": "xq,xk,xv = projections → apply q/k norm → apply RoPE (self/full) → update KV cache → GQA repeat → scaled_dot_product_attention → wo → all_reduce (TP)"
+    },
+    {
+      "name": "GQA",
+      "file": "autoregressive/training/modules/attention.py",
+      "parent": "torch.nn.Module",
+      "purpose": "Training GQA; extends inference Attention with dropout, parallel linear layers, flash attention",
+      "attributes": [
+        "n_kv_heads: int",
+        "n_local_heads: int",
+        "head_dim: int",
+        "attention_type: str (self|cross|full)",
+        "wq/wk/wv/wo: Linear | ColumnParallelLinear/RowParallelLinear",
+        "cache_k, cache_v: Tensor (inference only)",
+        "q_norm, k_norm: RMSNorm (optional)",
+        "attention_dropout: float"
+      ],
+      "methods": [
+        "forward(x, rope, input_pos, mask, context) -> Tensor",
+        "init_kv_cache(dtype)",
+        "init_weights(init_std)"
+      ]
+    },
+    {
+      "name": "RotaryPositionEmbedding",
+      "file": "autoregressive/modules/embedding.py",
+      "parent": "torch.nn.Module",
+      "purpose": "Base RoPE class; supports 1D/2D/3D rope_dim, YaRN scaling",
+      "attributes": [
+        "dim: int",
+        "max_position_embeddings: int",
+        "rope_theta: float",
+        "apply_yarn: bool",
+        "rope_dim: str (1D|2D|3D)",
+        "latent_shape: List[int] (2D/3D)",
+        "inv_freq / spatial_inv_freq / temporal_inv_freq: Tensor",
+        "mscale: float"
+      ],
+      "methods": [
+        "forward(seq_len) -> Tensor",
+        "compute_freqs() -> Tensor",
+        "get_inv_freq(device)",
+        "get_scale_factors(inv_freq, original_seq_len) -> Tensor",
+        "get_mscale(scale) -> float"
+      ]
+    },
+    {
+      "name": "RotaryPositionEmbeddingPytorchV1",
+      "file": "autoregressive/modules/embedding.py",
+      "parent": "RotaryPositionEmbedding",
+      "purpose": "Llama3/mistral-style RoPE (cos * x + sin * rotate_half(x))",
+      "attributes": ["cos_cached: Tensor [1, seq, 1, dim]", "sin_cached: Tensor"],
+      "methods": [
+        "forward(q, k, input_pos, seq_len) -> (Tensor, Tensor)",
+        "rotate_half(x) -> Tensor"
+      ]
+    },
+    {
+      "name": "RotaryPositionEmbeddingPytorchV2",
+      "file": "autoregressive/modules/embedding.py",
+      "parent": "RotaryPositionEmbedding",
+      "purpose": "TransformerEngine-compatible RoPE using _apply_rotary_pos_emb_te",
+      "attributes": ["cos_cached: Tensor [1, seq, 1, dim]", "sin_cached: Tensor"],
+      "methods": [
+        "forward(q, k, input_pos, seq_len) -> (Tensor, Tensor)",
+        "create_rope_freqs(seq_len, training_type) -> Tensor"
+      ]
+    },
+    {
+      "name": "RotaryPositionEmbeddingTE",
+      "file": "autoregressive/modules/embedding.py",
+      "parent": "RotaryPositionEmbedding",
+      "purpose": "TE-compatible RoPE; pads to multiple_of; prepends <bov> token PE for text_to_video",
+      "methods": ["forward(seq_len, training_type) -> Tensor"]
+    },
+    {
+      "name": "RotaryPositionEmbeddingPytorch",
+      "file": "autoregressive/modules/embedding.py",
+      "parent": "RotaryPositionEmbedding",
+      "purpose": "Alternative PyTorch RoPE (used in training transformer v1)",
+      "methods": ["forward(q, k, input_pos, seq_len) -> (Tensor, Tensor)", "rotate_half(x) -> Tensor"]
+    },
+    {
+      "name": "SinCosPosEmbAxisTE",
+      "file": "autoregressive/modules/embedding.py",
+      "parent": "torch.nn.Module",
+      "purpose": "Absolute 3D sincos position embeddings for T×H×W video latents",
+      "attributes": [
+        "latent_shape: (T, H, W)",
+        "pos_emb_h: Tensor",
+        "pos_emb_w: Tensor",
+        "pos_emb_t: Tensor",
+        "pad_to_multiple_of: int"
+      ],
+      "methods": ["forward(training_type) -> Tensor [1, seq_len, dim]"]
+    },
+    {
+      "name": "MLP",
+      "file": "autoregressive/modules/mlp.py",
+      "parent": "torch.nn.Module",
+      "purpose": "Inference feed-forward (SwiGLU): w2(silu(w1(x)) * w3(x))",
+      "attributes": ["w1: Linear", "w2: Linear", "w3: Linear", "tp_size: int"],
+      "methods": ["forward(x) -> Tensor"]
+    },
+    {
+      "name": "TrainingMLP",
+      "file": "autoregressive/modules/mlp.py",
+      "parent": "torch.nn.Module",
+      "purpose": "Training feed-forward (SwiGLU + dropout); supports ColumnParallelLinear/RowParallelLinear",
+      "attributes": [
+        "w1: Linear | ColumnParallelLinear",
+        "w2: Linear | RowParallelLinear",
+        "w3: Linear | ColumnParallelLinear",
+        "hidden_dropout: float",
+        "tp_size: int",
+        "inference: bool"
+      ],
+      "methods": ["forward(x) -> Tensor", "init_weights(init_std)"]
+    }
+  ],
+
+  "relationships": [
+    "AutoRegressiveModel extends torch.nn.Module",
+    "AutoRegressiveModel composes Transformer (self.model)",
+    "AutoRegressiveModel composes DiscreteMultimodalTokenizer (self.tokenizer)",
+    "AutoRegressiveModel composes VisionTransformer (self.vision_encoder, optional)",
+    "AutoRegressiveModel composes MultimodalProjector (self.mm_projector, optional)",
+    "AutoRegressiveModel depends_on prefill, decode_one_token, decode_n_tokens (utils/sampling)",
+
+    "AutoRegressiveTrainingModel extends Model",
+    "AutoRegressiveTrainingModel composes Transformer[Training] (self.model)",
+    "AutoRegressiveTrainingModel composes DiscreteMultimodalTokenizer (self.tokenizer)",
+    "AutoRegressiveTrainingModel composes VisionTransformer (optional)",
+    "AutoRegressiveTrainingModel composes MultimodalProjector (optional)",
+
+    "Transformer[inference] extends torch.nn.Module",
+    "Transformer[inference] composes nn.ModuleList of TransformerBlock[inference]",
+    "Transformer[inference] composes RotaryPositionEmbeddingPytorchV1 OR RotaryPositionEmbeddingPytorchV2",
+    "Transformer[inference] composes SinCosPosEmbAxisTE (optional abs pos emb)",
+    "Transformer[inference] composes VocabParallelEmbedding OR nn.Embedding",
+
+    "Transformer[training] composes nn.ModuleList of TransformerBlock[training] OR TransformerBlockTE",
+    "Transformer[training] composes RotaryPositionEmbeddingTE OR RotaryPositionEmbeddingPytorchV2",
+
+    "TransformerBlock[inference] extends torch.nn.Module",
+    "TransformerBlock[inference] composes Attention (self.attention)",
+    "TransformerBlock[inference] composes MLP (self.feed_forward)",
+    "TransformerBlock[inference] composes Attention (self.cross_attention, optional)",
+
+    "TransformerBlock[training] extends torch.nn.Module",
+    "TransformerBlock[training] composes GQA (self.attention)",
+    "TransformerBlock[training] composes TrainingMLP (self.feed_forward)",
+    "TransformerBlock[training] composes GQA (self.cross_attention, optional)",
+
+    "TransformerBlockTE extends te.pytorch.TransformerLayer",
+
+    "Attention extends torch.nn.Module",
+    "Attention uses RotaryPositionEmbedding (receives rope as arg)",
+
+    "GQA extends torch.nn.Module",
+    "GQA uses RotaryPositionEmbedding (receives rope as arg)",
+
+    "RotaryPositionEmbeddingPytorchV1 extends RotaryPositionEmbedding",
+    "RotaryPositionEmbeddingPytorchV2 extends RotaryPositionEmbedding",
+    "RotaryPositionEmbeddingPytorch extends RotaryPositionEmbedding",
+    "RotaryPositionEmbeddingTE extends RotaryPositionEmbedding",
+    "RotaryPositionEmbedding extends torch.nn.Module"
+  ],
+
+  "key_design_patterns": [
+    "Two-path design: inference path (model.py + networks/transformer.py + modules/) vs training path (training/model.py + training/networks/transformer.py + training/modules/)",
+    "TransformerBlock[inference] uses Attention (custom PyTorch KV cache); TransformerBlock[training] uses GQA (Megatron parallel linear)",
+    "TransformerBlockTE wraps TransformerEngine for FP8 training",
+    "RoPE hierarchy: base RotaryPositionEmbedding with 1D/2D/3D freq; V1=Llama3-style, V2=TE-style apply, TE=for training, Pytorch=for inference",
+    "Vocab expansion: expand_vocab() resizes tok_embeddings and output projection in-place with Gaussian/zero init",
+    "Cross-attention is optional and inserted every K layers (insert_cross_attn_every_k_layers)",
+    "Tensor parallelism supported via VocabParallelEmbedding, ColumnParallelLinear, RowParallelLinear, all_gather on output",
+    "Training loss = CrossEntropy + Z-loss; text portion masked for text_to_video mode"
+  ],
+
+  "important_config_params": [
+    "n_layers, n_heads, n_kv_heads, dim, head_dim, ffn_hidden_size",
+    "max_seq_len, max_batch_size, vocab_size",
+    "rope_dim (1D|3D), rope_theta, apply_yarn, yarn_scale, yarn_beta_fast, yarn_beta_slow",
+    "pytorch_rope_version (v1|v2)",
+    "apply_abs_pos_emb, video_latent_shape, num_video_frames",
+    "tensor_model_parallel_size",
+    "insert_cross_attn, insert_cross_attn_every_k_layers, context_dim",
+    "norm_type, norm_eps",
+    "precision (bfloat16)",
+    "use_qk_normalization, causal_mask, fuse_qkv"
+  ],
+
+  "source_files_analyzed": [
+    "autoregressive/model.py",
+    "autoregressive/networks/transformer.py",
+    "autoregressive/training/model.py",
+    "autoregressive/training/networks/transformer.py",
+    "autoregressive/modules/attention.py",
+    "autoregressive/modules/embedding.py",
+    "autoregressive/modules/mlp.py",
+    "autoregressive/training/modules/attention.py"
+  ]
+}

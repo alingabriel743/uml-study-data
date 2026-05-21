@@ -1,0 +1,153 @@
+@startuml
+
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    BarColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #DEE2E6
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam NoteBackgroundColor #FFF3CD
+skinparam NoteBorderColor #FFC107
+
+title Unit AI Behavior Update\n<size:11>(AIController.updateUnit — stance, targeting, movement, physics)</size>
+
+|AsyncCore|
+start
+
+:PhysicsProcess.begin()\nSnapshot unit positions; assign PhysicsBody for new units; set collision layer;
+:AvoidanceProcess.begin()\nCollect ground-unit positions and radii as packed int requests;
+
+fork
+  |AsyncCore|
+  note right
+    Runs concurrently on
+    background thread pool
+  end note
+  :PhysicsProcess.process() [async]\nPhysicsWorld.update(): QuadTree collision\nmass-weighted displacement per layer;
+  :AvoidanceProcess.process() [async]\nDouble-buffer avoidance grid:\nstamp circular footprint per ground unit;
+
+fork again
+  |AIController|
+  note right
+    Runs on main game thread
+    during async phase
+  end note
+  :Unit.update() calls AIController.updateUnit();
+
+  if (useFallback() &&\nfallback != null?) then (yes)
+    :fallback.unit = this unit\nfallback.updateUnit();
+    note right: Early exit — entire tick\ndelegated to fallback controller
+    detach
+  else (no)
+  endif
+
+  ' ── STEP 1: Visuals ──
+  :updateVisuals()\nIf flying && type.wobble → apply wobble offset\nunit.lookAt(prefRotation());
+
+  ' ── STEP 2: Targeting ──
+  if (unit.hasWeapons()?) then (yes)
+    :updateWeapons();
+
+    |WeaponSystem|
+    :retarget() — check timer:\n• No target  → fires every 40 ticks\n• Has target → fires every 90 ticks;
+
+    if (retarget() == true?) then (yes)
+      :findMainTarget(x, y, range, targetAir, targetGround)\nvia Units.closestTarget();
+    endif
+
+    :noTargetTime += Time.delta;
+
+    if (invalid(target)?) then (yes)
+      if (target is dead\n(Healthc.isValid() == false)?) then (yes)
+        :targetInvalidated()\nReset timerTarget → force immediate retarget next tick;
+      endif
+      :target = null;
+    else (no)
+      :noTargetTime = 0;
+    endif
+
+    :unit.isShooting = false;
+
+    group Per-Mount Weapon Loop
+      if (weapon.controllable &&\n!weapon.noAttack?) then (yes)
+
+        if (unit.type.singleTarget?) then (yes)
+          :mount.target = main target\n(all mounts share one target);
+        else (no)
+          if (retarget == true?) then (yes)
+            :mount.target = findTarget\n(mountX, mountY, wrange,\ncollidesAir, collidesGround);
+          endif
+          if (checkTarget → invalid?) then (yes)
+            :mount.target = null;
+          endif
+        endif
+
+        if (mount.target != null?) then (yes)
+          :shoot = target.within(mountX, mountY, wrange)\n&& shouldShoot();
+
+          if (type.autoDropBombs\n&& !shoot?) then (yes)
+            :bomberTarget = closestTarget(ground only)\nnear mount position;
+            :shoot = (bomberTarget != null);
+          endif
+
+          if (weapon.aiControllable?) then (yes)
+            :Calculate aim:\nPredict.intercept(unit, mount.target, weapon.bullet)\n→ mount.aimX / mount.aimY;
+          endif
+        endif
+
+        :mount.shoot = shoot\nmount.rotate = shoot;
+
+        if (!shouldFire()?) then (yes)
+          :mount.shoot = false;
+        endif
+
+        :unit.isShooting |= mount.shoot;
+
+        if (no target && !shoot &&\nnoTargetTime >= rotateBackTimer (300s)?) then (yes)
+          :Rotate mount back to baseRotation;
+        endif
+
+      else (skip)
+        :Skip mount\n(not controllable or noAttack);
+      endif
+    end group
+
+    |AIController|
+  else (no)
+    note right: Unit is unarmed;\nskip weapon logic
+  endif
+
+  ' ── STEP 3: Movement ──
+  :updateMovement()\n[Subclass override — base impl is empty];
+
+  note right
+    Movement variants:
+    • GroundAI  → pathfind() via flowfield
+      + AvoidanceProcess buffer
+    • FlyingAI  → circleAttack() / moveTo()
+    • MechAI    → faceTarget() + strafe
+  end note
+
+end fork
+
+|AsyncCore|
+:AsyncCore.end()\nJoin all async futures (wait for physics + avoidance threads);
+:PhysicsProcess.end()\nApply body displacement: entity.move(dx, dy) per unit;
+:AvoidanceProcess.end()\nSwap double-buffer; read buffer ready for next pathfind tick;
+
+stop
+
+@enduml

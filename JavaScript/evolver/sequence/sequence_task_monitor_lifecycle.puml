@@ -1,0 +1,162 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+}
+
+title Task Monitor Subscription and Metrics
+
+actor "Worker / Client" as worker
+participant "RouteHandler\n(routes.js)" as routes
+participant "TaskMonitor\n(task/monitor.js)" as monitor
+participant "MailboxStore" as store
+participant "LifecycleManager" as lifecycle
+
+== Initialization ==
+
+[-> monitor : new TaskMonitor({ store, logger })
+activate monitor
+monitor -> store : getState('task_monitor_stats')
+activate store
+store --> monitor : raw JSON string | null
+deactivate store
+monitor -> monitor : _restoreStats()\nhydrate _stats from persisted JSON
+deactivate monitor
+
+== Subscribe ==
+
+worker -> routes : POST /task/subscribe\n{ capability_filter: [...] }
+activate routes
+routes -> monitor : subscribe(filters)
+activate monitor
+monitor -> store : setState('task_subscription',\nJSON{ enabled:true, filters, subscribed_at })
+activate store
+store --> monitor : ok
+deactivate store
+monitor -> store : send({ type:'task_subscribe',\npayload:{ capability_filter: filters } })
+activate store
+store --> monitor : { message_id }
+deactivate store
+monitor --> routes : { message_id }
+deactivate monitor
+routes --> worker : { body: { message_id } }
+deactivate routes
+
+== Unsubscribe ==
+
+worker -> routes : POST /task/unsubscribe
+activate routes
+routes -> monitor : unsubscribe()
+activate monitor
+monitor -> store : setState('task_subscription',\nJSON{ enabled:false, unsubscribed_at })
+activate store
+store --> monitor : ok
+deactivate store
+monitor -> store : send({ type:'task_unsubscribe', payload:{} })
+activate store
+store --> monitor : { message_id }
+deactivate store
+monitor --> routes : { message_id }
+deactivate monitor
+routes --> worker : { body: { message_id } }
+deactivate routes
+
+== Record Claim ==
+
+worker -> routes : POST /task/claim\n{ task_id }
+activate routes
+routes -> store : send({ type:'task_claim',\npayload: body, priority:'high' })
+activate store
+store --> routes : result
+deactivate store
+routes -> monitor : recordClaim(task_id)
+activate monitor
+monitor -> monitor : _stats.tasks_claimed++\nlast_claim_at = Date.now()
+monitor -> store : setState('task_monitor_stats',\nJSON.stringify(getMetrics()))
+activate store
+store --> monitor : ok
+deactivate store
+deactivate monitor
+routes --> worker : { body: result }
+deactivate routes
+
+== Record Complete ==
+
+worker -> routes : POST /task/complete\n{ task_id, started_at }
+activate routes
+routes -> store : send({ type:'task_complete',\npayload: body })
+activate store
+store --> routes : result
+deactivate store
+routes -> monitor : recordComplete(task_id, started_at)
+activate monitor
+monitor -> monitor : _stats.tasks_completed++\ncompute avg_completion_ms\n(rolling window of last 100)
+monitor -> store : setState('task_monitor_stats',\nJSON.stringify(getMetrics()))
+activate store
+store --> monitor : ok
+deactivate store
+deactivate monitor
+routes --> worker : { body: result }
+deactivate routes
+
+== Record Failed ==
+
+routes -> monitor : recordFailed(task_id)
+activate monitor
+monitor -> monitor : _stats.tasks_failed++
+monitor -> store : setState('task_monitor_stats',\nJSON.stringify(getMetrics()))
+activate store
+store --> monitor : ok
+deactivate store
+deactivate monitor
+
+== Get Metrics ==
+
+worker -> routes : GET /task/metrics
+activate routes
+routes -> monitor : getMetrics()
+activate monitor
+monitor -> store : countPending({ direction:'inbound' })
+activate store
+store --> monitor : pendingCount (number)
+deactivate store
+monitor --> routes : { subscribed, tasks_received,\ntasks_claimed, tasks_completed,\ntasks_failed, tasks_pending,\nlast_claim_at, last_complete_at,\navg_completion_ms }
+deactivate monitor
+routes --> worker : { body: metrics }
+deactivate routes
+
+== Heartbeat Meta (LifecycleManager) ==
+
+lifecycle -> monitor : getHeartbeatMeta()
+activate monitor
+monitor -> store : countPending({ direction:'inbound' })
+activate store
+store --> monitor : pendingCount (number)
+deactivate store
+monitor --> lifecycle : { task_subscription: bool,\ntask_metrics: { pending, claimed,\ncompleted, failed, avg_completion_ms } }
+deactivate monitor
+
+@enduml

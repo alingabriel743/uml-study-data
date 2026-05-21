@@ -1,0 +1,127 @@
+{
+  "scope": "s3_storage_and_file_io",
+  "title": "S3 Storage and File I/O Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Caller",
+    "misc (load_from_s3_with_cache)",
+    "easy_io",
+    "Boto3Backend",
+    "Boto3Client",
+    "ProcessPoolExecutor",
+    "AsyncEventLoop",
+    "aioboto3_S3Client",
+    "SharedMemory",
+    "LocalFileSystem",
+    "distributed"
+  ],
+
+  "interaction_flow_load_from_s3_with_cache": [
+    "Caller → misc: load_from_s3_with_cache(s3_path, cache_fp=None, cache_dir=None, rank_sync=True, backend_args, backend_key, easy_io_kwargs)",
+    "misc → misc: download_from_s3_with_cache(s3_path, cache_fp, cache_dir, rank_sync, backend_args, backend_key)",
+    "misc → misc: resolve cache_dir (TORCH_HOME → COSMOS_CACHE_DIR → ~/.cache/cosmos)",
+    "misc → misc: derive cache_fp = cache_dir / s3_path.replace('s3://', '')",
+    "misc → distributed: get_rank() → check if rank==0 for empty-file cleanup",
+    "misc → LocalFileSystem: os.path.exists(cache_fp) + os.path.getsize check",
+    "[rank_sync=True, cache miss] misc → easy_io: copyfile_to_local(s3_path, cache_fp, dst_type='file', backend_args, backend_key)",
+    "easy_io → Boto3Backend: copyfile_to_local(src=s3_path, dst=cache_fp, dst_type='file')",
+    "Boto3Backend → Boto3Backend: _map_path → _format_path → _replace_prefix(filepath)",
+    "Boto3Backend → Boto3Backend: os.makedirs(parent_dir, exist_ok=True)",
+    "Boto3Backend → Boto3Backend: self.get(src)",
+    "Boto3Backend → Boto3Client: get(filepath)",
+    "Boto3Client → Boto3Client: _check_path(filepath) [strips 's3://']",
+    "Boto3Client → boto3._client: download_fileobj(Bucket, Key, Fileobj=BytesIO)",
+    "boto3._client → S3: HTTP GET object [up to 3 retries]",
+    "boto3._client → Boto3Client: bytes in BytesIO buffer",
+    "Boto3Client → Boto3Backend: bytes",
+    "Boto3Backend → LocalFileSystem: open(dst,'wb').write(data)",
+    "misc → distributed: barrier() [rank sync after download]",
+    "misc → Caller: cache_fp (str)",
+    "misc → easy_io: load(cache_fp, **easy_io_kwargs)",
+    "easy_io → Caller: loaded data object"
+  ],
+
+  "interaction_flow_multipart_upload": [
+    "Caller → Boto3Backend: fast_put(obj: bytes|BytesIO|str, filepath, num_processes=32)",
+    "Boto3Backend → Boto3Backend: _map_path → _format_path → _replace_prefix",
+    "Boto3Backend → Boto3Client: fast_put(obj, filepath, num_processes)",
+    "Boto3Client → Boto3Client: read obj into bytes (bytes/BytesIO/file path)",
+    "Boto3Client → Boto3Client: if file_size <= part_size*num_processes: fallback to put()",
+    "Boto3Client → boto3._client: create_multipart_upload(Bucket, Key) → UploadId",
+    "Boto3Client → Boto3Client: np.array_split(arange(num_parts), num_processes) → part_numbers[]",
+    "Boto3Client → ProcessPoolExecutor: map(upload_parts_to_s3, args[]) [max_workers=num_processes]",
+    "ProcessPoolExecutor → upload_parts_to_s3: (part_numbers, upload_id, part_size, chunk_data, bucket, key, client_config)",
+    "upload_parts_to_s3 → AsyncEventLoop: asyncio.new_event_loop(); run_until_complete(upload_parts_async(...))",
+    "AsyncEventLoop → upload_parts_async: (part_size, part_numbers, upload_id, data, bucket, key, client_config)",
+    "upload_parts_async → aioboto3_S3Client: session.client('s3', config=AioConfig) [retries=3, adaptive]",
+    "upload_parts_async → upload_parts_async: build tasks = [upload_single_part_async(...) for each part]",
+    "upload_parts_async → aioboto3_S3Client: asyncio.gather(*tasks) [concurrent part uploads]",
+    "upload_single_part_async → aioboto3_S3Client: s3.upload_part(Bucket, Key, PartNumber, UploadId, Body) [retries with exp backoff, MAX_RETRIES=5]",
+    "aioboto3_S3Client → upload_single_part_async: {PartNumber, ETag}",
+    "upload_parts_async → upload_parts_to_s3: List[{PartNumber, ETag}] sorted",
+    "ProcessPoolExecutor → Boto3Client: merged parts list",
+    "Boto3Client → boto3._client: complete_multipart_upload(Bucket, Key, UploadId, Parts)"
+  ],
+
+  "interaction_flow_multipart_download": [
+    "Caller → download_parts_to_s3: (part_numbers, part_size, bucket, key, client_config, shm_name)",
+    "download_parts_to_s3 → AsyncEventLoop: asyncio.new_event_loop(); run_until_complete(download_parts_async(...))",
+    "AsyncEventLoop → download_parts_async: (part_size, part_numbers, bucket, key, client_config, shm_name)",
+    "download_parts_async → aioboto3_S3Client: aioboto3.Session().client('s3', config=AioConfig) [retries=5, adaptive, timeout=10/30s]",
+    "download_parts_async → download_parts_async: build tasks = [download_single_part_async(...) for part_number in part_numbers]",
+    "download_parts_async → aioboto3_S3Client: asyncio.gather(*tasks) [concurrent byte-range fetches]",
+    "download_single_part_async → aioboto3_S3Client: s3.get_object(Bucket, Key, Range='bytes={start}-{end}') [MAX_RETRIES=5, exp backoff]",
+    "aioboto3_S3Client → download_single_part_async: response['Body'].read() → bytes",
+    "download_single_part_async → SharedMemory: shm.buf[part_number*part_size : offset+len(data)] = data",
+    "download_parts_async → download_parts_to_s3: (None; data in shared memory)"
+  ],
+
+  "key_relationships": [
+    "FileClient wraps BaseStorageBackend (singleton pattern, backends dict: disk→HardDiskBackend, http→HTTPBackend)",
+    "Boto3Backend extends BaseStorageBackend; composes Boto3Client as _client",
+    "Boto3Client owns boto3.client('s3') as _client and optional _mc_kv_store (memcached)",
+    "easy_io (FileClient instance) used by misc.load_from_s3_with_cache via easy_io.copyfile_to_local and easy_io.load",
+    "Boto3Backend path pipeline: _map_path(path_mapping dict) → _format_path(fix backslashes) → _replace_prefix(strip nothing, legacy)",
+    "fast_put uses ProcessPoolExecutor (process-level) + per-process asyncio event loop + aioboto3 for parallelism",
+    "download_parts_async writes to multiprocessing.shared_memory (SharedMemory) for zero-copy IPC",
+    "distributed.barrier() called after rank-0 download in load_from_s3_with_cache for DDP sync"
+  ],
+
+  "important_notes": [
+    "Part size for multipart upload: 16 MB; fallback to single put if file_size <= part_size * num_processes",
+    "MAX_RETRIES=5 for downloads, 5 for upload_single_part (3 for AioConfig session); exponential backoff with asyncio.sleep(RETRY_DELAY * 2^attempt)",
+    "Boto3Client.get() checks optional _mc_kv_store (memcached) as L1 cache before hitting S3",
+    "download_from_s3_with_cache: only rank-0 downloads; all ranks sync via distributed.barrier(); cache_dir from TORCH_HOME → COSMOS_CACHE_DIR → ~/.cache/cosmos",
+    "load_from_s3_with_cache delegates download to download_from_s3_with_cache, then loads via easy_io.load(cache_fp)",
+    "aioboto3/aiobotocore optional import; aioboto3=None if not installed; fast_put asserts aioboto3 available",
+    "Boto3Client credentials loaded from JSON file via auto_auth module (prod/dev/stg envs skip file check)",
+    "FileClient (cosmos_predict1) only supports disk+http backends; Boto3Backend is NOT registered here — easy_io in Lyra-2 has it registered"
+  ],
+
+  "class_summary": {
+    "FileClient": {
+      "file": "cosmos_predict1/utils/easy_io/file_client.py",
+      "pattern": "Singleton via __new__; keyed by 'backend:prefix:kwargs'",
+      "attributes": ["_backends: dict (class)", "_prefix_to_backends: dict (class)", "_instances: dict (class)", "client: BaseStorageBackend"],
+      "key_methods": ["get(filepath)", "put(obj,filepath)", "get_local_path(filepath)", "infer_client(file_client_args, uri)", "register_backend(name,backend,force,prefixes)"]
+    },
+    "Boto3Backend": {
+      "file": "easy_io/backends/boto3_backend.py",
+      "extends": "BaseStorageBackend",
+      "attributes": ["_client: Boto3Client", "path_mapping: dict"],
+      "key_methods": ["get(filepath)->bytes", "put(obj,filepath)", "fast_put(obj,filepath,num_processes=32)", "copyfile_to_local(src,dst,dst_type)", "get_local_path(filepath) [contextmanager]", "list_dir_or_file(dir_path,list_dir,list_file,suffix,recursive)"]
+    },
+    "Boto3Client": {
+      "file": "easy_io/backends/boto3_client.py",
+      "attributes": ["_client: boto3.client('s3')", "_s3_cred_info: dict", "_mc_kv_store: optional memcached", "max_attempt: int=3"],
+      "key_methods": ["get(filepath)->bytes", "put(obj,filepath)", "fast_put(obj,filepath,num_processes)", "_get_file_size(bucket,key)", "contains(filepath)->bool", "isdir(filepath)->bool", "list(filepath)->Generator", "ls_dir(filepath)->Generator"]
+    }
+  },
+
+  "source_files_analyzed": [
+    "Lyra-2/lyra_2/_ext/imaginaire/utils/easy_io/backends/boto3_backend.py",
+    "Lyra-2/lyra_2/_ext/imaginaire/utils/easy_io/backends/boto3_client.py",
+    "Lyra-1/cosmos_predict1/utils/misc.py",
+    "Lyra-1/cosmos_predict1/utils/easy_io/file_client.py"
+  ]
+}

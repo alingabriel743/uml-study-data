@@ -1,0 +1,173 @@
+{
+  "scope": "mariadb_streaming_pipeline",
+  "title": "MariaDB Streaming Pipeline",
+  "diagram_type": "activity",
+  "description": "MariaDB-specific streaming workflow including charset registry initialization and full connector lifecycle",
+
+  "activity_phases": [
+    {
+      "phase": "1_connector_task_prestart",
+      "label": "ConnectorTask PreStart",
+      "steps": [
+        "MariaDbConnectorTask.preStart(config) called by Kafka Connect runtime",
+        "Instantiate MariaDbConnectorConfig(config)",
+        "Instantiate MariaDbTaskContext(config, connectorConfig)",
+        "Return taskContext as CdcSourceTaskContext"
+      ]
+    },
+    {
+      "phase": "2_task_start_infrastructure",
+      "label": "Task Start — Infrastructure Setup",
+      "steps": [
+        "start(configuration): build DB config with responseBuffering=adaptive, fetchSize=10000",
+        "Create DefaultMainConnectionProvidingConnectionFactory → new MariaDbConnection(MariaDbConnectionConfiguration, MariaDbFieldReader)",
+        "connection = connectionFactory.mainConnection()",
+        "Load previousOffsets via MariaDbPartition.Provider + MariaDbOffsetContext.Loader",
+        "registerServiceProviders(connectorConfig.getServiceRegistry()) — registers MariaDbCharsetRegistryServiceProvider"
+      ]
+    },
+    {
+      "phase": "3_charset_registry_init",
+      "label": "Charset Registry Initialization (Service Provider)",
+      "steps": [
+        "MariaDbCharsetRegistryServiceProvider.getServiceClass() → returns BinlogCharsetRegistry.class",
+        "MariaDbCharsetRegistryServiceProvider.createService(configuration, serviceRegistry) → new MariaDbCharsetRegistry()",
+        "MariaDbCharsetRegistry() constructor → loadCharacterSetMappingsFromFileResource()",
+        "Load charset_mappings.json via ClassLoader.getResourceAsStream()",
+        "ObjectMapper.readValue(stream, CharacterSetMappings.class) → parse JSON into CharacterSetMappings",
+        "loadCharacterSetMappings(characterSets): populate characterSetNameToCharacterSet map (name + aliases)",
+        "loadCollationMappings(collations): populate collationIndexToCollationName list + collationIndexToCharacterSet map",
+        "[BRANCH] encoding resolution: Charset.forName(encoding) → add canonical name + aliases; if unknown && mblen==1 → add raw encoding; if empty → fallback UTF-8 (mblen>1) or Cp1252"
+      ]
+    },
+    {
+      "phase": "4_schema_and_bean_registration",
+      "label": "Schema & Bean Registration",
+      "steps": [
+        "MariaDbValueConverters created with decimal/temporal/binary modes + serviceRegistry",
+        "new MariaDbDatabaseSchema(connectorConfig, valueConverters, topicNamingStrategy, schemaNameAdjuster, tableIdCaseInsensitive, converterRegistry, taskContext)",
+        "BeanRegistry: register config, connectorConfig, schema, jdbcConnection, valueConverters, offsets, taskContext",
+        "SnapshotterService.getSnapshotter() to determine snapshot mode"
+      ]
+    },
+    {
+      "phase": "5_validation",
+      "label": "Pre-Streaming Validation",
+      "steps": [
+        "validateBinlogConfiguration(snapshotter, connection) — verify binlog enabled",
+        "[BRANCH] validateSnapshotFeasibility: if binlog pos unavailable → previousOffsets.resetOffset()",
+        "[BRANCH] guardrailCollectionsMax > 0 → connection.getAllTableIds() → GuardrailValidator.validate(allTableIds)",
+        "connection.close() before schema recovery",
+        "validateSchemaHistory(connectorConfig, connection::validateLogPosition, previousOffsets, schema, snapshotter)",
+        "Reconnect: connection.execute('SELECT 1'); on failure → connection.close() + connectionFactory.mainConnection()",
+        "connection.setAutoCommit(false)"
+      ]
+    },
+    {
+      "phase": "6_pipeline_components",
+      "label": "Pipeline Component Assembly",
+      "steps": [
+        "Build ChangeEventQueue<DataChangeEvent> with pollInterval, maxBatchSize, maxQueueSize, buffering",
+        "new MariaDbErrorHandler(connectorConfig, queue, errorHandler)",
+        "new SignalProcessor<>(MariaDbConnector.class, connectorConfig, signalChannels, ...)",
+        "new EventDispatcher<>(connectorConfig, topicNamingStrategy, schema, queue, dataCollectionFilter, ...)",
+        "new BinaryLogClient(hostname, port, username, password)",
+        "[BRANCH] isSqlQueryIncluded → binaryLogClient.setUseSendAnnotateRowsEvent(true)",
+        "new MariaDbStreamingChangeEventSourceMetrics(taskContext, queue, metadataProvider, schema::dataCollectionIds, binaryLogClient)",
+        "new NotificationService<>(...)",
+        "new MariaDbChangeEventSourceFactory(config, connectionFactory, errorHandler, dispatcher, clock, schema, taskContext, streamingMetrics, queue, snapshotterService, binaryLogClient)"
+      ]
+    },
+    {
+      "phase": "7_coordinator_start",
+      "label": "Coordinator Start",
+      "steps": [
+        "new ChangeEventSourceCoordinator<>(previousOffsets, errorHandler, MariaDbConnector.class, connectorConfig, changeEventSourceFactory, metricsFactory, dispatcher, schema, signalProcessor, notificationService, snapshotterService)",
+        "coordinator.start(taskContext, queue, metadataProvider)"
+      ]
+    },
+    {
+      "phase": "8_streaming_execute",
+      "label": "Streaming Execution (BinlogStreamingChangeEventSource.execute)",
+      "steps": [
+        "MariaDbStreamingChangeEventSource.init(offsetContext): set effectiveOffsetContext (or MariaDbOffsetContext.initial(config))",
+        "configureReplicaCompatibility: binaryLogClient.setMariaDbSlaveCapability(4)",
+        "sslModeFor(secureConnectionMode): map MariaDbSecureConnectionMode → SSLMode",
+        "Register event handlers: STOP, HEARTBEAT, INCIDENT, ROTATE, TABLE_MAP, QUERY, TRANSACTION_PAYLOAD",
+        "[BRANCH] !skipCreate → register WRITE_ROWS / EXT_WRITE_ROWS → handleInsert",
+        "[BRANCH] !skipUpdate → register UPDATE_ROWS / EXT_UPDATE_ROWS → handleUpdate",
+        "[BRANCH] !skipDelete → register DELETE_ROWS / EXT_DELETE_ROWS → handleDelete",
+        "Register XID → handleTransactionCompletion, XA_PREPARE, VIEW_CHANGE",
+        "[BRANCH] isSqlQueryIncluded → register ANNOTATE_ROWS → handleRecordingQuery",
+        "[BRANCH] bufferSize==0 → direct listener; else → EventBuffer listener",
+        "client.registerEventListener(listener); client.registerLifecycleListener(ReaderThreadLifecycleListener)"
+      ]
+    },
+    {
+      "phase": "9_gtid_setup",
+      "label": "GTID / Position Setup",
+      "steps": [
+        "[BRANCH] isGtidModeEnabled && shouldRecoverUsingGtid() → register MARIADB_GTID → handleGtidEvent",
+        "connection.knownGtidSet() + connection.purgedGtidSet()",
+        "connection.filterGtidSet(gtidSourceFilter, offsetGtidSet, availableGtidSet, purgedGtidSet)",
+        "[BRANCH] filteredGtidSet not null → client.setGtidSet(filtered); initializeGtidSet(filtered) → new MariadbGtidSet(value)",
+        "[BRANCH] filteredGtidSet null + purged empty → client.setGtidSet(''); initializeGtidSet('')",
+        "[BRANCH] filteredGtidSet null + purged non-empty → client.setGtidSet(purged); initializeGtidSet('')",
+        "[BRANCH] not GTID mode → client.setBinlogFilename + setBinlogPosition"
+      ]
+    },
+    {
+      "phase": "10_event_loop",
+      "label": "Streaming Event Loop",
+      "steps": [
+        "BinaryLogClient connects to MariaDB, starts reading binlog events",
+        "Each event → handleEvent(partition, offsetContext, context, event) dispatches to registered handler",
+        "MARIADB_GTID event → handleGtidEvent: construct GTID string (domainId-serverId-sequence), gtidSet.add(gtid), offsetContext.startGtid(), optionally setIgnoreDmlEventByGtidSource, handleTransactionBegin",
+        "ANNOTATE_ROWS event → handleRecordingQuery: extract query; [BRANCH] if signal table query → skip; else offsetContext.setQuery(query)",
+        "QUERY event → handleQueryEvent (DDL processing, schema changes)",
+        "WRITE/UPDATE/DELETE_ROWS → handleInsert/handleUpdate/handleDelete → EventDispatcher → ChangeEventQueue",
+        "XID → handleTransactionCompletion (commit)"
+      ]
+    },
+    {
+      "phase": "11_stop",
+      "label": "Connector Stop",
+      "steps": [
+        "doStop(): connection.close()",
+        "beanRegistryJdbcConnection.close()",
+        "schema.close()"
+      ]
+    }
+  ],
+
+  "key_components": [
+    "MariaDbConnectorTask extends BinlogSourceTask<MariaDbPartition, MariaDbOffsetContext>",
+    "MariaDbStreamingChangeEventSource extends BinlogStreamingChangeEventSource<MariaDbPartition, MariaDbOffsetContext>",
+    "MariaDbChangeEventSourceFactory implements ChangeEventSourceFactory<MariaDbPartition, MariaDbOffsetContext>",
+    "MariaDbCharsetRegistryServiceProvider implements ServiceProvider<BinlogCharsetRegistry>",
+    "MariaDbCharsetRegistry implements BinlogCharsetRegistry",
+    "MariaDbCharsetRegistry.MAP_SIZE = 1024; data structures: collationIndexToCollationName (List), collationIndexToCharacterSet (TreeMap), characterSetNameToCharacterSet (HashMap)"
+  ],
+
+  "key_decisions": [
+    "isSqlQueryIncluded → enable ANNOTATE_ROWS (MariaDB-specific, equivalent to MySQL ROWS_QUERY)",
+    "isGtidModeEnabled && shouldRecoverUsingGtid → GTID-based vs binlog-file-position recovery",
+    "filteredGtidSet present/absent + purgedGtidSet present/absent → determines client GTID start point",
+    "isReadOnlyConnection + isGtidModeEnabled → MariaDbReadOnlyIncrementalSnapshotChangeEventSource",
+    "signalingDataCollectionIds empty → no incremental snapshot source created",
+    "guardrailCollectionsMax <= 0 → skip guardrail validation",
+    "bufferSize == 0 → direct event handling; else → buffered via EventBuffer",
+    "MariaDB GTID format: {domainId}-{serverId}-{sequence} (constructed manually from GTID_EVENT header + payload)"
+  ],
+
+  "important_notes": "MariaDB uses ANNOTATE_ROWS instead of MySQL's ROWS_QUERY. GTID format differs (domain-server-seq). MariaDB slave capability 4 set via configureReplicaCompatibility. charset_mappings.json loaded at startup via Jackson. Collation index range 0-1023 (MAP_SIZE=1024). SSL modes: DISABLE→DISABLED, TRUST→REQUIRED, VERIFY_CA→VERIFY_CA, VERIFY_FULL→VERIFY_IDENTITY.",
+
+  "source_files_analyzed": [
+    "debezium-connector-mariadb/src/main/java/io/debezium/connector/mariadb/charset/MariaDbCharsetRegistryServiceProvider.java",
+    "debezium-connector-mariadb/src/main/java/io/debezium/connector/mariadb/charset/MariaDbCharsetRegistry.java",
+    "debezium-connector-mariadb/src/main/java/io/debezium/connector/mariadb/MariaDbStreamingChangeEventSource.java",
+    "debezium-connector-mariadb/src/main/java/io/debezium/connector/mariadb/MariaDbConnectorTask.java",
+    "debezium-connector-mariadb/src/main/java/io/debezium/connector/mariadb/MariaDbChangeEventSourceFactory.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogStreamingChangeEventSource.java (partial)"
+  ]
+}

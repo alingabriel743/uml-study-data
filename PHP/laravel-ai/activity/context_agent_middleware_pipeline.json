@@ -1,0 +1,121 @@
+{
+  "scope": "agent_middleware_pipeline",
+  "title": "Agent Middleware Pipeline",
+  "diagram_type": "activity",
+  "key_participants": [
+    "Agent (Promptable trait)",
+    "AssistantAgent (HasMiddleware)",
+    "AnonymousAgent",
+    "Promptable::prompt()",
+    "GeneratesText::prompt()",
+    "Pipeline (Illuminate)",
+    "gatherMiddlewareFor()",
+    "middleware (passthrough)",
+    "shortCircuitingMiddleware",
+    "RememberConversation (built-in middleware)",
+    "FakePendingDispatch",
+    "AgentPrompt",
+    "AgentResponse",
+    "AgentPrompted (event)"
+  ],
+  "activity_flow": [
+    "START: Agent::prompt(string $prompt) called on agent instance",
+    "Agent::prompt() calls withModelFailover(callback, provider, model)",
+    "withModelFailover() resolves provider via Ai::textProviderFor()",
+    "withModelFailover() calls callback(provider, model) → Provider::prompt(AgentPrompt)",
+    "Provider::prompt() delegates to GeneratesText::prompt(AgentPrompt)",
+    "GeneratesText::prompt() generates invocationId = Str::uuid7()",
+    "GeneratesText::prompt() creates pipeline()->send(AgentPrompt)->through(gatherMiddlewareFor(agent))",
+    "--- FORK: gatherMiddlewareFor() assembles middleware stack ---",
+    "  [if agent is faked] prepend fake-recording middleware (Ai::recordPrompt)",
+    "  [if agent uses RemembersConversations AND has conversationParticipant] append RememberConversation middleware",
+    "  [if agent implements HasMiddleware] append agent->middleware() array",
+    "--- END FORK ---",
+    "Pipeline executes each middleware in order calling handle(AgentPrompt, Closure $next)",
+    "--- DECISION: Does middleware short-circuit? ---",
+    "  [YES - short-circuit path]: middleware returns AgentResponse directly WITHOUT calling $next($prompt)",
+    "    → Pipeline returns short-circuit AgentResponse immediately",
+    "    → processedPrompt remains null",
+    "  [NO - passthrough path]: middleware calls $next($prompt) and returns result",
+    "    → Next middleware in chain is invoked",
+    "    → Eventually reaches pipeline terminal 'then' callback",
+    "--- Pipeline terminal callback (non-short-circuit path) ---",
+    "processedPrompt = received AgentPrompt",
+    "dispatch PromptingAgent event",
+    "Collect messages: agent->messages() + new UserMessage(prompt, attachments)",
+    "listenForToolInvocations(invocationId, agent)",
+    "[if HasStructuredOutput] get schema from agent->schema()",
+    "textGateway()->generateText(provider, model, instructions, messages, tools, schema, options, timeout)",
+    "[if schema set] return StructuredAgentResponse",
+    "[else] return AgentResponse with messages, toolCalls, toolResults, steps",
+    "--- POST-PIPELINE (always runs) ---",
+    "dispatch AgentPrompted(invocationId, processedPrompt ?? originalPrompt, response)",
+    "Note: AgentPrompted always fires even on short-circuit, receiving the original prompt",
+    "Return AgentResponse to caller",
+    "END"
+  ],
+  "middleware_contract": {
+    "method": "handle(AgentPrompt $prompt, Closure $next)",
+    "passthrough": "return $next($prompt) — forwards to next middleware or terminal",
+    "short_circuit": "return new AgentResponse(...) — bypasses terminal, pipeline, and AI gateway"
+  },
+  "builtin_middleware": {
+    "RememberConversation": {
+      "trigger": "agent uses RemembersConversations trait AND hasConversationParticipant()",
+      "behavior": "calls $next($prompt)->then(...) to store conversation, user message, assistant message post-response"
+    },
+    "fake_recording_closure": {
+      "trigger": "Ai::hasFakeGatewayFor(agent::class) is true",
+      "behavior": "calls Ai::recordPrompt($prompt) then $next($prompt)"
+    }
+  },
+  "queue_path": {
+    "method": "Promptable::queue()",
+    "faked": "Ai::recordPrompt(QueuedAgentPrompt) + return QueuedAgentResponse(new FakePendingDispatch)",
+    "real": "InvokeAgent::dispatch(agent, prompt, ...) + return QueuedAgentResponse(PendingDispatch)"
+  },
+  "fake_pending_dispatch": {
+    "class": "Laravel\\Ai\\FakePendingDispatch extends PendingDispatch",
+    "purpose": "No-op stub for queue dispatch in fake/test mode. All fluent methods (onConnection, onQueue, delay, chain, etc.) return $this without action. __destruct() is empty (prevents real dispatch)."
+  },
+  "make_agent_middleware_command": {
+    "class": "MakeAgentMiddlewareCommand extends GeneratorCommand",
+    "artisan": "make:agent-middleware",
+    "stub": "stubs/agent-middleware.stub",
+    "default_namespace": "{rootNamespace}\\Ai\\Middleware",
+    "options": ["--force / -f"]
+  },
+  "key_classes": [
+    "AnonymousAgent implements Agent, Conversational, HasTools — uses Promptable",
+    "AssistantAgent implements Agent, HasMiddleware — uses Promptable; withMiddleware(array) sets middleware array",
+    "Promptable (trait) — prompt(), stream(), queue(), broadcast(), withModelFailover()",
+    "GeneratesText (trait on Provider) — prompt(AgentPrompt), gatherMiddlewareFor(), listenForToolInvocations()",
+    "RememberConversation — handle(AgentPrompt, Closure $next): stores conversation and messages post-response",
+    "FakePendingDispatch extends PendingDispatch — no-op for test queue dispatch",
+    "MakeAgentMiddlewareCommand extends GeneratorCommand — artisan scaffold command",
+    "AgentPrompt — value object: agent, prompt string, attachments, provider, model, timeout",
+    "AgentResponse — value object: invocationId, text, usage, meta, messages, toolCalls, steps",
+    "Pipeline (Illuminate) — send()->through()->then() execution engine"
+  ],
+  "key_decisions": [
+    "Does middleware call $next()? → YES: passthrough; NO: short-circuit",
+    "Is agent faked? → prepend fake-recording middleware",
+    "Does agent use RemembersConversations + have participant? → prepend RememberConversation",
+    "Does agent implement HasMiddleware? → append agent-defined middleware",
+    "Does agent implement HasStructuredOutput? → return StructuredAgentResponse vs AgentResponse",
+    "Is queue() called while faked? → return FakePendingDispatch instead of real dispatch"
+  ],
+  "important_notes": "AgentPrompted event always fires after pipeline (even on short-circuit), receiving processedPrompt ?? originalPrompt. Middleware stack order: [fake-recording?] → [RememberConversation?] → [agent custom middleware...]. pipeline() returns a new Illuminate Pipeline backed by the IoC container.",
+  "source_files_analyzed": [
+    "tests/Feature/AgentMiddlewareTest.php",
+    "src/FakePendingDispatch.php",
+    "src/AnonymousAgent.php",
+    "src/Promptable.php",
+    "src/Contracts/HasMiddleware.php",
+    "src/Providers/Concerns/GeneratesText.php",
+    "src/Middleware/RememberConversation.php",
+    "src/Console/Commands/MakeAgentMiddlewareCommand.php",
+    "tests/Fixtures/Agents/AssistantAgent.php",
+    "functions.php"
+  ]
+}

@@ -1,0 +1,414 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+title Sandbox – Capabilities
+
+' ─────────────────────────────────────────
+' External base types (abbreviated)
+' ─────────────────────────────────────────
+abstract class "pydantic.BaseModel" as BaseModel #E3F2FD {
+}
+
+abstract class FunctionTool #E3F2FD {
+}
+
+abstract class CustomTool #E3F2FD {
+}
+
+abstract class ApplyPatchEditor #E3F2FD {
+}
+
+' ─────────────────────────────────────────
+' Core Capability infrastructure
+' ─────────────────────────────────────────
+package "capabilities" {
+
+    abstract class Capability {
+        +type: str
+        +session: BaseSandboxSession | None
+        +run_as: User | None
+        --
+        +clone(): Capability
+        +bind(session: BaseSandboxSession): None
+        +bind_run_as(user: User | None): None
+        +required_capability_types(): set[str]
+        +tools(): list[Tool]
+        +process_manifest(manifest: Manifest): Manifest
+        +{abstract} instructions(manifest: Manifest): str | None
+        +sampling_params(sampling_params: dict): dict
+        +process_context(context: list): list
+    }
+    note right of Capability
+        Base Pydantic model for all capabilities.
+        arbitrary_types_allowed = True.
+        Subclasses override tools(), instructions(),
+        sampling_params(), process_manifest(),
+        process_context() as needed.
+    end note
+
+    class Capabilities {
+        --
+        +{static} default(): list[Capability]
+    }
+    note bottom of Capabilities
+        Default set: [Filesystem, Shell, Compaction]
+    end note
+
+    ' ─────────────────────────────────────
+    ' Concrete capabilities
+    ' ─────────────────────────────────────
+    class Filesystem {
+        +type: Literal["filesystem"] = "filesystem"
+        +configure_tools: FilesystemToolConfigurator | None
+        --
+        +tools(): list[Tool]
+    }
+    note right of Filesystem
+        Builds FilesystemToolSet (view_image, apply_patch).
+        Calls configure_tools callback if set.
+    end note
+
+    class Shell {
+        +type: Literal["shell"] = "shell"
+        +configure_tools: ShellToolConfigurator | None
+        --
+        +tools(): list[Tool]
+        +instructions(manifest: Manifest): str | None
+    }
+    note right of Shell
+        WriteStdinTool only added when
+        session.supports_pty() is True.
+        Injects _SHELL_INSTRUCTIONS to model.
+    end note
+
+    class Memory {
+        +type: Literal["memory"] = "memory"
+        +layout: MemoryLayoutConfig
+        +read: MemoryReadConfig | None
+        +generate: MemoryGenerateConfig | None
+        --
+        +clone(): Memory
+        +required_capability_types(): set[str]
+        +instructions(manifest: Manifest): str | None
+    }
+    note right of Memory
+        Requires Shell; also Filesystem if
+        live_update=True. Reads memory_summary.md
+        from sandbox at runtime.
+    end note
+
+    class Skills {
+        +type: Literal["skills"] = "skills"
+        +skills: list[Skill]
+        +from_: BaseEntry | None
+        +lazy_from: LazySkillSource | None
+        +skills_path: str = ".agents"
+        -{field}_skills_metadata: list[SkillMetadata] | None
+        --
+        +process_manifest(manifest: Manifest): Manifest
+        +bind(session: BaseSandboxSession): None
+        +tools(): list[Tool]
+        +load_skill(skill_name: str): dict[str, str]
+        +instructions(manifest: Manifest): str | None
+    }
+    note right of Skills
+        Exactly one source required:
+        inline skills, from_ (dir entry),
+        or lazy_from (on-demand load).
+        Mounts skill dirs into sandbox.
+    end note
+
+    class Compaction {
+        +type: Literal["compaction"] = "compaction"
+        +policy: CompactionPolicy | None
+        --
+        +sampling_params(sampling_params: dict): dict
+        +process_context(context: list): list
+    }
+    note right of Compaction
+        Auto-selects DynamicCompactionPolicy from
+        model name if no policy set.
+        Default threshold: 240,000 tokens.
+        process_context() trims before last
+        compaction event item.
+    end note
+}
+
+' ─────────────────────────────────────────
+' Skill domain types
+' ─────────────────────────────────────────
+package "capabilities.skills" {
+
+    class Skill {
+        +name: str
+        +description: str
+        +content: str | bytes | BaseEntry
+        +compatibility: str | None
+        +scripts: dict[str | Path, BaseEntry]
+        +references: dict[str | Path, BaseEntry]
+        +assets: dict[str | Path, BaseEntry]
+        +deferred: bool
+        --
+        +content_artifact(): BaseEntry
+        +as_dir_entry(): Dir
+    }
+    note bottom of Skill
+        as_dir_entry() builds Dir with
+        SKILL.md, scripts/, references/, assets/.
+        Paths must not escape skills root.
+    end note
+
+    class SkillMetadata <<frozen dataclass>> {
+        +name: str
+        +description: str
+        +path: Path
+    }
+
+    abstract class LazySkillSource {
+        --
+        +{abstract} list_skill_metadata(*, skills_path: str): list[SkillMetadata]
+        +{abstract} load_skill(*, skill_name, session, skills_path, user): dict[str, str]
+    }
+
+    class LocalDirLazySkillSource {
+        +source: LocalDir
+        --
+        +list_skill_metadata(*, skills_path: str): list[SkillMetadata]
+        +load_skill(*, skill_name, session, skills_path, user): dict[str, str]
+    }
+    note bottom of LocalDirLazySkillSource
+        Reads SKILL.md frontmatter from local
+        host filesystem. Copies skill dir into
+        sandbox on demand.
+    end note
+}
+
+' ─────────────────────────────────────────
+' Compaction policy types
+' ─────────────────────────────────────────
+package "capabilities.compaction" {
+
+    abstract class CompactionPolicy {
+        +type: str
+        --
+        +{abstract} compaction_threshold(sampling_params: dict): int
+    }
+
+    class StaticCompactionPolicy {
+        +type: Literal["static"]
+        +threshold: int = 240_000
+        --
+        +compaction_threshold(sampling_params: dict): int
+    }
+
+    class DynamicCompactionPolicy {
+        +type: Literal["dynamic"]
+        +model_info: CompactionModelInfo
+        +threshold: float = 0.9
+        --
+        +compaction_threshold(sampling_params: dict): int
+    }
+    note bottom of DynamicCompactionPolicy
+        threshold = context_window * threshold (0.9)
+    end note
+
+    class CompactionModelInfo {
+        +context_window: int
+        --
+        +{static} for_model(model: str): CompactionModelInfo
+    }
+}
+
+' ─────────────────────────────────────────
+' Tool bundles
+' ─────────────────────────────────────────
+package "capabilities.tools" {
+
+    class FilesystemToolSet <<dataclass>> {
+        +view_image: ViewImageTool
+        +apply_patch: SandboxApplyPatchTool
+    }
+    note bottom of FilesystemToolSet
+        Mutable bundle passed to
+        FilesystemToolConfigurator callback.
+    end note
+
+    class ShellToolSet <<dataclass>> {
+        +exec_command: ExecCommandTool
+        +write_stdin: WriteStdinTool | None
+    }
+    note bottom of ShellToolSet
+        Mutable bundle passed to
+        ShellToolConfigurator callback.
+    end note
+
+    class ExecCommandTool <<dataclass>> {
+        +{static} tool_name: str = "exec_command"
+        +{static} args_model: type = ExecCommandArgs
+        +session: BaseSandboxSession
+        +user: str | User | None
+        --
+        +run(args: ExecCommandArgs): str
+    }
+    note bottom of ExecCommandTool
+        Supports PTY exec with fallback to one-shot.
+        Returns formatted output with chunk ID,
+        wall time, exit code.
+    end note
+
+    class ExecCommandArgs {
+        +cmd: str
+        +workdir: str | None
+        +shell: str | None
+        +login: bool = True
+        +tty: bool = False
+        +yield_time_ms: int = 10_000
+        +max_output_tokens: int | None
+    }
+
+    class WriteStdinTool <<dataclass>> {
+        +{static} tool_name: str = "write_stdin"
+        +{static} args_model: type = WriteStdinArgs
+        +session: BaseSandboxSession
+        --
+        +run(args: WriteStdinArgs): str
+    }
+    note bottom of WriteStdinTool
+        Only available when
+        session.supports_pty() is True.
+        Writes chars to running PTY session.
+    end note
+
+    class WriteStdinArgs {
+        +session_id: int
+        +chars: str = ""
+        +yield_time_ms: int = 250
+        +max_output_tokens: int | None
+    }
+
+    class SandboxApplyPatchTool {
+        +needs_approval: bool | ApplyPatchApprovalFunction
+        +on_approval: ApplyPatchOnApprovalFunction | None
+        +session: BaseSandboxSession
+        +editor: SandboxApplyPatchEditor
+        --
+        +parse_custom_input(raw_input: str): list[ApplyPatchOperation]
+        +operation_needs_approval: property
+        +runtime_needs_approval(): CustomToolApprovalFunction
+    }
+    note bottom of SandboxApplyPatchTool
+        Freeform patch format (not JSON).
+        Supports Add/Update/Delete/Move operations.
+        Grammar defined via Lark.
+    end note
+
+    class SandboxApplyPatchEditor {
+        +session: BaseSandboxSession
+        +user: str | User | None
+        --
+        +create_file(operation: ApplyPatchOperation): ApplyPatchResult
+        +update_file(operation: ApplyPatchOperation): ApplyPatchResult
+        +delete_file(operation: ApplyPatchOperation): ApplyPatchResult
+    }
+    note bottom of SandboxApplyPatchEditor
+        Delegates all operations to WorkspaceEditor.
+    end note
+
+    class ViewImageTool <<dataclass>> {
+        +{static} tool_name: str = "view_image"
+        +{static} args_model: type = ViewImageArgs
+        +session: BaseSandboxSession
+        +user: str | User | None
+        --
+        +run(args: ViewImageArgs): ToolOutputImage | str
+    }
+    note bottom of ViewImageTool
+        Max 10 MB. Detects MIME type
+        (PNG, JPEG, GIF, WEBP, BMP, TIFF, SVG).
+        Returns base64 data URL.
+    end note
+
+    class _LoadSkillTool <<dataclass>> {
+        +tool_name: str = "load_skill"
+        +args_model: type = _LoadSkillArgs
+        +skills: Skills
+        --
+        +run(args: _LoadSkillArgs): dict[str, str]
+    }
+    note bottom of _LoadSkillTool
+        Only exposed when Skills.lazy_from
+        is configured. Delegates to
+        skills.load_skill() to stage files.
+    end note
+}
+
+' ─────────────────────────────────────────
+' Inheritance
+' ─────────────────────────────────────────
+Capability      --|>  BaseModel
+
+Filesystem      --|>  Capability
+Shell           --|>  Capability
+Memory          --|>  Capability
+Skills          --|>  Capability
+Compaction      --|>  Capability
+
+LazySkillSource        --|>  BaseModel
+LocalDirLazySkillSource --|> LazySkillSource
+
+CompactionPolicy       --|>  BaseModel
+StaticCompactionPolicy  --|> CompactionPolicy
+DynamicCompactionPolicy --|> CompactionPolicy
+
+ExecCommandTool          --|>  FunctionTool
+WriteStdinTool           --|>  FunctionTool
+ViewImageTool            --|>  FunctionTool
+_LoadSkillTool           --|>  FunctionTool
+SandboxApplyPatchTool    --|>  CustomTool
+SandboxApplyPatchEditor  --|>  ApplyPatchEditor
+
+' ─────────────────────────────────────────
+' Composition / Aggregation
+' ─────────────────────────────────────────
+Capabilities     ..>  Filesystem              : creates (default)
+Capabilities     ..>  Shell                   : creates (default)
+Capabilities     ..>  Compaction              : creates (default)
+
+Filesystem       *--  FilesystemToolSet       : builds on tools()
+Shell            *--  ShellToolSet            : builds on tools()
+
+FilesystemToolSet  *--  ViewImageTool
+FilesystemToolSet  *--  SandboxApplyPatchTool
+
+ShellToolSet       *--  ExecCommandTool
+ShellToolSet       o--  WriteStdinTool         : optional (PTY only)
+
+SandboxApplyPatchTool  *--  SandboxApplyPatchEditor
+
+Skills     o--  "0..*" Skill                  : contains
+Skills     o--  LazySkillSource               : optional lazy source
+Skills     ..>  _LoadSkillTool                : creates when lazy_from set
+Skills     ..>  SkillMetadata                 : resolves metadata
+
+Compaction   o--  CompactionPolicy            : optional policy
+DynamicCompactionPolicy  *--  CompactionModelInfo
+
+ExecCommandTool   *--  ExecCommandArgs        : args model
+WriteStdinTool    *--  WriteStdinArgs         : args model
+
+@enduml

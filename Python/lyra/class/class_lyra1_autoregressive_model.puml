@@ -1,0 +1,322 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #F9A825
+}
+
+title Lyra-1 Autoregressive Model & Transformer
+
+' ─── External / Framework ────────────────────────────────────────────────────
+package "PyTorch / External" <<Frame>> {
+    abstract class "nn.Module" as NNModule {
+    }
+    abstract class "Model" as BaseModel {
+        +training_step()
+        +validation_step()
+    }
+    abstract class "te.TransformerLayer" as TETransformerLayer {
+    }
+}
+
+' ─── Positional Embeddings ───────────────────────────────────────────────────
+package "Positional Embeddings\n(autoregressive/modules/embedding.py)" <<Frame>> {
+
+    class RotaryPositionEmbedding {
+        #dim: int
+        #max_position_embeddings: int
+        #rope_theta: float
+        #apply_yarn: bool
+        #rope_dim: str
+        #latent_shape: List[int]
+        #inv_freq: Tensor
+        #mscale: float
+        +forward(seq_len): Tensor
+        +compute_freqs(): Tensor
+        +get_inv_freq(device)
+        +get_scale_factors(inv_freq, original_seq_len): Tensor
+        +get_mscale(scale): float
+    }
+
+    class RotaryPositionEmbeddingPytorchV1 {
+        -cos_cached: Tensor
+        -sin_cached: Tensor
+        +forward(q, k, input_pos, seq_len): (Tensor, Tensor)
+        -rotate_half(x): Tensor
+    }
+
+    class RotaryPositionEmbeddingPytorchV2 {
+        -cos_cached: Tensor
+        -sin_cached: Tensor
+        +forward(q, k, input_pos, seq_len): (Tensor, Tensor)
+        +create_rope_freqs(seq_len, training_type): Tensor
+    }
+
+    class RotaryPositionEmbeddingPytorch {
+        +forward(q, k, input_pos, seq_len): (Tensor, Tensor)
+        -rotate_half(x): Tensor
+    }
+
+    class RotaryPositionEmbeddingTE {
+        +forward(seq_len, training_type): Tensor
+    }
+
+    class SinCosPosEmbAxisTE {
+        -latent_shape: (T, H, W)
+        -pos_emb_h: Tensor
+        -pos_emb_w: Tensor
+        -pos_emb_t: Tensor
+        -pad_to_multiple_of: int
+        +forward(training_type): Tensor
+    }
+
+    RotaryPositionEmbeddingPytorchV1  --|> RotaryPositionEmbedding : extends
+    RotaryPositionEmbeddingPytorchV2  --|> RotaryPositionEmbedding : extends
+    RotaryPositionEmbeddingPytorch    --|> RotaryPositionEmbedding : extends
+    RotaryPositionEmbeddingTE         --|> RotaryPositionEmbedding : extends
+    RotaryPositionEmbedding           --|> NNModule : extends
+    SinCosPosEmbAxisTE                --|> NNModule : extends
+}
+
+' ─── Inference Path ──────────────────────────────────────────────────────────
+package "Inference\n(autoregressive/model.py + networks/ + modules/)" <<Frame>> {
+
+    class AutoRegressiveModel {
+        -model: Transformer
+        -tokenizer: DiscreteMultimodalTokenizer
+        -config: ModelConfig
+        -model_parallel: ModelParallelConfig
+        -vision_encoder: VisionTransformer
+        -mm_projector: MultimodalProjector
+        +{static} build(model_config, tokenizer_config, model_parallel, shard_checkpoint): AutoRegressiveModel
+        +generate(prompt_tokens, max_gen_len, temperature, top_k, top_p, ...): (seq, None)
+        +load_ar_model(shard_checkpoint, tokenizer_config)
+        +load_tokenizer(tokenizer_config)
+        +embed_vision_language_features(input_ids, images): Tensor
+        +get_num_params(): int
+        +state_dict(*args, **kwargs)
+        +load_state_dict(state_dict, strict, assign): _IncompatibleKeys
+        +precision: torch.dtype
+    }
+
+    class Transformer {
+        -params: Namespace
+        -vocab_size: int
+        -n_layers: int
+        -precision: torch.dtype
+        -tok_embeddings: nn.Embedding
+        -layers: ModuleList[TransformerBlock]
+        -norm: RMSNorm
+        -rope: RotaryPositionEmbeddingPytorchV1
+        -causal_mask: Tensor
+        -output: nn.Linear
+        -pos_emb: SinCosPosEmbAxisTE
+        -has_cross_attention: bool
+        +forward(tokens, input_pos, token_embeddings, context, context_mask): Tensor
+        -_create_attention_mask(input_pos): Tensor
+        -_prepare_layer_kwargs(input_pos, mask, context, context_mask): Dict
+        -_create_rope_config(): Dict
+        +expand_vocab(new_vocab_size, init_method, multiple_of)
+        +state_dict()
+        +load_state_dict(state_dict, strict, assign)
+    }
+
+    class TransformerBlock {
+        -layer_id: int
+        -attention: Attention
+        -feed_forward: MLP
+        -attention_norm: RMSNorm
+        -ffn_norm: RMSNorm
+        -has_cross_attention: bool
+        -cross_attention: Attention
+        -cross_attention_norm: RMSNorm
+        +forward(x, rope, input_pos, mask, context, context_mask): Tensor
+        +init_weights()
+    }
+
+    class Attention {
+        -n_kv_heads: int
+        -n_local_heads: int
+        -n_local_kv_heads: int
+        -head_dim: int
+        -attn_type: str
+        -wq: nn.Linear
+        -wk: nn.Linear
+        -wv: nn.Linear
+        -wo: nn.Linear
+        -wqkv: nn.Linear
+        -cache_k: Tensor
+        -cache_v: Tensor
+        -q_norm: RMSNorm
+        -k_norm: RMSNorm
+        +forward(x, rope, input_pos, mask, context): Tensor
+        +init_kv_cache(dtype)
+        +load_hook(state_dict, prefix)
+    }
+
+    class MLP {
+        -w1: nn.Linear
+        -w2: nn.Linear
+        -w3: nn.Linear
+        -tp_size: int
+        +forward(x): Tensor
+    }
+
+    AutoRegressiveModel --|> NNModule : extends
+    Transformer         --|> NNModule : extends
+    TransformerBlock    --|> NNModule : extends
+    Attention           --|> NNModule : extends
+    MLP                 --|> NNModule : extends
+
+    AutoRegressiveModel *-- Transformer          : model
+    Transformer         *-- TransformerBlock     : layers[ ]
+    TransformerBlock    *-- Attention            : attention / cross_attention
+    TransformerBlock    *-- MLP                  : feed_forward
+    Transformer         *-- SinCosPosEmbAxisTE   : pos_emb (optional)
+    Transformer         o-- RotaryPositionEmbeddingPytorchV1 : rope (v1)
+    Transformer         o-- RotaryPositionEmbeddingPytorchV2 : rope (v2)
+    Attention           ..> RotaryPositionEmbedding          : uses (receives as arg)
+}
+
+' ─── Training Path ───────────────────────────────────────────────────────────
+package "Training\n(autoregressive/training/model.py + training/networks/ + training/modules/)" <<Frame>> {
+
+    class AutoRegressiveTrainingModel {
+        -model: TrainingTransformer
+        -tokenizer: DiscreteMultimodalTokenizer
+        -config: TrainingModelConfig
+        -model_parallel: ModelParallelConfig
+        -vision_encoder: VisionTransformer
+        -mm_projector: MultimodalProjector
+        -inference_params: InferenceParams
+        -monitor_output_logits: bool
+        +training_step(data_batch, iteration): (output_batch, total_loss)
+        +validation_step(data_batch, iteration): (output_batch, total_loss)
+        +get_num_params(): int
+        +gather_output_logits_stats(logits, labels, output_batch, ignore_index)
+        +embed_vision_language_features(input_ids, images): Tensor
+    }
+
+    class "Transformer [Training]" as TransformerTraining {
+        -tok_embeddings: nn.Embedding
+        -layers: ModuleList[TransformerBlockTraining]
+        -norm: RMSNormTE
+        -rope: RotaryPositionEmbeddingPytorchV2
+        -output: LinearTE
+        +forward(tokens, input_pos, token_embeddings, context, context_mask, action, total_seq_len): Tensor
+        +enable_context_parallel(cp_group)
+        +expand_vocab(...)
+    }
+
+    class "TransformerBlock [Training]" as TransformerBlockTraining {
+        -layer_id: int
+        -attention: GQA
+        -feed_forward: TrainingMLP
+        -attention_norm: RMSNorm
+        -ffn_norm: RMSNorm
+        -weight_init_std: float
+        -has_cross_attention: bool
+        -cross_attention: GQA
+        -cross_attention_norm: RMSNorm
+        +forward(x, rope, input_pos, mask, context, context_mask): Tensor
+        +init_weights()
+    }
+
+    class TransformerBlockTE {
+        -has_cross_attention: bool
+        -layer_id: int
+        -inference: bool
+        -weight_init_std: float
+        +forward(x, rotary_pos_emb, mask, inference_params, context, context_mask): Tensor
+        +set_inference_flag(flag: bool)
+    }
+
+    class GQA {
+        -n_kv_heads: int
+        -n_local_heads: int
+        -head_dim: int
+        -attention_type: str
+        -wq: ColumnParallelLinear
+        -wk: ColumnParallelLinear
+        -wv: ColumnParallelLinear
+        -wo: RowParallelLinear
+        -cache_k: Tensor
+        -cache_v: Tensor
+        -q_norm: RMSNorm
+        -k_norm: RMSNorm
+        -attention_dropout: float
+        +forward(x, rope, input_pos, mask, context): Tensor
+        +init_kv_cache(dtype)
+        +init_weights(init_std)
+    }
+
+    class TrainingMLP {
+        -w1: ColumnParallelLinear
+        -w2: RowParallelLinear
+        -w3: ColumnParallelLinear
+        -hidden_dropout: float
+        -tp_size: int
+        -inference: bool
+        +forward(x): Tensor
+        +init_weights(init_std)
+    }
+
+    AutoRegressiveTrainingModel --|> BaseModel              : extends
+    TransformerTraining         --|> NNModule               : extends
+    TransformerBlockTraining    --|> NNModule               : extends
+    TransformerBlockTE          --|> TETransformerLayer     : extends
+    GQA                         --|> NNModule               : extends
+    TrainingMLP                 --|> NNModule               : extends
+
+    AutoRegressiveTrainingModel *-- TransformerTraining         : model
+    TransformerTraining         *-- TransformerBlockTraining    : layers[ ]
+    TransformerTraining         *-- TransformerBlockTE          : layers[ ] (TE variant)
+    TransformerBlockTraining    *-- GQA                         : attention / cross_attention
+    TransformerBlockTraining    *-- TrainingMLP                 : feed_forward
+    TransformerTraining         o-- RotaryPositionEmbeddingPytorchV2 : rope (v2)
+    TransformerTraining         o-- RotaryPositionEmbeddingTE        : rope (TE)
+    GQA                         ..> RotaryPositionEmbedding          : uses (receives as arg)
+}
+
+' ─── Cross-path notes ────────────────────────────────────────────────────────
+note bottom of Attention
+  GQA-style (Grouped Query Attention).
+  KV cache for inference.
+  Supports self / cross / full attn types.
+end note
+
+note bottom of GQA
+  Training counterpart of Attention.
+  Uses Megatron parallel linear layers.
+  Flash Attention + dropout.
+end note
+
+note right of TransformerBlockTE
+  TransformerEngine block.
+  FP8-capable training.
+  Uses TE RMSNorm + SwiGLU natively.
+end note
+
+note right of AutoRegressiveTrainingModel
+  Loss = CrossEntropy + Z-loss
+  (z_loss_coeff * mean(logsumexp²)).
+  Labels shifted by 1 for AR training.
+  Supports text_to_video & class_to_image.
+end note
+
+@enduml

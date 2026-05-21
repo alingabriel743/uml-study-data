@@ -1,0 +1,210 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #495057
+    StartColor #212529
+    EndColor #212529
+}
+
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 12
+}
+
+title Reselect Columns Post-Processing\n<size:11><i>ReselectColumnsPostProcessor.apply() — mutates Struct 'after' in-place with re-selected DB values</i></size>
+
+|#DDEEFF|ReselectColumnsPostProcessor|
+start
+:Receive change event\n(messageKey: Object, value: Struct);
+
+if (value == null?) then (yes)
+    :Log debug: skip null value;
+    stop
+else (no)
+endif
+
+if (messageKey not instanceof Struct?) then (yes)
+    :Log debug: skip non-Struct key;
+    stop
+else (no)
+endif
+
+:Extract **after** = value.getStruct("after");
+
+if (after == null?) then (yes)
+    :Log debug: skip — no after-image;
+    stop
+else (no)
+endif
+
+:Extract **operation** = value.getString("op");
+
+if (operation == READ ("r")?) then (yes)
+    :Skip — snapshot read events\nnever re-queried;
+    stop
+else (no)
+endif
+
+:Extract **source** = value.getStruct("source");
+
+if (source == null?) then (yes)
+    :Log debug: skip — no source info;
+    stop
+else (no)
+endif
+
+|ReselectColumnsPostProcessor|
+:Call **getTableIdFromSource**(source);
+
+|#D5F0D5|Schema & Config|
+:Read source fields:\ndatabase, schema (optional), table;
+
+if (database or table is null/empty?) then (yes)
+    :Return null tableId;
+else (no)
+    :jdbcConnection.createTableId\n(database, schema, table) → **TableId**;
+endif
+
+|ReselectColumnsPostProcessor|
+if (tableId == null?) then (yes)
+    :Return — cannot identify table;
+    stop
+else (no)
+endif
+
+|Schema & Config|
+:connectorConfig.isSignalDataCollection\n(tableId);
+
+|ReselectColumnsPostProcessor|
+if (tableId is a signal collection?) then (yes)
+    :Log debug: skip signal table;
+    stop
+else (no)
+endif
+
+|Schema & Config|
+:schema.tableFor(tableId) → **Table**;
+
+|ReselectColumnsPostProcessor|
+if (table == null?) then (yes)
+    :Log debug: table not found\nin schema registry;
+    stop
+else (no)
+endif
+
+:Call **getRequiredColumnSelections**\n(tableId, after);
+
+note right
+  Iterates all fields in after.schema().fields()
+  For each field value:
+  • reselectUnavailableValues &&
+    isUnavailableValueHolder() → candidate
+  • reselectNullValues && value == null → candidate
+  Apply selector predicate on
+  fully-qualified name "schema.table:column"
+  (include list takes priority over exclude list)
+end note
+
+if (requiredColumns is empty?) then (yes)
+    :Log debug: no columns need reselection;
+    stop
+else (no)
+endif
+
+:Build **keyColumns** and **keyValues**;
+
+if (reselectUseEventKeyFields == true?) then (yes — use Kafka key)
+    :Iterate key.schema().fields()\n→ resolveKeyFieldValue(messageKey, field);
+else (no — use table PK)
+    :Iterate table.primaryKeyColumns()\n→ resolveKeyFieldValue(after, field);
+endif
+
+|#FFE8CC|JdbcConnection|
+:jdbcConnection.**reselectColumns**(\n  table, requiredColumns,\n  keyColumns, keyValues,\n  source, callback);
+
+:Execute SELECT query\nfor required columns\nWHERE PK = keyValues;
+
+if (row found in ResultSet?) then (yes)
+    :Iterate each columnName\nin requiredColumns;
+
+    |#EDE0F5|ValueConverter|
+    :customConverterRegistry\n.getValueConverter(tableId, column)\n→ Optional<ValueConverter>;
+
+    if (custom converter present?) then (yes)
+        :Apply custom converter\nconverter.convert(rawValue);
+    else (no)
+        :valueConverterProvider\n.converter(column, field)\n→ converter;
+        if (converter != null?) then (yes)
+            :converter.convert(rawValue);
+        else (no)
+            :Use raw JDBC value;
+        endif
+    endif
+
+    |ReselectColumnsPostProcessor|
+    :after.put(field.name(), convertedValue)\n// mutate Struct in-place;
+
+    :Next column →;
+
+    |JdbcConnection|
+    if (more required columns?) then (yes)
+        :Process next column;
+    else (no)
+    endif
+
+    |ReselectColumnsPostProcessor|
+    :Change event after-struct\n**fully updated** with re-selected values;
+    stop
+
+else (no — row not found)
+    |ReselectColumnsPostProcessor|
+    if (errorHandlingMode == FAIL?) then (yes)
+        :Throw **DebeziumException**\n"Row not found for reselect";
+        stop
+    else (no — WARN)
+        :Log warn: row not found,\nretain original values;
+        stop
+    endif
+endif
+
+|JdbcConnection|
+note left
+  **SQLException** path
+end note
+
+if (SQLException thrown?) then (yes)
+    |ReselectColumnsPostProcessor|
+    if (errorHandlingMode == FAIL?) then (yes)
+        :Throw **DebeziumException**\nwrapping SQLException;
+        stop
+    else (no — WARN)
+        :Log warn: SQL error,\nretain original values;
+        stop
+    endif
+else (no)
+endif
+
+@enduml

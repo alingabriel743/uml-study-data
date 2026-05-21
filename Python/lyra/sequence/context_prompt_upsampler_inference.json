@@ -1,0 +1,105 @@
+{
+  "scope": "prompt_upsampler_inference",
+  "title": "Prompt Upsampler Inference Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Caller/main()",
+    "guardrail_presets",
+    "create_prompt_upsampler",
+    "AutoRegressiveModel",
+    "run_chat_completion",
+    "chat_completion",
+    "TextTokenizer",
+    "clean_text",
+    "DiffusionText2WorldGenerationPipeline"
+  ],
+  "interaction_flow": [
+    "main() → guardrail_presets: create_text_guardrail_runner(checkpoint_dir) → guardrail_runner",
+    "main() → guardrail_presets: run_text_guardrail(input_prompt, guardrail_runner) → is_safe [GUARD: abort if not safe]",
+    "main() → create_prompt_upsampler(checkpoint_dir + prompt_upsampler_dir)",
+    "create_prompt_upsampler → create_text_model_config(model_ckpt_path, tokenizer_path, model_family='mistral', model_size='12b', is_instruct=True, max_batch_size=1, max_seq_len=1024) → (model_config, tokenizer_config)",
+    "create_prompt_upsampler → AutoRegressiveModel.build(model_config, tokenizer_config).to('cuda') → prompt_upsampler",
+    "main() → run_chat_completion(prompt_upsampler, input, temperature=0.01)",
+    "run_chat_completion: builds dialogs = [[{role:'user', content:'Upsample the short caption to a long caption: <input>'}]]",
+    "run_chat_completion → chat_completion(model, dialogs, max_gen_len=512, temperature, top_p=None, top_k=None, logprobs=False)",
+    "chat_completion: checks tokenizer type (ImageTextTokenizer vs TextTokenizer)",
+    "chat_completion → model.tokenizer.text_tokenizer.apply_chat_template(dialog, generation_prefix='', add_generation_prompt=True) → prompt_tokens",
+    "chat_completion → model.generate(prompt_tokens, max_gen_len=512, temperature, top_k, top_p, compile_sampling, compile_prefill, ...) → (generation_tokens, generation_logprobs)",
+    "chat_completion → model.tokenizer.text_tokenizer.decode(t) for each t in generation_tokens → content",
+    "chat_completion → returns List[ChatPrediction({role:'assistant', content:...})]",
+    "run_chat_completion → clean_text(results[0]['generation']['content']) → upsampled_prompt",
+    "clean_text: strips newlines, removes '- **...**' sections with <10 words, strips prefixes/punctuation, normalizes whitespace",
+    "main() → guardrail_presets: run_text_guardrail(upsampled_prompt, guardrail_runner) → is_safe [GUARD: abort if not safe]",
+    "main() → log.info(upsampled_prompt)"
+  ],
+  "pipeline_integration_flow": [
+    "DiffusionText2WorldGenerationPipeline.__init__(enable_prompt_upsampler, offload_prompt_upsampler, prompt_upsampler_dir, ...)",
+    "  if enable_prompt_upsampler AND NOT offload_prompt_upsampler → _load_prompt_upsampler_model() [eager load]",
+    "_load_prompt_upsampler_model() → create_prompt_upsampler(checkpoint_dir/prompt_upsampler_dir) → self.prompt_upsampler",
+    "generate(prompt, word_limit_to_skip_upsampler, ...) → _run_guardrail_on_prompt_with_offload(prompt) [if not disable_guardrail]",
+    "generate: if enable_prompt_upsampler AND word_count <= word_limit → _run_prompt_upsampler_on_prompt_with_offload(prompt)",
+    "_run_prompt_upsampler_on_prompt_with_offload: if offload_prompt_upsampler → _load_prompt_upsampler_model()",
+    "_run_prompt_upsampler_on_prompt_with_offload → _run_prompt_upsampler_on_prompt(prompt)",
+    "_run_prompt_upsampler_on_prompt(prompt) → run_chat_completion(self.prompt_upsampler, prompt) → upsampled_prompt",
+    "_run_prompt_upsampler_on_prompt_with_offload: if offload_prompt_upsampler → _offload_prompt_upsampler_model() [del self.prompt_upsampler, gc.collect, cuda.empty_cache]",
+    "generate: run_guardrail on upsampled_prompt [if not disable_guardrail]",
+    "generate: _run_text_embedding_on_prompt_with_offload([prompt]) → proceed to diffusion"
+  ],
+  "key_classes_and_methods": {
+    "chat_completion": {
+      "file": "cosmos_predict1/diffusion/prompt_upsampler/inference.py",
+      "signature": "chat_completion(model: AutoRegressiveModel, dialogs: List, seed=None, temperature=0.01, top_k=None, top_p=None, max_gen_len=None, num_gen_seq=1, logprobs=False, generation_prefix='', compile_sampling=False, compile_prefill=False, stop_tokens=None, verbose=False) -> List[ChatPrediction]",
+      "returns": "List[ChatPrediction] with 'generation': {'role': 'assistant', 'content': decoded_text}"
+    },
+    "run_chat_completion": {
+      "file": "cosmos_predict1/diffusion/prompt_upsampler/text2world_prompt_upsampler_inference.py",
+      "signature": "run_chat_completion(model: AutoRegressiveModel, input: str, temperature: float = 0.01) -> str",
+      "notes": "Wraps chat_completion with fixed dialog template for upsampling. max_gen_len=512."
+    },
+    "create_prompt_upsampler": {
+      "file": "text2world_prompt_upsampler_inference.py",
+      "signature": "create_prompt_upsampler(checkpoint_dir: str) -> AutoRegressiveModel",
+      "notes": "Builds mistral-12B instruct model with max_seq_len=1024, rope_dim='1D', pytorch_rope_version='v1'"
+    },
+    "clean_text": {
+      "file": "text2world_prompt_upsampler_inference.py",
+      "signature": "clean_text(text: str) -> str",
+      "notes": "Post-processing: newline normalization, bold section removal (<10 words), prefix stripping, whitespace normalization"
+    },
+    "DiffusionText2WorldGenerationPipeline._run_prompt_upsampler_on_prompt": {
+      "file": "cosmos_predict1/diffusion/inference/world_generation_pipeline.py",
+      "signature": "_run_prompt_upsampler_on_prompt(self, prompt: str) -> str",
+      "notes": "Calls run_chat_completion(self.prompt_upsampler, prompt)"
+    },
+    "DiffusionText2WorldGenerationPipeline._run_prompt_upsampler_on_prompt_with_offload": {
+      "file": "world_generation_pipeline.py",
+      "signature": "_run_prompt_upsampler_on_prompt_with_offload(self, *args, **kwargs) -> str",
+      "notes": "Handles lazy load/unload of prompt_upsampler to save GPU memory when offload_prompt_upsampler=True"
+    }
+  },
+  "key_relationships": [
+    "DiffusionText2WorldGenerationPipeline extends BaseWorldGenerationPipeline",
+    "DiffusionVideo2WorldGenerationPipeline extends DiffusionText2WorldGenerationPipeline",
+    "DiffusionText2WorldMultiviewGenerationPipeline extends DiffusionText2WorldGenerationPipeline",
+    "DiffusionWorldInterpolatorGenerationPipeline extends DiffusionVideo2WorldGenerationPipeline",
+    "DiffusionText2WorldGenerationPipeline owns AutoRegressiveModel (self.prompt_upsampler)",
+    "run_chat_completion depends_on chat_completion (from inference.py)",
+    "chat_completion depends_on AutoRegressiveModel.generate + AutoRegressiveModel.tokenizer.text_tokenizer",
+    "AutoRegressiveModel.tokenizer.text_tokenizer is TextTokenizer or ImageTextTokenizer",
+    "create_prompt_upsampler depends_on create_text_model_config + AutoRegressiveModel.build"
+  ],
+  "conditions_and_branching": [
+    "Guardrail check on input prompt: if not safe → abort early",
+    "Guardrail check on upsampled prompt: if not safe → abort early",
+    "enable_prompt_upsampler flag: controls whether upsampling runs at all",
+    "word_limit_to_skip_upsampler: skip upsampling if prompt word count > threshold",
+    "offload_prompt_upsampler: lazy load model before call, unload after (GPU memory optimization)",
+    "Tokenizer type branching in chat_completion: ImageTextTokenizer (VLM path with images) vs TextTokenizer (text-only path)"
+  ],
+  "important_notes": "Text2World uses text-only AutoRegressiveModel (Mistral-12B instruct); Video2World uses VLM variant (run_chat_completion_vlm). Model checkpoint: Cosmos-UpsamplePrompt1-12B-Text2World. Dialog template: 'Upsample the short caption to a long caption: <input>'. max_seq_len=1024 at inference (trained on 512). Temperature defaults to 0.01 (near-deterministic).",
+  "source_files_analyzed": [
+    "Lyra-1/cosmos_predict1/diffusion/prompt_upsampler/inference.py",
+    "Lyra-1/cosmos_predict1/diffusion/prompt_upsampler/text2world_prompt_upsampler_inference.py",
+    "Lyra-1/cosmos_predict1/diffusion/inference/world_generation_pipeline.py (prompt upsampler sections)"
+  ]
+}

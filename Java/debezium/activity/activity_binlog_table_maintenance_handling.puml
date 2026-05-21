@@ -1,0 +1,130 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title Binlog Table Maintenance Handling\n(ANALYZE / OPTIMIZE / REPAIR TABLE — DBZ-253)
+
+|MySQL / MariaDB|
+start
+:Execute table maintenance statement\n(ANALYZE TABLE / OPTIMIZE TABLE / REPAIR TABLE);
+:Binlog captures statement as **QUERY** event;
+
+|BinlogStreamingChangeEventSource|
+:EventType.QUERY handler fires\n**handleQueryEvent**(partition, offsetContext, event);
+:Extract SQL text via\nQueryEventData.getSql().trim();
+
+if (sql == "BEGIN"?) then (yes)
+    :handleTransactionBegin();
+    stop
+else (no)
+endif
+
+if (sql == "COMMIT"?) then (yes)
+    :handleTransactionCompletion();
+    stop
+else (no)
+endif
+
+if (sql starts with "XA "?) then (yes)
+    :Ignore XA transaction statement;
+    stop
+else (no)
+endif
+
+|SchemaHistory (DDL Filter)|
+if (!TRUNCATE_STATEMENT_PATTERN.matches(sql)\nAND schema.ddlFilter().test(sql)?) then (yes — matches ANALYZE/OPTIMIZE/REPAIR regex)
+    :LOGGER.debug(\n  "DDL '{}' was filtered out of processing");
+    note right
+      DDL_FILTER regex:
+      ^(?:SET STATEMENT\s+.*?FOR\s+)?
+      (?:ANALYZE|OPTIMIZE|REPAIR)\s+
+      (?:NO_WRITE_TO_BINLOG\s+|LOCAL\s+)?
+      TABLE\s+.*
+      (also covers MariaDB SET STATEMENT variant)
+    end note
+    :Return — no SchemaChangeEvent emitted\nno Kafka/schema-history record produced;
+    stop
+else (no — not a maintenance statement)
+endif
+
+|BinlogStreamingChangeEventSource|
+if (isDmlStatement(sql)?) then (yes)
+    :Log WARN: unexpected DML in DDL handler;
+    stop
+else (no)
+endif
+
+if (sql == "ROLLBACK"?) then (yes)
+    :Log WARN: unsupported ROLLBACK;
+    stop
+else (no)
+endif
+
+|BinlogDatabaseSchema|
+:schema.parseStreamingDdl(\n  partition, sql, database, offsetContext, eventTime)\n→ List<SchemaChangeEvent>;
+
+:Check ignoredQueryStatements\n(BEGIN / END / FLUSH PRIVILEGES);
+
+:ddlParser.parse(ddlStatements, tables())\n→ DdlChanges via AntlrDdlParser;
+
+note right
+  For ANALYZE/OPTIMIZE/REPAIR:
+  Parser produces **zero** DdlParserListener events.
+  Tables remain unchanged.
+end note
+
+if (ddlChanges.isEmpty()?) then (yes)
+    :Emit SchemaChangeEvent.ofDatabase()\nas fallback (database-level event);
+else (no)
+    :Emit per-table SchemaChangeEvent(s);
+endif
+
+|BinlogStreamingChangeEventSource|
+repeat
+    :Process next SchemaChangeEvent;
+    if (schema.skipSchemaChangeEvent(event)?) then (yes)
+        :Skip event;
+    else (no)
+        if (eventType == TRUNCATE\nAND tableId != null?) then (yes)
+            |EventDispatcher|
+            :dispatchDataChangeEvent(TRUNCATE)\nfor the affected table;
+        else (no)
+            |EventDispatcher|
+            :dispatchSchemaChangeEvent(\n  partition, offsetContext, tableId, receiver);
+        endif
+    endif
+    |BinlogStreamingChangeEventSource|
+repeat while (more SchemaChangeEvents?) is (yes)
+-> no;
+
+stop
+
+@enduml

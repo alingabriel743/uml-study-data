@@ -1,0 +1,160 @@
+@startuml activity_scheduled_task_execution
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #212529
+    EndColor #212529
+}
+
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title Scheduled Task Execution (scheduler.check)
+
+|Scheduler|
+start
+:check() invoked\n<i>(every INTERVAL = 120s)</i>;
+
+' ── L4 Cron Gate ──────────────────────────────────
+if (now − _l4_t > 43200 s\n(12-hour L4 cron gate)?) then (yes)
+    :Update _l4_t = time.time();
+    |L4 Session Archive|
+    :Glob model_responses_*.txt\nfrom ../temp/model_responses/;
+    if (No raw files found?) then (yes)
+        :Return zero-stats dict;
+    else (no)
+        :_existing_sessions(l4_dir)\n→ read SESSION: lines\nfrom all_histories.txt;
+        :cutoff = now − 7200 s\n<i>(skip files modified < 2 h ago)</i>;
+        note right
+            **Phase 1 — Compress & Extract**
+            For each raw file:
+            • mtime > cutoff → skip (recent)
+            • _detect_format() → 'json' | 'raw'
+            • if raw → _compress_raw()
+              (strip sys-prompt & assistant echo)
+            • compressed < 4 500 B → skip (too small)
+            • session in existing → skip (duplicate)
+            • else → write to tmp_dir/{MMDD_HHMM}.txt
+        end note
+        :Phase 1: compress each raw session\nto tmp_dir;
+        if (dry_run == True?) then (yes)
+            :Cleanup tmp_dir;
+            :Return preview stats dict;
+        else (no, dry_run=False)
+            :Phase 2: append history blocks\nto all_histories.txt;
+            :Phase 3: archive compressed .txt\nto memory/L4_raw_sessions/{YYYY-MM}.zip;
+            :Phase 4: delete processed raw files\n<i>(skip 'recent' files)</i>;
+            :Cleanup tmp_dir;
+            :Return report dict\n{processed, skipped, errors,\nnew_sessions, deleted_raw};
+        endif
+    endif
+    |Scheduler|
+    :Print L4 cron result;
+    note right: On exception → log error
+else (no, < 12 h since last run)
+endif
+
+' ── Task Directory Gate ────────────────────────────
+if (TASKS dir\n(../sche_tasks/) exists?) then (no)
+    :return None;
+    stop
+else (yes)
+endif
+
+:makedirs(DONE=../sche_tasks/done/,\nexist_ok=True);
+:done_files = set(os.listdir(DONE));
+:Sort .json files in TASKS dir;
+
+' ── Per-Task Iteration ─────────────────────────────
+|Task Filter|
+:Pick next .json task file;
+
+:Parse tid = filename[:-5];
+:Load task JSON definition;
+note right: On JSON parse error → log + continue
+
+if (task['enabled'] == False?) then (yes, disabled)
+    :Skip task (continue);
+    |Task Filter|
+    :Pick next .json task file;
+else (no, enabled)
+endif
+
+:Read repeat\n<i>(default: 'daily')</i>;
+:Read schedule HH:MM\n<i>(default: '00:00')</i>;
+
+if (Invalid schedule\nHH:MM format?) then (yes)
+    :Log error + continue;
+    |Task Filter|
+    :Pick next .json task file;
+else (no, valid)
+endif
+
+if (repeat == 'weekday'\nAND today is Sat or Sun?) then (yes, weekend)
+    :Skip task (continue);
+    |Task Filter|
+    :Pick next .json task file;
+else (no)
+endif
+
+if (now < scheduled\nHH:MM time?) then (yes, not yet due)
+    :Skip task (continue);
+    |Task Filter|
+    :Pick next .json task file;
+else (no, past schedule time)
+endif
+
+:max_delay = task.get(\n'max_delay_hours', 6);
+
+if ((now_minutes − sched_minutes)\n> max_delay × 60 ?) then (yes, stale)
+    :Log SKIP — task stale;
+    :Continue;
+    |Task Filter|
+    :Pick next .json task file;
+else (no, within delay window)
+endif
+
+:_last_run(tid, done_files)\n→ scan done_files for *_{tid}.md\n→ parse timestamps → latest datetime;
+
+:_parse_cooldown(repeat)\n→ map repeat string → timedelta\n<i>(daily→20 h, weekly→6 d,\nmonthly→27 d, every_Nh→N h…)</i>;
+
+if (last_run exists AND\n(now − last_run) < cooldown?) then (yes, cooldown active)
+    :Skip task (continue);
+    |Task Filter|
+    :Pick next .json task file;
+else (no, cooldown elapsed or first run)
+endif
+
+' ── Task Triggered ────────────────────────────────
+|Scheduler|
+:Log TRIGGER event for tid;
+:Build report path\nDONE/{YYYY-MM-DD_HHMM}_{tid}.md;
+:Return task prompt string\nwith [定时任务], [报告路径],\nSOP instruction, prompt body,\ndone-report path;
+stop
+
+@enduml

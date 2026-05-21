@@ -1,0 +1,139 @@
+{
+  "scope": "crash_handling_reporting",
+  "title": "Crash Handling & Error Reporting",
+  "diagram_type": "activity",
+  "description": "Uncaught exception capture, mod-cause identification, crash report file generation, and user notification",
+
+  "key_participants": [
+    "JVM / Thread (UncaughtExceptionHandler)",
+    "ServerLauncher",
+    "DesktopLauncher",
+    "AndroidLauncher",
+    "CrashHandler",
+    "ErrorDialog",
+    "ServerControl"
+  ],
+
+  "entry_points": [
+    "ServerLauncher.main() wraps HeadlessApplication with lambda: throwable -> CrashHandler.handle(throwable, f -> {}); outer try/catch also calls CrashHandler.handle(t, f -> {})",
+    "DesktopLauncher constructor catch(Throwable e) → handleCrash(e)",
+    "AndroidLauncher: Thread.setDefaultUncaughtExceptionHandler((thread, error) -> CrashHandler.log(error))",
+    "IOSLauncher: CrashHandler.log(t)"
+  ],
+
+  "activity_flow": [
+    "START: Uncaught exception thrown at runtime",
+    "FORK by platform:",
+    "  [Android/iOS] → CrashHandler.log(exception) → createReport() → write to crashes/crash_<ts>.txt → END (no UI)",
+    "  [Desktop] → DesktopLauncher.handleCrash(e)",
+    "  [Server] → CrashHandler.handle(throwable, f -> {}) directly",
+
+    "--- DesktopLauncher.handleCrash(e) flow ---",
+    "STEP 1: Analyse error strings for GPU/window init failure",
+    "  DECISION: total.contains('Couldn\\'t create window') OR 'OpenGL 2.0' OR 'pixel format' OR 'GLEW'?",
+    "    YES → message(GPU/graphics error string); set badGPU=true",
+    "    NO  → continue",
+    "STEP 2: CrashHandler.getModCause(e) → returns LoadedMod or null",
+    "  DECISION: cause != null?",
+    "    YES → causeString = '<ModName> has caused Mindustry to crash...'",
+    "    NO  → DECISION: stack trace contains 'rhino.gen.'?",
+    "             YES → causeString = 'A mod or script has caused Mindustry to crash...'",
+    "             NO  → causeString = 'Mindustry has crashed.'",
+    "STEP 3: CrashHandler.handle(e, writeListener)",
+
+    "--- CrashHandler.handle(exception, writeListener) flow ---",
+    "STEP A: Log.err(exception)  [log to console/file]",
+    "STEP B: settings.manualSave()  [attempt to save game data]",
+    "STEP C: DECISION: OS.username == 'anuke' && modifier != 'steam'?",
+    "          YES → System.exit(1)  [skip crash report for dev builds]",
+    "          NO  → continue",
+    "STEP D: DECISION: Version.number == 0?",
+    "          YES → load version from /version.properties",
+    "          NO  → continue",
+    "STEP E: Build crash report file path: crashes/crash-report-<MM_dd_yyyy_HH_mm_ss>.txt",
+    "STEP F: new Fi(...).child('crashes').mkdirs()",
+    "STEP G: CrashHandler.createReport(exception) → write to file",
+    "STEP H: writeListener.get(file)  [callback with File reference]",
+    "STEP I: net.dispose()  [close network connections]",
+    "STEP J: System.exit(1)",
+
+    "--- CrashHandler.createReport(exception) sub-flow ---",
+    "STEP i:   writeException(exception) → stack trace string via StringWriter/PrintWriter",
+    "STEP ii:  getModCause(exception) → scan stack frames; match against mods.list() by class name prefix",
+    "STEP iii: Build report string: header (mod or vanilla), report URL if no mods + not custom build, version info, date, OS, GL version, Java version, memory, cores, likely cause, enabled mods list, patches, stack trace",
+    "STEP iv:  return report string",
+
+    "--- Desktop writeListener callback (after file written) ---",
+    "DECISION: badGPU == false?",
+    "  YES → message(causeString + '\\nThe logs have been saved in:\\n' + file.getAbsolutePath() + ...)",
+    "  NO  → skip message (GPU error already shown)",
+
+    "--- ErrorDialog.show(text) flow (used for pre-crash checks, e.g. bad Java/32-bit) ---",
+    "STEP 1: Log.err(text)",
+    "STEP 2: SDL.SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, 'it\\'s over', text)",
+    "  ON FAIL → JOptionPane.showMessageDialog(null, text)",
+    "STEP 3: System.exit(1)",
+
+    "--- Server path (ServerLauncher / ServerControl) ---",
+    "CrashHandler.handle(t, f -> {})  [empty writeListener — no user dialog on headless server]",
+    "All steps A-J execute; no UI message displayed",
+    "ServerControl itself does not directly call CrashHandler; it relies on the HeadlessApplication crash callback registered in ServerLauncher"
+  ],
+
+  "key_methods": [
+    "CrashHandler.handle(Throwable exception, Cons<File> writeListener): void — full crash pipeline",
+    "CrashHandler.log(Throwable exception): void — silent log-only path (Android/iOS)",
+    "CrashHandler.createReport(Throwable exception): String — builds full report string",
+    "CrashHandler.getModCause(Throwable e): LoadedMod? — stack-trace mod attribution",
+    "CrashHandler.getMatches(String name1, String name2): int — package prefix match count",
+    "CrashHandler.writeException(Throwable e): String — stack trace to string",
+    "DesktopLauncher.handleCrash(Throwable e): void — desktop-specific crash entry with GPU check",
+    "ErrorDialog.show(String text): void — SDL/Swing modal error dialog + System.exit(1)"
+  ],
+
+  "conditions_and_branches": [
+    "Dev build skip: username == 'anuke' && modifier != 'steam' → immediate exit, no report written",
+    "GPU/graphics error (desktop): detected from exception message → show GPU error, skip causeString message",
+    "Mod cause (desktop + report): stack frame class doesn't match core packages → matched against mod.meta.main prefix",
+    "JS mod cause: stack frame filename ends with .js and starts with mod.name + '/' → attributed to that mod",
+    "Rhino scripting error (desktop): stack contains 'rhino.gen.' → generic mod/script message",
+    "No mods + official build: append reportIssueURL to report",
+    "Version not yet loaded: fall back to reading /version.properties before writing report",
+    "32-bit Windows (desktop pre-launch): ErrorDialog.show(...) → immediate exit before crash handler needed",
+    "Old Java version (desktop pre-launch): ErrorDialog.show(...) → immediate exit"
+  ],
+
+  "key_relationships": [
+    "ServerLauncher registers CrashHandler.handle as HeadlessApplication crash callback",
+    "DesktopLauncher.handleCrash depends_on CrashHandler.getModCause + CrashHandler.handle",
+    "AndroidLauncher depends_on CrashHandler.log (no full handle pipeline)",
+    "CrashHandler.handle calls createReport → writes crash file; calls writeListener callback",
+    "DesktopLauncher.handleCrash calls ErrorDialog.show indirectly via 'message()' (same SDL/Swing path)",
+    "ErrorDialog.show is also called directly for pre-flight checks (Java version, 32-bit)",
+    "ServerControl is an ApplicationListener registered by ServerLauncher; crash propagates up to HeadlessApplication callback"
+  ],
+
+  "output_artifacts": [
+    "Crash report file: <appDataDir>/crashes/crash-report-<timestamp>.txt",
+    "Silent log file (Android/iOS): <dataDir>/crashes/crash_<ms>.txt",
+    "User dialog (desktop): SDL message box or JOptionPane modal",
+    "Console error log: Log.err(exception)"
+  ],
+
+  "important_notes": [
+    "Both desktop and server ultimately call System.exit(1) after reporting",
+    "CrashHandler is a pure static utility class (no instantiation)",
+    "ErrorDialog is desktop-only; server path has no UI notification",
+    "The writeListener pattern decouples file-write from notification (server uses no-op lambda)",
+    "Mod attribution uses package-prefix matching; JS mods matched by filename pattern",
+    "settings.manualSave() is attempted before exit to preserve game state"
+  ],
+
+  "source_files_analyzed": [
+    "core/src/mindustry/net/CrashHandler.java",
+    "desktop/src/mindustry/desktop/ErrorDialog.java",
+    "desktop/src/mindustry/desktop/DesktopLauncher.java (handleCrash, checkJavaVersion, check32Bit)",
+    "server/src/mindustry/server/ServerLauncher.java",
+    "android/src/mindustry/android/AndroidLauncher.java (crash hook)"
+  ]
+}

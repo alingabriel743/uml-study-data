@@ -1,0 +1,78 @@
+{
+  "scope": "rate_limiting_flow",
+  "title": "Rate Limiting and Redis SLA Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "DriverService",
+    "RateLimitService",
+    "runRedis (closure)",
+    "redisClient",
+    "Database (rl_usage_fixed_window)",
+    "Context",
+    "APIError"
+  ],
+  "interaction_flow": [
+    "DriverService → RateLimitService: check_and_increment(`V1:${svc}:${iface}:${method}`, policy.max, policy.period)",
+    "RateLimitService → Context: get() → user → consumerId = `user:${user.id}` (or 'missing')",
+    "RateLimitService: builds rateLimitKey=`${consumerId}:${key}`, windowStartKey=`rate-limit:...:window_start`, countKey=`rate-limit:...:count`",
+    "RateLimitService: defines inner closure runRedis(operationName, operationPromise) → wraps with withTimeout(200ms)",
+    "RateLimitService → runRedis('window-start-read', redisClient.get(windowStartKey))",
+    "[Redis FAIL] runRedis → {ok:false} → RateLimitService → #checkAndIncrementInDb(dbKey, max, period, methodName) → RETURN",
+    "[Redis OK, windowStart=0] RateLimitService → Database: SELECT * FROM rl_usage_fixed_window WHERE key=?",
+    "[DB row found] RateLimitService → runRedis('window-start-seed', redisClient.set(windowStartKey, windowStart)) + runRedis('count-seed', redisClient.set(countKey, count))",
+    "[DB row NOT found, windowStart still 0] RateLimitService → runRedis('window-start-init', redisClient.set(windowStartKey, now)) + runRedis('count-init', redisClient.set(countKey, 0)) + Database: INSERT INTO rl_usage_fixed_window",
+    "[window expired: windowStart+period < now] RateLimitService → runRedis('window-start-reset', ...) + runRedis('count-reset', ...) + Database: UPDATE SET window_start=now, count=0",
+    "RateLimitService → runRedis('count-read', redisClient.get(countKey))",
+    "[Redis FAIL on count-read] RateLimitService → #checkAndIncrementInDb(dbKey, max, period, methodName) → RETURN",
+    "[current >= max] RateLimitService → APIError.create('rate_limit_exceeded') → THROW (request DENIED, HTTP 429)",
+    "[current < max] RateLimitService → runRedis('count-incr', redisClient.incr(countKey)) + Database: UPDATE SET count=count+1 WHERE key=? (request ALLOWED)"
+  ],
+  "fallback_flow": [
+    "#checkAndIncrementInDb: SELECT window row from DB",
+    "[no row] INSERT with count=0, windowStart=now",
+    "[row exists] use DB windowStart and count",
+    "[window expired] UPDATE SET window_start=now, count=0",
+    "[count >= max] throw APIError rate_limit_exceeded",
+    "[count < max] UPDATE SET count=count+1"
+  ],
+  "key_methods": {
+    "RateLimitService.check_and_increment": "async (key: string, max: number, period: number, options={global?:boolean}) → void | throws APIError",
+    "RateLimitService.#checkAndIncrementInDb": "async ({dbKey, max, period, methodName}) → void | throws APIError",
+    "RateLimitService._get_consumer_id": "() → 'user:{id}' | 'missing'  [reads Context]",
+    "runRedis (closure)": "async (operationName: string, operationPromise: Promise) → {ok: boolean, value: any}",
+    "withTimeout": "async (operationPromise, timeoutMs=200, timeoutMessage) → value | throws timeout Error",
+    "RateLimitRedisCacheSpace.windowStartKey": "(consumerScopedKey) → `rate-limit:${key}:window_start`",
+    "RateLimitRedisCacheSpace.countKey": "(consumerScopedKey) → `rate-limit:${key}:count`"
+  },
+  "key_relationships": [
+    "RateLimitService extends BaseService",
+    "RateLimitService uses SyncFeature([check_and_increment]) — serializes concurrent calls",
+    "RateLimitService depends_on DatabaseService (DB_WRITE, 'rate-limit' namespace)",
+    "RateLimitService depends_on redisClient (singleton)",
+    "RateLimitService reads Context to identify consumer/user",
+    "DriverService calls RateLimitService.check_and_increment (via services.get('rate-limit'))",
+    "DriverService wraps call in svc_su.sudo(policy_holder, ...) to enforce policy holder identity",
+    "ServiceManager registers/initializes RateLimitService (register → maybe_init_ → init_service_ → Running)",
+    "ServiceManager._init calls services.get('database').get(DB_WRITE, 'rate-limit')"
+  ],
+  "important_notes": [
+    "Fixed-window counter strategy: window resets when windowStart+period < now",
+    "Redis is the PRIMARY store; DB (rl_usage_fixed_window) is fallback and persistent sync",
+    "runRedis timeout default=200ms; configurable via global_config.services['rate-limit'].redis_timeout_ms",
+    "Redis key scope: global option uses rateLimitKey alone; per-server uses `${server_id}:${rateLimitKey}`",
+    "SyncFeature ensures check_and_increment is not concurrently re-entrant for same service instance",
+    "APIError 'rate_limit_exceeded' carries method_name and {max, period} metadata",
+    "EdgeRateLimitService (login.js) is a SEPARATE service for edge-level rate limiting (not part of this flow)",
+    "ServiceManager.get() returns undefined if service not yet Running; use aget() for async await"
+  ],
+  "db_schema": {
+    "table": "rl_usage_fixed_window",
+    "columns": ["key (string)", "window_start (unix seconds)", "count (integer)"]
+  },
+  "source_files_analyzed": [
+    "src/backend/src/services/sla/RateLimitService.js",
+    "src/backend/src/services/sla/RateLimitRedisCacheSpace.js",
+    "src/putility/src/system/ServiceManager.js",
+    "src/backend/src/services/drivers/DriverService.js (check_and_increment call site)"
+  ]
+}

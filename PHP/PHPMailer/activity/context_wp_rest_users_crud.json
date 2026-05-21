@@ -1,0 +1,197 @@
+{
+  "scope": "wp_rest_users_crud",
+  "title": "WordPress REST Users CRUD Flow",
+  "diagram_type": "activity",
+  "source_files_analyzed": [
+    "tests/Frameworks/WordPress/Version_6_1/wp-includes/rest-api/endpoints/class-wp-rest-users-controller.php"
+  ],
+  "controller": {
+    "class": "WP_REST_Users_Controller",
+    "extends": "WP_REST_Controller",
+    "namespace": "wp/v2",
+    "rest_base": "users",
+    "properties": ["$meta (WP_REST_User_Meta_Fields)", "$namespace", "$rest_base"]
+  },
+  "routes": [
+    "GET    /wp/v2/users          → get_items_permissions_check → get_items",
+    "POST   /wp/v2/users          → create_item_permissions_check → create_item",
+    "GET    /wp/v2/users/{id}     → get_item_permissions_check → get_item",
+    "POST|PUT /wp/v2/users/{id}   → update_item_permissions_check → update_item",
+    "DELETE /wp/v2/users/{id}     → delete_item_permissions_check → delete_item",
+    "GET    /wp/v2/users/me       → (no perm check) → get_current_item",
+    "POST|PUT /wp/v2/users/me     → update_current_item_permissions_check → update_current_item",
+    "DELETE /wp/v2/users/me       → delete_current_item_permissions_check → delete_current_item"
+  ],
+  "activities": {
+    "GET_items": {
+      "permission_gate": "get_items_permissions_check",
+      "permission_logic": [
+        "IF roles param AND NOT current_user_can('list_users') → 403",
+        "IF capabilities param AND NOT current_user_can('list_users') → 403",
+        "IF context=edit AND NOT current_user_can('list_users') → 403",
+        "IF orderby=email|registered_date AND NOT current_user_can('list_users') → 403",
+        "IF who=authors → check edit_posts cap on any REST-visible post type, else → 403",
+        "ELSE → true"
+      ],
+      "handler_steps": [
+        "Map API params to WP_User_Query args (exclude, include, order, per_page, roles, capabilities, slug)",
+        "IF who=authors → set prepared_args['who']='authors'",
+        "ELSE IF NOT list_users → restrict to has_published_posts",
+        "apply_filters('rest_user_query', prepared_args, request)",
+        "new WP_User_Query(prepared_args)",
+        "For each user: prepare_item_for_response() + prepare_response_for_collection()",
+        "Set X-WP-Total and X-WP-TotalPages headers",
+        "Add prev/next Link headers if multi-page",
+        "Return WP_REST_Response"
+      ]
+    },
+    "GET_item": {
+      "permission_gate": "get_item_permissions_check",
+      "permission_logic": [
+        "get_user(id) → WP_Error if invalid/not-found/not-blog-member",
+        "IF current user IS requested user → true",
+        "IF context=edit AND NOT list_users → 403",
+        "IF no posts AND NOT edit_user AND NOT list_users → 403",
+        "ELSE → true"
+      ],
+      "handler_steps": [
+        "get_user(request['id']) → WP_Error or WP_User",
+        "prepare_item_for_response(user, request)",
+        "rest_ensure_response() → return 200"
+      ]
+    },
+    "GET_current_item": {
+      "permission_gate": "none (open)",
+      "handler_steps": [
+        "get_current_user_id()",
+        "IF empty → WP_Error rest_not_logged_in 401",
+        "wp_get_current_user()",
+        "prepare_item_for_response(user, request)",
+        "Return WP_REST_Response"
+      ]
+    },
+    "POST_create_item": {
+      "permission_gate": "create_item_permissions_check",
+      "permission_logic": [
+        "IF NOT current_user_can('create_users') → 403",
+        "ELSE → true"
+      ],
+      "handler_steps": [
+        "IF request['id'] set → 400 rest_user_exists",
+        "IF roles in request → check_role_update(id, roles) → WP_Error or continue",
+        "prepare_item_for_database(request) → stdClass user object",
+        "IF multisite: wpmu_validate_user_signup() → errors → 400",
+        "IF multisite: wpmu_create_user() → wp_update_user() → add_user_to_blog()",
+        "ELSE: wp_insert_user(wp_slash(user))",
+        "IF WP_Error → return error",
+        "do_action('rest_insert_user', user, request, true)",
+        "IF roles → user->add_role() for each",
+        "IF meta → this->meta->update_value(meta, user_id)",
+        "update_additional_fields_for_object(user, request)",
+        "do_action('rest_after_insert_user', user, request, true)",
+        "prepare_item_for_response() → set_status(201) + Location header",
+        "Return 201 WP_REST_Response"
+      ]
+    },
+    "PUT_update_item": {
+      "permission_gate": "update_item_permissions_check",
+      "permission_logic": [
+        "get_user(id) → WP_Error if not found",
+        "IF roles in request AND NOT promote_user → 403",
+        "IF only {id, roles} params → promote_user cap sufficient → true",
+        "IF NOT current_user_can('edit_user', user.ID) → 403",
+        "ELSE → true"
+      ],
+      "handler_steps": [
+        "get_user(id) → WP_Error or user",
+        "IF email already used by different user → 400",
+        "IF username change attempted → 400 (not editable)",
+        "IF slug conflict → 400",
+        "IF roles → check_role_update(id, roles)",
+        "prepare_item_for_database(request)",
+        "wp_update_user(wp_slash(user))",
+        "do_action('rest_insert_user', user, request, false)",
+        "IF roles → add_role for each",
+        "IF meta → meta->update_value()",
+        "update_additional_fields_for_object()",
+        "do_action('rest_after_insert_user', user, request, false)",
+        "prepare_item_for_response() → return 200"
+      ]
+    },
+    "PUT_update_current_item": {
+      "permission_gate": "update_current_item_permissions_check",
+      "permission_logic": [
+        "Sets request['id'] = get_current_user_id()",
+        "Delegates to update_item_permissions_check(request)"
+      ],
+      "handler_steps": [
+        "Sets request['id'] = get_current_user_id()",
+        "Delegates entirely to update_item(request)"
+      ]
+    },
+    "DELETE_item": {
+      "permission_gate": "delete_item_permissions_check",
+      "permission_logic": [
+        "get_user(id) → WP_Error if not found",
+        "IF NOT current_user_can('delete_user', user.ID) → 403",
+        "ELSE → true"
+      ],
+      "handler_steps": [
+        "IF multisite → 501 not supported",
+        "get_user(id) → WP_Error or user",
+        "IF force=false → 501 trash not supported",
+        "Parse reassign param via check_reassign()",
+        "IF reassign == same id OR user not found → 400 invalid_reassign",
+        "prepare_item_for_response() → snapshot as 'previous'",
+        "require wp-admin/includes/user.php",
+        "wp_delete_user(id, reassign)",
+        "IF failed → 500",
+        "do_action('rest_delete_user', user, response, request)",
+        "Return {deleted: true, previous: data}"
+      ]
+    }
+  },
+  "shared_helpers": {
+    "get_user(id)": "Validates ID > 0, get_userdata(), checks exists() and multisite blog membership → WP_User or WP_Error 404",
+    "check_reassign(value, request, param)": "Returns numeric value, false (empty/false/'false'), or WP_Error 400 for invalid",
+    "check_role_update(user_id, roles)": [
+      "For each role: check role exists in wp_roles → 400 if not",
+      "IF editing own role AND role lacks edit_users cap AND not multisite super admin → 403",
+      "get_editable_roles() → IF role not editable → 403",
+      "Return true"
+    ],
+    "prepare_item_for_database(request)": "Builds stdClass with user fields from request",
+    "prepare_item_for_response(user, request)": "Serialises WP_User to response array based on requested fields"
+  },
+  "key_conditions_for_diagram": [
+    "Permission check always runs before handler — WP_Error short-circuits the flow",
+    "Multisite branching in create_item (wpmu_create_user vs wp_insert_user)",
+    "delete_item is multisite-blocked (501)",
+    "Trashing not supported — force=true required for delete",
+    "Reassign param is optional on delete; validated for self-reassign and existence",
+    "Role update has layered checks: promote_user cap + role existence + editable roles",
+    "update_current_item / delete_current_item are thin wrappers: inject current user id then delegate",
+    "Hooks: rest_user_query (filter), rest_insert_user, rest_after_insert_user, rest_delete_user (actions)"
+  ],
+  "error_codes": {
+    "rest_user_cannot_view": "403 — list filtering without list_users cap",
+    "rest_forbidden_context": "403 — edit context without list_users",
+    "rest_forbidden_orderby": "403 — email/date orderby without list_users",
+    "rest_forbidden_who": "403 — authors filter without edit_posts",
+    "rest_user_invalid_id": "404 — bad or non-existent user id",
+    "rest_not_logged_in": "401 — /me with no session",
+    "rest_cannot_create_user": "403 — missing create_users cap",
+    "rest_user_exists": "400 — POST with existing id",
+    "rest_cannot_edit_roles": "403 — missing promote_user cap",
+    "rest_cannot_edit": "403 — missing edit_user cap",
+    "rest_user_invalid_email": "400 — email in use by another user",
+    "rest_user_invalid_argument": "400 — username change attempted",
+    "rest_user_invalid_slug": "400 — slug conflict",
+    "rest_user_cannot_delete": "403 — missing delete_user cap",
+    "rest_cannot_delete": "501 — multisite or delete failure",
+    "rest_trash_not_supported": "501 — force not set on delete",
+    "rest_user_invalid_reassign": "400 — bad reassign target",
+    "rest_user_invalid_role": "400/403 — non-existent or non-editable role"
+  },
+  "important_notes": "Source is WordPress 6.1. All permission callbacks return true|WP_Error. WP REST infrastructure calls the permission callback first and aborts with 401/403 if it returns WP_Error. The /me sub-resource has no permission callback for GET (open to any logged-in or anonymous caller — the handler itself returns 401 if not logged in)."
+}

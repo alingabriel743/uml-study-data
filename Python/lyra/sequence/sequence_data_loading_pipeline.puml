@@ -1,0 +1,223 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+}
+
+title Data Loading Pipeline
+
+' ─────────────────────────────────────────────────────────────────────────
+' LYRA-1 TRAINING DATA PIPELINE
+' ─────────────────────────────────────────────────────────────────────────
+box "Lyra-1 Training Data Pipeline" #EEF2FF
+    participant "TrainingLoop" as TL
+    participant "Provider\n(torch.Dataset)" as PROV
+    participant "RadymWrapper" as RW
+    participant "Radym" as RADYM
+    participant "VideoReader" as VR
+    participant "FileSystem\n(npz / zip / pkl)" as FS
+    participant "ImageTransform" as IT
+end box
+
+' ─────────────────────────────────────────────────────────────────────────
+' COSMOS TOKENIZER PIPELINE
+' ─────────────────────────────────────────────────────────────────────────
+box "Cosmos Tokenizer Data Pipeline" #F0FFF4
+    participant "get_video_dataloader" as GVD
+    participant "AugmentDataset" as AD
+    participant "BaseDataset" as BD
+    participant "DataLoader" as DL
+end box
+
+' ══════════════════════════════════════════════════════════════════════════
+' SEQUENCE: Lyra-1 – Provider.__getitem__
+' ══════════════════════════════════════════════════════════════════════════
+== Lyra-1: Fetch Training Batch (Provider.__getitem__) ==
+
+TL -> PROV : __getitem__(idx)
+activate PROV
+
+PROV -> PROV : get_item(idx)
+note right of PROV
+  Retries up to 20× on exception,
+  re-samples random index on failure
+end note
+
+PROV -> RW : mp4_file_paths[idx].stem → file_name
+PROV -> PROV : _get_indices_static(idx)\n  OR _get_indices_dynamic(idx)
+
+activate PROV
+  PROV -> RW : count_frames(video_idx)
+  activate RW
+    RW -> RADYM : num_frames(video_idx)\n → len(_get_mp4_reader(...))
+    activate RADYM
+    RADYM --> RW : frame_count : int
+    deactivate RADYM
+  RW --> PROV : frame_count : int
+  deactivate RW
+
+  PROV -> RW : count_cameras(video_idx)
+  activate RW
+  RW --> PROV : num_cameras : int
+  deactivate RW
+
+  PROV -> PROV : _get_num_input_multi_views() → num_input_multi_views
+  PROV -> PROV : _get_view_indices(...)\n  OR _get_view_indices_from_input(...) → view_indices
+deactivate PROV
+
+note right of PROV
+  Returns (frame_indices, view_indices,
+  num_input_multi_views)
+end note
+
+' ── Data retrieval from Radym ──────────────────────────────────────────
+PROV -> RW : get_data(idx, data_fields,\n  frame_indices, view_indices)
+activate RW
+
+  loop for each view_idx in view_indices
+    RW -> RADYM : _read_data(video_idx, frame_idxs,\n  [view_idx], data_fields)
+    activate RADYM
+
+      alt DataField.IMAGE_RGB
+        RADYM -> VR : get_batch(frame_indices)
+        activate VR
+        VR --> RADYM : rgb tensor [T,C,H,W] (normalized to [0,1])
+        deactivate VR
+      end
+
+      alt DataField.CAMERA_C2W_TRANSFORM
+        RADYM -> FS : np.load(pose/*.npz)[frame_idx]
+        activate FS
+        FS --> RADYM : c2w tensor [T,4,4]
+        deactivate FS
+      end
+
+      alt DataField.CAMERA_INTRINSICS
+        RADYM -> FS : np.load(intrinsics/*.npz)
+        activate FS
+        FS --> RADYM : intrinsics tensor [T,4]
+        deactivate FS
+      end
+
+      alt DataField.METRIC_DEPTH
+        RADYM -> FS : zipfile + OpenEXR frame_idx.exr
+        activate FS
+        FS --> RADYM : depth tensor [T,H,W]
+        deactivate FS
+      end
+
+      alt DataField.LATENT_RGB
+        RADYM -> FS : torch.load(latent/*.pkl)
+        activate FS
+        FS --> RADYM : latent tensor [T,...]
+        deactivate FS
+      end
+
+    RADYM --> RW : output_dict {DataField → tensor}
+    deactivate RADYM
+  end
+
+RW --> PROV : merged output_dict\n(views concatenated along dim-0)
+deactivate RW
+
+' ── Pre-processing ────────────────────────────────────────────────────
+PROV -> PROV : _preprocess(file_name, rgbs, c2ws,\n  intrinsics, depths, timesteps,\n  latents, target_index, num_input_multi_views)
+activate PROV
+
+  PROV -> IT : preprocess_images(rgbs, depths)
+  activate IT
+  IT --> PROV : cropped/resized rgbs, depths,\n  shift, scale, flip_flag
+  deactivate IT
+
+  PROV -> PROV : adjust intrinsics with shift/scale
+  PROV -> PROV : compute relative camera poses\n  c2ws_new = inv(c2w_ref) @ c2ws
+  PROV -> PROV : _norm_camera_scale(c2ws) → scaled c2ws
+  PROV -> PROV : split rgbs/c2ws/intrinsics → input & target views
+  PROV -> PROV : input_normalizer_vae(rgbs[:input_frames])\n  → images_input_vae  [Normalize(0.5, 0.5)]
+  PROV -> PROV : timestep_embedding(timesteps, dim)\n  → time_embeddings  [sinusoidal]
+
+deactivate PROV
+
+PROV --> TL : out_dict {\n  images_output, images_input_vae,\n  cam_view, intrinsics, c2ws_input,\n  intrinsics_input, time_embeddings,\n  depths_output, flip_flag, file_name, ...\n}
+deactivate PROV
+
+' ══════════════════════════════════════════════════════════════════════════
+' SEQUENCE: Cosmos Tokenizer – Video DataLoader Setup & __getitem__
+' ══════════════════════════════════════════════════════════════════════════
+== Cosmos Tokenizer: DataLoader Setup ==
+
+TL -> GVD : get_video_dataloader(\n  dataset_name, is_train,\n  batch_size, num_video_frames,\n  resolution, crop_height)
+activate GVD
+
+  GVD -> AD : dataset_entry(dataset_name, 'video',\n  is_train, resolution,\n  crop_height, num_video_frames)
+  activate AD
+    AD -> BD : Dataset(video_pattern, num_video_frames)
+    activate BD
+    BD --> AD : base dataset instance
+    deactivate BD
+
+    alt is_train
+      AD -> AD : video_train_augmentations() → aug_dict
+    else validation
+      AD -> AD : video_val_augmentations() → aug_dict
+    end
+  AD --> GVD : AugmentDataset instance
+  deactivate AD
+
+  GVD -> DL : LazyCall(DataLoader)(\n  dataset=AugmentDataset,\n  batch_size, num_workers=8,\n  pin_memory=True)
+  activate DL
+  DL --> GVD : DataLoader (lazy)
+  deactivate DL
+
+GVD --> TL : DataLoader instance
+deactivate GVD
+
+== Cosmos Tokenizer: Fetch Training Batch (DataLoader.__iter__) ==
+
+TL -> DL : next(iter(dataloader))
+activate DL
+
+  DL -> AD : __getitem__(index)
+  activate AD
+
+    AD -> BD : base_dataset[index]
+    activate BD
+    BD --> AD : raw data_dict
+    deactivate BD
+
+    AD -> AD : categorize_aspect_and_store(data)\n  → annotated data_dict
+
+    loop for each augmentation in aug_dict
+      AD -> AD : aug_instance(data_dict)\n  → transformed data_dict
+    end
+
+  AD --> DL : augmented data_dict
+  deactivate AD
+
+DL --> TL : batched data_dict (N × augmented samples)
+deactivate DL
+
+@enduml

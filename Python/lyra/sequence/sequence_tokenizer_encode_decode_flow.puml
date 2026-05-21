@@ -1,0 +1,179 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+}
+skinparam noteBackgroundColor #FFF9DB
+skinparam noteBorderColor #FAB005
+
+title Tokenizer Encode/Decode Flow
+
+actor Caller as caller
+
+box "cosmos_1_tokenizer.py" #E8F4FD
+    participant "load_cosmos_1_tokenizer" as loader
+    participant "TokenizerConfigs\n(Enum)" as configs
+    participant "TokenizerModels\n(Enum)" as models
+end box
+
+box "tokenizer/inference" #EDF7EE
+    participant "CausalVideoTokenizer\n(JIT wrapper)" as cvt
+    participant "JIT Encoder\n(_enc_model)" as enc_jit
+    participant "JIT Decoder\n(_dec_model)" as dec_jit
+end box
+
+box "model.py helpers" #FFF3E0
+    participant "encode_video" as enc_video
+    participant "encode_video_model\n/ encode_cosmos1" as enc_model
+    participant "decode_multi_view_latents" as dec_mv
+    participant "decode_video_model\n/ decode_cosmos1" as dec_model
+end box
+
+' ─────────────────────────────────────────────
+' PHASE 1: TOKENIZER LOADING
+' ─────────────────────────────────────────────
+== Phase 1: Tokenizer Loading ==
+
+caller -> loader : load_cosmos_1_tokenizer(checkpoint_path,\nload_encoder, load_decoder,\nload_jit, return_tokenizer_config)
+activate loader
+
+loader -> configs : get_tokenizer_config(checkpoint_path)\nparses suffix e.g. "CV8x8x8_720p"
+activate configs
+configs --> loader : tokenizer_config dict
+deactivate configs
+
+alt load_jit = True  (inference — JIT models)
+    loader -> cvt : CausalVideoTokenizer(\n  checkpoint_enc=".../encoder.jit",\n  checkpoint_dec=".../decoder.jit")
+    activate cvt
+    cvt -> enc_jit : torch.jit.load(encoder.jit)\n.to(bfloat16)
+    activate enc_jit
+    enc_jit --> cvt : JIT encoder loaded
+    deactivate enc_jit
+    cvt -> dec_jit : torch.jit.load(decoder.jit)\n.to(bfloat16)
+    activate dec_jit
+    dec_jit --> cvt : JIT decoder loaded
+    deactivate dec_jit
+    cvt --> loader : CausalVideoTokenizer instance
+    deactivate cvt
+else load_jit = False  (training — full PyTorch model)
+    loader -> models : TokenizerModels[tokenizer_name].value\n(**tokenizer_config)
+    activate models
+    note right of models
+      CV → CausalContinuousVideoTokenizer
+      DV → CausalDiscreteVideoTokenizer
+      CI → ContinuousImageTokenizer
+      DI → DiscreteImageTokenizer
+    end note
+    models --> loader : full nn.Module tokenizer
+    deactivate models
+end
+
+loader --> caller : tokenizer [, tokenizer_config]
+deactivate loader
+
+' ─────────────────────────────────────────────
+' PHASE 2: VIDEO ENCODING
+' ─────────────────────────────────────────────
+== Phase 2: Encode Video Frames → Latents ==
+
+caller -> enc_video : encode_video(vae, video [B,T,C,H,W], vae_backbone)
+activate enc_video
+
+enc_video -> enc_video : get_encoder_chunk_size(video)\ne.g. T=49, H=480 → chunk=4
+enc_video -> enc_video : video.permute(0,2,1,3,4)\n→ [B,C,F,H,W]
+
+loop over temporal chunks (OOM-safe batching)
+    enc_video -> enc_model : encode_video_model(vae, video_batch, vae_backbone)
+    activate enc_model
+
+    enc_model -> cvt : encode_cosmos1(vae, video_batch)\n→ CausalVideoTokenizer.encode(video_batch)
+    activate cvt
+    note right of cvt : @torch.no_grad()\ninput: [B,C,T,H,W] range [-1, 1]
+    cvt -> enc_jit : self._enc_model(input_tensor)\nJIT encoder forward
+    activate enc_jit
+    enc_jit --> cvt : latent tuple
+    deactivate enc_jit
+    cvt --> enc_model : latent[0]\nCV: [B,16,t,h,w]  (t=T/8, h=H/8, w=W/8)\nDV: indices [B,t,h,w] + code [B,6,t,h,w]
+    deactivate cvt
+
+    enc_model --> enc_video : chunk latents
+    deactivate enc_model
+end
+
+enc_video -> enc_video : torch.cat(chunks, dim=0)
+enc_video -> enc_video : samples.permute(0,2,1,3,4)\n→ [B,F,C,H,W]
+enc_video --> caller : latents [B,F,C,H,W]
+deactivate enc_video
+
+note over caller, enc_video
+  Multi-view variant: encode_multi_view_video() folds views into the batch dim
+  before calling encode_video, then unfolds: (b v) t c h w → b (v t) c h w
+end note
+
+' ─────────────────────────────────────────────
+' PHASE 3: LATENT DECODING
+' ─────────────────────────────────────────────
+== Phase 3: Decode Latents → Pixel Video ==
+
+caller -> dec_mv : decode_multi_view_latents(vae,\nlatents [B,V*T,C,H,W],\nnum_input_multi_views, vae_backbone)
+activate dec_mv
+
+opt num_views > 1
+    dec_mv -> dec_mv : rearrange\nb (v t) c h w → (b v) t c h w
+end
+
+dec_mv -> dec_mv : get_encoder_chunk_size(latents, encoder=False)\ndetermine decode chunk size
+
+loop over latent chunks
+    dec_mv -> dec_model : decode_video_model(vae, latents_batch, vae_backbone)
+    activate dec_model
+
+    dec_model -> dec_model : decode_cosmos1:\nrearrange b t c h w → b c t h w
+    dec_model -> cvt : CausalVideoTokenizer.decode(video)\ninput latent [B,C,t,h,w]
+    activate cvt
+    cvt -> dec_jit : self._dec_model(input_latent)\nJIT decoder forward
+    activate dec_jit
+    dec_jit --> cvt : reconstructed tensor [B,3,T,H,W]
+    deactivate dec_jit
+    cvt --> dec_model : pixel tensor range [-1, 1]
+    deactivate cvt
+
+    dec_model --> dec_mv : decoded chunk
+    deactivate dec_model
+end
+
+dec_mv -> dec_mv : torch.cat(chunks, dim=0)
+
+opt num_views > 1
+    dec_mv -> dec_mv : rearrange\n(b v) c t h w → b c (v t) h w
+end
+
+dec_mv -> dec_mv : video.transpose(1,2) → [B,T,C,H,W]
+dec_mv -> dec_mv : video.clip(-1, 1)
+dec_mv --> caller : pixel video [B,T,C,H,W]\nclipped to [-1, 1]
+deactivate dec_mv
+
+@enduml

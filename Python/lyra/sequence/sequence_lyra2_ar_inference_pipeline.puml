@@ -1,0 +1,215 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceArrowColor #495057
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceLifeLineBackgroundColor #F8F9FA
+skinparam sequenceParticipantBackgroundColor #F8F9FA
+skinparam sequenceParticipantBorderColor #495057
+skinparam sequenceParticipantFontColor #212529
+skinparam sequenceBoxBackgroundColor #E9ECEF
+skinparam sequenceBoxBorderColor #6C757D
+skinparam sequenceGroupBackgroundColor #DEE2E6
+skinparam sequenceGroupBorderColor #6C757D
+skinparam sequenceGroupHeaderFontColor #212529
+skinparam noteBackgroundColor #FFF3CD
+skinparam noteBorderColor #FFC107
+skinparam activationBorderColor #495057
+skinparam activationBackgroundColor #E9ECEF
+
+title Lyra2 Autoregressive Inference Pipeline
+
+actor "Caller Script" as Caller
+participant "model_loader" as ModelLoader
+participant "depth_utils" as DepthUtils
+participant "camera_traj_utils" as CamTraj
+participant "run_lyra2_sample" as RunSample
+participant "Lyra2InferencePipeline" as Pipeline
+participant "Lyra2Model" as Lyra2
+participant "WanVAE" as VAE
+participant "DA3Model" as DA3
+participant "Sparse3DCache" as SCache
+
+== Model & Depth Initialization ==
+
+Caller -> ModelLoader: load_model_from_checkpoint(\n  config_file, experiment_name,\n  checkpoint_path, enable_fsdp=False)
+activate ModelLoader
+ModelLoader -> ModelLoader: get_config_module(config_file)\n→ make_config() → override(config, experiment_opts)
+ModelLoader -> Lyra2: instantiate(config.model).cuda()\n+ on_train_start()
+activate Lyra2
+Lyra2 --> ModelLoader: model instance
+deactivate Lyra2
+ModelLoader -> ModelLoader: load .pth via easy_io.load()\nOR DCP via DistributedCheckpointer\n+ dcp.load()
+ModelLoader --> Caller: (model, config)
+deactivate ModelLoader
+
+Caller -> DepthUtils: load_da3_model(da3_model_name, device)
+activate DepthUtils
+DepthUtils --> Caller: da3_model
+deactivate DepthUtils
+
+Caller -> DepthUtils: load_moge_model(device)\n[optional — scale alignment]
+activate DepthUtils
+DepthUtils --> Caller: moge_model
+deactivate DepthUtils
+
+Caller -> DepthUtils: _da3_infer_depth_intrinsics_single(\n  da3_model, img_rgb_uint8, target_hw)
+activate DepthUtils
+DepthUtils --> Caller: (image_chw01, depth_hw, K_33, mask_hw)
+deactivate DepthUtils
+
+== Camera Trajectory Construction ==
+
+Caller -> CamTraj: build_camera_trajectory(\n  initial_w2c_44, K_33, center_depth,\n  video_len, trajectory, direction, strength)
+activate CamTraj
+CamTraj -> CamTraj: dispatch → create_spiral / horizontal /\norbit / dolly_zoom_trajectory(...)
+CamTraj --> Caller: (w2cs [T,4,4], Ks [T,3,3])
+deactivate CamTraj
+
+Caller -> Caller: assemble data_batch {\n  video, t5_text_embeddings,\n  camera_w2c, intrinsics,\n  depth, fps, padding_mask\n}
+
+== Pipeline Entry & Initialization ==
+
+Caller -> RunSample: run_lyra2_sample(\n  model, data_batch, args,\n  da3_model=da3_model)
+activate RunSample
+
+RunSample -> Lyra2: _normalize_video_databatch_inplace(data_batch)
+activate Lyra2
+Lyra2 --> RunSample: (in-place, normalized)
+deactivate Lyra2
+
+RunSample -> Pipeline: __init__(model, args, first_frame,\n  first_depth, first_cam_w2c,\n  first_intrinsics, da3_model)
+activate Pipeline
+
+Pipeline -> Pipeline: _get_vae_handles(model)\n→ (vae_iface, vae_wrap, vae_core)\n[model.tokenizer.model.model chain]
+
+Pipeline -> VAE: _prime_encoder_cache_with_history(\n  init_video, vae_wrap, vae_core, model)
+activate VAE
+VAE -> Lyra2: _vae_encode_range_stream(\n  video_cast, 0, T, skip_first_frame=False)\n→ feats
+activate Lyra2
+Lyra2 --> VAE: encoder features
+deactivate Lyra2
+VAE -> Lyra2: _encoder_feats_to_normalized_latents(feats)\n→ history_latents
+activate Lyra2
+Lyra2 --> VAE: history_latents [B,C,T,H,W]
+deactivate Lyra2
+VAE --> Pipeline: (history_latents, enc_feat_cache)
+deactivate VAE
+
+Pipeline -> VAE: _decode_new_latent_chunk(\n  vae_wrap, vae_core, dec_feat_cache,\n  history_latents, latent_offset=0)\n[warmup / decoder cache prime]
+activate VAE
+VAE -> VAE: vae_core.conv2(z) → x\n[per-frame] vae_core.decoder(\n  x[:,:,t:t+1], feat_cache=dec_feat_cache)
+VAE --> Pipeline: primed dec_feat_cache
+deactivate VAE
+
+Pipeline -> SCache: __init__(downsample=4, store_values=True)
+activate SCache
+SCache --> Pipeline: retrieval_cache
+deactivate SCache
+
+Pipeline -> SCache: add(first_depth_b1hw, first_w2c,\n  first_K, latent_index=0, frame_id=0)
+activate SCache
+SCache --> Pipeline: (updated cache)
+deactivate SCache
+
+Pipeline --> RunSample: pipeline instance (initialized)
+
+== Autoregressive Inference Loop ==
+
+RunSample -> RunSample: compute num_iters =\n  ceil(tokens_needed / tokens_per_step)
+
+loop for ar_idx in range(num_iters)
+
+    RunSample -> RunSample: slice cam_chunk, intr_chunk,\npos_t5 from data_batch\n[start_px_idx : end_px_idx]
+
+    RunSample -> Pipeline: autoregressive_step(\n  cam_w2c_chunk, intrinsics_chunk,\n  t5_text_embeddings, neg_t5, is_last_step)
+    activate Pipeline
+
+    Pipeline -> Pipeline: _append_cameras(cam_w2c_chunk, intrinsics_chunk)\n→ concat to self.cam_w2c, self.intrinsics
+
+    Pipeline -> Lyra2: _prepare_lyra2_inputs(\n  history_full, gen_cond, spatial_cache,\n  video, buffer_depth, camera_w2c,\n  intrinsics, video_indices)\n→ (latents_full, cond_latent, mask, buffer_cond_latents)
+    activate Lyra2
+    Lyra2 --> Pipeline: prepared inputs
+    deactivate Lyra2
+
+    Pipeline -> Lyra2: inference(\n  history_latents=history_window,\n  cond_latent, cond_latent_mask,\n  cond_latent_buffer, guidance, seed,\n  num_steps, shift,\n  t5_text_embeddings, neg_t5_text_embeddings,\n  last_hist_frame, fps, padding_mask)\n→ gen_chunk [diffusion denoising]
+    activate Lyra2
+    Lyra2 --> Pipeline: gen_chunk (denoised latents)
+    deactivate Lyra2
+
+    Pipeline -> VAE: _decode_new_latent_chunk(\n  vae_wrap, vae_core, dec_feat_cache,\n  gen_chunk, latent_offset=history_latents.shape[2])
+    activate VAE
+    VAE -> VAE: _offload_diffusion_to_cpu(model)
+    VAE -> VAE: unnormalize latent → z\nvae_core.conv2(z) → x
+    VAE -> VAE: [per-frame] vae_core.decoder(\n  x[:,:,t:t+1], feat_cache=dec_feat_cache,\n  feat_idx=[0]) → out_t\nconcat → video_chunk
+    VAE -> VAE: _restore_diffusion_to_gpu(model)
+    VAE --> Pipeline: new_generated_frames (pixel video)
+    deactivate VAE
+
+    Pipeline -> Lyra2: vae_encode_with_cache(\n  enc_cache, new_generated_frames,\n  start_t, end_t)\n→ (feats_gen, enc_cache_out)\n[re-encode for history latents]
+    activate Lyra2
+    Lyra2 --> Pipeline: feats_gen, enc_cache_out
+    deactivate Lyra2
+
+    Pipeline -> Lyra2: _encoder_feats_to_normalized_latents(feats_gen)\n→ gen_chunk_reencoded
+    activate Lyra2
+    Lyra2 --> Pipeline: gen_chunk_reencoded
+    deactivate Lyra2
+
+    Pipeline -> Pipeline: cat history_frames, history_latents\nwith new chunk (sliding window update)
+
+    opt NOT last step
+        Pipeline -> Pipeline: _update_depth_cache(end_px_idx)
+        Pipeline -> Pipeline: _predict_da3_depth_window(\n  da3_model, history_frames, start_index,\n  abs_last_idx, cam_w2c, intrinsics,\n  frame_interval, max_history_frames)
+        activate Pipeline
+        Pipeline -> DA3: da3_model.inference(\n  images=[uint8 frames], extrinsics,\n  intrinsics, align_to_input_ext_scale=True,\n  infer_gs=False, process_res=...)\n→ prediction
+        activate DA3
+        DA3 --> Pipeline: {frame_indices, depth_prediction}
+        deactivate DA3
+        Pipeline -> SCache: add(depth, w2c, K,\n  latent_index, frame_id)\n[per new frame in depth window]
+        activate SCache
+        SCache --> Pipeline: (updated depth cache)
+        deactivate SCache
+        deactivate Pipeline
+    end
+
+    Pipeline --> RunSample: (step complete)
+    deactivate Pipeline
+
+end
+
+== Output Assembly ==
+
+RunSample -> Pipeline: build_outputs(\n  da3_gs_export_stem, log_prefix)
+activate Pipeline
+Pipeline --> RunSample: {video, warp_video,\n  use_pose, use_plucker}
+deactivate Pipeline
+
+RunSample --> Caller: result dict\n{video, warp_video, ...}
+deactivate RunSample
+
+Caller -> Caller: save_img_or_video(\n  video_01, video_path, fps=args.fps)
+
+note over Caller, SCache
+  Pipeline is FramePack-style: fixed history window (T_hist latents) + growing generated sequence.
+  Camera poses drive Sparse3DCache warping for pose conditioning every AR step.
+  Optional CPU offload of diffusion model during VAE encode/decode and DA3 inference.
+end note
+
+@enduml

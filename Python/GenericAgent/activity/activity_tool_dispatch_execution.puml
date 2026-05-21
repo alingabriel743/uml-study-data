@@ -1,0 +1,136 @@
+@startuml activity_tool_dispatch_execution
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #212529
+    EndColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+
+title Tool Dispatch & Execution Flow
+
+|agent_runner_loop|
+start
+
+:Receive LLM response containing tool_calls;
+:Parse tool_calls → list of {tool_name, args, id};
+
+while (more tool_calls?) is (yes)
+
+  if (tool_name == "no_tool"?) then (yes)
+    :Skip dispatch — fall through;
+  else (no)
+    :Call handler.dispatch(tool_name, args, response, index=ii);
+
+    |BaseHandler.dispatch|
+    :Compute method_name = "do_" + tool_name;
+    if (hasattr(self, method_name)?) then (yes)
+      :Inject args["_index"] = index;
+
+      |try_call_generator|
+      :Call tool_before_callback(tool_name, args, response);
+      note right: No-op in BaseHandler;\noverridable for logging/validation
+
+      |BaseHandler.dispatch|
+      :Drive try_call_generator(tool_before_callback, ...)\n→ pre_result;
+
+      |try_call_generator|
+      :Call do_<tool_name>(args, response);
+
+      |do_* method (GenericAgentHandler)|
+      :Execute tool logic\n(code_run / ask_user / web_scan /\nfile_patch / file_write / file_read / etc.);
+      :yield intermediate output strings\n(streamed to UI);
+      :return StepOutcome(data, next_prompt, should_exit);
+
+      |try_call_generator|
+      if (result is a generator?) then (yes)
+        :yield from result\n(stream output chunks);
+      else (no)
+        :use result directly;
+      endif
+      :Return StepOutcome as ret;
+
+      |BaseHandler.dispatch|
+      :Drive try_call_generator(do_method, ...)\n→ ret (StepOutcome);
+      :Drive try_call_generator(tool_after_callback, ..., ret)\n→ ignored;
+      note right: No-op in BaseHandler;\noverridable for post-processing
+      :yield StepOutcome ret;
+
+    else (no)
+      if (tool_name == "bad_json"?) then (yes)
+        :Return StepOutcome(None,\nnext_prompt=args.get("msg","bad_json"),\nshould_exit=False);
+      else (unknown tool)
+        :yield "未知工具: {tool_name}";
+        :Return StepOutcome(None,\nnext_prompt="未知工具 {tool_name}",\nshould_exit=False);
+      endif
+    endif
+
+    |agent_runner_loop|
+    :Drive dispatch generator:\nnext(gen) → first yield;\nproxy remaining yielded chunks;
+    :Capture StepOutcome via StopIteration.value;
+
+    if (outcome.should_exit == True?) then (yes)
+      :Set exit_reason = {result: "EXITED", data: outcome.data};
+      break
+    endif
+
+    if (outcome.next_prompt is falsy?) then (yes)
+      :Set exit_reason = {result: "CURRENT_TASK_DONE", data: outcome.data};
+      break
+    endif
+
+    if (next_prompt starts with "未知工具"?) then (yes)
+      :Reset client.last_tools = ""\n(clear LLM tools cache);
+    endif
+
+    if (outcome.data is not None\nAND tool_name != "no_tool"?) then (yes)
+      :Serialize outcome.data\n→ append to tool_results[];
+    endif
+
+    :Add outcome.next_prompt to next_prompts set;
+  endif
+
+endwhile (no more)
+
+if (next_prompts empty OR exit_reason set?) then (yes)
+  if (_done_hooks available?) then (yes)
+    :Pop hook → add to next_prompts\n(chained deferred task);
+  else (no)
+    :BREAK outer while loop;
+    stop
+  endif
+endif
+
+:Call turn_end_callback(\n  response, tool_calls, tool_results,\n  turn, joined_next_prompts, exit_reason\n) → next_prompt;
+note right: Overridden in GenericAgentHandler\nfor history compression & plan-mode logic
+
+:Build new messages:\n[{role: user, content: next_prompt,\ntool_results: tool_results}];
+:Continue to next LLM turn;
+
+stop
+
+@enduml

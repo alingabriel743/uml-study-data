@@ -1,0 +1,131 @@
+{
+  "scope": "browser_extension_core",
+  "title": "Browser Extension Core (Service Worker & Content Script)",
+  "diagram_type": "class",
+  "source_files_analyzed": [
+    "extension/background/service-worker.js",
+    "extension/content/content-script.js"
+  ],
+
+  "classes": [
+    {
+      "name": "ServiceWorker",
+      "stereotype": "module",
+      "file": "extension/background/service-worker.js",
+      "fields": [
+        "tabState: Map<tabId, TabState>  // per-tab state",
+        "panelPorts: Map<tabId, Set<Port>>  // active DevTools panel connections",
+        "devtoolsTabs: Set<tabId>  // tabs with DevTools open"
+      ],
+      "methods": [
+        "getState(tabId): TabState  // lazy-init state entry",
+        "updateBadge(tabId): void  // sets badge text + color via chrome.action",
+        "notifyPanels(tabId, message): void  // forwards message to all panel ports",
+        "getSettings(): Promise<Settings>  // reads chrome.storage.sync",
+        "buildScanConfig(): Promise<ScanConfig>  // derives config from settings",
+        "ensureContentScriptInjected(tabId): Promise<boolean>  // on-demand injection via chrome.scripting",
+        "sendScanToTab(tabId): Promise<void>  // injects CS if needed then sends scan message",
+        "tearDownTab(tabId): Promise<void>  // resets state, removes badge, clears panelPorts"
+      ],
+      "event_handlers": [
+        "chrome.runtime.onMessage  // scan, findings, toggle-overlays, get-state, overlays-toggled, page-pointer-active, inject-fallback, disabled-rules-changed",
+        "chrome.runtime.onConnect  // ports: impeccable-devtools-*, impeccable-panel-*, impeccable-sidebar-*",
+        "chrome.webNavigation.onCompleted  // re-scan on page navigation if DevTools open",
+        "chrome.tabs.onRemoved  // clean up tabState and panelPorts"
+      ]
+    },
+    {
+      "name": "TabState",
+      "stereotype": "dataclass",
+      "fields": [
+        "findings: Finding[]",
+        "overlaysVisible: boolean  // default true",
+        "injected: boolean  // detector injected in page context",
+        "csInjected: boolean  // content-script.js injected into tab"
+      ]
+    },
+    {
+      "name": "Settings",
+      "stereotype": "dataclass",
+      "fields": [
+        "disabledRules: string[]",
+        "lineLengthMode: 'strict' | 'lax'  // 80 or 120",
+        "spotlightBlur: boolean",
+        "autoScan: 'panel' | 'devtools'"
+      ]
+    },
+    {
+      "name": "ScanConfig",
+      "stereotype": "dataclass",
+      "fields": [
+        "disabledRules?: string[]",
+        "lineLengthMax: number  // 80 or 120",
+        "spotlightBlur: boolean"
+      ]
+    },
+    {
+      "name": "ContentScript",
+      "stereotype": "module",
+      "file": "extension/content/content-script.js",
+      "note": "IIFE with idempotency guard (window.__IMPECCABLE_CS_LOADED__)",
+      "fields": [
+        "injected: boolean  // detector loaded in page context",
+        "pendingScan: boolean  // scan queued before detector ready",
+        "scanConfig: ScanConfig | null",
+        "lastPageActive: number  // timestamp for pointer throttle",
+        "lastUrl: string  // SPA navigation detection"
+      ],
+      "methods": [
+        "injectAndScan(): void  // injects detector/detect.js via <script> tag or fallback",
+        "sendScanCommand(): void  // postMessage scan command to page context",
+        "onPossibleNavigation(): void  // SPA pushState/popstate/hashchange handler"
+      ],
+      "event_handlers": [
+        "chrome.runtime.onMessage  // scan → injectAndScan, toggle-overlays/remove/highlight/unhighlight → window.postMessage",
+        "window.addEventListener('message')  // impeccable-results → sendMessage findings, impeccable-overlays-toggled → sendMessage overlays-toggled, impeccable-ready → sendScanCommand if pendingScan",
+        "document.addEventListener('pointermove')  // throttled, sends page-pointer-active to SW",
+        "window.addEventListener('popstate', 'hashchange')  // SPA navigation detection"
+      ]
+    }
+  ],
+
+  "key_relationships": [
+    "ServiceWorker owns tabState (composition: Map<tabId, TabState>)",
+    "ServiceWorker owns panelPorts (composition: Map<tabId, Set<Port>>)",
+    "ServiceWorker owns devtoolsTabs (composition: Set<tabId>)",
+    "ServiceWorker uses TabState  (creates/reads/mutates via getState)",
+    "ServiceWorker uses Settings  (reads via getSettings, consumed by buildScanConfig)",
+    "ServiceWorker uses ScanConfig (produced by buildScanConfig, sent to ContentScript)",
+    "ServiceWorker depends_on ContentScript  (injects via chrome.scripting, sends messages)",
+    "ContentScript depends_on ServiceWorker  (sends findings/overlays-toggled/page-pointer-active/inject-fallback via chrome.runtime.sendMessage)",
+    "ContentScript depends_on Detector  (injects detector/detect.js into page MAIN world via <script> tag or chrome.scripting fallback)",
+    "ContentScript bridges ServiceWorker <-> Detector  (postMessage in both directions)"
+  ],
+
+  "message_flow": [
+    "Panel/Popup → SW.onMessage('scan') → sendScanToTab → ensureContentScriptInjected → CS.onMessage('scan') → injectAndScan",
+    "injectAndScan → injects <script src=detector/detect.js> → page fires impeccable-ready → sendScanCommand → postMessage(scan, config)",
+    "Detector → postMessage(impeccable-results) → CS.window.onMessage → SW.onMessage('findings') → updateBadge + notifyPanels + broadcast",
+    "Panel.port.onMessage('toggle-overlays') → SW → chrome.tabs.sendMessage(toggle-overlays) → CS → postMessage(toggle-overlays) → Detector",
+    "Detector → postMessage(impeccable-overlays-toggled) → CS → SW.onMessage('overlays-toggled') → notifyPanels + broadcast",
+    "DevTools opens → chrome.runtime.connect(impeccable-devtools-{tabId}) → SW registers devtoolsTabs entry",
+    "Panel opens → chrome.runtime.connect(impeccable-panel-{tabId}) → SW adds to panelPorts, sends current state, triggers scan if no findings",
+    "Tab closes → chrome.tabs.onRemoved → delete tabState + panelPorts",
+    "Navigation → webNavigation.onCompleted → reset state, notifyPanels('navigated'), re-scan if wasActive"
+  ],
+
+  "port_names": [
+    "impeccable-devtools-{tabId}  // lifecycle tracking, keepalive pings",
+    "impeccable-panel-{tabId}     // DevTools panel findings/commands",
+    "impeccable-sidebar-{tabId}   // Elements panel sidebar (treated same as panel port)"
+  ],
+
+  "important_notes": [
+    "Content script is injected ON-DEMAND only (removed from manifest static content_scripts) — minimizes always-on footprint",
+    "csInjected flag prevents double-injection across SW restarts; page reload resets it",
+    "Detector runs in MAIN world (needs getComputedStyle, styleSheets.cssRules) — content script runs in ISOLATED world and bridges via window.postMessage",
+    "CSP fallback: if <script> inject fails, CS sends inject-fallback to SW which uses chrome.scripting with world:'MAIN'",
+    "SW tearDownTab uses async/await to keep SW alive in MV3 (setTimeout unreliable before termination)",
+    "SPA navigation handled in content script (popstate/hashchange); full navigations handled in SW via webNavigation.onCompleted"
+  ]
+}

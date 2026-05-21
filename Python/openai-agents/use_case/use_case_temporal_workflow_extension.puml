@@ -1,0 +1,160 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam actor {
+    BackgroundColor #D0E8FF
+    BorderColor #3A7ABF
+    FontColor #1A3A5C
+}
+skinparam usecase {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam ArrowColor #495057
+skinparam NoteBackgroundColor #FFFDE7
+skinparam NoteBorderColor #F9A825
+
+title Temporal Workflow Extension\nAgent Sessions Orchestrated as Durable Temporal Workflows
+
+left to right direction
+
+' ─── Actors ───────────────────────────────────────────────────
+actor "TUI Client\n(temporal_sandbox_tui.py)" as TUI
+actor "Developer" as Dev
+actor "Temporal Worker" as Worker
+actor "OpenAI Agents SDK\n(Runner)" as Runner
+
+' ─── System boundary ──────────────────────────────────────────
+rectangle "Temporal Workflow Extension" {
+
+    ' === Session Manager boundary ===
+    package "SessionManagerWorkflow\n(singleton: 'session-manager')" as SMW {
+        usecase "Create Agent Session\n(CreateSessionRequest:\ncwd, manifest, backend)" as UC_Create
+        usecase "Fork Session\n(ForkSessionRequest:\nsource_workflow_id,\ntitle, target_backend)" as UC_Fork
+        usecase "Switch Session Backend\nin-place\n(SwitchBackendRequest)" as UC_Switch
+        usecase "Destroy / Terminate\nAgent Session" as UC_Destroy
+        usecase "List Active Sessions\n(sorted newest first)" as UC_List
+        usecase "Rename Session\n(RenameRequest:\nworkflow_id, title)" as UC_Rename
+        usecase "Shutdown Session Manager" as UC_Shutdown
+    }
+
+    ' === Agent Workflow boundary ===
+    package "AgentWorkflow\n(per-session, long-lived)\nTask Queue: sandbox-agent-queue" as AW {
+        usecase "Run Conversation Turn\n(Runner.run with SandboxRunConfig)" as UC_Turn
+        usecase "Send User Message\n(chat turn)" as UC_Chat
+        usecase "Approve / Reject\nAgent Tool Calls\n(human-in-the-loop)" as UC_Approve
+        usecase "Query Live Turn State\n(status, tool calls,\napproval requests)" as UC_QueryTurn
+        usecase "Pause Agent Session\n(stops active sandbox session)" as UC_Pause
+        usecase "Resume Paused Session\n(with prior conversation history)" as UC_Resume
+        usecase "Query Workflow Snapshot\n(WorkflowSnapshot:\nhistory, sandbox_session_state)" as UC_Snapshot
+        usecase "Switch Backend\nin Agent Workflow\n(SwitchBackendSignal)" as UC_SwitchAW
+    }
+
+    ' === Infrastructure / Activities ===
+    package "Temporal Activities\n(executed by Temporal Worker)" as Activities {
+        usecase "Execute pause_workflow\nActivity" as ACT_Pause
+        usecase "Execute query_workflow_snapshot\nActivity" as ACT_QuerySnap
+        usecase "Execute switch_workflow_backend\nActivity" as ACT_Switch
+    }
+
+    ' === Backend Support ===
+    package "Supported Backends\n(BackendConfig)" as Backends {
+        usecase "Connect to Daytona Backend" as BE_Daytona
+        usecase "Connect to Docker Backend" as BE_Docker
+        usecase "Connect to E2B Backend" as BE_E2B
+        usecase "Connect to Local (Unix) Backend" as BE_Local
+    }
+}
+
+' ─── TUI Client interactions (updates / queries / signals) ────
+TUI --> UC_Create       : update
+TUI --> UC_Fork         : update
+TUI --> UC_Switch       : update
+TUI --> UC_Destroy      : update
+TUI --> UC_List         : query
+TUI --> UC_Rename       : signal
+TUI --> UC_Shutdown     : signal
+TUI --> UC_Chat         : send message
+TUI --> UC_Approve      : approve / reject
+TUI --> UC_QueryTurn    : poll (query)
+
+' ─── Developer interactions ───────────────────────────────────
+Dev --> UC_Create       : configure & initiate
+Dev -[dashed]-> Worker  : start Temporal worker\n& server (localhost:7233)
+
+' ─── Temporal Worker executes activities ──────────────────────
+Worker --> ACT_Pause
+Worker --> ACT_QuerySnap
+Worker --> ACT_Switch
+
+' ─── SessionManagerWorkflow orchestrates AgentWorkflow ────────
+UC_Create   -[dashed]-> UC_Resume       : <<start child>>\nstart_child_workflow\n(ABANDON policy)
+UC_Fork     -[dashed]-> ACT_Pause       : <<include>>\nexecute_activity
+UC_Fork     -[dashed]-> ACT_QuerySnap   : <<include>>\nexecute_activity
+UC_Fork     -[dashed]-> UC_Resume       : <<start child>>\nwith snapshot + history
+UC_Switch   -[dashed]-> ACT_Switch      : <<include>>\nexecute_activity
+UC_Destroy  -[dashed]-> UC_Resume       : <<signal>>\ndestroy()
+
+' ─── Activity → AgentWorkflow interactions ────────────────────
+ACT_Pause     -[dashed]-> UC_Pause       : <<update>>\nAgentWorkflow.pause()
+ACT_QuerySnap -[dashed]-> UC_Snapshot    : <<query>>\nAgentWorkflow.get_snapshot()
+ACT_Switch    -[dashed]-> UC_SwitchAW    : <<update>>\nAgentWorkflow.switch_backend()
+
+' ─── AgentWorkflow internal interactions ──────────────────────
+UC_Resume   -[dashed]-> UC_Turn         : <<include>>\nidle → Runner.run()
+UC_Chat     -[dashed]-> UC_Turn         : <<include>>
+UC_Turn     -[dashed]-> UC_Approve      : <<extend>>\nif tool approval needed
+UC_SwitchAW -[dashed]-> BE_Daytona      : <<extend>>
+UC_SwitchAW -[dashed]-> BE_Docker       : <<extend>>
+UC_SwitchAW -[dashed]-> BE_E2B          : <<extend>>
+UC_SwitchAW -[dashed]-> BE_Local        : <<extend>>
+UC_Turn     -[dashed]-> BE_Daytona      : <<extend>>
+UC_Turn     -[dashed]-> BE_Docker       : <<extend>>
+UC_Turn     -[dashed]-> BE_E2B          : <<extend>>
+UC_Turn     -[dashed]-> BE_Local        : <<extend>>
+
+' ─── Runner drives each conversation turn ─────────────────────
+Runner --> UC_Turn      : execute each turn\n(SandboxRunConfig)
+
+' ─── Notes ────────────────────────────────────────────────────
+note bottom of SMW
+  Singleton workflow (ID: "session-manager").
+  Lives indefinitely until shutdown signal.
+  Manages _sessions registry: dict[str, SessionInfo].
+  Child workflows use ParentClosePolicy.ABANDON —
+  agent sessions survive manager restarts.
+end note
+
+note bottom of AW
+  Long-lived per-session workflow.
+  Idles between conversation turns.
+  Each turn calls Runner.run() with active BackendConfig.
+  Supports fork (portable SnapshotBase, cross-backend).
+  Switch backend: in-place, clears session state,
+  next turn creates fresh backend session.
+end note
+
+note right of Activities
+  All Temporal connections: localhost:7233
+  Codec: pydantic_data_converter
+  TASK_QUEUE = "sandbox-agent-queue"
+  Activity timeouts: pause 11 min,
+  snapshot query 30 s, switch 30 s
+end note
+
+@enduml

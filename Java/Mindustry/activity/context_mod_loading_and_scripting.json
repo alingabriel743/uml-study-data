@@ -1,0 +1,212 @@
+{
+  "scope": "mod_loading_and_scripting",
+  "title": "Mod Loading & Script Injection",
+  "diagram_type": "activity",
+  "key_participants": [
+    "Mods", "LoadedMod", "ContentLoader", "Scripts", "FileTree",
+    "AndroidRhinoContext", "ScriptMainGenerator", "ContentParser", "ModClassLoader"
+  ],
+
+  "activity_phases": [
+    {
+      "phase": "1. Mod Discovery (Mods.load())",
+      "steps": [
+        "Scan modDirectory for .jar/.zip files and directories containing mod.json/mod.hjson/plugin.hjson",
+        "Add Steam Workshop mods via platform.getWorkshopContent()",
+        "For each candidate: findMeta(resolveRoot(file)) → parse ModMeta (name, version, main class, dependencies)",
+        "[GUARD] meta == null or meta.name == null → skip candidate",
+        "resolveDependencies(metas) → topological sort; outputs Map<name, ModState>",
+        "For each resolved entry: loadMod(file, overwrite=false, initialize=(state==enabled))",
+        "[ERROR] load fails → log error, skip mod (continue loop)",
+        "mods.each(updateDependencies) → resolve dependency/soft-dependency refs",
+        "[CONDITION] mod.state==enabled AND !mod.isSupported() → set state=unsupported",
+        "[CONDITION] mod.state==enabled AND !mod.shouldBeEnabled() → set state=disabled",
+        "sortMods() → sort by state ordinal then name",
+        "buildFiles() → walk each enabled mod root, addFile() all non-special-folder files into FileTree",
+        "Load bundle .properties files into I18NBundle chain",
+        "Events.fire(FileTreeInitEvent)"
+      ]
+    },
+    {
+      "phase": "2. loadMod(sourceFile, overwrite, initialize)",
+      "steps": [
+        "resolveRoot: if directory use as-is, else wrap in ZipFi",
+        "findMeta(zip) → parse mod.json/mod.hjson → ModMeta",
+        "[GUARD] meta==null → throw ModLoadException('No mod.json found')",
+        "Derive mainClass: meta.main ?? (lowercaseName + '.' + camelizedName + 'Mod')",
+        "[CONDITION] mod with same baseName already in mods list:",
+        "  [overwrite && !hasSteamID] → close classloader, delete old zip/dir, remove from list",
+        "  [else] → throw ModLoadException('already imported')",
+        "[CONDITION] Android platform → mainFile = zip.child('classes.dex')",
+        "[CONDITION] Desktop → traverse class path segments to find .class file",
+        "[GUARD] mainFile.exists() && !skipModLoading && enabled && versionCompat && !blacklisted && initialize:",
+        "  Create ModClassLoader(mainLoader) or AndroidDexClassLoader",
+        "  loader.loadClass(mainClass) → instantiate Mod via reflection",
+        "  metas.put(mod.class, meta); mod.init()",
+        "[else] mainMod = null (script-only or JSON-only mod)",
+        "Return LoadedMod(root=zip, file=sourceFile, meta, main=mainMod, loader)"
+      ]
+    },
+    {
+      "phase": "3. Async Sprite Packing (Mods.loadAsync() — Loadable)",
+      "steps": [
+        "[GUARD] no enabled mods → return early",
+        "Create MultiPacker",
+        "eachEnabled(mod): find mod.root/sprites/**/*.png and mod.root/sprites-override/**/*.png",
+        "packSprites() → submit async tasks: read Pixmap, optionally bleed(2px), queue for packing",
+        "If mod.main != null → mod.main.packSprites(packer) (Java mod custom sprites)",
+        "Await all futures; pack each pixmap into MultiPacker pages",
+        "waitForMain: dispose old Core.atlas, install shadow atlas for icon generation",
+        "For each mod content (UnlockableContent): u.load(), u.loadIcon(), u.createIcons(packer)",
+        "waitForMain: flush packer → new TextureAtlas, apply texture scale overrides",
+        "Events.fire(AtlasPackEvent)",
+        "loadSync() → loadIcons(): load icon.png texture for each mod"
+      ]
+    },
+    {
+      "phase": "4. Content Loading (Mods.loadContent() called from ContentLoader.createModContent())",
+      "steps": [
+        "Phase A — Java mod content:",
+        "  For each mod in orderedMods() where mod.main!=null && !mod.meta.hidden:",
+        "    content.setCurrentMod(mod)",
+        "    mod.main.loadContent() → mod registers Content objects (Items, Blocks, etc.)",
+        "  content.setCurrentMod(null)",
+        "Phase B — JSON/HJSON mod content:",
+        "  For each enabled mod: scan mod.root/content/{type}s/ for .json/.hjson files",
+        "  Respect meta.contentOrder: ordered files loaded first, rest sorted alphabetically",
+        "  For each LoadRun: content.setCurrentMod(run.mod)",
+        "    parser.parse(mod, name, fileContent, file, contentType)",
+        "    → ContentLoader.handleContent(content): assign ID, add to contentMap",
+        "    → ContentLoader.handleMappableContent(content): prefix name with mod name via transformName(), add to nameMap",
+        "    [ERROR] duplicate name → remove from list, throw IllegalArgumentException",
+        "    [ERROR] parse failure → mods.handleContentError(content, e), continue"
+      ]
+    },
+    {
+      "phase": "5. Script Execution (Mods.loadScripts())",
+      "steps": [
+        "[GUARD] skipModCode==true → return immediately",
+        "eachEnabled(mod): check mod.root.child('scripts').exists()",
+        "  content.setCurrentMod(mod)",
+        "  allScripts = mod.root/scripts/**/*.js",
+        "  main = (allScripts.size==1) ? allScripts.first() : scripts/main.js",
+        "  [GUARD] main.exists() && !main.isDirectory()",
+        "  [CONDITION] scripts==null → scripts = platform.createScripts() (lazy init Rhino engine)",
+        "    Scripts(): platform.getScriptContext() → (Android) AndroidRhinoContext.enter(cacheDir) or (Desktop) Context.enter()",
+        "    Create ImporterTopLevel scope",
+        "    RequireBuilder.setSandboxed(true).createRequire().install(scope)",
+        "    run(global.js, false) → loads all importPackage() + EventType consts",
+        "    [ERROR] global.js fails → errored=true",
+        "  scripts.run(mod, main):",
+        "    currentMod = mod",
+        "    run(file.readString(), 'modName/file.js', wrap=true)",
+        "    Inject: context.evaluateString('modName = \"...\"; scriptName = \"...\"')",
+        "    context.evaluateString(scope, '(function(){\"use strict\";\n'+script+'\n})();')",
+        "    [ERROR] Throwable → log error at LogLevel.err, return false",
+        "    currentMod = null",
+        "[POST] checkWarnings(): if scripts.hasErrored() → ui.showErrorMessage"
+      ]
+    },
+    {
+      "phase": "6. Android Rhino Context Init (AndroidRhinoContext.enter(cacheDir))",
+      "steps": [
+        "[CONDITION] !ContextFactory.hasExplicitGlobal() → create AndroidContextFactory(cacheDir)",
+        "  initApplicationClassLoader(createClassLoader(parent))",
+        "  Android O+ (SDK >= 26): use InMemoryAndroidClassLoader (holds DEX in ByteBuffer)",
+        "  Android < O: use FileAndroidClassLoader (writes .dex to cache file)",
+        "[CONDITION] global already set but not AndroidContextFactory → throw IllegalStateException",
+        "factory.enterContext() → returns Rhino Context ready for use",
+        "defineClass(name, bytecode):",
+        "  DexOptions → DexFile → DirectClassFile → CfTranslator.translate() → Java bytecode to DEX",
+        "  If existing DEX: DexMerger.merge([newDex, oldDex], KEEP_FIRST)",
+        "  loadClass(dex, name) → DexClassLoader / InMemoryDexClassLoader",
+        "onContextReleased(cx): BaseAndroidClassLoader.reset() (delete file or set last=null)"
+      ]
+    },
+    {
+      "phase": "7. Content Init & Load (ContentLoader)",
+      "steps": [
+        "createBaseContent(): loads all vanilla content (Items, Blocks, Units, Bullets, Planets, etc.)",
+        "createModContent() → mods.loadContent() (phase 4 above)",
+        "init(): initialize(Content::init) then initialize(Content::postInit), logicVars.init(), Events.fire(ContentInitEvent)",
+        "load() [client only]: initialize(Content::loadIcon) then initialize(Content::load)",
+        "initialize(callable): idempotent (tracks called set); iterates all ContentType.all × contentMap; error in mod content → handleContentError, error in base → rethrow"
+      ]
+    },
+    {
+      "phase": "8. FileTree Operations",
+      "steps": [
+        "addFile(path, fi): normalize path (backslash→slash), store in ObjectMap<String,Fi>",
+        "get(path, safe): check files map (with and without leading /), fallback to Core.files.internal(path)",
+        "clear(): wipe all mod file entries (called on reload)",
+        "loadSound(name): cache-backed Core.assets.load(path, Sound.class, SoundParameter)",
+        "loadMusic(name): cache-backed Core.assets.load(path, Music.class, MusicParameter)",
+        "resolve(fileName): delegates to get() — implements FileHandleResolver for asset system"
+      ]
+    },
+    {
+      "phase": "9. ScriptMainGenerator (build-time, offline tool)",
+      "steps": [
+        "Scan classpath packages: mindustry.*, arc.func, arc.struct, arc.scene, arc.math, arc.audio, arc.input, arc.util, arc.files, arc.flabel",
+        "Add explicit whitelist classes (Draw, Fill, Color, Core, Mathf, Call, etc.)",
+        "Filter: remove synthetic, anonymous, private, blacklisted packages (tools, arc.flabel.effects)",
+        "Deduplicate and sort by name",
+        "Generate importPackage(Packages.xxx) for each unique package",
+        "Prepend core/assets/scripts/base.js content",
+        "For each EventType inner class: generate 'const ClassName = Packages.mindustry.game.EventType.ClassName'",
+        "Write result to core/assets/scripts/global.js",
+        "Also generate ClassMap.java: ObjectMap<String,Class<?>> of simple name → concrete class for JSON mod use"
+      ]
+    },
+    {
+      "phase": "10. Reload Lifecycle",
+      "steps": [
+        "mods.reload() triggered after importMod()",
+        "newImports.each(updateDependencies)",
+        "[CONDITION] any newImport has missing/soft dependencies → checkDependencies() → show auto-import dialog",
+        "[else] → ui.showInfoOnHidden('@mods.reloadexit') → Core.app.exit()",
+        "On app restart: full pipeline re-runs from phase 1 (discovery → build files → pack sprites → load content → load scripts)"
+      ]
+    }
+  ],
+
+  "key_relationships": [
+    "Mods owns Scripts (lazy-init via platform.createScripts())",
+    "Mods owns ContentParser (for JSON content parsing)",
+    "Mods uses FileTree (tree.addFile()) to register mod asset paths",
+    "Mods calls ContentLoader.setCurrentMod() before each mod's content registration",
+    "ContentLoader.createModContent() delegates to Mods.loadContent()",
+    "Scripts uses Rhino Context + Scriptable scope for JS evaluation",
+    "AndroidRhinoContext provides Android-specific Rhino Context via ContextFactory override",
+    "AndroidRhinoContext.BaseAndroidClassLoader implements Rhino's GeneratedClassLoader (DEX compilation)",
+    "ScriptMainGenerator (build-time) generates global.js consumed by Scripts constructor at runtime",
+    "ScriptMainGenerator generates ClassMap.java consumed by ContentParser for JSON type resolution",
+    "FileTree implements FileHandleResolver → plugged into Core.assets",
+    "LoadedMod.main (Mod subclass) provides loadContent() hook and packSprites() hook",
+    "ModClassLoader extends ClassLoader, child of mainLoader"
+  ],
+
+  "key_conditions_and_branches": [
+    "mod.state: enabled | disabled | unsupported | missingDependency",
+    "Android vs Desktop: different ClassLoader strategy (DEX vs JVM bytecode)",
+    "Android O+ vs older: InMemoryAndroidClassLoader vs FileAndroidClassLoader",
+    "allScripts.size==1: use that single file as main; else require scripts/main.js",
+    "scripts==null: lazy-init Rhino engine on first scripted mod encounter",
+    "skipModCode flag: bypasses all Java class loading and JS execution",
+    "meta.hidden: Java mod main loaded but loadContent() skipped",
+    "contentOrder in meta: deterministic JSON content load ordering per mod",
+    "overwrite flag in loadMod: controls whether existing mod is replaced or error thrown",
+    "global.js parse error → Scripts.errored=true → warning shown on ClientLoadEvent"
+  ],
+
+  "important_notes": "Rhino JS engine is used for scripting (not Nashorn/GraalVM). global.js is pre-generated at build time by ScriptMainGenerator and bundled in core/assets/scripts/. Each mod script runs wrapped in an IIFE with 'use strict'. Android requires DEX compilation of Rhino-generated bytecode (Java bytecode is not directly executable). Mod file tree is flat-mapped by path into FileTree which resolves mod overrides before falling back to internal assets. Content names are prefixed with mod name (e.g. 'mymod-myblock') via ContentLoader.transformName().",
+
+  "source_files_analyzed": [
+    "android/src/mindustry/android/AndroidRhinoContext.java",
+    "tools/src/mindustry/tools/ScriptMainGenerator.java",
+    "core/src/mindustry/core/ContentLoader.java",
+    "core/src/mindustry/core/FileTree.java",
+    "core/src/mindustry/mod/Mods.java",
+    "core/src/mindustry/mod/Scripts.java"
+  ]
+}

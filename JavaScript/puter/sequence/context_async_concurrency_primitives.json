@@ -1,0 +1,156 @@
+{
+  "scope": "async_concurrency_primitives",
+  "title": "Async Concurrency Primitives Flow",
+  "diagram_type": "sequence",
+  "source_files_analyzed": [
+    "src/putility/src/libs/promise.js",
+    "src/gui/src/util/TeePromise.js",
+    "src/backend/src/services/LockService.js",
+    "src/backend/src/services/fs/FSLockService.js"
+  ],
+
+  "key_participants": [
+    "Caller",
+    "TeePromise",
+    "Lock",
+    "RWLock",
+    "LockService",
+    "FSLockService",
+    "asyncSafeSetInterval",
+    "raceCase"
+  ],
+
+  "classes": [
+    {
+      "name": "TeePromise",
+      "file": "src/putility/src/libs/promise.js",
+      "static_fields": ["STATUS_PENDING (Symbol)", "STATUS_RUNNING ({})", "STATUS_DONE (Symbol)"],
+      "instance_fields": ["status_ (STATUS_PENDING)", "donePromise (native Promise)", "doneResolve (fn)", "doneReject (fn)"],
+      "methods": [
+        "constructor() — creates native Promise, exposes resolve/reject handles",
+        "get status() / set status(s) — setting STATUS_DONE auto-calls doneResolve()",
+        "resolve(value) — sets status_ = DONE, calls doneResolve(value)",
+        "reject(err) — sets status_ = DONE, calls doneReject(err)",
+        "awaitDone() — returns donePromise",
+        "then(fn, ...a) — delegates to donePromise.then()",
+        "onComplete(fn) [deprecated] — alias for then(fn)"
+      ],
+      "notes": "Acts as a resolvable/rejectable promise handle. Used internally by RWLock as p_operation and p_unlock signals."
+    },
+    {
+      "name": "Lock",
+      "file": "src/putility/src/libs/promise.js",
+      "instance_fields": ["_locked (bool)", "_waiting (Array<{resolve}>)"],
+      "methods": [
+        "acquire(callback?) — if not locked: sets _locked=true, resolves immediately; else pushes resolve to _waiting queue. If callback provided, auto-calls release() in finally.",
+        "release() — if _waiting non-empty: shifts next waiter and resolves it; else sets _locked=false"
+      ],
+      "notes": "Simple FIFO mutex. Optional callback pattern for auto-release."
+    },
+    {
+      "name": "RWLock",
+      "file": "src/putility/src/libs/promise.js",
+      "static_fields": ["TYPE_READ (Symbol)", "TYPE_WRITE (Symbol)"],
+      "instance_fields": ["queue (Array<{type,p_operation,p_unlock}>)", "readers_ (int)", "writer_ (bool)", "mode (TYPE_READ)", "on_empty_ (callback)"],
+      "methods": [
+        "rlock() — creates p_read:TeePromise + p_unlock:TeePromise, pushes {TYPE_READ, p_read, p_unlock} via push_(), awaits p_read, returns handle{unlock: ()=>p_unlock.resolve()}",
+        "wlock() — same as rlock() but with TYPE_WRITE; awaits p_write exclusively",
+        "push_(item) — sets mode if queue was empty, pushes to queue, calls check_queue_()",
+        "check_queue_() — if TYPE_READ mode: drains all consecutive readers concurrently (each increments readers_, async awaits p_unlock then decrements and re-checks); if TYPE_WRITE mode and no writer_: grants single writer (sets writer_=true, async awaits p_unlock then clears and re-checks). Calls on_empty_() when queue empty and no holders.",
+        "get effective_mode() — returns TYPE_READ if readers_>0, TYPE_WRITE if writer_, else undefined"
+      ],
+      "notes": "Queue-based RW lock. Readers run concurrently; writer is exclusive. Mode is determined by first item in queue batch."
+    }
+  ],
+
+  "interaction_flow": {
+    "TeePromise_fan_out": [
+      "Caller → TeePromise: new TeePromise()",
+      "TeePromise → native Promise: new Promise((resolve, reject) => { doneResolve=resolve; doneReject=reject })",
+      "Caller → TeePromise: resolve(value) or reject(err)",
+      "TeePromise: status_ = STATUS_DONE, calls doneResolve(value) / doneReject(err)",
+      "All awaiting .then() / .awaitDone() subscribers unblock simultaneously (fan-out)"
+    ],
+    "Lock_acquire_release": [
+      "Caller → Lock: acquire(callback?)",
+      "Lock: if !_locked → set _locked=true → resolve immediately",
+      "Lock: else → push {resolve} to _waiting queue → suspend caller",
+      "Lock (callback path): await callback() in try/finally → release()",
+      "Lock.release(): if _waiting.length>0 → shift().resolve() (next waiter unblocks) else _locked=false"
+    ],
+    "RWLock_rlock": [
+      "Caller → RWLock: rlock()",
+      "RWLock: create p_read:TeePromise, p_unlock:TeePromise",
+      "RWLock → push_({TYPE_READ, p_read, p_unlock})",
+      "push_ → check_queue_()",
+      "check_queue_: mode=TYPE_READ → drain all consecutive readers: readers_++, start async watcher for p_unlock, call p_read.resolve() → unblocks caller",
+      "RWLock → Caller: return handle{unlock: ()=>p_unlock.resolve()}",
+      "Caller → handle: unlock() → p_unlock.resolve()",
+      "RWLock (async watcher): p_unlock resolves → readers_-- → check_queue_() → on_empty_() if no holders"
+    ],
+    "RWLock_wlock": [
+      "Caller → RWLock: wlock()",
+      "RWLock: create p_write:TeePromise, p_unlock:TeePromise",
+      "RWLock → push_({TYPE_WRITE, p_write, p_unlock})",
+      "check_queue_: if writer_=false and no current mode conflict → set writer_=true, start async watcher, call p_write.resolve() → unblocks caller",
+      "RWLock → Caller: return handle{unlock: ()=>p_unlock.resolve()}",
+      "Caller → handle: unlock() → p_unlock.resolve()",
+      "RWLock (async watcher): p_unlock resolves → writer_=false → check_queue_()"
+    ],
+    "LockService_lock": [
+      "Caller → LockService: lock(name, [opts], callback)",
+      "LockService: if name is Array → build nested lock chain via reduce(), call outermost section()",
+      "LockService: if !locks[name] → new RWLock(); locks[name] = rwlock",
+      "LockService → RWLock: wlock() → returns handle",
+      "LockService: if opts.timeout → setTimeout(() => handle.unlock(), timeout)",
+      "LockService → callback: await callback()",
+      "LockService (finally): clearTimeout if set, handle.unlock()"
+    ],
+    "FSLockService_lock_path": [
+      "Caller → FSLockService: lock_child(path, name, mode)",
+      "FSLockService → lock_path(`${path}/${name}`, mode)",
+      "FSLockService: if !locks[path] → new RWLock(), set on_empty_=()=>delete locks[path], locks[path]=rwlock",
+      "FSLockService → RWLock: rlock() [MODE_READ] or wlock() [MODE_WRITE]",
+      "FSLockService → Caller: return handle"
+    ],
+    "asyncSafeSetInterval": [
+      "Caller → asyncSafeSetInterval(callback, delay, args?, options?)",
+      "asyncSafeSetInterval: loop forever:",
+      "  → sleep(delay) [initial wait]",
+      "  → record ts_start = Date.now()",
+      "  → await callback(...args)",
+      "  → record ts_end = Date.now(), runtime = ts_end - ts_start",
+      "  → sleep_time = delay - runtime",
+      "  → if sleep_time < 0: await onBehindSchedule(-sleep_time) → if returns true: return (cancel)",
+      "  → else: await sleep(sleep_time)",
+      "Note: prevents overlapping async callback invocations; drift detection via onBehindSchedule"
+    ],
+    "raceCase": [
+      "Caller → raceCase(promise_map: {key: Promise})",
+      "raceCase: Object.entries(promise_map).map(([key, p]) => p.then(value => [key, value]))",
+      "raceCase → Promise.race([...wrapped])",
+      "First resolved promise wins → returns [winnerKey, winnerValue] to Caller"
+    ]
+  },
+
+  "key_relationships": [
+    "RWLock depends_on TeePromise (uses as p_operation and p_unlock signals)",
+    "LockService depends_on RWLock (creates RWLock per lock name)",
+    "FSLockService depends_on RWLock (creates RWLock per file path, with on_empty_ cleanup)",
+    "Lock is independent (no TeePromise dependency, uses raw Promise)",
+    "asyncSafeSetInterval wraps setInterval semantics with async safety",
+    "raceCase wraps Promise.race with named-key result"
+  ],
+
+  "important_notes": [
+    "TeePromise is the core signal primitive: used as both operation-ready (p_operation.resolve signals lock granted) and unlock signal (p_unlock.resolve signals holder is done).",
+    "RWLock batches concurrent readers: all TYPE_READ items at queue front are drained in one check_queue_ pass, readers run truly concurrently.",
+    "RWLock writer exclusion: if writer_=true, check_queue_ returns immediately — no new readers or writers start.",
+    "Lock._waiting uses raw Promise resolvers (not TeePromise) — simpler FIFO queue.",
+    "LockService only ever calls wlock() (write-exclusive), even for reads — per comment 'enforcing write locks exclusively'.",
+    "FSLockService supports both rlock() and wlock() and cleans up entries via on_empty_ callback.",
+    "asyncSafeSetInterval uses a for(;;) loop with manual sleep(), NOT native setInterval — guarantees no overlap.",
+    "raceCase returns a tuple [key, value] not just a value, enabling case-switch dispatch on async race outcomes.",
+    "All five utilities exported together from src/putility/src/libs/promise.js."
+  ]
+}

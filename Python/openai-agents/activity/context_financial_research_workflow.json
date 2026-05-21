@@ -1,0 +1,121 @@
+{
+  "scope": "financial_research_workflow",
+  "title": "Financial Research Agent Workflow",
+  "diagram_type": "activity",
+  "orchestrator": "FinancialResearchManager",
+  "entry_point": "FinancialResearchManager.run(query: str) -> None",
+
+  "activity_steps": [
+    {
+      "step": 1,
+      "name": "Initialize Trace",
+      "actor": "FinancialResearchManager.run",
+      "action": "gen_trace_id() → wrap execution in trace('Financial research trace')",
+      "output": "trace_id (OpenAI platform trace URL)"
+    },
+    {
+      "step": 2,
+      "name": "Plan Searches",
+      "actor": "_plan_searches(query: str) -> FinancialSearchPlan",
+      "action": "Runner.run(planner_agent, 'Query: {query}')",
+      "agent": "FinancialPlannerAgent (model=o3-mini)",
+      "output": "FinancialSearchPlan { searches: list[FinancialSearchItem(reason, query)] }",
+      "notes": "Produces 5–15 search terms: recent news, earnings calls, 10-K filings, analyst commentary, industry background"
+    },
+    {
+      "step": 3,
+      "name": "Perform Searches (parallel)",
+      "actor": "_perform_searches(search_plan: FinancialSearchPlan) -> Sequence[str]",
+      "action": "For each FinancialSearchItem → asyncio.create_task(_search(item)); gather via asyncio.as_completed",
+      "parallelism": "All searches launched concurrently; results collected as they finish",
+      "output": "list[str] — collected non-None search summaries",
+      "notes": "Tracks num_succeeded / num_failed; wrapped in custom_span('Search the web')"
+    },
+    {
+      "step": 4,
+      "name": "Execute Single Search",
+      "actor": "_search(item: FinancialSearchItem) -> str | None",
+      "action": "Runner.run(search_agent, 'Search term: {item.query}\\nReason: {item.reason}')",
+      "agent": "FinancialSearchAgent (model=gpt-5.4, tools=[WebSearchTool])",
+      "output": "str summary (≤300 words) or None on exception",
+      "notes": "Exception caught → returns None (contributes to num_failed count)"
+    },
+    {
+      "step": 5,
+      "name": "Write Report",
+      "actor": "_write_report(query: str, search_results: Sequence[str]) -> FinancialReportData",
+      "action": [
+        "financials_agent.as_tool('fundamentals_analysis', custom_output_extractor=_summary_extractor)",
+        "risk_agent.as_tool('risk_analysis', custom_output_extractor=_summary_extractor)",
+        "writer_agent.clone(tools=[fundamentals_tool, risk_tool])",
+        "Runner.run_streamed(writer_with_tools, input_data) → stream_events()"
+      ],
+      "agent": "FinancialWriterAgent (model=gpt-5.4, output_type=FinancialReportData)",
+      "sub_agents_as_tools": [
+        "FundamentalsAnalystAgent → tool 'fundamentals_analysis' (revenue, profit, margins, growth)",
+        "RiskAnalystAgent → tool 'risk_analysis' (competitive threats, regulatory, supply chain)"
+      ],
+      "streaming": "Streamed; printer updates every 5s: 'Planning report structure...', 'Writing sections...', 'Finalizing report...'",
+      "output": "FinancialReportData { short_summary, markdown_report, follow_up_questions: list[str] }"
+    },
+    {
+      "step": 6,
+      "name": "Verify Report",
+      "actor": "_verify_report(report: FinancialReportData) -> VerificationResult",
+      "action": "Runner.run(verifier_agent, report.markdown_report)",
+      "agent": "VerificationAgent (model=gpt-5.4, output_type=VerificationResult)",
+      "output": "VerificationResult { verified: bool, issues: str }",
+      "notes": "Checks internal consistency, sourcing, unsupported claims"
+    },
+    {
+      "step": 7,
+      "name": "Output Results",
+      "actor": "FinancialResearchManager.run",
+      "action": "Print markdown_report, follow_up_questions, verification to stdout",
+      "output": "Console display: REPORT, FOLLOW UP QUESTIONS, VERIFICATION sections"
+    }
+  ],
+
+  "branching_logic": [
+    "In _perform_searches: each _search task → result is None (failed) or str (succeeded); both paths collected/counted",
+    "In _write_report: writer may or may not invoke fundamentals_tool / risk_tool (LLM decides based on need)",
+    "In _verify_report: VerificationResult.verified = True or False, issues string populated if problems found"
+  ],
+
+  "data_models": [
+    "FinancialSearchItem: reason: str, query: str",
+    "FinancialSearchPlan: searches: list[FinancialSearchItem]",
+    "AnalysisSummary: summary: str (shared by financials_agent and risk_agent)",
+    "FinancialReportData: short_summary: str, markdown_report: str, follow_up_questions: list[str]",
+    "VerificationResult: verified: bool, issues: str"
+  ],
+
+  "agents_summary": [
+    "FinancialPlannerAgent: o3-mini, structured output FinancialSearchPlan, generates 5-15 search queries",
+    "FinancialSearchAgent: gpt-5.4, WebSearchTool, returns ≤300 word summary per query",
+    "FundamentalsAnalystAgent: default model, AnalysisSummary output, key financial metrics analysis",
+    "RiskAnalystAgent: default model, AnalysisSummary output, risk/red-flag analysis",
+    "FinancialWriterAgent: gpt-5.4, FinancialReportData output, synthesizes report + calls specialist tools inline",
+    "VerificationAgent: gpt-5.4, VerificationResult output, audits report for consistency"
+  ],
+
+  "key_relationships": [
+    "FinancialResearchManager orchestrates all agents via code (not LLM handoffs)",
+    "writer_agent uses financials_agent and risk_agent as_tool (agents-as-tools pattern)",
+    "_summary_extractor bridges AnalysisSummary → plain string for writer consumption",
+    "All search tasks run concurrently via asyncio; report writing is streamed",
+    "Verification is final sequential step after report generation"
+  ],
+
+  "important_notes": "Pipeline is code-orchestrated (deterministic order). Parallelism only in search phase. Writer invokes specialist sub-agents as tools inline during streaming. Entire run is wrapped in OpenAI tracing span.",
+
+  "source_files_analyzed": [
+    "examples/financial_research_agent/manager.py",
+    "examples/financial_research_agent/agents/planner_agent.py",
+    "examples/financial_research_agent/agents/search_agent.py",
+    "examples/financial_research_agent/agents/writer_agent.py",
+    "examples/financial_research_agent/agents/financials_agent.py",
+    "examples/financial_research_agent/agents/risk_agent.py",
+    "examples/financial_research_agent/agents/verifier_agent.py"
+  ]
+}

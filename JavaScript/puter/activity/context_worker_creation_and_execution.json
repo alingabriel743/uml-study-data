@@ -1,0 +1,170 @@
+{
+  "scope": "worker_creation_and_execution",
+  "title": "Worker Creation and Execution",
+  "diagram_type": "activity",
+  "key_participants": [
+    "Client (WorkersHandler)",
+    "puter.ui (Auth)",
+    "puter.apps",
+    "puter.kv (KV Store)",
+    "utils.make_driver_method",
+    "WorkerService (Backend)",
+    "es:subdomain (Entity Store)",
+    "cloudflareDeploy.createWorker",
+    "cloudflareDeploy.deleteWorker",
+    "svc_auth",
+    "svc_notification"
+  ],
+
+  "activities": {
+    "constructor": [
+      "Receive authToken",
+      "Store as this.authToken"
+    ],
+
+    "create(workerName, filePath, appName)": [
+      "START",
+      "Check puter.authToken — if missing in web env → call puter.ui.authenticateWithPuter()",
+      "[Auth fails] → throw 'Authentication failed.'",
+      "Resolve appId:",
+      "  [appName is object/undefined] → call puter.whoami or puter.getUser()",
+      "    [user.is_user_token && sandbox not disabled] → try puter.apps.get('sandbox-{workerName}')",
+      "      [not found] → create sandbox app via puter.apps.create()",
+      "      [owner mismatch] → throw Error 'Sandbox context not owned by you'",
+      "      → appId = sandboxApp.uid",
+      "  [appName is string] → appId = puter.apps.list().find(name).uid",
+      "Normalize workerName to lowercase",
+      "Read currentWorkers from puter.kv.get('user-workers')",
+      "Resolve absolute filePath via getAbsolutePathForApp(filePath)",
+      "Call driver: make_driver_method(['authorization','filePath','workerName','appId'], 'workers', 'worker-service', 'create')(authToken, filePath, workerName, appId)",
+      "[driverResult.success === false] → throw Error(driverResult.errors)",
+      "Update currentWorkers[workerName] = {filePath, url, deployTime, createTime}",
+      "Persist via puter.kv.set('user-workers', currentWorkers)",
+      "Return driverResult",
+      "END"
+    ],
+
+    "WorkerService.create({filePath, workerName, authorization, appId}) [backend]": [
+      "START",
+      "Normalize workerName to lowercase",
+      "Get es:subdomain, svc_auth, svc_su services",
+      "Select existing subdomains starting with 'workers.puter.' (via svc_su.sudo)",
+      "[appId provided] → get_app({uid: appId}); validate actor owns app; get app-scoped token via svc_auth.get_user_app_token(appId)",
+      "[currentDomains.length >= 100] → throw APIError subdomain_limit_reached",
+      "[workerName in reserved_words] → throw APIError subdomain_reserved",
+      "[workerName fails regex /^[a-zA-Z0-9_-]+$/] → return undefined",
+      "Resolve filePath via FSNodeParam.consolidate()",
+      "Fetch userData via getUserInfo(authorization, api_base_url)",
+      "[appId] → sudo as app-token actor; upsert subdomain entity with SKIP_ES_VALIDATION",
+      "[no appId] → upsert subdomain entity directly",
+      "Read file content via readPuterFile(actor, filePath) — max 10MB",
+      "Prepend preamble to fileData",
+      "Deploy to Cloudflare: createWorker(userData, authorization, calculatedName, preamble+fileData, PREAMBLE_LENGTH)",
+      "Return cfData {success, url, errors}",
+      "END"
+    ],
+
+    "exec(...args)": [
+      "START",
+      "Check auth → authenticateWithPuter() if needed",
+      "Create Request object from args",
+      "[No 'puter-auth' header AND no 'x-puter-no-auth' header] → set puter-auth = puter.authToken",
+      "Delete x-puter-no-auth header",
+      "Forward request via fetch(req)",
+      "Return fetch Response",
+      "END"
+    ],
+
+    "list()": [
+      "START",
+      "Check auth → authenticateWithPuter() if needed",
+      "Call driver: make_driver_method([], 'workers', 'worker-service', 'getFilePaths')()",
+      "Return array of {name, url, file_path, file_uid, created_at}",
+      "END"
+    ],
+
+    "get(workerName)": [
+      "START",
+      "Check auth → authenticateWithPuter() if needed",
+      "Normalize workerName to lowercase",
+      "Call driver: make_driver_method(['workerName'], 'workers', 'worker-service', 'getFilePaths')(workerName)",
+      "Return first result (driverCall[0])",
+      "END"
+    ],
+
+    "delete(workerName)": [
+      "START",
+      "Check auth → authenticateWithPuter() if needed",
+      "Normalize workerName to lowercase",
+      "Call driver: make_driver_method(['authorization','workerName'], 'workers', 'worker-service', 'destroy')(authToken, workerName)",
+      "[driverResult.result falsy] → throw Error(driverResult.errors)",
+      "Read currentWorkers from puter.kv.get('user-workers')",
+      "delete currentWorkers[workerName]",
+      "Persist via puter.kv.set('user-workers', currentWorkers)",
+      "Return true",
+      "END"
+    ],
+
+    "WorkerService.destroy({workerName, authorization}) [backend]": [
+      "START",
+      "Normalize workerName to lowercase",
+      "Get userData via getUserInfo(authorization)",
+      "Select subdomain entity where subdomain = 'workers.puter.{name}'",
+      "[owner uuid !== userData.uuid] → throw Error 'This is not your worker!'",
+      "Call deleteWorker(userData, authorization, workerName) on Cloudflare",
+      "Delete subdomain entity from es:subdomain",
+      "Return cfData",
+      "END"
+    ],
+
+    "WorkerService._init() [event-driven auto-redeploy]": [
+      "START",
+      "Listen on event 'fs.write.file'",
+      "[meta.from_outside] → skip",
+      "[node.uid missing] → skip",
+      "Select subdomain where root_dir = written node",
+      "[no matching subdomains] → skip",
+      "For each matching subdomain:",
+      "  [subdomain doesn't start with 'workers.puter.'] → skip",
+      "  Read file content via readPuterFile(actor, node.path)",
+      "  [appOwner exists] → authToken = svc_auth.get_user_app_token(appID)",
+      "  [no appOwner] → authToken = svc_auth.create_session_token(owner).token",
+      "  createWorker(owner.user, authToken, workerName, preamble+fileData, PREAMBLE_LENGTH)",
+      "  [success] → svc_notification.notify user 'Successfully deployed {url}'",
+      "  [failure] → svc_notification.notify user 'Failed to deploy {workerName}'",
+      "END"
+    ]
+  },
+
+  "key_relationships": [
+    "WorkersHandler depends_on utils.make_driver_method (all driver calls)",
+    "WorkersHandler depends_on puter.kv (persists worker registry)",
+    "WorkersHandler depends_on puter.apps (sandbox app resolution)",
+    "WorkersHandler depends_on puter.ui (auth flow)",
+    "WorkerService extends BaseService",
+    "WorkerService depends_on es:subdomain (subdomain entity persistence)",
+    "WorkerService depends_on cloudflareDeploy.createWorker / deleteWorker",
+    "WorkerService depends_on svc_auth (token generation)",
+    "WorkerService depends_on svc_notification (deployment status notifications)",
+    "WorkerService depends_on svc_fs / LLRead (file reading)",
+    "WorkerService listens to event 'fs.write.file' for auto-redeploy"
+  ],
+
+  "important_notes": [
+    "All public methods guard with auth check: if no authToken in web env → puter.ui.authenticateWithPuter()",
+    "Worker names are always normalized to lowercase",
+    "Worker limit: 100 subdomains per user",
+    "File size limit: 10MB for worker source code",
+    "Workers are deployed as Cloudflare Workers with a puter.js preamble prepended",
+    "Subdomain pattern: workers.puter.{calculatedName} → URL: https://{name}.puter.work",
+    "Sandbox app: auto-created as 'sandbox-{workerName}' on workers.puter.com if user token",
+    "KV store 'user-workers' tracks client-side metadata (filePath, url, deployTime, createTime)",
+    "exec() acts as authenticated fetch proxy — injects puter-auth header if absent",
+    "Auto-redeploy: writing to a worker's source file triggers re-deployment via event listener"
+  ],
+
+  "source_files_analyzed": [
+    "src/puter-js/src/modules/Workers.js",
+    "src/backend/src/services/worker/WorkerService.js"
+  ]
+}

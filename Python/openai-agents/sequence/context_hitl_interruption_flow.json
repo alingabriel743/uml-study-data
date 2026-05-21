@@ -1,0 +1,170 @@
+{
+  "scope": "hitl_interruption_flow",
+  "title": "HITL Interruption Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Caller",
+    "Runner (run.py)",
+    "RunLoop / start_streaming (run_loop.py)",
+    "TurnResolution (turn_resolution.py)",
+    "ToolExecution (tool_execution.py)",
+    "ToolPlanning (tool_planning.py)",
+    "AgentRunnerHelpers (agent_runner_helpers.py)",
+    "RunState",
+    "RunResult / RunResultStreaming",
+    "ToolApprovalItem",
+    "NextStepInterruption"
+  ],
+
+  "interaction_flow_fresh_run": [
+    "Caller → Runner: Runner.run(agent, input)",
+    "Runner → RunLoop: invoke run loop (non-streaming) or start_streaming() for streaming",
+    "RunLoop → TurnResolution: execute_tools_and_side_effects(bindings, processed_response, ...)",
+    "TurnResolution → ToolExecution: function_needs_approval(function_tool, context_wrapper, tool_call)",
+    "ToolExecution → evaluate_needs_approval_setting(needs_approval, context_wrapper, parsed_args, call_id)",
+    "evaluate_needs_approval_setting → ToolExecution: returns bool",
+    "ToolExecution → TurnResolution: if needs approval → create ToolApprovalItem(raw_item, tool_name, tool_namespace, tool_origin)",
+    "TurnResolution → ToolPlanning: _collect_tool_interruptions(function_results, custom_tool_results, shell_results, apply_patch_results)",
+    "ToolPlanning → TurnResolution: returns list[ToolApprovalItem] (also includes nested agent-as-tool interruptions)",
+    "TurnResolution: processed_response.interruptions = interruptions",
+    "TurnResolution → RunLoop: return SingleStepResult(next_step=NextStepInterruption(interruptions=[ToolApprovalItem...]))",
+    "RunLoop: detect isinstance(turn_result.next_step, NextStepInterruption)",
+    "RunLoop → AgentRunnerHelpers: update_run_state_for_interruption(run_state, model_responses, processed_response, generated_items, session_items, current_turn, next_step)",
+    "AgentRunnerHelpers → RunState: set _model_responses, _last_processed_response, _generated_items, _session_items, _current_step=NextStepInterruption, _current_turn",
+    "RunLoop → AgentRunnerHelpers: build_interruption_result(result_input, session_items, model_responses, current_agent, interruptions=approvals_from_step(next_step), processed_response, ...)",
+    "AgentRunnerHelpers: construct RunResult(final_output=None, interruptions=[ToolApprovalItem...], new_items=session_items)",
+    "RunLoop → Caller: return RunResult with interruptions populated"
+  ],
+
+  "interaction_flow_streaming": [
+    "RunLoop / start_streaming: detect isinstance(turn_result.next_step, NextStepInterruption)",
+    "RunLoop: inline update run_state fields (_model_responses, _last_processed_response, _generated_items, _session_items, _current_step, _current_turn, _current_turn_persisted_item_count)",
+    "RunLoop → _finalize_streamed_interruption(streamed_result, save_items, items, response_id, store_setting, interruptions=approvals_from_step(next_step), processed_response)",
+    "_finalize_streamed_interruption: await save_items(items, response_id, store_setting)",
+    "_finalize_streamed_interruption → _complete_stream_interruption(streamed_result, interruptions, processed_response)",
+    "_complete_stream_interruption: set streamed_result.interruptions, streamed_result._last_processed_response, streamed_result.is_complete=True",
+    "_complete_stream_interruption: put QueueCompleteSentinel() into _event_queue → stream ends",
+    "RunLoop: break out of loop",
+    "Caller: drain stream_events() until complete, inspect RunResultStreaming.interruptions"
+  ],
+
+  "interaction_flow_resumed_run": [
+    "Caller: state = result.to_state() → RunState",
+    "Caller → RunState: state.approve(interruption, always_approve=False) or state.reject(interruption, rejection_message=...)",
+    "Caller → Runner: Runner.run(agent, state) or Runner.run_streamed(agent, state)",
+    "Runner → RunLoop: is_resumed_state=True, run_state._current_step = NextStepInterruption",
+    "RunLoop: detect isinstance(run_state._current_step, NextStepInterruption)",
+    "RunLoop: validate run_state._model_responses and _last_processed_response exist (raises UserError if missing)",
+    "RunLoop → TurnResolution: resolve_interrupted_turn(bindings, original_input=run_state._original_input, original_pre_step_items=run_state._generated_items, new_response=last_model_response, processed_response=run_state._last_processed_response, run_state=run_state)",
+    "resolve_interrupted_turn → _pending_approvals_from_state(): read ToolApprovalItems from run_state._current_step.interruptions",
+    "resolve_interrupted_turn → _function_requires_approval(run): check if call_id in approval_items_by_call_id",
+    "resolve_interrupted_turn: if rejected → _record_function_rejection() → resolve_approval_rejection_message() → append rejection ToolCallOutputItem",
+    "resolve_interrupted_turn: if approved → execute tool normally",
+    "resolve_interrupted_turn → RunLoop: return SingleStepResult (NextStepFinalOutput | NextStepRunAgain | NextStepInterruption)",
+    "RunLoop: if NextStepInterruption again → update_run_state_for_interruption + build_interruption_result → return to Caller",
+    "RunLoop: if NextStepFinalOutput → complete the run normally",
+    "RunLoop: if NextStepRunAgain → continue the loop"
+  ],
+
+  "key_data_structures": {
+    "ToolApprovalItem": {
+      "file": "src/agents/items.py:480",
+      "type_field": "tool_approval_item",
+      "fields": ["raw_item: ToolApprovalRawItem", "tool_name: str|None", "tool_namespace: str|None", "tool_origin: ToolOrigin|None", "tool_lookup_key: FunctionToolLookupKey|None", "_allow_bare_name_alias: bool"],
+      "raw_item_union": "ResponseFunctionToolCall | McpCall | McpApprovalRequest | LocalShellCall | dict"
+    },
+    "NextStepInterruption": {
+      "file": "src/agents/run_internal/run_steps.py:159",
+      "fields": ["interruptions: list[ToolApprovalItem]"],
+      "note": "Returned by TurnResolution when any tool calls need approval"
+    },
+    "RunResult_interrupted": {
+      "final_output": "None",
+      "interruptions": "list[ToolApprovalItem]",
+      "note": "Caller inspects .interruptions to identify pending approvals"
+    },
+    "RunState_interruption_fields": {
+      "_current_step": "NextStepInterruption",
+      "_model_responses": "list[ModelResponse]",
+      "_last_processed_response": "ProcessedResponse",
+      "_generated_items": "list[RunItem]",
+      "_session_items": "list[RunItem]",
+      "_current_turn": "int"
+    }
+  },
+
+  "key_functions": {
+    "build_interruption_result": {
+      "file": "src/agents/run_internal/agent_runner_helpers.py:338",
+      "signature": "build_interruption_result(*, result_input, session_items, model_responses, current_agent, input_guardrail_results, tool_input_guardrail_results, tool_output_guardrail_results, context_wrapper, interruptions, processed_response, tool_use_tracker, max_turns, current_turn, generated_items, run_state, original_input) -> RunResult",
+      "note": "Constructs RunResult with final_output=None and interruptions list; sets _current_turn, _model_input_items, _trace_state"
+    },
+    "update_run_state_for_interruption": {
+      "file": "src/agents/run_internal/agent_runner_helpers.py:406",
+      "signature": "update_run_state_for_interruption(*, run_state, model_responses, processed_response, generated_items, session_items, current_turn, next_step: NextStepInterruption) -> None",
+      "note": "Syncs all RunState fields needed to resume after interruption"
+    },
+    "resolve_interrupted_turn": {
+      "file": "src/agents/run_internal/turn_resolution.py:719",
+      "signature": "async resolve_interrupted_turn(*, bindings, original_input, original_pre_step_items, new_response, processed_response, hooks, context_wrapper, run_config, server_manages_conversation, run_state) -> SingleStepResult",
+      "note": "Re-enters tool execution for a previously-interrupted turn; reads approvals/rejections from RunState"
+    },
+    "_finalize_streamed_interruption": {
+      "file": "src/agents/run_internal/run_loop.py:413",
+      "signature": "async _finalize_streamed_interruption(*, streamed_result, save_items, items, response_id, store_setting, interruptions, processed_response) -> None",
+      "note": "Persists items, then calls _complete_stream_interruption to mark stream as done"
+    },
+    "_complete_stream_interruption": {
+      "file": "src/agents/run_internal/run_loop.py:284",
+      "signature": "_complete_stream_interruption(streamed_result, *, interruptions, processed_response) -> None",
+      "note": "Sets interruptions, is_complete=True, puts QueueCompleteSentinel to end the stream"
+    },
+    "function_needs_approval": {
+      "file": "src/agents/run_internal/tool_execution.py:1176",
+      "signature": "async function_needs_approval(function_tool, context_wrapper, tool_call) -> bool",
+      "note": "Evaluates needs_approval: True|False|async callable. Callable receives (ctx, parsed_args, call_id)"
+    },
+    "_collect_tool_interruptions": {
+      "file": "src/agents/run_internal/tool_planning.py:302",
+      "note": "Collects ToolApprovalItems from function_results, custom_tool_results, shell_results, apply_patch_results; also surfaces nested agent-as-tool interruptions"
+    },
+    "approvals_from_step": {
+      "file": "src/agents/run_internal/approvals.py:51",
+      "note": "Extracts list[ToolApprovalItem] from a NextStepInterruption"
+    }
+  },
+
+  "approval_sources": [
+    "function_tool with needs_approval=True/callable",
+    "ShellTool with needs_approval",
+    "ApplyPatchTool with needs_approval",
+    "Custom tools via runtime_needs_approval()",
+    "Hosted MCP via McpApprovalRequest (require_approval=always on HostedMCPTool)",
+    "Local MCP via require_approval on MCPServerStdio/MCPServerSse",
+    "Agent.as_tool() with needs_approval — surfaces on outer run"
+  ],
+
+  "important_notes": [
+    "Interruptions surface on the outer run regardless of nesting depth (handoffs, Agent.as_tool())",
+    "RunState._current_step=NextStepInterruption is the signal that the run is paused",
+    "Not all interruptions need to be resolved in one pass; partial resolution re-enters the interruption loop",
+    "always_approve=True / always_reject=True persist decisions across calls to the same tool for the rest of the run",
+    "Sticky decisions survive state.to_json() / RunState.from_json() serialization",
+    "RunConfig.tool_error_formatter controls default rejection message; state.reject(interruption, rejection_message=...) overrides per-call",
+    "For streaming: caller must drain stream_events() before inspecting .interruptions",
+    "Session items are saved (excluding approval placeholders) before the interruption is surfaced"
+  ],
+
+  "source_files_analyzed": [
+    "src/agents/run_internal/agent_runner_helpers.py",
+    "src/agents/run_internal/turn_resolution.py",
+    "src/agents/run_internal/run_loop.py",
+    "src/agents/run_internal/run_steps.py",
+    "src/agents/run_internal/tool_planning.py",
+    "src/agents/run_internal/tool_execution.py",
+    "src/agents/run_internal/approvals.py",
+    "src/agents/items.py",
+    "src/agents/run.py",
+    "docs/human_in_the_loop.md"
+  ]
+}

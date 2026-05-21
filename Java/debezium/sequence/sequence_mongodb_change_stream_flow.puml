@@ -1,0 +1,244 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #F1F3F5
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title MongoDB Change Stream CDC Flow
+
+actor "Kafka Connect\nFramework" as Kafka
+
+box "Connector Task Layer" #EEF2FF
+    participant "MongoDbConnectorTask" as ConnTask
+end box
+
+box "Change Event Source" #E8F5E9
+    participant "MongoDbStreaming\nChangeEventSource" as StreamSrc
+end box
+
+box "Stream Initialization" #FFF3E0
+    participant "MongoUtils" as MongoUtils
+    participant "ChangeStream\nPipelineFactory" as PipelineFact
+end box
+
+box "MongoDB Driver" #FCE4EC
+    participant "MongoClient\n(MongoDB)" as MongoClient
+end box
+
+box "Buffered Cursor" #E3F2FD
+    participant "BufferingChange\nStreamCursor" as BufCursor
+    participant "EventFetcher\n[background thread]" as EventFetcher
+end box
+
+box "Event Processing" #F3E5F5
+    participant "SplitEventHandler" as SplitHandler
+    participant "MongoDbOffset\nContext" as OffsetCtx
+    participant "SourceInfo" as SrcInfo
+    participant "MongoDbChange\nRecordEmitter" as RecordEmitter
+    participant "EventDispatcher" as Dispatcher
+end box
+
+== Connector Startup ==
+
+Kafka -> ConnTask: start(config)
+activate ConnTask
+ConnTask -> StreamSrc: execute(context, partition, offsetContext)
+activate StreamSrc
+
+== Change Stream Initialization ==
+
+StreamSrc -> MongoUtils: openChangeStream(client, taskContext)
+activate MongoUtils
+
+MongoUtils -> PipelineFact: new ChangeStreamPipelineFactory(config, filterConfig)
+activate PipelineFact
+MongoUtils -> PipelineFact: create()
+note right of PipelineFact
+  Combines:
+  • sizePipeline (oversize filter)
+  • userAndInternalPipeline (collection filters)
+  • splitPipeline ($changeStreamSplitLargeEvent)
+end note
+PipelineFact --> MongoUtils: ChangeStreamPipeline
+deactivate PipelineFact
+
+alt scope == DEPLOYMENT
+    MongoUtils -> MongoClient: client.watch(pipeline.getStages(), BsonDocument.class)
+else scope == DATABASE
+    MongoUtils -> MongoClient: client.getDatabase(db).watch(stages)
+else scope == COLLECTION
+    MongoUtils -> MongoClient: getDatabase(db).getCollection(coll).watch(stages)
+end
+
+MongoClient --> MongoUtils: ChangeStreamIterable<BsonDocument>
+deactivate MongoClient
+
+note over MongoUtils
+  Resume/Start position setup:
+end note
+
+alt offsetContext.lastResumeToken() != null
+    MongoUtils -> MongoClient: stream.resumeAfter(lastResumeTokenDoc())
+else offsetContext.lastTimestamp() != null
+    MongoUtils -> MongoClient: stream.startAtOperationTime(lastTimestamp())
+else config.startAtOperationTime().isPresent()
+    MongoUtils -> MongoClient: stream.startAtOperationTime(configTime)
+end
+
+alt captureMode.isFullUpdate()
+    MongoUtils -> MongoClient: stream.fullDocument(WHEN_AVAILABLE | UPDATE_LOOKUP)
+end
+
+alt captureMode.isIncludePreImage()
+    MongoUtils -> MongoClient: stream.fullDocumentBeforeChange(WHEN_AVAILABLE)
+end
+
+MongoUtils --> StreamSrc: ChangeStreamIterable<BsonDocument>
+deactivate MongoUtils
+
+== Buffered Cursor Setup ==
+
+StreamSrc -> BufCursor: fromIterable(stream, taskContext, metrics, clock)
+activate BufCursor
+note right of BufCursor
+  Creates:
+  • EventFetcher(stream, maxBatchSize, metrics, clock, pollInterval)
+  • ExecutorService (single background thread)
+  • ConcurrentLinkedQueue (semaphore-bounded)
+end note
+
+BufCursor -> EventFetcher: executor.submit(fetcher)
+activate EventFetcher
+
+EventFetcher -> MongoClient: stream.cursor()
+activate MongoClient
+MongoClient --> EventFetcher: MongoChangeStreamCursor<BsonDocument>
+deactivate MongoClient
+
+BufCursor --> StreamSrc: BufferingChangeStreamCursor
+deactivate BufCursor
+
+== Main Event Processing Loop ==
+
+loop while context.isRunning()
+
+    StreamSrc -> BufCursor: cursor.tryNext()
+    activate BufCursor
+
+    BufCursor -> EventFetcher: poll() from ConcurrentLinkedQueue
+    note right of EventFetcher
+      Background thread continuously:
+      cursor.tryNext() → ResumableChangeStreamEvent
+      • document present → new ResumableChangeStreamEvent(doc)
+      • no document → new ResumableChangeStreamEvent(cursor.getResumeToken())
+      enqueue(event) [semaphore-bounded by maxBatchSize]
+    end note
+    BufCursor -> BufCursor: update lastResumeToken
+    BufCursor --> StreamSrc: ResumableChangeStreamEvent (or null)
+    deactivate BufCursor
+
+    alt resumableEvent.document.isPresent() — Change Event
+
+        StreamSrc -> SplitHandler: handle(document)
+        activate SplitHandler
+        alt $changeStreamSplitLargeEvent fragment
+            SplitHandler -> SplitHandler: collect fragments
+            SplitHandler -> SplitHandler: reassemble full document
+        end
+        SplitHandler --> StreamSrc: Optional<reassembled ChangeStreamDocument>
+        deactivate SplitHandler
+
+        StreamSrc -> OffsetCtx: changeStreamEvent(event)
+        activate OffsetCtx
+        OffsetCtx -> SrcInfo: changeStreamEvent(event)
+        activate SrcInfo
+        SrcInfo -> SrcInfo: resumeToken = ResumeTokens.toBase64(event.getResumeToken())
+        SrcInfo -> SrcInfo: ts = event.getClusterTime()
+        SrcInfo -> SrcInfo: position = Position.changeStreamPosition(ts, resumeToken, sessionTxnId)
+        SrcInfo --> OffsetCtx: position updated
+        deactivate SrcInfo
+        OffsetCtx --> StreamSrc: offset updated
+        deactivate OffsetCtx
+
+        StreamSrc -> RecordEmitter: new MongoDbChangeRecordEmitter(partition, offsetContext, clock, event, config)
+        activate RecordEmitter
+        note right of RecordEmitter
+          Maps OperationType → Operation:
+          • INSERT  → CREATE
+          • UPDATE/REPLACE → UPDATE
+          • DELETE  → DELETE
+        end note
+
+        StreamSrc -> Dispatcher: dispatchDataChangeEvent(partition, collectionId, emitter)
+        activate Dispatcher
+        Dispatcher -> RecordEmitter: emitChangeEvent()
+        RecordEmitter -> RecordEmitter: key = schema.keyFromDocument(event.getDocumentKey())
+        RecordEmitter -> RecordEmitter: value = schema.valueFromDocumentChangeStream(event, operation)
+        RecordEmitter -> Dispatcher: changeRecord(partition, schema, operation, key, value, offset)
+        deactivate RecordEmitter
+        Dispatcher --> StreamSrc: record dispatched to Kafka
+        deactivate Dispatcher
+
+    else resumableEvent.document.isEmpty() — Heartbeat
+
+        StreamSrc -> OffsetCtx: noEvent(resumableEvent)
+        activate OffsetCtx
+        OffsetCtx -> SrcInfo: noEvent(ResumeTokens.toBase64(resumeToken))
+        SrcInfo --> OffsetCtx: token stored
+        deactivate OffsetCtx
+
+        StreamSrc -> Dispatcher: dispatchHeartbeatEvent(partition, offsetContext)
+        activate Dispatcher
+        Dispatcher --> StreamSrc: heartbeat dispatched
+        deactivate Dispatcher
+
+    end
+
+end
+
+== Offset Persistence ==
+
+Kafka -> OffsetCtx: getOffset()
+activate OffsetCtx
+OffsetCtx --> Kafka: Map {TIMESTAMP, ORDER, RESUME_TOKEN,\n[LSID, TXN_NUMBER if txn], [INITIAL_SYNC if snapshot]}
+deactivate OffsetCtx
+
+note over SrcInfo, OffsetCtx
+  Resume Token lifecycle:
+  • Store:  ResumeTokens.toBase64(BsonDocument) → Base64 string → Kafka offset map
+  • Restore: ResumeTokens.fromBase64(String) → BsonDocument → stream.resumeAfter()
+  • Fallback: ResumeTokens.fromData(String) → old _data string format
+  • Timestamp: ResumeTokens.getTimestamp(BsonDocument) → BsonTimestamp (type 130 bytes)
+end note
+
+deactivate EventFetcher
+deactivate StreamSrc
+deactivate ConnTask
+
+@enduml

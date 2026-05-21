@@ -1,0 +1,189 @@
+@startuml
+
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 11
+skinparam backgroundColor #FEFEFE
+skinparam activityBackgroundColor #F8F9FA
+skinparam activityBorderColor #495057
+skinparam activityArrowColor #495057
+skinparam activityFontColor #212529
+skinparam partitionBackgroundColor #E9ECEF
+skinparam partitionBorderColor #6C757D
+skinparam noteBackgroundColor #FFF9E6
+skinparam noteBorderColor #C9A400
+
+title Tracing Span and Trace Lifecycle
+
+'──────────────────────────────────────────────────────────────────
+'  SECTION 1 — TRACE LIFECYCLE
+'──────────────────────────────────────────────────────────────────
+
+|Caller / Runner|
+start
+:Enter trace context\n**with trace(workflow_name)**;
+
+|TraceCtxManager|
+:create_trace_for_run()\nworkflow_name, trace_id, group_id,\nmetadata, tracing, disabled;
+
+if (Active trace already\npresent in Scope?) then (yes)
+  :Return None\n(reuse existing trace context);
+  stop
+else (no)
+endif
+
+if (Resumed run &\nreattach_resumed_trace=True\n& trace_id already started?) then (yes)
+  :reattach_trace()\nReturn **ReattachedTrace**;
+  note right
+    on_trace_start is NOT fired.
+    Trace silently registered as
+    current in Scope only.
+  end note
+else (no)
+  |DefaultTraceProvider|
+  :_refresh_disabled_flag()\nCheck OPENAI_AGENTS_DISABLE_TRACING\nenv var + manual override;
+
+  if (Tracing disabled?) then (yes)
+    :Return **NoOpTrace**;
+    note right
+      No processor callbacks fired.
+      Scope context management
+      still functions normally.
+    end note
+  else (no)
+    :Create **TraceImpl**\n(trace_id, workflow_name, group_id,\nmetadata, processor=\nSynchronousMultiTracingProcessor);
+  endif
+endif
+
+|TraceCtxManager|
+:trace.start(mark_as_current=True);
+
+|TraceImpl|
+:Set _started = True\n_mark_trace_id_started(trace_id);
+
+|SynchronousMultiTracingProcessor|
+:**on_trace_start(trace)** — Fan-out;
+fork
+  :Processor 1\non_trace_start(trace);
+fork again
+  :Processor 2 … N\non_trace_start(trace);
+end fork
+note right
+  Processors iterated in order.
+  Exceptions caught & logged per
+  processor — others still execute.
+  Thread-safe: processors read
+  from immutable snapshot tuple.
+end note
+
+|Scope (contextvars)|
+:set_current_trace(TraceImpl)\n→ Token stored for later reset\n(async-safe via Python contextvar);
+
+'──────────────────────────────────────────────────────────────────
+'  SECTION 2 — SPAN CREATION & LIFECYCLE
+'──────────────────────────────────────────────────────────────────
+
+|Caller / Runner|
+:WORKFLOW EXECUTES
+----
+Enter span context\n**with agent_span(...) as span**\n(also: generation_span, function_span,\nguardrail_span, handoff_span, custom_span…);
+
+|DefaultTraceProvider|
+:create_span(span_data, span_id, parent)\n_refresh_disabled_flag();
+
+if (Tracing disabled?) then (yes)
+  :Return **NoOpSpan**(span_data);
+  note right
+    NoOpSpan propagates when:
+    • Global tracing is disabled
+    • No current trace in Scope
+    • Current trace is NoOpTrace
+    • Parent span is NoOpSpan
+  end note
+else (no)
+  if (No current trace\nin Scope?) then (yes)
+    :Log error\nReturn **NoOpSpan**;
+  else (no)
+    if (Current trace is NoOpTrace\nor parent span is NoOpSpan?) then (yes)
+      :Return **NoOpSpan**\n(propagate NoOp to child);
+    else (no)
+      :Resolve parent context:\n• parent=None → parent_id from\n  Scope.get_current_span()\n  trace_id from current_trace\n• parent=Trace → parent_id=None\n• parent=Span → parent_id=span.span_id;
+      :Create **SpanImpl**\n(trace_id, span_id, parent_id,\nprocessor=SynchronousMultiTracingProcessor,\nspan_data, tracing_api_key);
+    endif
+  endif
+endif
+
+|SpanImpl|
+:__enter__() → start(mark_as_current=True)\nSet _started_at = time_iso();
+
+|SynchronousMultiTracingProcessor|
+:**on_span_start(span)** — Fan-out;
+fork
+  :Processor 1\non_span_start(span);
+fork again
+  :Processor 2 … N\non_span_start(span);
+end fork
+
+|Scope (contextvars)|
+:set_current_span(SpanImpl)\nNested spans auto-inherit parent_id\nvia Scope.get_current_span();
+
+|Caller / Runner|
+:OPERATION RUNS\n(nested spans created inside\nwith deeper parent_id nesting);
+
+|SpanImpl|
+:__exit__() → finish(reset_current=True)\nSet _ended_at = time_iso();
+note right
+  If GeneratorExit is raised,
+  Scope reset is skipped
+  (generator cleanup path).
+end note
+
+|SynchronousMultiTracingProcessor|
+:**on_span_end(span)** — Fan-out;
+fork
+  :Processor 1\non_span_end(span);
+fork again
+  :Processor 2 … N\non_span_end(span);
+end fork
+
+|Scope (contextvars)|
+:reset_current_span(_prev_span_token)\nRestores parent span as active;
+
+'──────────────────────────────────────────────────────────────────
+'  SECTION 3 — TRACE TEARDOWN & EXPORT
+'──────────────────────────────────────────────────────────────────
+
+|TraceCtxManager|
+:trace.finish(reset_current=True);
+
+|TraceImpl|
+:Call _processor.on_trace_end(self);
+
+|SynchronousMultiTracingProcessor|
+:**on_trace_end(trace)** — Fan-out;
+fork
+  :Processor 1\non_trace_end(trace);
+fork again
+  :Processor 2 … N\non_trace_end(trace);
+end fork
+
+|Scope (contextvars)|
+:reset_current_trace(token)\nRestores previous trace context;
+
+|BatchTraceProcessor|
+:Buffer spans & traces\nin in-memory queue;
+:Export batches to\nOpenAI backend (BackendSpanExporter)\nevery few seconds or on queue fill;
+note right
+  Default processor registered at
+  GLOBAL_TRACE_PROVIDER init (lazy).
+  atexit hook ensures final flush
+  on process exit.
+  Call flush_traces() for immediate
+  delivery in long-running workers
+  (Celery, RQ, FastAPI tasks).
+end note
+
+|Caller / Runner|
+stop
+
+@enduml

@@ -1,0 +1,157 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #212529
+    EndColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title Extension Registration and Route Mounting
+
+|Extension Developer|
+start
+:Host runtime loads extension file;
+:Call extension.import('extensionController');
+
+|ExtensionController|
+:Return { ExtensionController, Controller,\nGet, Post, Put, Delete, HttpError };
+
+|Extension Developer|
+:Define subclass with @Controller(prefix, adminUsernames?, allowedAppIds?);
+
+note right
+  Sets on prototype:
+  __controllerPrefix = prefix
+  __adminUsernames = [...provided, 'admin', 'system']
+  __allowedAppIds = allowedAppIds (optional)
+end note
+
+:Define route methods with @Get / @Post / @Put / @Delete\n(path, routeOptions?, adminUsernames?);
+
+note right
+  Each decorator calls addInitializer to push
+  RouteMeta onto prototype.__routes[]:
+  { method, path, options, adminUsernames,
+    allowedAppIds, handler }
+end note
+
+:Instantiate controller and call registerRoutes();
+
+|ExtensionController|
+:Read prototype.__routes[] via\nObject.getPrototypeOf(this);
+
+repeat
+
+  :Build fullPath = (prefix + '/' + route.path)\n.replace(/\/+/g, '/');
+  :Merge adminUsernames: controller-level UNION route-level;
+  :Merge allowedAppIds: controller-level UNION route-level;
+
+  if (extension[route.method] defined?) then (no)
+    #FFD6D6:throw Error('Unsupported HTTP method: ...');
+    stop
+  else (yes)
+    :Log "Registering route: [METHOD] fullPath";
+    :Call extension[route.method](fullPath, options, wrappedHandler);
+    note right: Wraps handler in auth-guard closure
+  endif
+
+repeat while (more routes in __routes[]) is (yes)
+-> no more routes;
+
+|Express Router|
+:Mount route on Express router\n(delegates from extension[method]);
+
+|Extension Developer|
+:Registration complete — routes live on Express router;
+
+note right
+  Route registration phase ends here.
+  Execution resumes at request time below.
+end note
+
+|Express Router|
+:Incoming HTTP request matches registered route;
+:Invoke wrappedHandler(req, res, next);
+
+|ExtensionController|
+if (adminsForRoute OR allowedAppIds defined?) then (yes)
+  if (req.actor present?) then (no)
+    #FFD6D6:throw HttpError(401, 'Unauthenticated');
+    :res.status(401).send({ error: ... });
+    stop
+  else (yes)
+  endif
+else (no)
+endif
+
+if (adminsForRoute defined?) then (yes)
+  if (req.actor.username in adminsForRoute?) then (no)
+    #FFD6D6:throw HttpError(403,\n'Only admins may request this resource.');
+    :res.status(403).send({ error: ... });
+    stop
+  else (yes)
+  endif
+else (no)
+endif
+
+if (allowedAppIds defined?) then (yes)
+  if (req.actor.app.uid present AND\nnot in allowedAppIds?) then (yes)
+    #FFD6D6:throw HttpError(403,\n'This app may not request this resource.');
+    :res.status(403).send({ error: ... });
+    stop
+  else (no)
+  endif
+else (no)
+endif
+
+:Call route.handler.bind(controllerInstance)(req, res, next);
+
+|Extension Developer|
+if (Handler throws?) then (HttpError)
+  |ExtensionController|
+  :Build payload { error, code?, errorCode?, ...fields };
+  :res.status(httpError.statusCode).send(payload);
+  :Log warn;
+  stop
+elseif (Handler throws?) then (generic Error)
+  |ExtensionController|
+  :res.status(500).send({ error: message });
+  :Log error;
+  stop
+elseif (Handler throws?) then (unknown)
+  |ExtensionController|
+  :res.status(500).send({ error:\n'An unknown error occurred' });
+  :Log error;
+  stop
+else (no error)
+  |Extension Developer|
+  :Handler sends response normally via res;
+  stop
+endif
+
+@enduml

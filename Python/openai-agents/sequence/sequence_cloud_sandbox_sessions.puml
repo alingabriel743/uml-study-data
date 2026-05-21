@@ -1,0 +1,414 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipant underline
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #F9A825
+}
+skinparam sequence {
+    GroupBorderColor #6C757D
+    GroupHeaderFontColor #212529
+    GroupBackgroundColor #E9ECEF
+    LifeLineBorderColor #495057
+    DividerBorderColor #6C757D
+    DividerBackgroundColor #DEE2E6
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #F1F3F5
+}
+
+title Cloud Sandbox Sessions (Blaxel / Cloudflare / Vercel / Runloop)\nProvisioning, HTTP/WS Session Establishment, Path Normalization & Shutdown
+
+actor Caller as caller
+
+box "Common Abstraction Layer" #EEF2FF
+    participant "BaseSandboxClient" as base_client
+    participant "BaseSandboxSession" as base_session
+end box
+
+box "Blaxel Backend" #E8F5E9
+    participant "BlaxelSandboxClient" as blaxel_client
+    participant "BlaxelSandboxSession" as blaxel_session
+    participant "BlaxelSDK\n(SandboxInstance)" as blaxel_sdk
+end box
+
+box "Cloudflare Backend" #FFF3E0
+    participant "CloudflareSandboxClient" as cf_client
+    participant "CloudflareSandboxSession" as cf_session
+    participant "CloudflareWorkerHTTP" as cf_worker
+end box
+
+box "Vercel Backend" #E3F2FD
+    participant "VercelSandboxClient" as vercel_client
+    participant "VercelSandboxSession" as vercel_session
+    participant "VercelSDK\n(AsyncSandbox)" as vercel_sdk
+end box
+
+box "Runloop Backend" #FCE4EC
+    participant "RunloopSandboxClient" as runloop_client
+    participant "RunloopSandboxSession" as runloop_session
+    participant "RunloopSDK\n(AsyncRunloopSDK)" as runloop_sdk
+end box
+
+== Blaxel: Sandbox Provisioning & Session Creation ==
+
+caller -> blaxel_client : create(snapshot, manifest,\nBlaxelSandboxClientOptions\n{name, image, memory, region, ttl})
+activate blaxel_client
+
+blaxel_client -> blaxel_sdk : SandboxInstance.create_if_not_exists(\n  {name, image, memory, region,\n   envs, ports, ttl})
+activate blaxel_sdk
+blaxel_sdk --> blaxel_client : blaxel_sandbox (SandboxInstance)
+deactivate blaxel_sdk
+
+blaxel_client -> blaxel_client : _get_sandbox_url(blaxel_sandbox)\n→ sandbox_url
+
+blaxel_client -> blaxel_session : from_state(BlaxelSandboxSessionState,\n  sandbox=blaxel_sandbox, token)
+activate blaxel_session
+
+blaxel_client -> base_client : _wrap_session(inner, instrumentation)
+activate base_client
+base_client --> blaxel_client : SandboxSession (wrapped)
+deactivate base_client
+
+blaxel_client --> caller : SandboxSession
+deactivate blaxel_client
+
+caller -> blaxel_session : start()
+activate blaxel_session
+
+blaxel_session -> blaxel_sdk : sandbox.process.exec(\n  {command: 'mkdir -p {root}',\n   wait_for_completion: true, timeout: 10000})
+activate blaxel_sdk
+blaxel_sdk --> blaxel_session : ok
+deactivate blaxel_sdk
+
+blaxel_session -> base_session : super().start()
+activate base_session
+note right of base_session
+  _ensure_backend_started()
+  → _probe_workspace_root_for_preserved_resume()
+  → _prepare_backend_workspace()
+  → materialize manifest
+  Default root: /home/user
+end note
+base_session --> blaxel_session : workspace ready
+deactivate base_session
+deactivate blaxel_session
+
+group Blaxel: WebSocket PTY Session
+    blaxel_session -> blaxel_session : _build_ws_url(\n  sandbox_url, token, session_id,\n  cwd, cols=80, rows=24)
+    note right of blaxel_session
+      URL = sandbox_url (https→wss)
+        + /terminal/ws
+        ?token=&cols=&rows=
+        &sessionId=&workingDir=
+    end note
+    blaxel_session -> blaxel_sdk : aiohttp.ws_connect(ws_url)
+    activate blaxel_sdk
+    blaxel_sdk --> blaxel_session : ClientWebSocketResponse
+    deactivate blaxel_sdk
+end
+
+group Blaxel: Shutdown
+    caller -> blaxel_session : shutdown()
+    activate blaxel_session
+    blaxel_session -> blaxel_session : pty_terminate_all()
+    alt pause_on_exit = False
+        blaxel_session -> blaxel_sdk : sandbox.delete()
+        activate blaxel_sdk
+        blaxel_sdk --> blaxel_session : deleted
+        deactivate blaxel_sdk
+    else pause_on_exit = True
+        note right of blaxel_session
+          Sandbox kept alive;
+          auto-resumes on next connection
+        end note
+    end
+    deactivate blaxel_session
+end
+
+== Cloudflare: Sandbox Provisioning & Session Creation ==
+
+caller -> cf_client : create(snapshot, manifest,\nCloudfareSandboxClientOptions\n{worker_url, api_key})
+activate cf_client
+
+note right of cf_client
+  Validates: manifest.root == '/workspace'
+  (fixed root — cannot be overridden)
+end note
+
+cf_client -> cf_worker : POST {worker_url}/v1/sandbox\n  Authorization: Bearer {api_key}
+activate cf_worker
+cf_worker --> cf_client : {id: sandbox_id}
+deactivate cf_worker
+
+cf_client -> cf_session : __init__(state:\n  CloudflareSandboxSessionState\n  {worker_url, sandbox_id}, api_key)
+activate cf_session
+
+cf_client -> base_client : _wrap_session(inner)
+activate base_client
+base_client --> cf_client : SandboxSession (wrapped)
+deactivate base_client
+
+cf_client --> caller : SandboxSession
+deactivate cf_client
+
+group Cloudflare: HTTP/WS Path Construction
+    note over cf_session
+      _url(path)    = {worker_url}/v1/sandbox/{sandbox_id}/{path}
+      _ws_pty_url() = wss://{worker_url}/v1/sandbox/{sandbox_id}/pty?cols=&rows=
+      HTTP session lazy-created with Authorization: Bearer {api_key}
+      Path normalization via _normalize_path_for_remote_io() (runtime-assisted)
+    end note
+end
+
+group Cloudflare: Running Check
+    caller -> cf_session : running()
+    activate cf_session
+    cf_session -> cf_worker : GET /v1/sandbox/{sandbox_id}/running
+    activate cf_worker
+    cf_worker --> cf_session : {running: bool}
+    deactivate cf_worker
+    cf_session --> caller : bool
+    deactivate cf_session
+end
+
+note over cf_session
+  No explicit shutdown() — inherits BaseSandboxSession no-op.
+  Sandbox lifecycle is managed server-side (TTL/expiry).
+end note
+
+== Vercel: Sandbox Provisioning & Session Creation ==
+
+caller -> vercel_client : create(snapshot, manifest,\nVercelSandboxClientOptions)
+activate vercel_client
+
+vercel_client -> vercel_client : _resolve_manifest_root(manifest)\n→ override root to '/vercel/sandbox'\n   if using default root
+
+vercel_client -> vercel_session : from_state(VercelSandboxSessionState\n  {sandbox_id='', project_id, team_id,\n   timeout_ms, runtime, ...}, token)
+activate vercel_session
+
+vercel_session -> vercel_session : _ensure_sandbox()
+activate vercel_session
+vercel_session -> vercel_sdk : _create_sandbox_with_retry(\n  source, ports, timeout, resources,\n  runtime, token, project_id, team_id,\n  interactive, env, network_policy)
+activate vercel_sdk
+vercel_sdk --> vercel_session : AsyncSandbox instance
+deactivate vercel_sdk
+
+vercel_session -> vercel_sdk : sandbox.wait_for_status(RUNNING, timeout=45s)
+activate vercel_sdk
+vercel_sdk --> vercel_session : RUNNING
+deactivate vercel_sdk
+
+vercel_session -> vercel_session : state.sandbox_id = sandbox.sandbox_id
+deactivate vercel_session
+
+vercel_client -> base_client : _wrap_session(inner)
+activate base_client
+base_client --> vercel_client : SandboxSession (wrapped)
+deactivate base_client
+
+vercel_client --> caller : SandboxSession
+deactivate vercel_client
+
+group Vercel: Running Check
+    caller -> vercel_session : running()
+    activate vercel_session
+    vercel_session -> vercel_sdk : sandbox.refresh()
+    activate vercel_sdk
+    vercel_sdk --> vercel_session : updated status
+    deactivate vercel_sdk
+    vercel_session --> caller : sandbox.status == SandboxStatus.RUNNING
+    deactivate vercel_session
+end
+
+note right of vercel_session
+  Path normalization: lexical PurePosixPath
+  against manifest.root (/vercel/sandbox).
+  Validates path does not escape root.
+  No PTY support.
+end note
+
+group Vercel: Shutdown
+    caller -> vercel_session : shutdown()
+    activate vercel_session
+    vercel_session -> vercel_session : _stop_attached_sandbox()
+    vercel_session -> vercel_sdk : sandbox.stop()
+    activate vercel_sdk
+    vercel_sdk --> vercel_session : stopped
+    deactivate vercel_sdk
+    vercel_session -> vercel_sdk : sandbox.client.aclose()
+    activate vercel_sdk
+    vercel_sdk --> vercel_session : closed
+    deactivate vercel_sdk
+    vercel_session -> vercel_session : self._sandbox = None
+    deactivate vercel_session
+end
+
+== Runloop: Sandbox Provisioning & Session Creation ==
+
+caller -> runloop_client : create(snapshot, manifest,\nRunloopSandboxClientOptions)
+activate runloop_client
+
+runloop_client -> runloop_client : validate manifest root\nvs user_parameters home
+
+runloop_client -> runloop_sdk : _upsert_runloop_managed_secrets(\n  managed_secrets)
+activate runloop_sdk
+runloop_sdk --> runloop_client : secrets registered
+deactivate runloop_sdk
+
+runloop_client -> runloop_sdk : sdk.devbox.create(\n  timeout, blueprint_id/name,\n  env_vars, name, user_parameters,\n  launch_parameters, tunnel,\n  gateways, mcp, metadata, secrets)
+activate runloop_sdk
+runloop_sdk --> runloop_client : devbox (with devbox.id)
+deactivate runloop_sdk
+
+runloop_client -> runloop_session : from_state(RunloopSandboxSessionState\n  {devbox_id, blueprint_id, ...}, sdk, devbox)
+activate runloop_session
+
+runloop_client -> base_client : _wrap_session(inner)
+activate base_client
+base_client --> runloop_client : SandboxSession (wrapped)
+deactivate base_client
+
+runloop_client --> caller : SandboxSession
+deactivate runloop_client
+
+caller -> runloop_session : start()
+activate runloop_session
+
+alt _skip_start=True AND snapshot.restorable()
+    runloop_session -> runloop_session : check fingerprint
+    alt fingerprint matches
+        runloop_session -> runloop_session : restore snapshot (fast path)
+    else fingerprint mismatch
+        runloop_session -> runloop_session : _reapply_ephemeral_manifest_on_resume()
+    end
+else _skip_start=True AND NOT restorable()
+    runloop_session -> runloop_session : _reapply_ephemeral_manifest_on_resume()
+else full start
+    runloop_session -> base_session : super().start()
+    activate base_session
+    note right of base_session
+      Full manifest materialization.
+      Path normalization via PurePosixPath
+      relative to runloop_home
+      (/home/user or /root)
+    end note
+    base_session --> runloop_session : workspace ready
+    deactivate base_session
+end
+deactivate runloop_session
+
+group Runloop: Exposed Port via Tunnel
+    runloop_session -> runloop_sdk : devbox.get_tunnel_url(port, timeout)
+    activate runloop_sdk
+    runloop_sdk --> runloop_session : tunnel_url (or empty)
+    deactivate runloop_sdk
+    opt tunnel_url is empty
+        runloop_session -> runloop_sdk : devbox.net.enable_tunnel(\n  auth_mode='open',\n  http_keep_alive=True, wake_on_http=False)
+        activate runloop_sdk
+        runloop_sdk --> runloop_session : tunnel enabled
+        deactivate runloop_sdk
+        runloop_session -> runloop_sdk : devbox.get_tunnel_url(port, timeout) [retry]
+        activate runloop_sdk
+        runloop_sdk --> runloop_session : tunnel_url
+        deactivate runloop_sdk
+    end
+end
+
+group Runloop: Shutdown
+    caller -> runloop_session : shutdown()
+    activate runloop_session
+    alt pause_on_exit = True
+        runloop_session -> runloop_sdk : devbox.suspend(timeout)
+        activate runloop_sdk
+        runloop_sdk --> runloop_session : suspending
+        deactivate runloop_sdk
+        runloop_session -> runloop_sdk : devbox.await_suspended()
+        activate runloop_sdk
+        runloop_sdk --> runloop_session : suspended
+        deactivate runloop_sdk
+    else pause_on_exit = False
+        runloop_session -> runloop_sdk : devbox.shutdown(timeout=timeouts.cleanup_s)
+        activate runloop_sdk
+        runloop_sdk --> runloop_session : shut down
+        deactivate runloop_sdk
+    end
+    deactivate runloop_session
+end
+
+== Common Resume Pattern (All Backends) ==
+
+note over caller, base_client
+  All backends implement resume() with a reconnect-before-recreate strategy.
+  On successful reconnect: inner._skip_start = True (skips full manifest replay).
+  On failure: falls back to create() — recreates the sandbox from scratch.
+end note
+
+group Resume: Blaxel (pause_on_exit)
+    caller -> blaxel_client : resume(BlaxelSandboxSessionState)
+    activate blaxel_client
+    alt pause_on_exit=True — try reconnect
+        blaxel_client -> blaxel_sdk : SandboxInstance.get(sandbox_name)
+        activate blaxel_sdk
+        blaxel_sdk --> blaxel_client : blaxel_sandbox
+        deactivate blaxel_sdk
+        blaxel_client -> blaxel_client : inner._skip_start = True
+    else get() fails or pause_on_exit=False
+        blaxel_client -> blaxel_sdk : create_if_not_exists(config)
+        activate blaxel_sdk
+        blaxel_sdk --> blaxel_client : blaxel_sandbox (new)
+        deactivate blaxel_sdk
+    end
+    blaxel_client -> blaxel_session : from_state(state, sandbox, token)
+    blaxel_client --> caller : SandboxSession
+    deactivate blaxel_client
+end
+
+group Resume: Runloop (suspend/resume)
+    caller -> runloop_client : resume(RunloopSandboxSessionState)
+    activate runloop_client
+    runloop_client -> runloop_sdk : sdk.devbox.from_id(devbox_id)
+    activate runloop_sdk
+    runloop_sdk --> runloop_client : devbox
+    deactivate runloop_sdk
+    runloop_client -> runloop_sdk : devbox.get_info(timeout=keepalive_s) → status
+    activate runloop_sdk
+    runloop_sdk --> runloop_client : info.status
+    deactivate runloop_sdk
+    alt status == 'suspended'
+        runloop_client -> runloop_sdk : devbox.resume()
+        activate runloop_sdk
+        runloop_sdk --> runloop_client : resuming
+        deactivate runloop_sdk
+        runloop_client -> runloop_sdk : devbox.await_running()
+        activate runloop_sdk
+        runloop_sdk --> runloop_client : running
+        deactivate runloop_sdk
+        runloop_client -> runloop_client : inner._skip_start = pause_on_exit AND reconnected
+    else status == 'resuming'
+        runloop_client -> runloop_sdk : devbox.await_running()
+        activate runloop_sdk
+        runloop_sdk --> runloop_client : running
+        deactivate runloop_sdk
+    else status != 'running'
+        runloop_client -> runloop_sdk : sdk.devbox.create(...) [recreate fallback]
+        activate runloop_sdk
+        runloop_sdk --> runloop_client : new devbox
+        deactivate runloop_sdk
+    end
+    runloop_client -> runloop_session : from_state(state, sdk, devbox)
+    runloop_client --> caller : SandboxSession
+    deactivate runloop_client
+end
+
+@enduml

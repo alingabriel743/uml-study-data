@@ -1,0 +1,215 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #212529
+    EndColor #212529
+}
+
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontStyle bold
+}
+
+title Session Messaging & Subtask Delegation
+
+|Caller / Agent|
+|SessionHandler|
+|MailboxStore (store)|
+
+' ─────────────────────────────────────────
+' 1. CREATE SESSION
+' ─────────────────────────────────────────
+|Caller / Agent|
+start
+:Call createSession(title, description,\ninviteNodeIds, maxParticipants);
+
+|SessionHandler|
+if (title missing?) then (yes)
+    :throw Error('title is required');
+    stop
+else (no)
+endif
+:Clamp inviteNodeIds\n(Array → slice ≤ 10, else []);
+:Clamp maxParticipants\n(Math.max(2, Math.min(20, value||5)));
+:Build envelope\n{ type: 'session_create',\n  priority: 'high',\n  payload: { title, description,\n    invite_node_ids, max_participants,\n    created_at: ISO } };
+
+|MailboxStore (store)|
+:store.send(envelope);
+:Return result;
+
+|Caller / Agent|
+:Receive session reference;
+
+' ─────────────────────────────────────────
+' 2. JOIN SESSION
+' ─────────────────────────────────────────
+:Call joinSession(sessionId);
+
+|SessionHandler|
+if (sessionId missing?) then (yes)
+    :throw Error('sessionId is required');
+    stop
+else (no)
+endif
+:Build envelope\n{ type: 'session_join',\n  priority: 'normal',\n  payload: { session_id, joined_at: ISO } };
+
+|MailboxStore (store)|
+:store.send(envelope);
+
+|Caller / Agent|
+:Session joined — ready to communicate;
+
+' ─────────────────────────────────────────
+' 3. SEND MESSAGE
+' ─────────────────────────────────────────
+:Call sendMessage(sessionId, toNodeId,\nmsgType, payload);
+
+|SessionHandler|
+if (sessionId missing?) then (yes)
+    :throw Error('sessionId is required');
+    stop
+else (no)
+endif
+if (payload is not an object?) then (yes)
+    :Sanitize payload → use {};
+else (no)
+endif
+:Serialize payload via JSON.stringify();
+if (serialized.length > 16 000 bytes?) then (yes)
+    :throw Error('payload too large (max 16KB)');
+    stop
+else (no)
+endif
+:Build envelope\n{ type: 'session_message',\n  priority: 'normal',\n  payload: { session_id,\n    to_node_id (null = broadcast),\n    msg_type (default: 'context_update'),\n    payload, sent_at: ISO } };
+
+|MailboxStore (store)|
+:store.send(envelope);
+:Return send result;
+
+|Caller / Agent|
+:Message delivered (broadcast or targeted);
+
+' ─────────────────────────────────────────
+' 4. DELEGATE SUBTASK
+' ─────────────────────────────────────────
+:Call delegateSubtask(sessionId, toNodeId,\ntitle, description, role);
+
+|SessionHandler|
+if (sessionId missing?) then (yes)
+    :throw Error('sessionId is required');
+    stop
+else (no)
+endif
+if (title missing?) then (yes)
+    :throw Error('title is required');
+    stop
+else (no)
+endif
+if (role in ['builder','planner','reviewer']?) then (valid)
+    :Use provided role;
+else (invalid / absent)
+    :Default role → 'builder';
+endif
+:Build envelope\n{ type: 'session_delegate',\n  priority: 'high',\n  payload: { session_id,\n    to_node_id (null = broadcast),\n    title, description, role,\n    delegated_at: ISO } };
+
+|MailboxStore (store)|
+:store.send(envelope);
+:Return send result;
+
+|Caller / Agent|
+:Subtask delegated to participant(s);
+
+' ─────────────────────────────────────────
+' 5. SUBMIT RESULT
+' ─────────────────────────────────────────
+:Call submitResult(sessionId, taskId,\nresultAssetId, summary);
+
+|SessionHandler|
+if (sessionId missing?) then (yes)
+    :throw Error('sessionId is required');
+    stop
+else (no)
+endif
+if (taskId missing?) then (yes)
+    :throw Error('taskId is required');
+    stop
+else (no)
+endif
+if (summary is a string?) then (yes)
+    :Truncate summary to 200 chars;
+else (no)
+    :summary → '';
+endif
+:Build envelope\n{ type: 'session_submit',\n  priority: 'high',\n  payload: { session_id, task_id,\n    result_asset_id (null if absent),\n    summary, submitted_at: ISO } };
+
+|MailboxStore (store)|
+:store.send(envelope);
+:Return send result;
+
+|Caller / Agent|
+:Result submitted;
+
+' ─────────────────────────────────────────
+' 6. LEAVE SESSION
+' ─────────────────────────────────────────
+fork
+    :Call leaveSession(sessionId);
+
+    |SessionHandler|
+    if (sessionId missing?) then (yes)
+        :throw Error('sessionId is required');
+        stop
+    else (no)
+    endif
+    :Build envelope\n{ type: 'session_leave',\n  priority: 'normal',\n  payload: { session_id, left_at: ISO } };
+
+    |MailboxStore (store)|
+    :store.send(envelope);
+
+fork again
+    ' ─────────────────────────────────────────
+    ' 7. POLL SESSION EVENTS & INVITES
+    ' ─────────────────────────────────────────
+    |Caller / Agent|
+    :Call pollSessionEvents(limit) /\npollInvites(limit);
+
+    |SessionHandler|
+    if (polling session events?) then (yes)
+        :store.poll({ type:'session_event',\n  limit: limit||20 });
+    else (polling invites)
+        :store.poll({ type:'collaboration_invite',\n  limit: limit||10 });
+    endif
+
+    |MailboxStore (store)|
+    :Return polled messages;
+
+    |Caller / Agent|
+    :Process inbound events / invites;
+end fork
+
+|Caller / Agent|
+stop
+
+@enduml

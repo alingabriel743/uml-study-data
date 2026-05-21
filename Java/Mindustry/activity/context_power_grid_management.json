@@ -1,0 +1,139 @@
+{
+  "scope": "power_grid_management",
+  "title": "Power Grid Management",
+  "diagram_type": "activity",
+  "key_participants": [
+    "Logic",
+    "PowerGraphUpdater",
+    "PowerGraph",
+    "Building (producer/consumer/battery)",
+    "PowerNode",
+    "NuclearReactorBuild",
+    "GeneratorBuild",
+    "GameStats"
+  ],
+
+  "activity_flow": [
+    "START: Logic.update() called each frame",
+    "GUARD: state.isGame() && !state.isPaused() → proceed",
+    "Logic calls Groups.update() → triggers all entity updates including PowerGraphUpdater",
+    "PowerGraphUpdater.update() → calls PowerGraph.update()",
+
+    "--- PowerGraph.update() ---",
+    "GUARD: if any consumer is cheating() → set all consumer power.status=1f, skip normal flow",
+    "STEP: getPowerNeeded() — iterate consumers[], sum requestedPower(consumer)*delta() for each shouldConsumePower==true",
+    "STEP: getPowerProduced() — iterate producers[], sum getPowerProduction()*delta()",
+    "STEP: record lastPowerNeeded, lastPowerProduced, lastScaledPowerIn/Out, lastCapacity, lastPowerStored",
+    "STEP: powerBalance.add((produced - needed + energyDelta) / Time.delta) — rolling 60-sample mean",
+    "STEP: energyDelta = 0",
+    "GUARD: all three lists empty → skip distribution",
+    "BRANCH: powerNeeded > powerProduced → useBatteries(deficit) — drain batteries proportionally, add to powerProduced",
+    "BRANCH: powerProduced > powerNeeded → chargeBatteries(excess) — fill batteries proportionally, charged=true",
+    "BRANCH: powerNeeded == powerProduced → no battery action",
+    "STEP: distributePower(needed, produced, charged) — compute coverage = min(1, produced/needed)",
+    "  FOR each consumer: if buffered → increment power.status by coverage*requestedPower/capacity",
+    "  FOR each consumer: if not buffered && shouldConsumePower → power.status = coverage",
+    "  FOR each consumer: if not buffered && !shouldConsumePower → power.status = estimate",
+
+    "--- PowerNode link/connectivity update ---",
+    "EVENT: node placed → PowerNodeBuild.placed() → getPotentialLinks() BFS in radius → configureAny(other.pos())",
+    "EVENT: link toggled (Integer config) → if linked: unlink, PowerGraph.reflow(this) + reflow(other) → creates 2 new graphs",
+    "EVENT: link added → power.graph.addGraph(other.power.graph) — merges smaller graph into larger",
+
+    "--- PowerGraph.reflow(tile) ---",
+    "BFS from tile: queue.add(tile), while queue not empty: pop child, add(child), iterate child.getPowerConnections()",
+    "PowerGraph.add(build): assign build.power.graph=this; categorise: outputsPower&&consumesPower&&!buffered→producers+consumers; outputsPower&&consumesPower&&buffered→batteries; outputsPower only→producers; consumesPower only→consumers",
+
+    "--- PowerGraph.remove(tile) ---",
+    "FOR each connection of removed tile: create new PowerGraph, BFS from that neighbour (skip removed tile), graph.update() to clear power on isolated nodes",
+    "Old graph entity removed",
+
+    "--- NuclearReactor overload (node overload handling) ---",
+    "NuclearReactorBuild.updateTile() each tick:",
+    "  STEP: productionEfficiency = fuel/itemCapacity",
+    "  STEP: if fuel>0 && enabled: heat += fullness * heating * min(delta,4)",
+    "  STEP: if timer(timerFuel, itemDuration/timeScale): consume() one fuel item",
+    "  STEP: if no fuel: heat -= Time.delta/ambientCooldownTime",
+    "  STEP: if heat>0: drain coolant liquid, heat -= liquidUsed * coolantPower",
+    "  STEP: if heat > smokeThreshold: emit smoke particles",
+    "  STEP: heat = clamp(heat, 0, 1)",
+    "  BRANCH: heat >= 0.999 → OVERLOAD: Events.fire(Trigger.thoriumReactorOverheat), kill()",
+    "    kill() → onDestroyed() → createExplosion()",
+    "    createExplosion(): if shouldExplode() [warmup>=explosionMinWarmup && fuel>=5||heat>=0.5]: Damage.damage(radius*tilesize=19, dmg=5000), Fx.reactorExplosion, Puddles.deposit liquid, Effect.shake",
+
+    "--- GeneratorBuild.getPowerProduction() ---",
+    "returns: enabled ? powerProduction * productionEfficiency : 0f",
+
+    "--- GameStats tracking (indirect) ---",
+    "Logic event BlockBuildEndEvent: state.stats.buildingsBuilt++ or buildingsDeconstructed++",
+    "Logic event BlockDestroyEvent: state.stats.buildingsDestroyed++ (own team) or destroyedBlockCount.increment(block) (enemy)",
+    "NOTE: GameStats has no direct power metrics; power data lives in PowerGraph (lastPowerNeeded, lastPowerProduced, lastPowerStored, powerBalance)"
+  ],
+
+  "key_methods": [
+    "Logic.update(): main game loop, calls Groups.update()",
+    "PowerGraph.update(): computes powerNeeded/Produced, battery balance, calls distributePower()",
+    "PowerGraph.getPowerNeeded(): sum consPower.requestedPower(consumer)*delta over consumers",
+    "PowerGraph.getPowerProduced(): sum producer.getPowerProduction()*delta over producers",
+    "PowerGraph.useBatteries(needed): drain all enabled batteries proportionally",
+    "PowerGraph.chargeBatteries(excess): charge all enabled batteries proportionally",
+    "PowerGraph.distributePower(needed, produced, charged): set power.status coverage ratio per consumer",
+    "PowerGraph.reflow(tile): BFS to rebuild full graph from tile",
+    "PowerGraph.add(build): add building to graph, classify producer/consumer/battery",
+    "PowerGraph.remove(tile): split graph into sub-graphs after node removal",
+    "PowerGraph.addGraph(graph): merge two graphs (smaller into larger)",
+    "PowerGraph.getSatisfaction(): clamp(produced/needed)",
+    "PowerGraph.transferPower(amount): diode-driven transfer, charge or drain batteries, track energyDelta",
+    "PowerNode.PowerNodeBuild.placed(): auto-link to nearby nodes via getPotentialLinks()",
+    "PowerNode.getPotentialLinks(tile,team,callback): spatial BFS for valid link candidates",
+    "NuclearReactorBuild.updateTile(): heat management, fuel consumption, overload check → kill()",
+    "GeneratorBuild.getPowerProduction(): powerProduction * productionEfficiency",
+    "GeneratorBuild.onDestroyed(): createExplosion() if rules.reactorExplosions"
+  ],
+
+  "key_relationships": [
+    "Logic orchestrates game loop → Groups.update() → PowerGraphUpdater → PowerGraph.update()",
+    "PowerGraph contains Seq<Building> producers, consumers, batteries, all",
+    "PowerGraph created by PowerGraph() constructor, entity=PowerGraphUpdater.create()",
+    "PowerNode.PowerNodeBuild config(Integer) → triggers PowerGraph.reflow() or addGraph()",
+    "NuclearReactorBuild extends GeneratorBuild extends Building",
+    "GeneratorBuild.getPowerProduction() feeds PowerGraph.getPowerProduced()",
+    "PowerGraph.distributePower() sets Building.power.status (coverage ratio 0..1) used by all consumers",
+    "GameStats updated by Logic event listeners (BlockBuildEnd, BlockDestroy, UnitDestroy, etc.) — no power fields"
+  ],
+
+  "branching_conditions": [
+    "cheating mode: skip normal power calc, set status=1",
+    "powerNeeded > powerProduced: draw from batteries",
+    "powerProduced > powerNeeded: charge batteries",
+    "buffered consumer: incremental status fill vs. instantaneous coverage assignment",
+    "shouldConsumePower true/false: full coverage vs. estimated coverage",
+    "heat >= 0.999: reactor overload → kill",
+    "heat > smokeThreshold: visual smoke",
+    "heat > flashThreshold: visual light flash",
+    "fuel == 0: ambient cooldown instead of heating",
+    "link already present: unlink + reflow; link absent + valid: link + addGraph"
+  ],
+
+  "important_notes": [
+    "PowerGraph is updated via PowerGraphUpdater entity (arc Entity), added to Groups automatically",
+    "PowerGraph.update() runs every tick; no separate 'grid tick' rate",
+    "energyDelta tracks cross-graph diode transfers within one tick before being zeroed",
+    "powerBalance is a 60-sample WindowedMean used for UI display (getPowerBalance())",
+    "NuclearReactor explosionDamage = 1250*4 = 5000, radius 19 tiles",
+    "ImpactReactor likely has similar overload (not read, but extends PowerGenerator)",
+    "Battery charging/discharging is proportional across all batteries in graph",
+    "Graph merging: smaller.all.size graph merges into larger; old entity removed",
+    "Graph splitting on removal: each neighbour gets its own new BFS-built graph",
+    "GameStats has no power fields; power stats are read-only from PowerGraph getters"
+  ],
+
+  "source_files_analyzed": [
+    "core/src/mindustry/core/Logic.java",
+    "core/src/mindustry/world/blocks/power/PowerGraph.java",
+    "core/src/mindustry/world/blocks/power/PowerGenerator.java",
+    "core/src/mindustry/world/blocks/power/NuclearReactor.java",
+    "core/src/mindustry/world/blocks/power/PowerNode.java",
+    "core/src/mindustry/game/GameStats.java"
+  ]
+}

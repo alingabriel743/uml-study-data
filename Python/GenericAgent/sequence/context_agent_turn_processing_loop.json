@@ -1,0 +1,73 @@
+{
+  "scope": "agent_turn_processing_loop",
+  "title": "Agent Turn Processing Loop",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Caller",
+    "agent_runner_loop",
+    "client (LLM)",
+    "BaseHandler",
+    "try_call_generator",
+    "StepOutcome"
+  ],
+  "interaction_flow": [
+    "Caller → agent_runner_loop: agent_runner_loop(client, system_prompt, user_input, handler, tools_schema, max_turns=40)",
+    "agent_runner_loop: init messages=[{system}, {user: initial_user_content or user_input}], turn=0, handler._done_hooks=[], handler.max_turns=max_turns",
+    "--- LOOP START: while turn < handler.max_turns ---",
+    "agent_runner_loop: turn += 1; yield 'LLM Running (Turn N)...'",
+    "agent_runner_loop: [every 10 turns] client.last_tools = '' (reset tool descriptions)",
+    "agent_runner_loop → client: client.chat(messages=messages, tools=tools_schema) → response_gen",
+    "agent_runner_loop: response = yield from response_gen (verbose) OR exhaust(response_gen) (non-verbose)",
+    "agent_runner_loop: parse response.tool_calls → tool_calls list [{tool_name, args, id}]; if no tool_calls → [{tool_name:'no_tool', args:{}}]",
+    "--- FOR EACH tool_call in tool_calls ---",
+    "agent_runner_loop: yield tool display string (name + pretty JSON args)",
+    "agent_runner_loop → BaseHandler: handler.dispatch(tool_name, args, response, index=ii) → generator",
+    "--- INSIDE BaseHandler.dispatch ---",
+    "BaseHandler.dispatch: method_name = f'do_{tool_name}'",
+    "BaseHandler.dispatch → try_call_generator: try_call_generator(self.tool_before_callback, tool_name, args, response) → prer",
+    "BaseHandler.dispatch → try_call_generator: try_call_generator(self.do_{tool_name}, args, response) → ret (StepOutcome)",
+    "BaseHandler.dispatch → try_call_generator: try_call_generator(self.tool_after_callback, tool_name, args, response, ret)",
+    "BaseHandler.dispatch → agent_runner_loop: return StepOutcome(data, next_prompt, should_exit)",
+    "  [alt: tool_name=='bad_json'] BaseHandler.dispatch → agent_runner_loop: return StepOutcome(None, next_prompt=msg, should_exit=False)",
+    "  [alt: unknown tool] BaseHandler.dispatch: yield '未知工具: {tool_name}'; return StepOutcome(None, next_prompt='未知工具...', should_exit=False)",
+    "--- BACK IN agent_runner_loop, evaluating StepOutcome ---",
+    "agent_runner_loop: [if outcome.should_exit] exit_reason = {result:'EXITED', data:outcome.data}; break",
+    "agent_runner_loop: [if not outcome.next_prompt] exit_reason = {result:'CURRENT_TASK_DONE', data:outcome.data}; break",
+    "agent_runner_loop: [if next_prompt starts with '未知工具'] client.last_tools = '' (reset tool cache)",
+    "agent_runner_loop: collect tool_results.append({tool_use_id, content: json(outcome.data)}); next_prompts.add(outcome.next_prompt)",
+    "--- END FOR EACH tool_call ---",
+    "agent_runner_loop: [if next_prompts empty or exit_reason and _done_hooks] next_prompts.add(handler._done_hooks.pop(0))",
+    "agent_runner_loop → BaseHandler: handler.turn_end_callback(response, tool_calls, tool_results, turn, joined_next_prompts, exit_reason) → next_prompt",
+    "agent_runner_loop: messages = [{role:'user', content:next_prompt, tool_results:tool_results}] (history kept in Session)",
+    "--- LOOP END ---",
+    "agent_runner_loop: [if exit_reason] handler.turn_end_callback(response, tool_calls, tool_results, turn, '', exit_reason) [final callback]",
+    "agent_runner_loop → Caller: return exit_reason OR {result:'MAX_TURNS_EXCEEDED'}"
+  ],
+  "key_relationships": [
+    "agent_runner_loop depends_on BaseHandler (dispatch, turn_end_callback, _done_hooks, max_turns, current_turn)",
+    "agent_runner_loop depends_on client (client.chat, client.last_tools)",
+    "BaseHandler.dispatch depends_on try_call_generator (to handle both generator and plain functions)",
+    "BaseHandler.dispatch produces StepOutcome (drives loop continuation/termination)",
+    "try_call_generator wraps any callable — yields streamed output, returns final value via StopIteration",
+    "StepOutcome: dataclass with fields data:Any, next_prompt:Optional[str]=None, should_exit:bool=False",
+    "exhaust(g): drains generator and returns StopIteration.value (used in non-verbose mode)"
+  ],
+  "termination_conditions": {
+    "EXITED": "outcome.should_exit == True",
+    "CURRENT_TASK_DONE": "outcome.next_prompt is None/empty",
+    "MAX_TURNS_EXCEEDED": "turn >= handler.max_turns (no exit_reason set)",
+    "_done_hooks": "If next_prompts empty, pops from handler._done_hooks before breaking"
+  },
+  "generator_pattern_notes": "agent_runner_loop is itself a generator (uses 'yield' for streaming output). dispatch is also a generator via try_call_generator. exhaust() drains a generator to get its return value. Both verbose and non-verbose paths handle generator output.",
+  "key_method_signatures": {
+    "agent_runner_loop": "agent_runner_loop(client, system_prompt, user_input, handler, tools_schema, max_turns=40, verbose=True, initial_user_content=None) -> generator yielding str, returns exit_reason dict",
+    "BaseHandler.dispatch": "dispatch(self, tool_name, args, response, index=0) -> generator, returns StepOutcome",
+    "BaseHandler.tool_before_callback": "tool_before_callback(self, tool_name, args, response) -> None",
+    "BaseHandler.tool_after_callback": "tool_after_callback(self, tool_name, args, response, ret) -> None",
+    "BaseHandler.turn_end_callback": "turn_end_callback(self, response, tool_calls, tool_results, turn, next_prompt, exit_reason) -> next_prompt:str",
+    "try_call_generator": "try_call_generator(func, *args, **kwargs) -> generator, returns func's return value",
+    "StepOutcome": "@dataclass(data:Any, next_prompt:Optional[str]=None, should_exit:bool=False)"
+  },
+  "important_notes": "Single message context window per turn — only the latest user message is sent (history kept in client Session). Tool results are attached as 'tool_results' on the user message. 'no_tool' is synthesized when response has no tool_calls. Unknown-tool responses reset client.last_tools to force tool re-description on next turn.",
+  "source_files_analyzed": ["data/83187709-02ea-456f-bd93-8dd46c9f9c58/agent_loop.py"]
+}

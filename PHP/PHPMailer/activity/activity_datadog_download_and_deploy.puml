@@ -1,0 +1,168 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #212529
+    EndColor #212529
+    BarColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title Datadog Extension Download & Deployment\n<size:11>(datadog-setup.php — install() function)</size>
+
+|#E8F4FD|Installer|
+start
+:install($options) called;
+
+|#EAF7EA|Environment Detection|
+:get_architecture()\nDetect host CPU architecture;
+note right
+  Linux: executes **uname -m**\n  (e.g. x86_64, aarch64)\n  Windows: reads\n  PROCESSOR_ARCHITECTURE env\n  (AMD64 → x86_64)
+end note
+
+:is_alpine()\nRead /etc/os-release;
+note right
+  Checks for 'alpine' string\n  via stripos()\n  Returns false on Windows\n  or unreadable file
+end note
+
+if (Alpine / musl Linux?) then (yes — Alpine)
+    :platform = '{arch}-linux-musl';
+else (no — GNU/Linux or Windows)
+    if (Windows?) then (yes)
+        :platform = '{arch}-windows';
+    else (no)
+        :platform = '{arch}-linux-gnu';
+    endif
+endif
+
+|#FDF3EA|Prerequisite Checks|
+:check_library_prerequisite_or_exit('libcurl');
+:check_library_prerequisite_or_exit('libgcc_s');
+note right
+  Alpine: find /usr/local/lib /usr/lib\n  -name '*{lib}*.so*'\n  GNU/Linux: ldconfig -p | grep {lib}
+end note
+
+if (OPT_ENABLE_PROFILING && NOT Alpine?) then (yes)
+    :check_library_prerequisite_or_exit\n('libdl.so', 'libpthread', 'librt');
+else (no / Alpine)
+endif
+
+:require_binaries_or_exit($options)\nResolve PHP binary paths;
+
+|Installer|
+fork
+    |#FDF3EA|Prerequisite Checks|
+    while (foreach selected PHP binary) is (more binaries)
+        :check_php_ext_prerequisite_or_exit\n($binary, 'json');
+        :ini_values($binary)\nExtract PHP properties\n(version, scan dir, ext dir,\nthread safety, debug flag);
+
+        if (INI_SCANDIR missing && INI_MAIN missing?) then (yes)
+            if (Windows?) then (yes)
+                :Default to dirname($binary)/php.ini;
+            else (Linux)
+                :print_error_and_exit()\nCannot determine PHP ini path;
+                stop
+            endif
+        else (paths found)
+        endif
+
+        :Build extensionSuffix\n('-debug', '-zts', or combination);
+        :Accumulate downloadVersions\nkeyed by '{PHP_API}{extensionSuffix}';
+    endwhile (done)
+fork end
+
+|Installer|
+if (count(downloadVersions) == 1?) then (yes — single PHP API)
+    :tar_gz_suffix = '-{PHP_API}{extensionSuffix}'\n(version-specific archive — smaller download);
+else (no — multiple PHP versions)
+    :tar_gz_suffix = ''\n(full/universal archive);
+endif
+
+:Prepare temp dir\nsys_get_temp_dir()/dd-install;
+:register_shutdown_function\nto auto-clean tmpDir on exit;
+
+if (OPT_FILE option provided?) then (yes — local file)
+    :Use provided file path directly\n(skip download — internal/testing use);
+    note right
+      Bypasses the entire\n      download pipeline
+    end note
+else (no — remote download)
+
+    |#E8F4FD|Download|
+    repeat
+        :Build archive URL\nRELEASE_URL_PREFIX +\n'dd-library-php-{RELEASE_VERSION}\n-{platform}{tar_gz_suffix}.tar.gz';
+        note right
+          Base URL from:\n  DD_TEST_INSTALLER_REPO env\n  or github.com/DataDog/dd-trace-php\n  /releases/download/{VERSION}/
+        end note
+
+        :download($url, $tmpDirTarGz,\nretry = (tar_gz_suffix != ''));
+
+        note right
+          **4-level download fallback:**\n  1. ext-curl → curl_init() +\n     CURLOPT_PROGRESSFUNCTION\n  2. curl CLI (non-Windows)\n  3. allow_url_fopen + ext-openssl\n     → file_get_contents()\n     (memory_limit bumped to 2G)\n  4. Windows → PowerShell\n     Invoke-WebRequest via proc_open
+        end note
+
+        if (Using ext-curl?) then (yes)
+            fork
+                :on_download_progress callback\nPrint dot every 5% progress\n(max 20 dots, skip if size==0);
+            fork end
+        else (no)
+        endif
+
+        if (download() succeeded?) then (yes)
+        else (no — 404 or error)
+            if (retry=true (was version-specific)?) then (yes)
+                :tar_gz_suffix = ''\nFallback to full archive;
+            else (retry=false)
+                :exit(1) — prerequisite error;
+                stop
+            endif
+        endif
+    repeat while (download failed AND retry available?) is (retry)
+    -> success;
+
+endif
+
+|#F3EAFD|Extraction & Install|
+if (OS / available extraction tool?) then (Linux/Mac — tar available)
+    :tar -xf {archive} -C {tmpDir};
+elseif (Windows — tar available) then (yes)
+    :tar -xf {archive} -C {tmpDir};
+elseif (Windows — 7z available) then (yes)
+    :7z x {archive} | 7z x -ttar\n(two-pass extraction);
+else (no tool available)
+    :die — no extraction tool found;
+    stop
+endif
+
+:Install extracted extension files\nto PHP extension directory;
+
+|Installer|
+:Shutdown function cleans up tmpDir;
+stop
+
+@enduml

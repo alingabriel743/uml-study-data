@@ -1,0 +1,223 @@
+{
+  "scope": "campaign_sector_management",
+  "title": "Campaign & Sector Progression",
+  "diagram_type": "activity",
+  "key_participants": [
+    "SectorSubmissions", "SectorPreset", "Sector", "SectorInfo",
+    "Universe", "Logic", "Control", "SectorDamage", "TechTree/TechNode",
+    "GameService", "Objectives.SectorComplete"
+  ],
+
+  "activity_flows": [
+
+    {
+      "flow": "A. Sector Registration (Game Init)",
+      "steps": [
+        "SectorSubmissions.registerSectors() called during content load",
+        "For each sector: registerSerpuloSector(id, author, mapFileLink, captureWave, difficulty)",
+        "  → new SectorPreset('sector-serpulo-N', 'hidden/N', planet, id)",
+        "  → preset.requireUnlock = false",
+        "  → if captureWave > 0: preset.captureWave = captureWave (wave-based win)",
+        "  → else: sector.generateEnemyBase = true (attack-mode win)",
+        "  → preset.difficulty set if > 0",
+        "threadMap.put(sector, MapSubmission{author, mapFileLink, threadLink})",
+        "Special named presets created inline: fallenVessel(difficulty=9), geothermalStronghold(difficulty=10), cruxscape(difficulty=10)",
+        "Mega-base sectors: shieldSectors added to sector 27 (requires sectors 246,244,242 captured)"
+      ]
+    },
+
+    {
+      "flow": "B. Sector State Queries",
+      "steps": [
+        "sector.hasBase()       → save != null && info.hasCore && !gameOver",
+        "sector.isCaptured()    → [playing]: !waves && !attackMode | [offline]: save!=null && !info.waves && !info.attack",
+        "sector.isAttacked()    → [playing]: waves || attackMode   | [offline]: save!=null && (info.waves||info.attack) && info.hasCore",
+        "sector.hasEnemyBase()  → (generateEnemyBase && preset==null || preset.captureWave==0) && (save==null || info.attack || !hasBase())",
+        "sector.isShielded()    → preset.shieldSectors.size>0 && any shieldSector not isCaptured()",
+        "sector.unlocked()      → hasBase() || (preset!=null && preset.alwaysUnlocked)",
+        "sector.isFrozen()      → isAttacked() && !isBeingPlayed()"
+      ]
+    },
+
+    {
+      "flow": "C. Universe Turn Processing (periodic)",
+      "steps": [
+        "Logic.update() → universe.update() each frame",
+        "[DECISION] turnCounter >= turnDuration → runTurn()",
+        "universe.runTurn():",
+        "  turn++",
+        "  For each planet's sector where hasBase():",
+        "    [DECISION] isAttacked() → minutesCaptured = 0 (frozen)",
+        "    else → minutesCaptured += turnDuration/60/60",
+        "    [DECISION] !isAttacked():",
+        "      if !isBeingPlayed(): add production stats to items (capped at storageCapacity), sector.saveInfo()",
+        "      [DECISION] sectorInvasion enabled && minutesCaptured > invasionGracePeriod && hasSpawns:",
+        "        count = nearby sectors with hasEnemyBase() && !hasBase()",
+        "        [DECISION] count>0 && Mathf.chance(baseInvasionChance*(0.8+(count-1)*0.3)):",
+        "          waveMax = max(info.winWave, currentWave) + random(2,4)*5",
+        "          if isBeingPlayed(): set state.rules.winWave, waves=true, attackMode=false",
+        "          else: set sector.info.winWave, waves=true, attack=false, saveInfo()",
+        "          fire SectorInvasionEvent(sector)",
+        "  fire TurnEvent()",
+        "  universe.save()"
+      ]
+    },
+
+    {
+      "flow": "D. Sector Capture (Win Condition)",
+      "steps": [
+        "[TRIGGER] Player reaches captureWave OR destroys all enemy cores in attackMode",
+        "Logic.sectorCapture() [@Remote called=Loc.server]:",
+        "  state.rules.waves = false",
+        "  state.rules.attackMode = false",
+        "  state.rules.disableWorldProcessors = true",
+        "  Call.clearObjectives()",
+        "  [DECISION] sector != null:",
+        "    boolean initial = !sector.info.wasCaptured",
+        "    sector.info.wasCaptured = true",
+        "    fire SectorCaptureEvent(sector, initial)",
+        "Logic SectorCaptureEvent listener:",
+        "  if !net.client() && sector being played: waveTeam.destroyToDerelict()",
+        "  apply planet.sectorCaptureReplacements (floor tile remaps)",
+        "  planet.generator.onSectorCaptured(sector)",
+        "  planet.stats().sectorsCaptured++",
+        "Universe SectorCaptureEvent listener:",
+        "  planet.updateBaseCoverage()",
+        "GameService SectorCaptureEvent listener:",
+        "  SStat.attacksWon.add() if attackMode",
+        "  check captureAllSectors, completeErekir, completeSerpulo achievements",
+        "  check captureNoBlocksBroken, defeatAttack5Waves achievements",
+        "  SStat.sectorsControlled.set(sectors with hasBase count)",
+        "control.saves.saveSector(sector)"
+      ]
+    },
+
+    {
+      "flow": "E. TechTree Unlock via SectorComplete Objective",
+      "steps": [
+        "TechNode created: new TechNode(parent, content, requirements)",
+        "  → if context is SectorPreset: auto-insert SectorComplete(preset) at objectives[0]",
+        "  → content.getDependencies() → add Research(dep) objectives",
+        "  → setupRequirements(): load finishedRequirements from settings ('req-<content>-<item>')",
+        "  → content.techNode = this; all.add(this)",
+        "TechNode.nodeRoot(name, content, requireUnlock, children):",
+        "  → root.requiresUnlock = requireUnlock; roots.add(root)",
+        "[DECISION] Player opens ResearchDialog:",
+        "  For each TechNode: check all objectives.complete()",
+        "  Objectives.SectorComplete.complete(): preset.sector.save!=null && sector.isCaptured() && sector.hasBase()",
+        "  Objectives.Research.complete():        content.unlockedHost()",
+        "  Objectives.Produce.complete():         content.unlockedHost()",
+        "[DECISION] All objectives met AND item requirements fulfilled:",
+        "  fire ResearchEvent(content) → UnlockEvent(content)",
+        "  GameService listens: researchRouter, researchLogic, researchAll achievements",
+        "TechNode.save(): flush finishedRequirements to settings",
+        "TechNode.reset(): clear finishedRequirements"
+      ]
+    },
+
+    {
+      "flow": "F. Sector Loss & Re-entry with Damage Simulation",
+      "steps": [
+        "[TRIGGER] All player cores destroyed → gameOver fired",
+        "Player selects lost sector to re-land → Control.playSector(origin, sector)",
+        "  Load existing save slot (slot.load())",
+        "  [DECISION] cores empty || !info.hasCore (sector has no core):",
+        "    [DECISION] clearSave || info.spawnPosition==0 || !sectorDataMatches:",
+        "      → playNewSector() (fresh map, no damage simulation)",
+        "    else (has saved spawn position):",
+        "      → Place defaultCore at tile(info.spawnPosition)",
+        "      → SectorDamage.apply(1f)   [full damage simulation]",
+        "      → capture previousPlans, previousBuildings, previousDerelicts",
+        "      → logic.reset()",
+        "      → playNewSector() with corePositionOverride=spawnPosition",
+        "      → Post-load callback:",
+        "          remove generated derelicts",
+        "          restore old derelicts from previous save",
+        "          copy previous player buildings as derelict team tiles"
+      ]
+    },
+
+    {
+      "flow": "G. SectorDamage.apply(fraction) — Damage Simulation Algorithm",
+      "steps": [
+        "Phase 1 — Path-based structural damage:",
+        "  Find all waveTeam CoreBlocks + spawn overlay tiles → add to frontier",
+        "  [DECISION] player core != null && frontier not empty:",
+        "    For each spawner:",
+        "      A* pathfind(spawner → player core.tile) using cost(tile)",
+        "      cost(tile) = 1 + (static&&solid ? 200 : 0) + (build.health/size²/20) + (liquid ? 10 : 0)",
+        "      [DECISION] fraction >= 1: totalHealth = 1 (destroy everything)",
+        "      else: sum health of buildings in radius-3 circle along path",
+        "      targetHealth = totalHealth * fraction",
+        "      Walk path tiles, radius=3 sweep:",
+        "        [DECISION] build != null && team==defaultTeam && !CoreBlock:",
+        "          add build.health to healthCount",
+        "          if rubble && !floor.solid && !floor.liquid && chance(0.4): Effect.rubble()",
+        "          removal.add(build)",
+        "          [DECISION] healthCount >= targetHealth && fraction < 0.999: break",
+        "      For each removal: build.addPlan(false), tile.remove()",
+        "[DECISION] fraction >= 1:",
+        "  Remove all player team cores",
+        "Phase 2 — BFS damage propagation (only if fraction > 0.15):",
+        "  falloff = fraction / (max(width,height) * sqrt2)",
+        "  BFS from all frontier tiles:",
+        "    currDamage = values[tile] - falloff",
+        "    For each 4-directional neighbor:",
+        "      [DECISION] in bounds && values[cx][cy] < currDamage:",
+        "        [DECISION] build != null && team==defaultTeam:",
+        "          build.health -= currDamage",
+        "          [DECISION] build instanceof CoreBlock: clamp health >= 1",
+        "          [DECISION] build.health < 0:",
+        "            rubble chance 40%, build.addPlan(false), tile.remove()",
+        "          else: indexer.notifyHealthChanged(build)",
+        "        [DECISION] solid && !synthetic: skip (no propagation through walls)",
+        "        if resultDamage > 0: add to frontier, update values[cx][cy]"
+      ]
+    }
+  ],
+
+  "key_conditions": [
+    "captureWave > 0 → wave-survival win condition; else → attack mode (destroy enemy cores)",
+    "fraction >= 1.0 → destroy all buildings along path + all player cores",
+    "fraction > 0.15 → enable BFS damage propagation phase",
+    "minutesCaptured > invasionGracePeriod + hasSpawns → eligible for random invasion",
+    "shieldSectors all captured → sector becomes landable",
+    "isLastSector = true → triggers planet completion achievement (completeSerpulo / completeErekir)",
+    "SectorComplete.complete() → sector.save!=null && isCaptured() && hasBase()"
+  ],
+
+  "key_relationships": [
+    "SectorSubmissions creates SectorPreset and links to Sector via planet.sectors.get(id)",
+    "SectorPreset owns Sector (1:1 preset per sector)",
+    "Sector owns SectorInfo (runtime state: waves, attack, hasCore, production, items)",
+    "Universe.runTurn() iterates all planet sectors, fires TurnEvent and SectorInvasionEvent",
+    "Logic.sectorCapture() fires SectorCaptureEvent → Logic/Universe/GameService all listen",
+    "Control.playSector() triggers SectorDamage.apply() on lost-sector re-entry",
+    "TechNode.objectives includes SectorComplete(preset) auto-inserted when parent is SectorPreset",
+    "GameService listens to SectorCaptureEvent, ResearchEvent, WaveEvent, TurnEvent for achievements/stats"
+  ],
+
+  "important_notes": [
+    "SectorSubmissions only manages community-submitted Discord map links for hidden sectors on Serpulo; does not control game logic",
+    "generateEnemyBase=true is set when captureWave<=0, meaning victory requires destroying all enemy cores (attack mode)",
+    "SectorDamage.apply(fraction): fraction=1.0 used when re-entering a fully lost sector; path removal targets buildings proportional to fraction of total path health",
+    "Universe.runTurn() auto-invades sectors after invasionGracePeriod minutes if nearby enemy bases exist",
+    "TechNode auto-inserts SectorComplete objective when parent TechNode's content is a SectorPreset",
+    "SectorInfo.waves=true / attack=true tracks offline sector attack state; isCaptured() checks both",
+    "Sector.isFrozen() = under attack but not currently being played → time-frozen, no production updates"
+  ],
+
+  "source_files_analyzed": [
+    "core/src/mindustry/maps/SectorSubmissions.java",
+    "core/src/mindustry/maps/SectorDamage.java",
+    "core/src/mindustry/content/TechTree.java",
+    "core/src/mindustry/type/SectorPreset.java",
+    "core/src/mindustry/type/Sector.java",
+    "core/src/mindustry/game/SectorInfo.java",
+    "core/src/mindustry/game/Universe.java",
+    "core/src/mindustry/core/Logic.java (lines 70-220, 394-425)",
+    "core/src/mindustry/core/Control.java (lines 440-520)",
+    "core/src/mindustry/service/GameService.java",
+    "core/src/mindustry/game/Objectives.java"
+  ]
+}

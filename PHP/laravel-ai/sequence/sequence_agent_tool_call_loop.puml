@@ -1,0 +1,145 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Agent Tool Call Loop
+
+actor Caller as caller
+participant "AnonymousAgent\n(Promptable)" as agent
+participant "Provider\n(GeneratesText)" as provider
+participant "Middleware\nPipeline" as middleware
+participant "EventDispatcher" as events
+participant "OpenAiGateway\n(ParsesTextResponses\n+ InvokesTools)" as gateway
+participant "LLM API\n(OpenAI /responses)" as llm
+participant "Tool\n(e.g. SimilaritySearch)" as tool
+database "Database" as db
+
+== Initiation ==
+
+caller -> agent : prompt(string $prompt, $attachments,\n$provider, $model, $timeout)
+activate agent
+
+agent -> agent : withModelFailover(Closure, $provider, $model)
+note right of agent : getProvidersAndModels() resolves\nprovider + model from method,\nattribute, or config
+
+agent -> provider : prompt(new AgentPrompt(\n  $agent, $prompt, $attachments,\n  $provider, $model, $timeout))
+activate provider
+
+provider -> events : dispatch(PromptingAgent(\n  $invocationId, $agentPrompt))
+
+provider -> middleware : pipeline()->send($agentPrompt)\n->through($middleware)->then(...)
+activate middleware
+note right of middleware : e.g. RememberConversation\nappends conversation history
+middleware --> provider : processed AgentPrompt
+deactivate middleware
+
+provider -> gateway : onToolInvocation(invokingCb, invokedCb)
+note right of gateway : Registers event callbacks\nfor tool lifecycle events
+
+provider -> gateway : generateText($provider, $model,\n$instructions, $messages,\n$tools, $schema, $options, $timeout)
+activate gateway
+
+gateway -> gateway : buildTextRequestBody(...)\nmaps messages, tools, schema
+
+gateway -> llm : POST /responses\n{model, instructions, input, tools, ...}
+activate llm
+llm --> gateway : HTTP 200 JSON\n{id, output, usage, status}
+deactivate llm
+
+gateway -> gateway : validateTextResponse($data)
+gateway -> gateway : parseTextResponse($data)\n→ processResponse($data, depth=0)
+
+== Tool Call Loop (processResponse — recursive) ==
+
+loop finishReason == ToolCalls AND steps.count < maxSteps
+    note over gateway : maxSteps = round(count($tools) * 1.5)\noverridable via TextGenerationOptions\nor #[MaxSteps] attribute
+
+    gateway -> gateway : extractText($output)
+    gateway -> gateway : extractToolCalls($output)
+    gateway -> gateway : extractFinishReason($data)
+    gateway -> gateway : push Step(text, toolCalls, [],\nfinishReason, usage, meta) to $steps
+
+    gateway -> gateway : executeToolCalls(\n  $mappedToolCalls, $tools)
+
+    loop for each ToolCall
+        gateway -> gateway : findTool($toolCall->name, $tools)\nmatches by class_basename()
+
+        gateway -> events : invokingCb(Tool, arguments)\n→ dispatch InvokingTool(\n  $invocationId, $toolInvocationId,\n  Agent, Tool, arguments)
+
+        gateway -> tool : handle(new Request($arguments))
+        activate tool
+
+        opt SimilaritySearch with vector DB
+            tool -> db : Model::query()\n->whereVectorSimilarTo($column, $query)\n->get()
+            activate db
+            db --> tool : Collection of results
+            deactivate db
+            tool -> tool : rerank($rerankBy, $query,\nlimit: $rerankLimit) [if rerank=true]
+        end
+
+        tool --> gateway : JSON string of results\n(or 'No relevant results found.')
+        deactivate tool
+
+        gateway -> events : invokedCb(Tool, arguments, result)\n→ dispatch ToolInvoked(\n  $invocationId, $toolInvocationId,\n  Agent, Tool, arguments, result)
+
+        gateway -> gateway : build ToolResult(\n  id, name, arguments, result, resultId)
+    end
+
+    gateway -> gateway : update Step with toolResults[]
+    gateway -> gateway : push ToolResultMessage\nto $messages
+
+    gateway -> llm : POST /responses\n{model, previous_response_id,\n input:[{type:function_call_output,\n  call_id, output}], tools}
+    activate llm
+    llm --> gateway : HTTP 200 JSON\n{id, output, usage, status}
+    deactivate llm
+
+    gateway -> gateway : processResponse($data, depth+1)\n— RECURSE
+end
+
+== Final Text Response ==
+
+note over gateway : Loop exits when finishReason != ToolCalls\n(Stop / Length / Error / Unknown)\nor steps.count >= maxSteps
+
+gateway -> gateway : build final TextResponse(\n  text, combinedUsage, meta)\n.withMessages($messages)\n.withSteps($steps)
+
+gateway --> provider : return TextResponse
+deactivate gateway
+
+provider -> provider : wrap into AgentResponse(\n  $invocationId, text, usage, meta)\n.withToolCallsAndResults()\n.withSteps()
+
+provider -> events : dispatch(AgentPrompted(\n  $invocationId, $agentPrompt, $response))
+
+provider --> agent : return AgentResponse
+deactivate provider
+
+agent --> caller : return AgentResponse
+deactivate agent
+
+@enduml

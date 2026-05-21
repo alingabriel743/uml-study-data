@@ -1,0 +1,173 @@
+{
+  "scope": "binlog_position_tracking",
+  "title": "Binlog Position Tracking and Offset Management",
+  "diagram_type": "use_case",
+  "actors": [
+    "Binlog Streaming Engine (BinlogStreamingChangeEventSource)",
+    "Kafka Connect Framework",
+    "External Operator",
+    "Database (MySQL/MariaDB)",
+    "BinlogSourceTask (Connector)"
+  ],
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Track Current Binlog Position",
+      "actor": "Binlog Streaming Engine",
+      "description": "Updates BinlogSourceInfo with current file, position, row, GTID, serverId, threadId during streaming",
+      "key_methods": [
+        "BinlogSourceInfo.setBinlogPosition(filename, positionOfFirstEvent)",
+        "BinlogSourceInfo.setEventPosition(positionOfCurrentEvent)",
+        "BinlogSourceInfo.setRowNumber(eventRowNumber)",
+        "BinlogSourceInfo.startGtid(gtid)",
+        "BinlogSourceInfo.setBinlogServerId(serverId)",
+        "BinlogSourceInfo.setBinlogThread(threadId)",
+        "BinlogOffsetContext.setEventPosition(positionOfCurrentEvent, eventSizeInBytes)"
+      ]
+    },
+    {
+      "id": "UC2",
+      "name": "Persist Offset to Kafka Connect",
+      "actor": "Kafka Connect Framework",
+      "description": "Serializes restart-safe offset map including file, position, GTID set, events-to-skip, rows-to-skip",
+      "key_methods": [
+        "BinlogOffsetContext.getOffset() -> Map<String,Object>",
+        "offsetUsingPosition(rowsToSkip) -> {file, pos, gtids, event, row, ts_sec, server_id}",
+        "TransactionContext.store(offset)",
+        "IncrementalSnapshotContext.store(offset)"
+      ]
+    },
+    {
+      "id": "UC3",
+      "name": "Restore Offset on Restart",
+      "actor": "BinlogSourceTask (Connector)",
+      "description": "Loads persisted offset back from Kafka Connect storage; uses BinlogOffsetContext.Loader to reconstruct state",
+      "key_methods": [
+        "BinlogOffsetContext.Loader.load(offset) [abstract]",
+        "BinlogOffsetContext.setBinlogStartPoint(binlogFilename, positionOfFirstEvent)",
+        "BinlogOffsetContext.setInitialSkips(restartEventsToSkip, restartRowsToSkip)",
+        "BinlogOffsetContext.setCompletedGtidSet(gtidSet)",
+        "BinlogStreamingChangeEventSource: client.setBinlogFilename(...) / client.setBinlogPosition(...)"
+      ]
+    },
+    {
+      "id": "UC4",
+      "name": "Manage Transaction Boundary for Exactly-Once Safety",
+      "actor": "Binlog Streaming Engine",
+      "description": "Resets/advances restart position at transaction boundaries to avoid duplicates or data loss",
+      "key_methods": [
+        "BinlogOffsetContext.startNextTransaction() -> saves current file+pos as restart point",
+        "BinlogOffsetContext.commitTransaction() -> advances restartBinlogPosition by currentEventLengthInBytes",
+        "BinlogOffsetContext.completeEvent() -> increments restartEventsToSkip",
+        "BinlogOffsetContext.changeEventCompleted() -> resets restartRowsToSkip=0",
+        "BinlogOffsetContext.setRowNumber(eventRowNumber, totalRows) -> sets restartRowsToSkip"
+      ]
+    },
+    {
+      "id": "UC5",
+      "name": "Skip Events/Rows on Restart (At-Least-Once)",
+      "actor": "Binlog Streaming Engine",
+      "description": "On restart mid-transaction, re-reads events and skips already-processed events/rows using stored counters",
+      "key_fields": [
+        "BinlogOffsetContext.restartEventsToSkip (offset key: 'event')",
+        "BinlogOffsetContext.restartRowsToSkip (offset key: 'row')",
+        "BinlogOffsetContext.eventsToSkipUponRestart() -> long",
+        "BinlogOffsetContext.rowsToSkipUponRestart() -> int"
+      ]
+    },
+    {
+      "id": "UC6",
+      "name": "Override Binlog Position via Signal",
+      "actor": "External Operator",
+      "description": "Operator sends 'set-binlog-position' signal to skip to a specific file/position or GTID set; persisted via heartbeat",
+      "key_methods": [
+        "SetBinlogPositionSignal.arrived(SignalPayload<P>)",
+        "validateSignalData(filename, position, gtidSet)",
+        "MySqlOffsetContext.setBinlogStartPoint(filename, position) OR setCompletedGtidSet(gtidSet)",
+        "EventDispatcher.alwaysDispatchHeartbeatEvent(partition, offsetContext)"
+      ],
+      "signal_formats": [
+        "{\"binlog_filename\": \"mysql-bin.000003\", \"binlog_position\": 1234}",
+        "{\"gtid_set\": \"uuid:1-100\"}"
+      ]
+    },
+    {
+      "id": "UC7",
+      "name": "Serialize Position to Source Info Struct",
+      "actor": "Kafka Connect Framework",
+      "description": "Builds Kafka Connect Struct with position metadata for change event envelope 'source' field",
+      "key_methods": [
+        "BinlogSourceInfoStructMaker.init(connector, version, config) -> builds Schema",
+        "BinlogSourceInfoStructMaker.struct(sourceInfo) -> Struct with server_id, gtid, file, pos, row, thread, table, query",
+        "BinlogSourceInfoStructMaker.schema() -> Schema"
+      ]
+    },
+    {
+      "id": "UC8",
+      "name": "Validate Binlog Configuration",
+      "actor": "BinlogSourceTask (Connector)",
+      "description": "Ensures DB has ROW binlog_format and FULL binlog_row_image before streaming; warns about purged binlogs",
+      "key_methods": [
+        "BinlogSourceTask.validateBinlogConfiguration(snapshotter, connection)",
+        "BinlogSourceTask.validateSnapshotFeasibility(snapshotter, offsetContext, connection)",
+        "connection.isBinlogFormatRow()",
+        "connection.isBinlogRowImageFull()",
+        "connection.earliestBinlogFilename()"
+      ]
+    },
+    {
+      "id": "UC9",
+      "name": "Track GTID-Based Position",
+      "actor": "Binlog Streaming Engine",
+      "description": "Manages GTID set for server-assigned transaction IDs as alternative to file/position offsets",
+      "key_methods": [
+        "BinlogOffsetContext.startGtid(gtid, gtidSet) -> updates currentGtidSet and restartGtidSet",
+        "BinlogOffsetContext.setCompletedGtidSet(gtidSet)",
+        "BinlogOffsetContext.gtidSet() -> currentGtidSet",
+        "BinlogOffsetContext.resetGtidSet()",
+        "BinlogSourceInfo.startGtid(gtid) -> stores currentGtid"
+      ]
+    }
+  ],
+  "key_relationships": [
+    "BinlogOffsetContext composes BinlogSourceInfo (holds as 'sourceInfo' field)",
+    "BinlogOffsetContext composes TransactionContext and IncrementalSnapshotContext",
+    "BinlogOffsetContext extends CommonOffsetContext<T extends BinlogSourceInfo>",
+    "BinlogOffsetContext.Loader implements OffsetContext.Loader<O extends BinlogOffsetContext>",
+    "BinlogSourceInfoStructMaker extends AbstractSourceInfoStructMaker<T extends BinlogSourceInfo>",
+    "BinlogTaskContext extends CdcSourceTaskContext<BinlogConnectorConfig>",
+    "BinlogSourceTask extends BaseSourceTask<P, O extends OffsetContext>",
+    "BinlogConnectorConfig extends HistorizedRelationalDatabaseConnectorConfig",
+    "BinlogSourceInfo extends BaseSourceInfo",
+    "SetBinlogPositionSignal implements SignalAction<P>",
+    "SetBinlogPositionSignal delegates to BinlogOffsetContext (via MySqlOffsetContext cast)"
+  ],
+  "offset_key_constants": {
+    "file": "BinlogSourceInfo.BINLOG_FILENAME_OFFSET_KEY",
+    "pos": "BinlogSourceInfo.BINLOG_POSITION_OFFSET_KEY",
+    "row": "BinlogSourceInfo.BINLOG_ROW_IN_EVENT_OFFSET_KEY",
+    "event": "BinlogOffsetContext.EVENTS_TO_SKIP_OFFSET_KEY",
+    "ts_sec": "BinlogOffsetContext.TIMESTAMP_KEY",
+    "gtids": "BinlogOffsetContext.GTID_SET_KEY",
+    "server_id": "BinlogSourceInfo.SERVER_ID_KEY",
+    "gtid": "BinlogSourceInfo.GTID_KEY"
+  },
+  "important_notes": [
+    "BinlogOffsetContext maintains two sets of state: 'current' (live position) and 'restart' (safe recovery point)",
+    "restartBinlogPosition is advanced AFTER transaction commit; within a transaction it stays at BEGIN position",
+    "restartEventsToSkip / restartRowsToSkip enable sub-event granularity for at-least-once replay on restart",
+    "GTID mode and file/position mode are mutually exclusive offset strategies",
+    "SetBinlogPositionSignal persists the new position via a heartbeat event dispatch before connector restart",
+    "BinlogSourceInfo is @NotThreadSafe — all mutations happen on the single streaming thread",
+    "BinlogTaskContext holds BinlogConnectorConfig and is used as the task-scoped state container"
+  ],
+  "source_files_analyzed": [
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogSourceInfo.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogOffsetContext.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogSourceInfoStructMaker.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogTaskContext.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogSourceTask.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogConnectorConfig.java",
+    "debezium-connector-mysql/src/main/java/io/debezium/connector/mysql/signal/SetBinlogPositionSignal.java"
+  ]
+}

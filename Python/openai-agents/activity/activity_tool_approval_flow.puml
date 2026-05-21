@@ -1,0 +1,171 @@
+@startuml activity_tool_approval_flow
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #212529
+    EndColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleFontSize 13
+    TitleFontStyle bold
+}
+skinparam noteBackgroundColor #FFF9C4
+skinparam noteBorderColor #F9A825
+
+title Tool Approval Flow
+
+|Agent Runtime\n(_FunctionToolBatchExecutor)|
+start
+:Model emits **ResponseFunctionToolCall**;
+:_FunctionToolBatchExecutor.execute()\ncreates async task per tool via _create_tool_task();
+:_run_single_tool() →\ncalls _maybe_execute_tool_approval(func_tool, tool_call);
+
+|Approval Logic\n(function_needs_approval / resolve_approval_status)|
+:Evaluate **function_needs_approval**(func_tool, ctx, tool_call)\n— inspects FunctionTool.needs_approval\n(bool OR async callable(ctx, params, call_id));
+
+if (needs_approval?) then (False)
+    :Skip approval gate;
+    note right
+        Tool is trusted —
+        proceed directly to
+        execute tool body
+    end note
+else (True)
+    :Query **context_wrapper.get_approval_status**\n(tool_name, call_id);
+
+    if (approval_status?) then (True\nalready approved)
+        :Proceed — no gate needed;
+        note right
+            Per-call or sticky
+            always_approve=True
+            decision already stored
+        end note
+    elseif (approval_status?) then (False\nalready rejected)
+        :resolve_approval_rejection_message()\n— format rejection string;
+        note right
+            Per-call rejection_message\noverrides run-wide\ntool_error_formatter
+        end note
+        :Return **FunctionToolResult**\nwith rejection output;
+    else (None\nno decision yet)
+        if (on_approval callback present?\n(ShellTool / ApplyPatchTool)) then (yes)
+
+            |Approval Logic\n(function_needs_approval / resolve_approval_status)|
+            :Invoke **on_approval**(ctx, approval_item)\n— auto-approve or auto-reject in code;
+            :context_wrapper.approve_tool() or reject_tool();
+            :Re-query approval_status → decision stored;
+            note right
+                Run continues without
+                surfacing interruption
+                to the caller
+            end note
+        else (no)
+            :Create **ToolApprovalItem**\n(agent.name, tool_name, tool_namespace,\ntool_origin, arguments, call_id);
+            :Return FunctionToolResult\nwith run_item = ToolApprovalItem\n— signals INTERRUPT;
+        endif
+    endif
+endif
+
+|Agent Runtime\n(_FunctionToolBatchExecutor)|
+:_build_function_tool_results()\ncollects all task results;
+:Populate **RunResult.interruptions**\nwith pending ToolApprovalItem list;
+note right
+    Partial resolution allowed —
+    unresolved items re-surface
+    on the next Runner.run() call
+end note
+
+if (interruptions present?) then (yes)
+    :Run **PAUSES**\n— RunResult returned to caller;
+
+    |Caller / User (External Approver)|
+    :Receive RunResult with interruptions;
+    :Call **result.to_state()** → **RunState**\n(serializable; includes sticky approvals,\nusage, trace metadata);
+    note right
+        Optionally persist state:
+        state.to_string() / state.to_json()
+        → store in DB, queue, or disk
+        state = RunState.from_string() /
+        RunState.from_json() to reload
+    end note
+    :Iterate **result.interruptions**;
+    :Inspect ToolApprovalItem\n(agent.name, tool_name, arguments);
+
+    if (Human decision?) then (Approve)
+        :state.**approve**(interruption,\nalways_approve=False|True);
+        note right
+            always_approve=True stores
+            sticky approval for all future
+            calls to this tool in the run
+        end note
+    else (Reject)
+        :state.**reject**(interruption,\nalways_reject=False|True,\nrejection_message=None|str);
+        note right
+            always_reject=True stores
+            sticky rejection for all
+            future calls to this tool
+        end note
+    endif
+
+    :Call **Runner.run**(agent, state)\n— Run **RESUMES** from saved state;
+
+    |Agent Runtime\n(_FunctionToolBatchExecutor)|
+    :_maybe_execute_tool_approval() re-evaluates\n— approval_status now True or False;
+
+    if (approval_status after resume?) then (approved)
+        :Execute tool body normally\n→ FunctionToolResult with output;
+    else (rejected)
+        :Resolve rejection message\n→ FunctionToolResult with rejection string;
+    endif
+
+    :Check for NEW approvals\n(nested tools, handoff targets,\nor Agent.as_tool() inner tools);
+    note right
+        Nested Agent.as_tool() interruptions
+        surface on the outer run —
+        always resume the top-level agent,
+        not the nested one
+    end note
+
+    if (New interruptions?) then (yes)
+        :Re-enter interruption loop;
+        note right
+            Hosted MCP: process_hosted_mcp_approvals()
+            checks McpApprovalRequest items;
+            emits MCPApprovalResponseItem
+            or surfaces new ToolApprovalItem
+        end note
+        :Run PAUSES again\n— back to Caller;
+    else (no)
+        :All approvals resolved;
+    endif
+else (no)
+    :All tools executed without interruption;
+endif
+
+|Agent Runtime\n(_FunctionToolBatchExecutor)|
+:No more interruptions\n— return **RunResult.final_output**;
+stop
+
+@enduml

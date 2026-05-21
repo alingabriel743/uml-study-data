@@ -1,0 +1,89 @@
+{
+  "scope": "trace_creation_for_agent_run",
+  "title": "Trace Creation for Agent Run",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Runner",
+    "TraceCtxManager",
+    "create_trace_for_run",
+    "trace()",
+    "DefaultTraceProvider",
+    "Scope",
+    "TraceImpl / NoOpTrace",
+    "task_span()",
+    "agent_span()",
+    "generation_span()",
+    "transcription_span()",
+    "SynchronousMultiTracingProcessor"
+  ],
+  "interaction_flow": [
+    "Runner._run_impl() → resolve_trace_settings(run_state, run_config) → (workflow_name, trace_id, group_id, metadata, trace_config)",
+    "Runner._run_impl() → TraceCtxManager.__enter__(workflow_name, trace_id, group_id, metadata, tracing, disabled, trace_state, reattach_resumed_trace)",
+    "TraceCtxManager.__enter__() → create_trace_for_run(workflow_name, trace_id, group_id, metadata, tracing, disabled, trace_state, reattach_resumed_trace)",
+    "create_trace_for_run() → get_current_trace() [via get_trace_provider().get_current_trace() → Scope.get_current_trace()]",
+    "create_trace_for_run(): if current_trace already active → return None (skip trace creation)",
+    "create_trace_for_run(): if reattach_resumed_trace AND _trace_id_was_started(trace_state.trace_id) AND settings match → reattach_trace(trace_state, tracing_api_key) → Trace",
+    "create_trace_for_run(): else → trace(workflow_name, trace_id, group_id, metadata, tracing, disabled)",
+    "trace() → get_trace_provider().get_current_trace() [warns if already active]",
+    "trace() → get_trace_provider().create_trace(name, trace_id, group_id, metadata, tracing, disabled)",
+    "DefaultTraceProvider.create_trace() → _refresh_disabled_flag() [reads OPENAI_AGENTS_DISABLE_TRACING env or manual flag]",
+    "DefaultTraceProvider.create_trace(): if disabled → return NoOpTrace()",
+    "DefaultTraceProvider.create_trace(): else → trace_id = trace_id or gen_trace_id() [format: 'trace_<32hex>']",
+    "DefaultTraceProvider.create_trace() → return TraceImpl(name, trace_id, group_id, metadata, processor=_multi_processor, tracing_api_key)",
+    "TraceCtxManager.__enter__(): if trace returned → trace.start(mark_as_current=True) [registers in Scope contextvar]",
+    "Runner._run_impl() → task_span(name=trace_workflow_name) [via get_trace_provider().create_span(TaskSpanData)]",
+    "Runner._run_impl() → current_task_span.start(mark_as_current=True)",
+    "Runner agent loop: if current_span is None → agent_span(name=agent.name, handoffs=[...], output_type='str'|custom)",
+    "agent_span() → get_trace_provider().create_span(AgentSpanData(name, handoffs, tools, output_type), span_id, parent, disabled)",
+    "DefaultTraceProvider.create_span(): resolve parent from Scope contextvar (current_span/current_trace) if parent not explicit",
+    "DefaultTraceProvider.create_span(): if disabled or NoOpTrace/NoOpSpan parent → return NoOpSpan(span_data)",
+    "DefaultTraceProvider.create_span() → return SpanImpl(trace_id, span_id, parent_id, processor=_multi_processor, span_data, tracing_api_key, trace_metadata)",
+    "Runner agent loop → current_span.start(mark_as_current=True) → SpanImpl registered in Scope",
+    "OpenAIChatCompletionsModel.get_response() → with generation_span(model, input, output, model_config, usage) as span",
+    "generation_span() → get_trace_provider().create_span(GenerationSpanData(...)) → SpanImpl (child of current agent_span)",
+    "OpenAISTTModel.transcribe() OR StreamedTranscriptionSession._start_turn() → with transcription_span(model, input, input_format='pcm', output, model_config)",
+    "transcription_span() → get_trace_provider().create_span(TranscriptionSpanData(...)) → SpanImpl (child of current span)",
+    "TraceCtxManager.__exit__() → trace.finish(reset_current=True) [deregisters from Scope, notifies processors via on_trace_end]"
+  ],
+  "key_relationships": [
+    "Runner depends_on TraceCtxManager (context manager for trace lifecycle)",
+    "TraceCtxManager calls create_trace_for_run() on __enter__",
+    "create_trace_for_run() calls trace() from create.py OR reattach_trace() from traces.py",
+    "trace() delegates to DefaultTraceProvider.create_trace()",
+    "agent_span(), generation_span(), transcription_span() all delegate to DefaultTraceProvider.create_span()",
+    "DefaultTraceProvider owns SynchronousMultiTracingProcessor (multi-processor fan-out)",
+    "DefaultTraceProvider reads current trace/span from Scope (Python contextvar)",
+    "TraceImpl and SpanImpl both hold a reference to SynchronousMultiTracingProcessor",
+    "Span hierarchy: Trace → task_span → agent_span → generation_span | transcription_span",
+    "DefaultTraceProvider implements abstract TraceProvider interface"
+  ],
+  "span_data_types": {
+    "AgentSpanData": "name, handoffs: list[str], tools: list[str], output_type: str",
+    "TaskSpanData": "name",
+    "GenerationSpanData": "input: Sequence[Mapping], output: Sequence[Mapping], model: str, model_config: Mapping, usage: dict",
+    "TranscriptionSpanData": "model: str, input: str (base64 PCM), input_format: str='pcm', output: str, model_config: Mapping"
+  },
+  "id_formats": {
+    "trace_id": "trace_<32 hex chars> (via gen_trace_id: uuid4().hex)",
+    "span_id": "span_<24 hex chars> (via gen_span_id: uuid4().hex[:24])",
+    "group_id": "group_<24 hex chars> (via gen_group_id)"
+  },
+  "disabled_logic": [
+    "OPENAI_AGENTS_DISABLE_TRACING=1 env var → NoOpTrace/NoOpSpan returned",
+    "set_tracing_disabled(True) → manual override sets _manual_disabled flag",
+    "RunConfig.tracing_disabled=True → passed as 'disabled' param to TraceCtxManager",
+    "If parent is NoOpTrace or NoOpSpan → child span also becomes NoOpSpan"
+  ],
+  "reattach_logic": "If reattach_resumed_trace=True AND trace_state.trace_id was previously started AND trace settings match (workflow_name, trace_id, group_id, metadata, api_key fingerprint) → reattach_trace() reuses existing live trace context instead of creating new one",
+  "context_propagation": "Python contextvar (Scope class) tracks current Trace and current Span; mark_as_current=True/reset_current=True manage the contextvar token stack; supports async concurrency automatically",
+  "important_notes": "1) Trace is only created if no current trace exists (prevents double-wrapping). 2) task_span is created immediately after TraceCtxManager entry, before the agent loop. 3) agent_span is created lazily per-agent inside the loop (only when current_span is None). 4) generation_span is created by the model implementation (OpenAIChatCompletionsModel), not the runner. 5) transcription_span is created by OpenAISTTModel for audio input. 6) Sensitive data (inputs/outputs) can be suppressed via RunConfig.trace_include_sensitive_data and VoicePipelineConfig.trace_include_sensitive_audio_data.",
+  "source_files_analyzed": [
+    "src/agents/tracing/context.py",
+    "src/agents/tracing/create.py",
+    "src/agents/tracing/provider.py",
+    "src/agents/tracing/setup.py",
+    "src/agents/run.py",
+    "src/agents/voice/models/openai_stt.py",
+    "docs/tracing.md"
+  ]
+}

@@ -1,0 +1,159 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam noteBackgroundColor #E7F3FF
+skinparam noteBorderColor #4A90D9
+
+title Synchronous Process Execution\n<size:11><color:#6C757D>ProcessExecutor — execute / executeTty → doExecute → runProcess</color></size>
+
+|Caller|
+start
+if (Using TTY mode?) then (executeTty())
+    |ProcessExecutor — Entry|
+    :Call executeTty($command, $cwd);
+    if (Platform::isTty()?) then (yes)
+        :tty = true;
+    else (no)
+        :tty = false;
+    endif
+else (execute())
+    |ProcessExecutor — Entry|
+    :Call execute($command, &$output, $cwd);
+    if (output reference arg provided?\n(func_num_args > 1)) then (yes)
+        :captureOutput = true\n(pass &$output ref);
+    else (no)
+        :captureOutput = false;
+    endif
+endif
+
+|ProcessExecutor — doExecute|
+:Call doExecute($command, $cwd, $tty, &$output);
+note right
+  Both execute() and executeTty()
+  funnel into this private method
+end note
+:outputCommandRun()\n→ if debug mode, log command\n  to io->writeError()\n  (redact credentials/tokens);
+:Set captureOutput = (func_num_args > 3)\nReset errorOutput = "";
+:requiresGitDirEnv($command)\n→ check if git subcommand needs GIT_DIR\n  (show / log / branch / remote set-url);
+
+if (cwd !== null\nAND requiresGitDirEnv?) then (yes)
+    if (Bare repository?\n(no .git subdirectory)) then (yes)
+        :runProcess(['git','config',\n  'safe.bareRepository'], cwd,\n  ['GIT_DIR'=>cwd], tty, $configValue)\n→ extra blocking call;
+        if (configValue === 'explicit'?) then (yes)
+            :env = ['GIT_DIR' => cwd];
+        else (no)
+            :env = null;
+        endif
+    else (no)
+        :env = null;
+    endif
+else (no)
+    :env = null;
+endif
+
+|ProcessExecutor — runProcess|
+:Call runProcess($command, $cwd, $env, $tty, &$output);
+
+if (command is a string?) then (yes — shell command line)
+    if (Windows AND matches\nexecutable prefix?) then (yes)
+        :Replace executable via\ngetExecutable()\n(uses ExecutableFinder,\nskips CMD built-ins);
+    endif
+    :Process::fromShellCommandline\n($command, $cwd, $env,\n null, $timeout);
+else (no — array of arguments)
+    if (Windows AND no path\nseparator in command[0]?) then (yes)
+        :command[0] = getExecutable\n(command[0]);
+    endif
+    :new Process($command, $cwd,\n$env, null, $timeout);
+endif
+
+if (NOT Windows AND tty = true?) then (yes)
+    :process->setTty(true);
+    note right: RuntimeException silently\nswallowed if TTY unsupported
+else (no / Windows)
+endif
+
+if ($output is callable?) then (yes)
+    :Use $output directly\nas process callback;
+else (no)
+    :Build outputHandler() closure\nas process callback;
+endif
+
+:Register SignalHandler\nfor SIGINT / SIGTERM / SIGHUP\n→ on trigger: log abort message;
+
+|Symfony Process|
+:process->run($callback)\n[BLOCKING — streams output\nchunk by chunk via callback];
+
+|ProcessExecutor — runProcess|
+fork
+    :outputHandler($type, $buffer) per chunk;
+    if (captureOutput = true?) then (yes)
+        :return\n(suppress all output);
+    else (no)
+        if (io is null?) then (yes)
+            :echo $buffer directly;
+        else (no)
+            if (type === STDERR?) then (yes)
+                :io->writeErrorRaw\n($buffer, false);
+            else (no)
+                :io->writeRaw\n($buffer, false);
+            endif
+        endif
+    endif
+end fork
+
+if (captureOutput AND\n$output NOT callable?) then (yes)
+    :$output = process->getOutput()\n(populate caller's reference);
+else (no)
+endif
+:errorOutput = process->getErrorOutput();
+
+|ProcessExecutor — doExecute|
+:Catch ProcessSignaledException?;
+if (Exception caught?) then (yes)
+    if (signalHandler->isTriggered()?) then (yes)
+        :signalHandler->exitWithLastSignal()\n→ process terminates;
+        stop
+    endif
+else (no)
+endif
+
+note right
+  **finally block always runs:**
+  signalHandler->unregister()
+end note
+
+:return process->getExitCode() : int;
+
+|Caller|
+:Receive exit code integer;
+stop
+
+@enduml

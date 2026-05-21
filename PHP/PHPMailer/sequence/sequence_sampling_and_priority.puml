@@ -1,0 +1,213 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipantBackgroundColor #F8F9FA
+skinparam sequenceParticipantBorderColor #495057
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceGroupBackgroundColor #E9ECEF
+skinparam sequenceGroupBorderColor #6C757D
+skinparam noteBorderColor #ADB5BD
+skinparam noteBackgroundColor #FFF9C4
+
+title Sampling and Priority Sampling Flow
+
+actor "Caller / Integration" as Caller
+participant "DDTrace\\\\Tracer" as Tracer
+participant "DDTrace\\\\OpenTracer\\\\Tracer" as OTTracer
+participant "DDTrace ext\n(PHP functions)" as Ext
+participant "RootSpanData /\nSpanData" as SpanData
+participant "C Extension\n(ddtrace.so)" as CExt
+
+' ─────────────────────────────────────────────────────────────
+== Set Priority Sampling (Trace-Level) ==
+' ─────────────────────────────────────────────────────────────
+
+Caller -> Tracer : setPrioritySampling($priority)
+activate Tracer
+note right of Tracer
+  $priority constants:
+  AUTO_KEEP / AUTO_REJECT  (agent-decided)
+  USER_KEEP / USER_REJECT  (user-decided)
+  UNKNOWN / UNSET
+end note
+
+Tracer -> Ext : set_priority_sampling($priority, false)
+activate Ext
+Ext -> CExt : store samplingPriority\non active trace RootSpanData
+activate CExt
+CExt --> Ext : ok
+deactivate CExt
+Ext --> Tracer : void
+deactivate Ext
+deactivate Tracer
+
+' ─────────────────────────────────────────────────────────────
+== Set Priority Sampling (Global Default) ==
+' ─────────────────────────────────────────────────────────────
+
+Caller -> Tracer : setPrioritySampling($priority, global=true)
+activate Tracer
+Tracer -> Ext : set_priority_sampling($priority, true)
+activate Ext
+Ext -> CExt : store samplingPriority on RootSpanData\n+ set process-wide default priority
+activate CExt
+CExt --> Ext : ok
+deactivate CExt
+Ext --> Tracer : void
+deactivate Ext
+deactivate Tracer
+
+' ─────────────────────────────────────────────────────────────
+== Set Priority from Distributed (Propagated) Context ==
+' ─────────────────────────────────────────────────────────────
+
+Caller -> Tracer : extractContext($carrier) [distributed tracing]
+activate Tracer
+Tracer -> SpanData : $span->getContext()\n->getPropagatedPrioritySampling()
+activate SpanData
+SpanData --> Tracer : $propagatedPriority (int|null)
+deactivate SpanData
+
+alt propagatedPriority !== null
+    Tracer -> Ext : set_priority_sampling($propagatedPriority, false)
+    activate Ext
+    note right of Ext
+      Updates root span only —
+      honours incoming trace's
+      sampling decision
+    end note
+    Ext -> CExt : store propagated samplingPriority\non RootSpanData
+    activate CExt
+    CExt --> Ext : ok
+    deactivate CExt
+    Ext --> Tracer : void
+    deactivate Ext
+end
+
+deactivate Tracer
+
+' ─────────────────────────────────────────────────────────────
+== Get Priority Sampling ==
+' ─────────────────────────────────────────────────────────────
+
+Caller -> Tracer : getPrioritySampling()
+activate Tracer
+Tracer -> Ext : get_priority_sampling(false)
+activate Ext
+Ext -> CExt : read RootSpanData->samplingPriority
+activate CExt
+CExt --> Ext : int|null priority constant
+deactivate CExt
+Ext --> Tracer : int|null
+deactivate Ext
+Tracer --> Caller : int|null (priority constant)
+deactivate Tracer
+
+' ─────────────────────────────────────────────────────────────
+== Try Drop Span ==
+' ─────────────────────────────────────────────────────────────
+
+Caller -> Ext : try_drop_span($span): bool
+activate Ext
+Ext -> CExt : check drop eligibility for $span
+activate CExt
+
+alt span has non-dropped child spans
+    CExt --> Ext : REJECT (false)
+else distributed tracing headers were generated on this span
+    CExt --> Ext : REJECT (false)
+else a span link to this span was generated
+    CExt --> Ext : REJECT (false)
+else no blocking conditions
+    CExt --> Ext : ACCEPT (true)\n→ span dropped, no metrics collected
+end
+
+deactivate CExt
+Ext --> Caller : bool (true = dropped, false = rejected)
+deactivate Ext
+
+note over Caller, CExt
+  CurlIntegration calls try_drop_span on span close if no curl handles were processed.
+  SymfonyIntegration registers an onClose handler that calls try_drop_span for unneeded spans.
+end note
+
+' ─────────────────────────────────────────────────────────────
+== Tracer Limit Check ==
+' ─────────────────────────────────────────────────────────────
+
+Caller -> Tracer : limited()
+activate Tracer
+Tracer -> Ext : dd_trace_tracer_is_limited()
+activate Ext
+Ext -> CExt : check memory usage vs configured limits
+activate CExt
+CExt --> Ext : bool (true = memory OVERUSED)
+deactivate CExt
+Ext --> Tracer : bool
+deactivate Ext
+Tracer --> Caller : bool (true = tracer is limited)
+deactivate Tracer
+
+' ─────────────────────────────────────────────────────────────
+== Memory Under Limit Check ==
+' ─────────────────────────────────────────────────────────────
+
+Caller -> Ext : dd_trace_check_memory_under_limit()
+activate Ext
+Ext -> CExt : compare current memory usage\nvs DD_TRACE_MEMORY_LIMIT env var
+activate CExt
+CExt --> Ext : bool (true = under limit, false = over limit)
+deactivate CExt
+Ext --> Caller : bool
+deactivate Ext
+
+note right of Ext
+  Inverse semantics vs limited():
+  true  → memory OK (under limit)
+  false → memory over limit
+end note
+
+' ─────────────────────────────────────────────────────────────
+== Add Span Flag – OpenTracing Bridge ==
+' ─────────────────────────────────────────────────────────────
+
+Caller -> OTTracer : startSpan($operationName, $options)
+activate OTTracer
+OTTracer -> Tracer : startSpan($operationName, $options)
+activate Tracer
+Tracer --> OTTracer : SpanData (internal span)
+deactivate Tracer
+
+OTTracer -> Ext : DDTrace\\Internal\\add_span_flag(\n  active_span(), SPAN_FLAG_OPENTRACING)
+activate Ext
+Ext -> CExt : set DDTRACE_SPAN_FLAG_OPENTRACING bit\non SpanData
+activate CExt
+CExt --> Ext : ok
+deactivate CExt
+Ext --> OTTracer : void
+deactivate Ext
+
+OTTracer --> Caller : Span (OpenTracing-tagged)
+deactivate OTTracer
+
+note over OTTracer, CExt
+  @internal — add_span_flag is also used by the OpenTelemetry bridge
+  (SPAN_FLAG_OPENTELEMETRY) to tag spans with their originating API.
+end note
+
+@enduml

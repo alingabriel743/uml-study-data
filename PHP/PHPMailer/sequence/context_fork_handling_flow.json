@@ -1,0 +1,89 @@
+{
+  "scope": "fork_handling_flow",
+  "title": "PHP Process Fork Handling Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "PHPUserCode",
+    "ddtrace_pcntl_fork (wrapper)",
+    "dd_prefork",
+    "OS (pcntl_fork)",
+    "dd_handle_fork",
+    "dd_internal_handle_fork",
+    "ddtrace_sidecar_handle_fork",
+    "COMSWriter",
+    "SpanStack",
+    "DDTrace\\Internal::handle_fork (PHP API)"
+  ],
+  "interaction_flow": [
+    "PHPUserCode → ddtrace_pcntl_fork: pcntl_fork() [intercepted by ddtrace handler]",
+    "ddtrace_pcntl_fork → dd_prefork: dd_prefork() [pre-fork preparation]",
+    "dd_prefork → COMSWriter: ddtrace_coms_flush_shutdown_writer_synchronous() [only if JOIN_BGS_BEFORE_FORK && !SIDECAR_TRACE_SENDER]",
+    "ddtrace_pcntl_fork → OS: dd_pcntl_fork_handler() [calls original pcntl_fork]",
+    "OS → ddtrace_pcntl_fork: returns pid (0=child, >0=parent, -1=error)",
+    "ddtrace_pcntl_fork → dd_handle_fork: dd_handle_fork(return_value)",
+    "dd_handle_fork → [CHILD branch if pid==0]: dd_internal_handle_fork()",
+    "dd_internal_handle_fork → COMSWriter: ddtrace_coms_curl_shutdown() [!SIDECAR_TRACE_SENDER, !WIN32]",
+    "dd_internal_handle_fork → COMSWriter: ddtrace_coms_clean_background_sender_after_fork() [kills inherited BGS thread]",
+    "dd_internal_handle_fork → ddtrace_sidecar_handle_fork: ddtrace_sidecar_handle_fork()",
+    "ddtrace_sidecar_handle_fork → Sidecar: ddtrace_force_new_instance_id()",
+    "ddtrace_sidecar_handle_fork → Sidecar: ddog_sidecar_transport_drop() [drop inherited connection]",
+    "ddtrace_sidecar_handle_fork → Sidecar: reconnect (worker→parent listener, or start new master)",
+    "dd_internal_handle_fork → RemoteConfig: ddog_agent_remote_config_reader_drop() [drop inherited reader]",
+    "dd_internal_handle_fork → RemoteConfig: ddog_shutdown_remote_config() [reset remote config state]",
+    "dd_internal_handle_fork → PRNG: ddtrace_seed_prng() [reseed random for child]",
+    "dd_internal_handle_fork → RuntimeID: ddtrace_generate_runtime_id() [new runtime ID for child]",
+    "dd_internal_handle_fork → Tracer: ddtrace_disable_tracing_in_current_request() [if !DD_TRACE_FORKED_PROCESS]",
+    "dd_internal_handle_fork → SpanStack: ddtrace_free_span_stacks(true) [discard parent spans in child]",
+    "dd_internal_handle_fork → SpanStack: ddtrace_init_span_stacks() [fresh span stack for child]",
+    "dd_internal_handle_fork → SpanStack: ddtrace_push_root_span() [if DD_TRACE_GENERATE_ROOT_SPAN]",
+    "dd_internal_handle_fork → COMSWriter: ddtrace_coms_init_and_start_writer() [start fresh writer in child, !SIDECAR, !WIN32]",
+    "dd_internal_handle_fork → RemoteConfig: ddog_agent_remote_config_reader_for_anon_shm() [re-attach config reader]",
+    "dd_handle_fork → [PARENT branch if pid>0]: ddtrace_coms_restart_writer() [only if JOIN_BGS_BEFORE_FORK && !SIDECAR]"
+  ],
+  "key_relationships": [
+    "ddtrace_pcntl_fork wraps OS pcntl_fork (also ddtrace_pcntl_rfork PHP>=8.1, ddtrace_pcntl_forkx PHP>=8.2)",
+    "dd_handle_fork dispatches to dd_internal_handle_fork (child) or ddtrace_coms_restart_writer (parent)",
+    "dd_internal_handle_fork orchestrates: COMSWriter cleanup, SidecarReconnect, RemoteConfigReset, PRNG reseed, SpanStack reset",
+    "DDTrace\\Internal::handle_fork() is the PHP-level API that calls dd_internal_handle_fork() directly",
+    "dd_trace_disable_in_request() calls ddtrace_disable_tracing_in_current_request() — same primitive used in fork child path",
+    "dd_trace_reset() is a stub (TODO) that returns bool, not used in fork path",
+    "dd_trace_coms_trigger_writer_flush() calls ddtrace_coms_trigger_writer_flush() — triggers async flush of buffered spans via COMSWriter",
+    "Tracer::flush() (DDTrace namespace) closes all spans and force-sends to agent — higher level than coms trigger",
+    "COMSWriter subsystem (coms.c/coms.h): manages background sender thread and curl transport",
+    "Sidecar mode (DD_TRACE_SIDECAR_TRACE_SENDER) bypasses COMSWriter — uses Rust FFI sidecar process instead"
+  ],
+  "branching_conditions": [
+    "fork return value == 0 → child process path (dd_internal_handle_fork)",
+    "fork return value > 0 → parent process path (restart writer if JOIN_BGS_BEFORE_FORK)",
+    "JOIN_BGS_BEFORE_FORK defined only under ASAN builds — controls pre/post-fork writer join",
+    "DD_TRACE_SIDECAR_TRACE_SENDER=true → skip COMSWriter curl operations, use sidecar transport",
+    "DD_TRACE_FORKED_PROCESS=true → keep tracing enabled in child; false (default) → disable tracing in child",
+    "DD_TRACE_ENABLED=false → dd_trace_coms_trigger_writer_flush returns 0 immediately",
+    "DD_TRACE_GENERATE_ROOT_SPAN=true → push new root span in child after stack reset",
+    "DD_DISTRIBUTED_TRACING=true → capture parent trace/span IDs as distributed context in child"
+  ],
+  "php_api_signatures": [
+    "DDTrace\\Internal\\handle_fork(): void  [internal, called post-fork in child]",
+    "dd_trace_disable_in_request(): bool  [disables tracing for current request]",
+    "dd_trace_reset(): bool  [stub/noop, returns true if not globally disabled]",
+    "dd_trace_coms_trigger_writer_flush(): int  [triggers async writer flush, returns count]",
+    "DDTrace\\Tracer::flush(): void  [closes all spans + force-sends to agent]",
+    "dd_trace_synchronous_flush(int $timeout=100): void  [blocking flush with timeout ms]"
+  ],
+  "important_notes": [
+    "Fork handling is transparent to PHP code: ddtrace intercepts pcntl_fork/rfork/forkx at MINIT via datadog_php_install_handler",
+    "Child process must NOT inherit parent's COMSWriter background thread (POSIX: only calling thread is duplicated) — hence cleanup + reinit",
+    "Sidecar transport (ddog/Rust FFI) maintains its own connection state, requires ddtrace_sidecar_handle_fork() reconnect logic",
+    "Default behavior: tracing is DISABLED in forked child unless DD_TRACE_FORKED_PROCESS=true",
+    "Parent span IDs are preserved as distributed context if DD_DISTRIBUTED_TRACING=true, enabling parent→child trace linking",
+    "dd_trace_coms_trigger_writer_flush is the parent-side mechanism to flush buffered spans before child takes over",
+    "Remote config and agent info readers are dropped and re-created in child to avoid shared-memory conflicts"
+  ],
+  "source_files_analyzed": [
+    "ext/handlers_pcntl.c",
+    "ext/ddtrace.c (lines 2430-2451, 2664-2722, 2955-2969)",
+    "ext/sidecar.c (lines 456-520)",
+    "ext/coms.h",
+    "ext/ddtrace.stub.php"
+  ]
+}

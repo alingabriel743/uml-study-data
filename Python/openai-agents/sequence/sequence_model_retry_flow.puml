@@ -1,0 +1,219 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #F1F3F5
+    GroupBorderColor #868E96
+    GroupBackgroundColor #F8F9FA
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #6C757D
+    DividerFontColor #212529
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F0C040
+}
+
+title Model Retry Flow
+
+actor "RunLoop" as RunLoop
+
+box "model_retry.py" #EDF2FF
+    participant "stream_response\n_with_retry" as StreamRetry
+    participant "_evaluate_retry" as EvalRetry
+    participant "_normalize\n_retry_error" as NormalizeErr
+    participant "_call_retry\n_policy" as CallPolicy
+end box
+
+participant "Model\n(get_stream)" as Model
+participant "get_retry_advice\n(provider callable)" as ProviderAdvice
+participant "RetryPolicy\n(user callback)" as RetryPolicy
+participant "rewind\n(callable)" as Rewind
+participant "asyncio.sleep" as Sleep
+
+note over RunLoop, Sleep
+  <b>Retry is opt-in</b> — requires <b>ModelRetrySettings.policy</b> to be set.
+  Stateful requests (conversation_id / previous_response_id) require replay safety approval.
+end note
+
+== Streaming Request Initiated ==
+
+RunLoop -> StreamRetry : stream_response_with_retry(\n  get_stream=model.stream_response,\n  rewind, retry_settings,\n  get_retry_advice,\n  previous_response_id,\n  conversation_id)
+activate StreamRetry
+
+note right of StreamRetry
+  Init counters:
+  request_attempt = 1
+  policy_attempt = 1
+  failed_policy_attempts = 0
+  compatibility_retries_taken = 0
+end note
+
+StreamRetry -> StreamRetry : _should_disable_provider_managed_retries(\n  retry_settings, attempt, stateful_request)
+StreamRetry -> StreamRetry : _should_disable_websocket_pre_event_retry(\n  retry_settings)
+
+StreamRetry -> Model : get_stream()\n[with provider_managed_retries_disabled context]
+activate Model
+Model --> StreamRetry : AsyncIterator[TResponseStreamEvent]
+deactivate Model
+
+== Normal Streaming Loop ==
+
+loop for each stream event
+    StreamRetry -> Model : await stream.__anext__()
+    activate Model
+    Model --> StreamRetry : TResponseStreamEvent
+    deactivate Model
+
+    alt event type NOT IN {"response.created", "response.in_progress"}
+        StreamRetry -> StreamRetry : emitted_retry_unsafe_event = True
+        note right : _stream_event_blocks_retry(event) → True\nFurther retry of this stream is blocked
+    end
+
+    StreamRetry --> RunLoop : yield event
+end
+
+StreamRetry -> StreamRetry : StopAsyncIteration → close stream, return
+StreamRetry --> RunLoop : (stream complete)
+
+== Error Path ==
+
+|||
+== ERROR OCCURS ==
+|||
+
+StreamRetry -> StreamRetry : catch Exception\n→ close stream quietly
+
+alt conversation_locked error AND compat enabled AND retries_taken < 3
+    note over StreamRetry : <b>Compatibility Path</b>\nHandles "conversation_locked" errors\nwithout requiring a retry policy
+    StreamRetry -> Rewind : rewind()\n[rollback session/conversation state]
+    activate Rewind
+    Rewind --> StreamRetry : done
+    deactivate Rewind
+
+    StreamRetry -> Sleep : asyncio.sleep(\n  1 * 2^(n-1))\n[1s → 2s → 4s backoff]
+    activate Sleep
+    Sleep --> StreamRetry : done
+    deactivate Sleep
+
+    StreamRetry -> StreamRetry : request_attempt += 1
+    note right : compatibility_retries_taken++\nLoop back to retry stream
+else policy retry path
+    == Evaluate Retry Eligibility ==
+
+    StreamRetry -> ProviderAdvice : get_retry_advice(\n  ModelRetryAdviceRequest(\n    error, attempt=policy_attempt,\n    stream=True,\n    previous_response_id,\n    conversation_id))
+    activate ProviderAdvice
+    ProviderAdvice --> StreamRetry : ModelRetryAdvice | None\n[suggested, retry_after, replay_safety, reason]
+    deactivate ProviderAdvice
+
+    StreamRetry -> EvalRetry : _evaluate_retry(\n  error, attempt=policy_attempt,\n  max_retries, retry_policy,\n  retry_backoff, stream=True,\n  replay_unsafe_request=stateful_request,\n  emitted_retry_unsafe_event,\n  provider_advice)
+    activate EvalRetry
+
+    == Inside _evaluate_retry ==
+
+    alt attempt > max_retries
+        EvalRetry --> StreamRetry : RetryDecision(retry=False)\n[budget exhausted]
+    else
+        EvalRetry -> NormalizeErr : _normalize_retry_error(\n  error, provider_advice)
+        activate NormalizeErr
+        note right of NormalizeErr
+          Extracts from error chain:
+          • status_code, error_code
+          • Retry-After header value
+          • is_abort, is_network_error, is_timeout
+          Provider advice overrides if provided
+        end note
+        NormalizeErr --> EvalRetry : ModelRetryNormalizedError
+        deactivate NormalizeErr
+
+        alt normalized.is_abort OR emitted_retry_unsafe_event OR provider_advice.replay_safety == "unsafe"
+            EvalRetry --> StreamRetry : RetryDecision(retry=False)\n[abort / unsafe to replay]
+        else retry_policy is None
+            EvalRetry --> StreamRetry : RetryDecision(retry=False)\n[no policy configured — opt-in required]
+        else
+            EvalRetry -> CallPolicy : _call_retry_policy(\n  retry_policy,\n  RetryPolicyContext(\n    error, attempt, max_retries,\n    stream, normalized, provider_advice))
+            activate CallPolicy
+            CallPolicy -> RetryPolicy : retry_policy(context)\n[sync or async callback]
+            activate RetryPolicy
+            RetryPolicy --> CallPolicy : bool | RetryDecision
+            deactivate RetryPolicy
+            CallPolicy --> EvalRetry : RetryDecision
+            deactivate CallPolicy
+
+            alt not decision.retry
+                EvalRetry --> StreamRetry : RetryDecision(retry=False)\n[policy declined]
+            else stateful_request AND not _approves_replay AND not provider_marks_replay_safe
+                EvalRetry --> StreamRetry : RetryDecision(retry=False)\n[replay safety guard: stateful request blocked]
+            else
+                EvalRetry -> EvalRetry : compute delay:\n  decision.delay\n  ?? normalized.retry_after\n  ?? _default_retry_delay(attempt, backoff)
+                note right of EvalRetry
+                  <b>Default backoff formula:</b>
+                  base = min(0.25s × 2.0^(attempt-1), 2.0s)
+                  apply ±12.5% jitter
+                  Delay precedence:
+                  1. decision.delay (policy override)
+                  2. Retry-After header
+                  3. _default_retry_delay
+                end note
+                EvalRetry --> StreamRetry : RetryDecision(retry=True, delay, reason)
+            end
+        end
+    end
+    deactivate EvalRetry
+
+    == Retry Decision Applied ==
+
+    alt not decision.retry
+        StreamRetry -> RunLoop : re-raise error
+    else retry approved
+        StreamRetry -> Rewind : rewind()\n[rollback session/conversation state]
+        activate Rewind
+        Rewind --> StreamRetry : done
+        deactivate Rewind
+
+        StreamRetry -> Sleep : asyncio.sleep(decision.delay)
+        activate Sleep
+        Sleep --> StreamRetry : done
+        deactivate Sleep
+
+        StreamRetry -> StreamRetry : request_attempt += 1\npolicy_attempt += 1\nfailed_policy_attempts += 1
+        note right : Loop restarts → re-issues\nstreaming request to Model
+    end
+end
+
+deactivate StreamRetry
+
+== Non-Streaming Path (get_response_with_retry) ==
+
+note over RunLoop, Sleep
+  <b>get_response_with_retry</b> follows the same retry/compatibility logic,
+  but calls <b>await get_response()</b> directly instead of streaming.
+  On success: <b>apply_retry_attempt_usage(response.usage, failed_attempts)</b>
+  prepends zero-token RequestUsage entries for each failed attempt to preserve accurate usage accounting.
+end note
+
+RunLoop -> StreamRetry : get_response_with_retry(\n  get_response=model.get_response,\n  rewind, retry_settings, ...) → ModelResponse
+
+@enduml

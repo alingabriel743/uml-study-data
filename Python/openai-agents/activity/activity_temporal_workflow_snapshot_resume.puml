@@ -1,0 +1,177 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam note {
+    BackgroundColor #E8F4FD
+    BorderColor #4A90D9
+    FontColor #1A3A5C
+}
+
+title Temporal Workflow Snapshot and Resume
+
+|SessionManagerWorkflow|
+start
+
+:Receive fork_session(ForkSessionRequest)\nvia Temporal @workflow.update;
+:Look up source SessionInfo\nfrom _sessions registry;
+
+:Execute Temporal activity:\npause_workflow(source_workflow_id);
+note right
+  Temporal activities run OUTSIDE the
+  sandboxed workflow runner, allowing
+  interaction with the Temporal server
+end note
+
+|AgentWorkflow (Source)|
+:Receive pause() @workflow.update;
+:Set _pause_requested = True;
+:Wait until current turn completes\n(_paused = True);
+note right
+  pause() is @workflow.update (awaitable):
+  safely quiesces the workflow
+  before snapshot is taken
+end note
+
+|SessionManagerWorkflow|
+:Execute Temporal activity:\nquery_workflow_snapshot(source_workflow_id);
+
+|AgentWorkflow (Source)|
+:get_snapshot() @workflow.query invoked;
+:Read _sandbox_session_state.snapshot\n(fallback: _snapshot field);
+:Return WorkflowSnapshot(\n  sandbox_session_state (backend-specific, nullable),\n  snapshot: SnapshotBase (portable),\n  previous_response_id: str,\n  history: list[dict]\n);
+
+|SessionManagerWorkflow|
+:Receive WorkflowSnapshot;
+:Extract portable snapshot =\nworkflow_snapshot.snapshot (SnapshotBase);
+note right
+  **SnapshotBase is portable** — survives backend switches.
+  SandboxSessionState is backend-specific and
+  NOT carried across fork boundaries.
+  Cross-backend fork: session_state dropped,
+  only SnapshotBase is forwarded.
+end note
+
+if (Backend ID matches?) then (no — mismatch)
+    :Raise ValueError:\nbackend_id mismatch;
+    stop
+else (yes)
+endif
+
+:workflow.start_child_workflow(\n  AgentWorkflow.run,\n  AgentRequest(\n    snapshot = portable_snapshot,\n    history = workflow_snapshot.history,\n    previous_response_id = ...,\n    sandbox_session_state = None\n  ),\n  parent_close_policy = ABANDON\n);
+note right
+  ABANDON policy ensures child AgentWorkflows
+  survive SessionManagerWorkflow restarts
+end note
+
+:Register new SessionInfo\nin _sessions registry;
+
+|AgentWorkflow (Resumed)|
+:AgentWorkflow.run(AgentRequest) initializes;
+note right
+  _snapshot = request.snapshot (SnapshotBase)
+  _conversation_history = request.history
+  _previous_response_id = request.previous_response_id
+  _sandbox_session_state = None (fork path)
+  or request.sandbox_session_state (turn-to-turn path)
+end note
+
+repeat
+
+    :workflow.wait_condition:\npending_messages > 0;
+    :Dequeue user_messages;
+    :Set _turn_status = 'thinking';
+    :_build_agent(manifest) -> SandboxAgent;
+    :Build RunConfig with SandboxRunConfig(\n  client = temporal_sandbox_client,\n  session_state = _sandbox_session_state,\n  snapshot = _snapshot\n);
+
+    |SandboxRuntimeSessionManager|
+    :ensure_session(agent, capabilities, is_resumed_state);
+
+    if (sandbox_config.session not None?) then (yes — live session injected)
+        :Use injected BaseSandboxSession directly;
+    else (no)
+        :_resolve_client() -> BaseSandboxClient\n(Daytona | Docker | E2B | UnixLocal);
+        :_resume_state_payload_for_agent(\n  client, agent, agent_id\n);
+        note right
+          Uses stable name-based resume_key
+          to support multi-agent runs
+        end note
+
+        if (session_state payload available?\n(turn-to-turn or RunState resume)) then (yes)
+            :client.deserialize_session_state(payload)\n-> SandboxSessionState;
+            :_process_resumed_state_manifest(\n  agent, capabilities, session_state\n);
+            :client.resume(explicit_state)\n-> BaseSandboxSession\n(reconnect existing sandbox);
+        else (no — fork from SnapshotBase)
+            :_resolve_snapshot_spec(\n  sandbox_config.snapshot\n) -> SnapshotBase;
+            :_resolve_manifest(agent)\n_process_manifest(capabilities, manifest)\n-> effective_manifest;
+            :client.create(\n  snapshot = snapshot_spec,\n  manifest = effective_manifest,\n  options = options\n) -> new SandboxSession\nseeded from snapshot filesystem;
+        endif
+
+        :_configure_session_materialization(\n  session, concurrency_limits\n);
+        :resources.ensure_started()\n-> session.start();
+    endif
+
+    :Return BaseSandboxSession\nto AgentWorkflow turn runner;
+
+    |AgentWorkflow (Resumed)|
+    :Runner.run(\n  agent, user_messages, run_config,\n  hooks, previous_response_id\n) -> RunResult;
+    note right
+      All LLM calls and sandbox operations run
+      as Temporal activities via OpenAIAgentsPlugin.
+      They are NOT replayed during
+      Temporal workflow history replay.
+    end note
+
+    :Extract _previous_response_id\n= result.last_response_id;
+    :result.to_state() -> RunState;\nstate.to_json() -> dict;
+    :Parse dict['sandbox']['session_state']\nvia SandboxSessionState.parse();
+    :Store _sandbox_session_state;\nUpdate _snapshot = _sandbox_session_state.snapshot;
+
+    |SandboxRuntimeSessionManager|
+    :cleanup(): iterate _resources_by_agent;
+    :resources.cleanup() for each agent session;
+    :serialize_resume_state() -> dict {\n  backend_id,\n  current_agent_key,\n  current_agent_name,\n  session_state: client.serialize_session_state(),\n  sessions_by_agent: _serialize_sessions_by_agent()\n};
+    note right
+      Stored in RunState._sandbox.
+      Used on NEXT turn (turn-to-turn resume)
+      or after workflow restart (RunState resume).
+      Stable name-based keys ensure correct
+      agent session lookup in multi-agent runs.
+    end note
+
+    |AgentWorkflow (Resumed)|
+    :Set _turn_status = 'idle';
+
+repeat while (More messages?) is (yes)
+
+:Return AgentResponse;
+stop
+
+@enduml

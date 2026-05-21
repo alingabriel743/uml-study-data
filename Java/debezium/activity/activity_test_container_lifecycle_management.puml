@@ -1,0 +1,155 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #212529
+    EndColor #212529
+}
+skinparam swimlane {
+    BackgroundColor #F8F9FA
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleBackgroundColor #E9ECEF
+}
+
+title Test Container Lifecycle Management
+
+|Quarkus Test Framework|
+start
+:Quarkus starts integration test suite;
+fork
+  |PostgresTestResourceLifecycleManager|
+  :**[Static Init]**
+  Create GenericContainer
+  image: quay.io/debezium/example-postgres
+  ── withEnv POSTGRES_USER=postgres
+  ── withEnv POSTGRES_PASSWORD=postgres
+  ── withEnv POSTGRES_DB=postgres
+  ── withEnv POSTGRES_INITDB_ARGS=-E UTF8
+  ── withEnv LANG=en_US.utf8
+  ── withExposedPorts(5432)
+  ── withStartupTimeout(30s);
+
+  |Quarkus Test Framework|
+  :call PostgresManager.start();
+
+  |PostgresTestResourceLifecycleManager|
+  :container.start();
+  :Wait for log pattern
+  "database system is ready
+  to accept connections"
+  (2 occurrences, timeout 30s);
+  :Build ConcurrentHashMap config params
+  ── hostname = 'localhost'
+  ── port = container.getMappedPort(5432)
+  ── user = 'postgres'
+  ── password = 'postgres'
+  ── dbname = 'postgres';
+
+  |Quarkus Test Framework|
+  :Receive Postgres config params
+  (debezium.source.database.*);
+
+fork again
+  |SchemaRegistryTestResourceLifecycleManager|
+  :**[Static Init]**
+  Create shared Docker Network;
+  :Create KafkaContainer
+  image: quay.io/debezium/confluentinc-cp-kafka:7.2.10
+  ── asCompatibleSubstituteFor
+     ('confluentinc/cp-kafka')
+  ── withNetwork(network);
+  :Create SchemaRegistryContainer
+  ── withNetwork(network)
+  ── withKafka(kafkaContainer)
+  ── withLogConsumer(Slf4jLogConsumer)
+  ── dependsOn(kafkaContainer)
+  ── withStartupTimeout(90s);
+
+  |Quarkus Test Framework|
+  :call SchemaRegistryManager.start();
+
+  |SchemaRegistryTestResourceLifecycleManager|
+  :Startables.deepStart(
+    Stream.of(kafkaContainer,
+              schemaRegistryContainer)
+  ).join()
+  — ordered parallel startup
+  — blocks until both ready (timeout 90s);
+  :Build ConcurrentHashMap config params
+  ── schema.registry.url =
+     'http://' + host + ':' +
+     getMappedPort(8081);
+
+  |Quarkus Test Framework|
+  :Receive Schema Registry config param
+  (debezium.format.schema.registry.url);
+
+end fork
+
+|Quarkus Test Framework|
+:Inject all config params into
+Quarkus test application context;
+:Execute integration tests;
+
+fork
+  |Quarkus Test Framework|
+  :call PostgresManager.stop();
+
+  |PostgresTestResourceLifecycleManager|
+  if (container != null?) then (yes)
+    :container.stop();
+  else (no)
+  endif
+  note right
+    Exceptions silently
+    swallowed
+  end note
+
+fork again
+  |Quarkus Test Framework|
+  :call SchemaRegistryManager.stop();
+
+  |SchemaRegistryTestResourceLifecycleManager|
+  if (schemaRegistryContainer != null?) then (yes)
+    :schemaRegistryContainer.stop();
+    note right
+      KafkaContainer NOT
+      explicitly stopped
+      (potential resource leak)
+    end note
+  else (no)
+  endif
+  note right
+    Exceptions silently
+    swallowed
+  end note
+
+end fork
+
+|Quarkus Test Framework|
+:Test suite teardown complete;
+stop
+
+@enduml

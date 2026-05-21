@@ -1,0 +1,161 @@
+{
+  "scope": "dapr_memory_session",
+  "title": "Dapr Memory Session",
+  "diagram_type": "sequence",
+  "description": "Storing and retrieving agent conversation state via the Dapr state store, with ETag-based optimistic concurrency conflict handling",
+
+  "key_participants": [
+    "Caller (Runner)",
+    "DaprSession",
+    "asyncio.Lock",
+    "SessionSettings / resolve_session_limit",
+    "DaprClient (gRPC sidecar)",
+    "DaprStateStore"
+  ],
+
+  "class_info": {
+    "DaprSession": {
+      "extends": "SessionABC",
+      "module": "agents.extensions.memory.dapr_session",
+      "key_attributes": [
+        "session_id: str",
+        "session_settings: SessionSettings | None",
+        "_dapr_client: DaprClient",
+        "_state_store_name: str",
+        "_ttl: int | None",
+        "_consistency: ConsistencyLevel ('eventual'|'strong')",
+        "_lock: asyncio.Lock",
+        "_owns_client: bool",
+        "_messages_key: '{session_id}:messages'",
+        "_metadata_key: '{session_id}:metadata'"
+      ],
+      "constants": {
+        "_MAX_WRITE_ATTEMPTS": 5,
+        "_RETRY_BASE_DELAY_SECONDS": 0.05,
+        "_RETRY_MAX_DELAY_SECONDS": 1.0
+      },
+      "constructors": [
+        "__init__(session_id, *, state_store_name, dapr_client, ttl=None, consistency='eventual', session_settings=None)",
+        "from_address(session_id, *, state_store_name, dapr_address='localhost:50001', session_settings=None, **kwargs) -> DaprSession  [classmethod, creates+owns DaprClient]"
+      ]
+    }
+  },
+
+  "interaction_flows": {
+
+    "get_items": [
+      "Caller → DaprSession.get_items(limit=None)",
+      "DaprSession → resolve_session_limit(limit, session_settings) → session_limit",
+      "DaprSession → asyncio.Lock.acquire()",
+      "DaprSession → DaprSession._get_read_metadata() → {'consistency': self._consistency}",
+      "DaprSession → DaprClient.get_state(store_name, key=messages_key, state_metadata) → StateResponse",
+      "DaprClient → DaprStateStore: gRPC GetState",
+      "DaprStateStore → DaprClient: StateResponse(data, etag)",
+      "DaprSession → DaprSession._decode_messages(response.data) → list[Any]",
+      "DaprSession: apply limit slice → messages[-session_limit:]  (if session_limit not None)",
+      "DaprSession: for each msg → _deserialize_item(msg) → TResponseInputItem  (if msg is str)",
+      "DaprSession → asyncio.Lock.release()",
+      "DaprSession → Caller: return list[TResponseInputItem]"
+    ],
+
+    "add_items": [
+      "Caller → DaprSession.add_items(items: list[TResponseInputItem])",
+      "DaprSession: guard — return early if items is empty",
+      "DaprSession: for each item → _serialize_item(item) → json.dumps(item) → serialized_items: list[str]",
+      "DaprSession → asyncio.Lock.acquire()",
+      "--- retry loop (attempt 1..MAX_WRITE_ATTEMPTS=5) ---",
+      "DaprSession → DaprClient.get_state(store_name, key=messages_key, state_metadata=_get_read_metadata()) → StateResponse(data, etag)",
+      "DaprClient → DaprStateStore: gRPC GetState",
+      "DaprSession → _decode_messages(response.data) → existing_messages",
+      "DaprSession: updated_messages = existing_messages + serialized_items",
+      "DaprSession: messages_json = json.dumps(updated_messages)",
+      "DaprSession → DaprSession._get_state_options(concurrency=Concurrency.first_write) → StateOptions",
+      "DaprSession → DaprSession._get_metadata() → {'ttlInSeconds': str(ttl)} (if ttl set)",
+      "DaprSession → DaprClient.save_state(store_name, key=messages_key, value=messages_json, etag=etag, state_metadata, options=StateOptions(first_write)) → success/exception",
+      "DaprClient → DaprStateStore: gRPC SaveState with ETag",
+      "DaprStateStore → DaprClient: OK  [ETag matches → write succeeds, break loop]",
+      "  OR DaprStateStore → DaprClient: ABORTED/FAILED_PRECONDITION  [ETag conflict]",
+      "  ON conflict exception → DaprSession._handle_concurrency_conflict(error, attempt)",
+      "    → _is_concurrency_conflict(error): checks gRPC code (ABORTED|FAILED_PRECONDITION) or message markers",
+      "    → if attempt >= 5: return False → raise exception",
+      "    → _calculate_retry_delay(attempt): base=0.05*2^(attempt-1) capped at 1.0s + 10% jitter",
+      "    → asyncio.sleep(delay)",
+      "    → return True → continue loop",
+      "--- end retry loop ---",
+      "DaprSession: build metadata dict {session_id, created_at, updated_at}",
+      "DaprSession → DaprClient.save_state(store_name, key=metadata_key, value=json(metadata), state_metadata, options=_get_state_options())",
+      "DaprClient → DaprStateStore: gRPC SaveState (metadata, no ETag/concurrency check)",
+      "DaprSession → asyncio.Lock.release()",
+      "DaprSession → Caller: return None"
+    ],
+
+    "pop_item": [
+      "Caller → DaprSession.pop_item()",
+      "DaprSession → asyncio.Lock.acquire()",
+      "--- retry loop (attempt 1..MAX_WRITE_ATTEMPTS=5) ---",
+      "DaprSession → DaprClient.get_state(store_name, key=messages_key, state_metadata) → StateResponse(data, etag)",
+      "DaprSession → _decode_messages(response.data) → messages",
+      "DaprSession: if messages empty → release lock, return None",
+      "DaprSession: last_item = messages.pop()  (removes last element)",
+      "DaprSession: messages_json = json.dumps(remaining messages)",
+      "DaprSession → DaprClient.save_state(key=messages_key, value=messages_json, etag=etag, options=first_write)",
+      "DaprClient → DaprStateStore: gRPC SaveState with ETag",
+      "  ON conflict exception → _handle_concurrency_conflict(error, attempt) → retry or raise",
+      "--- end retry loop ---",
+      "DaprSession: if last_item is str → _deserialize_item(last_item) → TResponseInputItem",
+      "DaprSession → asyncio.Lock.release()",
+      "DaprSession → Caller: return TResponseInputItem | None"
+    ],
+
+    "clear_session": [
+      "Caller → DaprSession.clear_session()",
+      "DaprSession → asyncio.Lock.acquire()",
+      "DaprSession → DaprClient.delete_state(store_name, key=messages_key, options=_get_state_options())",
+      "DaprClient → DaprStateStore: gRPC DeleteState",
+      "DaprSession → DaprClient.delete_state(store_name, key=metadata_key, options=_get_state_options())",
+      "DaprClient → DaprStateStore: gRPC DeleteState",
+      "DaprSession → asyncio.Lock.release()"
+    ],
+
+    "ping": [
+      "Caller → DaprSession.ping()",
+      "DaprSession → DaprClient.get_state(store_name, key='__ping__', state_metadata) → OK: return True",
+      "  ON exception → DaprSession → DaprClient.save_state(key='__ping__', value='ok', ...)",
+      "    → DaprSession → DaprClient.get_state(key='__ping__') → OK: return True",
+      "    → ON exception → logger.error(...) → return False"
+    ]
+  },
+
+  "concurrency_conflict_handling": {
+    "_is_concurrency_conflict": "Checks gRPC status code name in {ABORTED, FAILED_PRECONDITION} OR message contains: 'etag mismatch', 'etag does not match', 'precondition failed', 'concurrency conflict', 'invalid etag', 'failed to set key', 'user_script'",
+    "_calculate_retry_delay": "base = 0.05 * 2^max(0, attempt-1), capped at 1.0s, plus uniform jitter in [0, 10% of base]",
+    "_handle_concurrency_conflict": "Returns True (should retry) if: is_concurrency_conflict AND attempt < 5. Sleeps for calculated delay before returning True. Returns False to propagate exception otherwise.",
+    "strategy": "Optimistic concurrency via ETag + Concurrency.first_write. Read-modify-write with up to 5 retries and exponential backoff with jitter."
+  },
+
+  "key_relationships": [
+    "DaprSession extends SessionABC (protocol implementation)",
+    "DaprSession owns/wraps DaprClient (gRPC async client to Dapr sidecar)",
+    "DaprClient communicates with DaprStateStore via Dapr sidecar gRPC",
+    "DaprSession uses asyncio.Lock for mutual exclusion on all state operations",
+    "DaprSession depends on SessionSettings (via resolve_session_limit) for history limit",
+    "from_address() factory creates DaprClient internally (_owns_client=True); direct constructor accepts injected client",
+    "State stored under two keys: '{session_id}:messages' (list of serialized items) and '{session_id}:metadata' (timestamps)"
+  ],
+
+  "important_notes": [
+    "ETag-based optimistic locking: save_state uses Concurrency.first_write to detect conflicts",
+    "Consistency levels: 'eventual' (default) or 'strong' — passed via state_metadata for reads, StateOptions for writes",
+    "TTL: optional, passed as metadata 'ttlInSeconds' — support depends on backing store",
+    "Messages stored as JSON array of serialized strings; metadata stored as separate key",
+    "_serialize_item/_deserialize_item are overridable (json.dumps/json.loads by default)",
+    "asyncio.Lock ensures no concurrent reads/writes within same DaprSession instance",
+    "close() only closes DaprClient if _owns_client=True; supports async context manager (__aenter__/__aexit__)",
+    "Used by Runner to load history before each turn and persist new items after each turn"
+  ],
+
+  "source_files_analyzed": [
+    "src/agents/extensions/memory/dapr_session.py",
+    "docs/sessions/index.md"
+  ]
+}

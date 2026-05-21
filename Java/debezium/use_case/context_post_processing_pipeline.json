@@ -1,0 +1,135 @@
+{
+  "scope": "post_processing_pipeline",
+  "title": "Post-Processing Pipeline",
+  "diagram_type": "use_case",
+  "description": "Developer plugs in post-processors to enrich or filter records after capture, before they are placed on the change event queue.",
+
+  "actors": [
+    {
+      "name": "Developer",
+      "type": "primary",
+      "description": "Configures and implements custom PostProcessors via connector config or SPI"
+    },
+    {
+      "name": "Connector (BaseSourceTask)",
+      "type": "system",
+      "description": "Registers service providers and bootstraps the service registry on startup"
+    },
+    {
+      "name": "EventDispatcher",
+      "type": "system",
+      "description": "Invokes doPostProcessing(key, value) on every captured change record"
+    },
+    {
+      "name": "PostProcessorFactory (SPI)",
+      "type": "external",
+      "description": "Third-party extension point loaded via java.util.ServiceLoader to supply additional processors"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Configure Post-Processors",
+      "actor": "Developer",
+      "description": "Developer sets 'custom.post.processors' in connector config listing processor names. Each name requires a '<name>.type' class and optional '<name>.<option>' properties (new convention: 'custom.post.processors.<name>.*').",
+      "trigger": "Connector configuration at startup"
+    },
+    {
+      "id": "UC2",
+      "name": "Register PostProcessorRegistryServiceProvider",
+      "actor": "Connector (BaseSourceTask)",
+      "description": "BaseSourceTask.registerServiceProviders() calls serviceRegistry.registerServiceProvider(new PostProcessorRegistryServiceProvider()). Registers the provider lazily — the service is only created on first getService() call.",
+      "trigger": "Connector task start"
+    },
+    {
+      "id": "UC3",
+      "name": "Load and Instantiate PostProcessors",
+      "actor": "Connector (BaseSourceTask)",
+      "description": "DefaultServiceRegistry.getService(PostProcessorRegistry.class) triggers PostProcessorRegistryServiceProvider.createService(). It reads config, instantiates each PostProcessor via reflection (configuration.getInstance(type, PostProcessor.class)), calls postProcessor.configure(properties), then merges any processors from ServiceLoader<PostProcessorFactory>. Returns a PostProcessorRegistry holding the immutable list.",
+      "trigger": "First getService(PostProcessorRegistry.class) call"
+    },
+    {
+      "id": "UC4",
+      "name": "Inject Dependencies into PostProcessors",
+      "actor": "Connector (BaseSourceTask)",
+      "description": "DefaultServiceRegistry.doMultiPhaseInitialization() runs: injectDependencies (scans @InjectService methods + ServiceRegistryAware.injectServiceRegistry), configureService (Configurable.configure), startService (Startable.start). PostProcessorRegistry.start() injects BeanRegistry and ServiceRegistry into each processor that implements BeanRegistryAware / ServiceRegistryAware.",
+      "trigger": "Service initialization lifecycle"
+    },
+    {
+      "id": "UC5",
+      "name": "Apply Post-Processors to Change Record",
+      "actor": "EventDispatcher",
+      "description": "EventDispatcher.doPostProcessing(Object key, Struct value) iterates postProcessorRegistry.getProcessors() and calls processor.apply(key, value) on each. The Struct value is still mutable at this stage, enabling enrichment or filtering before the record is enqueued.",
+      "trigger": "Every snapshot or streaming change event dispatched"
+    },
+    {
+      "id": "UC6",
+      "name": "Re-select Columns (Built-in PostProcessor)",
+      "actor": "Developer",
+      "description": "Developer enables ReselectColumnsPostProcessor (implements PostProcessor, BeanRegistryAware, ServiceRegistryAware). On apply(), it re-queries the DB via JdbcConnection for columns that contain the unavailable-value placeholder or are null, patching the Struct in-place.",
+      "trigger": "apply(key, value) called by EventDispatcher"
+    },
+    {
+      "id": "UC7",
+      "name": "Supply External PostProcessors via SPI",
+      "actor": "PostProcessorFactory (SPI)",
+      "description": "Third party implements PostProcessorFactory and registers it in META-INF/services. PostProcessorRegistryServiceProvider uses ServiceLoader<PostProcessorFactory>.findFirst().map(PostProcessorFactory::get) and appends the returned list to the registry.",
+      "trigger": "PostProcessorRegistry creation"
+    },
+    {
+      "id": "UC8",
+      "name": "Shut Down and Close PostProcessors",
+      "actor": "Connector (BaseSourceTask)",
+      "description": "DefaultServiceRegistry.close() iterates registrations in reverse order, calling stopService() which calls Closeable.close() on each. PostProcessorRegistry.close() calls postProcessor.close() for every processor, releasing resources.",
+      "trigger": "Connector task stop"
+    }
+  ],
+
+  "key_relationships": [
+    "Developer configures UC1, enables UC6, implements UC7",
+    "BaseSourceTask (Connector) triggers UC2, UC3, UC4, UC8",
+    "EventDispatcher triggers UC5 for every change record",
+    "UC3 includes UC4 (multi-phase initialization)",
+    "UC5 includes UC6 when ReselectColumnsPostProcessor is registered",
+    "UC7 extends UC3 (SPI extension point)",
+    "PostProcessorRegistryServiceProvider implements ServiceProvider<PostProcessorRegistry>",
+    "PostProcessorRegistry implements Service, Startable, Closeable, ServiceRegistryAware",
+    "PostProcessor (interface) extended by ReselectColumnsPostProcessor",
+    "DefaultServiceRegistry implements ServiceRegistry; manages lifecycle of all services"
+  ],
+
+  "key_classes": [
+    "PostProcessorRegistryServiceProvider — ServiceProvider<PostProcessorRegistry>; createService() + getServiceClass()",
+    "PostProcessorRegistry — Service, Startable, Closeable, ServiceRegistryAware; holds List<PostProcessor>; start() injects deps into processors",
+    "PostProcessor (interface) — configure(Map), apply(Object key, Struct value), close()",
+    "PostProcessorFactory (interface) — get(): List<PostProcessor>; loaded via ServiceLoader",
+    "DefaultServiceRegistry — implements ServiceRegistry; ConcurrentMap registrations; getService(), registerServiceProvider(), doMultiPhaseInitialization()",
+    "ServiceRegistry (interface) — getService(Class<T>), tryGetService(Class<T>), registerServiceProvider(ServiceProvider<T>), close()",
+    "EventDispatcher — holds postProcessorRegistry; doPostProcessing(key, value) iterates processors",
+    "BaseSourceTask — registerServiceProviders() registers PostProcessorRegistryServiceProvider + others",
+    "ReselectColumnsPostProcessor — concrete PostProcessor; BeanRegistryAware, ServiceRegistryAware; re-selects DB columns on apply()"
+  ],
+
+  "configuration_keys": [
+    "CommonConnectorConfig.CUSTOM_POST_PROCESSORS — comma-separated list of processor names",
+    "<name>.type — fully-qualified PostProcessor class (old convention)",
+    "custom.post.processors.<name>.type — fully-qualified PostProcessor class (new convention)",
+    "<name>.<option> / custom.post.processors.<name>.<option> — per-processor config properties"
+  ],
+
+  "important_notes": "PostProcessors operate on raw mutable Structs before change event queue insertion — unlike Kafka SMTs which operate on serialized records. Dependency injection uses @InjectService annotation scanned by DefaultServiceRegistry. Old config convention is deprecated. ServiceLoader<PostProcessorFactory> SPI allows external processor bundles.",
+
+  "source_files_analyzed": [
+    "debezium-connector-common/src/main/java/io/debezium/processors/PostProcessorRegistryServiceProvider.java",
+    "debezium-connector-common/src/main/java/io/debezium/processors/PostProcessorRegistry.java",
+    "debezium-connector-common/src/main/java/io/debezium/processors/spi/PostProcessor.java",
+    "debezium-connector-common/src/main/java/io/debezium/processors/spi/PostProcessorFactory.java",
+    "debezium-connector-common/src/main/java/io/debezium/processors/reselect/ReselectColumnsPostProcessor.java",
+    "debezium-connector-common/src/main/java/io/debezium/service/DefaultServiceRegistry.java",
+    "debezium-connector-common/src/main/java/io/debezium/service/spi/ServiceRegistry.java",
+    "debezium-connector-common/src/main/java/io/debezium/service/spi/ServiceRegistryAware.java",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/EventDispatcher.java",
+    "debezium-connector-common/src/main/java/io/debezium/connector/common/BaseSourceTask.java"
+  ]
+}

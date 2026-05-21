@@ -1,0 +1,241 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ActorBorderColor #495057
+    ActorBackgroundColor #F8F9FA
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    DividerBackgroundColor #DEE2E6
+    GroupBorderColor #6C757D
+    NoteBackgroundColor #FFF3CD
+    NoteBorderColor #856404
+}
+
+title OpenTelemetry SpanBuilder Flow\n<size:11>(DDTrace PHP — OTel-compatible span construction lifecycle)</size>
+
+actor "Application" as App
+
+box "OpenTelemetry API / DDTrace OTel Bridge" #E9ECEF
+    participant "Tracer\n(TracerInterface)" as Tracer
+    participant "SpanBuilder\n(DDTrace\\OTel\\SDK\\Trace)" as Builder
+    participant "Context\n(OpenTelemetry\\Context)" as Ctx
+    participant "SpanContext\n(DDTrace\\OTel\\API\\Trace)" as SpanCtx
+    participant "Span\n(DDTrace\\OTel\\SDK\\Trace)" as Span
+end box
+
+box "DDTrace Internal" #DEE2E6
+    participant "TracerSharedState\n(Sampler + Resource)" as SharedState
+    participant "SpanProcessor" as Processor
+    participant "DDTrace\\SpanData\n(internal bridge)" as DDSpan
+end box
+
+' ─── Phase 1: Create SpanBuilder ───────────────────────────────────────────
+== Phase 1: Create SpanBuilder ==
+
+App -> Tracer : spanBuilder($spanName)
+activate Tracer
+
+Tracer -> SharedState : getSpanProcessor()\ngetSampler()\ngetResource()
+activate SharedState
+SharedState --> Tracer : SpanProcessor, Sampler, ResourceInfo
+deactivate SharedState
+
+Tracer -> Builder : new SpanBuilder(\n  $spanName,\n  InstrumentationScope,\n  TracerSharedState\n)
+activate Builder
+
+Tracer --> App : SpanBuilderInterface
+deactivate Tracer
+
+' ─── Phase 2: Configure the Builder (fluent chaining) ──────────────────────
+== Phase 2: Configure the Builder (fluent API) ==
+
+note over App, Builder
+  All setter methods return SpanBuilderInterface
+  for fluent chaining — order is not significant.
+end note
+
+App -> Builder : setParent($context)\n[ContextInterface | false | null]
+activate Builder
+Builder -> Ctx : Context::resolve($context)
+activate Ctx
+note right of Ctx
+  false/null → root span (no parent)
+  ContextInterface → extract parent span
+  from propagated context
+end note
+Ctx --> Builder : ContextInterface (resolved parent)
+deactivate Ctx
+Builder --> App : SpanBuilderInterface
+deactivate Builder
+
+App -> Builder : setAttribute($key, $value)
+activate Builder
+Builder --> App : SpanBuilderInterface
+deactivate Builder
+
+App -> Builder : setAttributes($attributes)
+activate Builder
+Builder --> App : SpanBuilderInterface
+deactivate Builder
+
+App -> Builder : addLink(SpanContextInterface $ctx,\n  iterable $attributes = [])
+activate Builder
+note right of Builder
+  Links connect this span to
+  other traces (e.g. batch jobs,
+  fan-out scenarios).
+end note
+Builder --> App : SpanBuilderInterface
+deactivate Builder
+
+App -> Builder : addEvent($name, $attributes, $timestamp)
+activate Builder
+Builder --> App : SpanBuilderInterface
+deactivate Builder
+
+App -> Builder : setSpanKind($spanKind)
+activate Builder
+note right of Builder
+  SpanKind: SERVER, CLIENT,
+  PRODUCER, CONSUMER, INTERNAL
+end note
+Builder --> App : SpanBuilderInterface
+deactivate Builder
+
+App -> Builder : setStartTimestamp($timestampNanos)
+activate Builder
+Builder --> App : SpanBuilderInterface
+deactivate Builder
+
+' ─── Phase 3: Start the Span ───────────────────────────────────────────────
+== Phase 3: startSpan() — Terminal Operation ==
+
+App -> Builder : startSpan()
+activate Builder
+
+Builder -> SpanCtx : SpanContext::create(\n  $traceId, $spanId,\n  TraceFlags, TraceState\n)
+activate SpanCtx
+note right of SpanCtx
+  For distributed traces, use:
+  SpanContext::createFromRemoteParent()
+  SpanContext::createFromLocalSpan()
+  to bridge DDTrace ↔ OTel contexts.
+end note
+SpanCtx --> Builder : SpanContextInterface
+deactivate SpanCtx
+
+Builder -> DDSpan : new DDTrace\\SpanData\n(internal span allocation)
+activate DDSpan
+DDSpan --> Builder : DDTrace\\SpanData
+deactivate DDSpan
+
+Builder -> Span : Span::startSpan(\n  DDSpanData, SpanContext,\n  InstrumentationScope, $kind,\n  $parentSpan, $parentContext,\n  SpanProcessor, ResourceInfo,\n  $attributes[], $links[],\n  $totalRecordedLinks, $events[]\n)
+activate Span
+
+Span -> Processor : onStart($span, $parentContext)
+activate Processor
+note right of Processor
+  SpanProcessor.onStart() is triggered
+  immediately — used for sampling
+  decisions and context enrichment.
+end note
+Processor --> Span : (callback complete)
+deactivate Processor
+
+Span --> Builder : Span (implements SpanInterface)
+deactivate Span
+
+Builder --> App : SpanInterface
+deactivate Builder
+
+' ─── Phase 4: Active Span Work ─────────────────────────────────────────────
+== Phase 4: Active Span Operations ==
+
+App -> Span : activate()
+activate Span
+note right of Span
+  Span is NOT automatically current.
+  activate() pushes it onto Context
+  and returns a ScopeInterface.
+  Call $scope->detach() when done.
+end note
+Span --> App : ScopeInterface
+deactivate Span
+
+App -> Span : setAttribute($key, $value)
+activate Span
+Span --> App : SpanInterface
+deactivate Span
+
+App -> Span : addEvent($name, $attributes, $timestamp)
+activate Span
+Span --> App : SpanInterface
+deactivate Span
+
+opt Exception occurred
+    App -> Span : recordException(Throwable $ex,\n  iterable $attributes = [])
+    activate Span
+    Span --> App : SpanInterface
+    deactivate Span
+end
+
+App -> Span : setStatus($code, $description)\n[OK | ERROR | UNSET]
+activate Span
+Span --> App : SpanInterface
+deactivate Span
+
+' ─── Phase 5: End the Span ─────────────────────────────────────────────────
+== Phase 5: End the Span ==
+
+App -> Span : end(?$endEpochNanos)
+activate Span
+
+Span -> Processor : onEnd($span)
+activate Processor
+note right of Processor
+  SpanProcessor.onEnd() exports the
+  completed span to the configured
+  Exporter (e.g. OTLP, Datadog Agent).
+end note
+Processor --> Span : (export complete)
+deactivate Processor
+
+Span -> DDSpan : finalize internal DDTrace\\SpanData\n(duration, tags, resource)
+activate DDSpan
+DDSpan --> Span : (finalized)
+deactivate DDSpan
+
+Span --> App : void
+deactivate Span
+
+note over App, Processor
+  **DDTrace OTel Bridge Note:**
+  SpanBuilder and Span are final DDTrace\\OpenTelemetry classes that natively implement
+  the standard OpenTelemetry API interfaces. Span::getDDSpan() provides access to the
+  underlying DDTrace\\SpanData for low-level DDTrace operations.
+end note
+
+@enduml

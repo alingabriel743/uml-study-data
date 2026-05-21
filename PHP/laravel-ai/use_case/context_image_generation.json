@@ -1,0 +1,160 @@
+{
+  "scope": "image_generation",
+  "title": "Image Generation",
+  "diagram_type": "use_case",
+  "description": "Developer generates images from text prompts using image-capable providers (OpenAI DALL-E, XAI, etc.).",
+
+  "actors": [
+    {
+      "name": "Developer",
+      "type": "primary",
+      "description": "Initiates image generation requests via the Image facade or PendingImageGeneration fluent API"
+    },
+    {
+      "name": "AI Provider",
+      "type": "external_system",
+      "description": "External image generation service (OpenAI DALL-E, XAI Aurora). Implements ImageProvider + ImageGateway interfaces.",
+      "concrete_implementations": ["XaiProvider (uses XaiImageGateway)", "OpenAiProvider"]
+    },
+    {
+      "name": "Queue System",
+      "type": "external_system",
+      "description": "Laravel queue that executes GenerateImage jobs asynchronously"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Generate Image Synchronously",
+      "actor": "Developer",
+      "entry_point": "Image::of($prompt)->generate($provider, $model)",
+      "flow": [
+        "Developer calls Image::of(prompt) → returns PendingImageGeneration",
+        "Developer optionally chains: size(), quality(), attachments(), timeout()",
+        "Developer calls generate(provider?, model?) on PendingImageGeneration",
+        "PendingImageGeneration resolves provider list via Provider::formatProviderAndModelList()",
+        "Iterates providers; calls Ai::fakeableImageProvider() to resolve concrete provider",
+        "Provider::image() dispatches GeneratingImage event, then delegates to imageGateway()->generateImage()",
+        "ImageGateway (e.g. XaiImageGateway) POSTs to AI Provider API",
+        "Returns ImageResponse containing GeneratedImage collection, Usage, Meta",
+        "Provider dispatches ImageGenerated event"
+      ],
+      "failover": "On FailoverableException, fires ProviderFailedOver event and tries next provider in list"
+    },
+    {
+      "id": "UC2",
+      "name": "Queue Image Generation",
+      "actor": "Developer",
+      "entry_point": "Image::of($prompt)->queue($provider, $model)",
+      "flow": [
+        "Developer calls queue() on PendingImageGeneration",
+        "Validates attachments are StoredImage or LocalImage (not transient)",
+        "Dispatches GenerateImage job onto Laravel queue",
+        "Queue executes GenerateImage::handle() → calls pendingImage->generate()",
+        "Returns QueuedImageResponse wrapping the pending dispatch"
+      ]
+    },
+    {
+      "id": "UC3",
+      "name": "Configure Image Options",
+      "actor": "Developer",
+      "entry_point": "Fluent methods on PendingImageGeneration",
+      "options": [
+        "size(string): '3:2'|'2:3'|'1:1'",
+        "square(): sets size to '1:1'",
+        "portrait(): sets size to '2:3'",
+        "landscape(): sets size to '3:2'",
+        "quality(string): 'low'|'medium'|'high'",
+        "timeout(?int): seconds for HTTP request",
+        "attachments(array<Image>): reference images sent with request"
+      ],
+      "note": "All return $this for chaining. Included in UC1 and UC2."
+    },
+    {
+      "id": "UC4",
+      "name": "Select Provider and Model",
+      "actor": "Developer",
+      "description": "Developer passes a provider identifier (string, array, or Lab enum) and optional model name to generate() or queue(). Falls back to config('ai.default_for_images') if null."
+    },
+    {
+      "id": "UC5",
+      "name": "Fake Image Generation (Testing)",
+      "actor": "Developer",
+      "entry_point": "Image::fake($responses)",
+      "flow": [
+        "Developer calls Image::fake(responses) → registers FakeImageGateway via Ai::fakeImages()",
+        "generate() calls record the ImagePrompt via Ai::recordImageGeneration()",
+        "FakeImageGateway::generateImage() returns a pre-configured or auto-generated ImageResponse",
+        "preventStrayImages() can throw if unexpected generation occurs"
+      ]
+    },
+    {
+      "id": "UC6",
+      "name": "Assert Image Generated",
+      "actor": "Developer",
+      "entry_point": "Image::assertGenerated(Closure) / assertNotGenerated() / assertNothingGenerated()",
+      "note": "Testing assertions. Delegates to Ai::assertImageGenerated() etc. Requires UC5 fake to be active."
+    },
+    {
+      "id": "UC7",
+      "name": "Assert Image Queued",
+      "actor": "Developer",
+      "entry_point": "Image::assertQueued(Closure) / assertNotQueued() / assertNothingQueued()",
+      "note": "Testing assertions for queued generations. Delegates to Ai::assertImageQueued() etc."
+    }
+  ],
+
+  "key_relationships": [
+    "Image (facade) creates PendingImageGeneration",
+    "PendingImageGeneration depends_on Provider (resolves via Ai::fakeableImageProvider)",
+    "PendingImageGeneration depends_on GenerateImage job (for queue path)",
+    "Provider (concrete) uses_trait GeneratesImages — implements ImageProvider.image()",
+    "Provider (concrete) uses_trait HasImageGateway — holds ImageGateway reference",
+    "ImageProvider (contract) interface requires imageGateway(), useImageGateway(), defaultImageModel(), defaultImageOptions()",
+    "ImageGateway (contract) interface requires generateImage(ImageProvider, model, prompt, ...): ImageResponse",
+    "XaiImageGateway implements ImageGateway — POSTs to xAI /images/generations, returns b64_json as GeneratedImage",
+    "FakeImageGateway implements ImageGateway — returns fake/pre-configured ImageResponse without HTTP call",
+    "GenerateImage (job) aggregates PendingImageGeneration and re-calls generate() on execution",
+    "GeneratesImages trait fires GeneratingImage and ImageGenerated events around gateway call"
+  ],
+
+  "key_classes": [
+    {"name": "Image", "namespace": "Laravel\\Ai", "type": "static_facade", "methods": ["of(string $prompt): PendingImageGeneration", "fake(Closure|array): FakeImageGateway", "assertGenerated(Closure)", "assertNotGenerated(Closure)", "assertNothingGenerated()", "assertQueued(Closure)", "assertNotQueued(Closure)", "assertNothingQueued()", "isFaked(): bool"]},
+    {"name": "PendingImageGeneration", "namespace": "Laravel\\Ai\\PendingResponses", "type": "fluent_builder", "properties": ["prompt: string", "attachments: array", "size: ?string", "quality: ?string", "timeout: ?int"], "methods": ["attachments(array): self", "size(string): self", "square(): self", "portrait(): self", "landscape(): self", "quality(string): self", "timeout(?int): self", "generate(provider?, model?): ImageResponse", "queue(provider?, model?): QueuedImageResponse"]},
+    {"name": "ImageProvider", "namespace": "Laravel\\Ai\\Contracts\\Providers", "type": "interface", "methods": ["image(prompt, attachments, size, quality, model, timeout): ImageResponse", "imageGateway(): ImageGateway", "useImageGateway(ImageGateway): self", "defaultImageModel(): string", "defaultImageOptions(?size, quality): array"]},
+    {"name": "ImageGateway (contract)", "namespace": "Laravel\\Ai\\Contracts\\Gateway", "type": "interface", "methods": ["generateImage(ImageProvider, model, prompt, attachments, size, quality, timeout): ImageResponse"]},
+    {"name": "XaiImageGateway", "namespace": "Laravel\\Ai\\Gateway\\Xai", "type": "class", "implements": "ImageGateway", "traits": ["CreatesXaiClient", "HandlesFailoverErrors"], "note": "POSTs to /images/generations, response_format=b64_json, default timeout 120s"},
+    {"name": "FakeImageGateway", "namespace": "Laravel\\Ai\\Gateway", "type": "class", "implements": "ImageGateway", "note": "For testing; returns pre-set or auto-faked ImageResponse"},
+    {"name": "GeneratesImages", "namespace": "Laravel\\Ai\\Providers\\Concerns", "type": "trait", "note": "Implements ImageProvider.image(); fires GeneratingImage/ImageGenerated events; delegates to imageGateway()->generateImage()"},
+    {"name": "HasImageGateway", "namespace": "Laravel\\Ai\\Providers\\Concerns", "type": "trait", "note": "Stores $imageGateway; falls back to $this->gateway if not set"},
+    {"name": "GenerateImage", "namespace": "Laravel\\Ai\\Jobs", "type": "queue_job", "implements": "ShouldQueue", "note": "Wraps PendingImageGeneration; handle() calls pendingImage->generate()"}
+  ],
+
+  "response_objects": [
+    "ImageResponse: contains Collection<GeneratedImage>, Usage, Meta",
+    "GeneratedImage: b64_json data + mime type (image/jpeg)",
+    "Meta: provider name + model name",
+    "QueuedImageResponse: wraps PendingDispatch from GenerateImage job"
+  ],
+
+  "important_notes": [
+    "Provider failover: if a provider throws FailoverableException, ProviderFailedOver event is fired and the next provider in the list is tried",
+    "Queue path validates attachments must be StoredImage or LocalImage (serialisable) — raw Image objects not allowed",
+    "Fake mode: Ai::fakeableImageProvider() swaps in FakeImageGateway transparently; generation is recorded for assertions",
+    "XAI gateway ignores attachments/size/quality params (passes only model+prompt to API)",
+    "Events fired: GeneratingImage (before), ImageGenerated (after), ProviderFailedOver (on failover)"
+  ],
+
+  "source_files_analyzed": [
+    "src/Image.php",
+    "src/PendingResponses/PendingImageGeneration.php",
+    "src/Contracts/Providers/ImageProvider.php",
+    "src/Contracts/Gateway/ImageGateway.php",
+    "src/Gateway/Xai/XaiImageGateway.php",
+    "src/Gateway/FakeImageGateway.php",
+    "src/Providers/Concerns/GeneratesImages.php",
+    "src/Providers/Concerns/HasImageGateway.php",
+    "src/Jobs/GenerateImage.php"
+  ]
+}

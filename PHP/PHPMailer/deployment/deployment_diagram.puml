@@ -1,0 +1,206 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam node {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam artifact {
+    BackgroundColor #DEE2E6
+    BorderColor #6C757D
+}
+skinparam database {
+    BackgroundColor #D0E8FF
+    BorderColor #4A90D9
+}
+skinparam cloud {
+    BackgroundColor #FFF3CD
+    BorderColor #FFC107
+}
+skinparam rectangle {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+title Datadog PHP Tracer — Deployment Architecture
+
+' ─────────────────────────────────────────────
+'  DEVELOPER / CI ENVIRONMENT
+' ─────────────────────────────────────────────
+node "CI / Developer Environment" <<Docker Host>> {
+
+    ' PHP Application Containers
+    node "PHP Application Node" <<Docker>> {
+        artifact "ddtrace PHP Extension\n(dd-trace-ci images)" as phpext
+        note right of phpext
+          Supports PHP 7.0 – 8.5
+          Linux: Alpine, Bookworm, Buster, CentOS 7
+          Windows containers also available
+        end note
+    }
+
+    ' Datadog Agent
+    node "Datadog Agent" <<Docker>> {
+        artifact "datadog/agent:latest" as ddagent
+        note right of ddagent
+          APM Receiver: :8126
+          DogStatsD: :8125
+          Unix socket: /var/run/datadog/apm.socket
+          Remote Configuration enabled
+        end note
+    }
+
+    ' Staging Agent (optional)
+    node "Staging Agent" <<Docker>> {
+        artifact "datadog/agent:latest\n(datad0g.com site)" as stagingagent
+        note right of stagingagent
+          APM Receiver: :8125
+          DD_SITE=datad0g.com
+          Remote Config refresh: 5s
+        end note
+    }
+
+    ' ── CI Test Infrastructure ──────────────────
+    package "CI Test Infrastructure" {
+
+        node "Request Replayer" <<Docker>> {
+            artifact "dd-trace-ci:php-request-replayer-2.0" as replayer
+            note right of replayer
+              Mock Datadog Agent HTTP API (:8766)
+              Endpoints: /replay, /replay-metrics,
+              /replay-stats, /v0.7/config (Remote Config),
+              /v0.6/stats, /metrics (DogStatsD)
+            end note
+        }
+
+        node "APM Test Agent" <<Docker>> {
+            artifact "ddapm-test-agent:latest\n(ghcr.io/datadog)" as testagent
+            note right of testagent
+              Port: 9126
+              Validates trace correctness
+              Snapshot-based regression testing
+              Checks: trace_stall, peer_service, dd_service
+            end note
+        }
+
+        node "Windows Request Replayer" <<Docker>> {
+            artifact "php-request-replayer-2.0-windows" as winreplayer
+        }
+    }
+
+    ' ── Integration Services ────────────────────
+    package "Integration Services" {
+
+        database "MySQL 8.0" as mysql
+        database "SQL Server 2022" as sqlsrv
+        database "MongoDB 4.2" as mongodb
+        database "Elasticsearch 7.17" as elastic
+        database "Redis 5.0" as redis
+        database "Memcached 1.5" as memcached
+        database "Google Spanner\nEmulator 1.5" as spanner
+
+        node "RabbitMQ 3.8 (AMQP)" <<Docker>> {
+            artifact "rabbitmq:3.8.9-alpine" as rabbitmq
+        }
+
+        node "Kafka + Zookeeper" <<Docker>> {
+            artifact "confluentinc/cp-kafka:7.7.1" as kafka
+            artifact "confluentinc/cp-zookeeper:7.7.1" as zookeeper
+        }
+
+        node "HTTPBin" <<Docker>> {
+            artifact "kong/httpbin:0.2.2" as httpbin
+        }
+    }
+
+    ' ── Package Builder ─────────────────────────
+    node "Packager" <<Docker>> {
+        artifact "ddtrace_php_fpm_packaging" as packager
+    }
+}
+
+' ─────────────────────────────────────────────
+'  DEPLOYMENT EXAMPLES (Production-like)
+' ─────────────────────────────────────────────
+package "Production Deployment Examples" {
+
+    node "Nginx + PHP-FPM Stack" <<Docker Compose>> {
+        artifact "nginx:latest" as nginx
+        artifact "PHP-FPM\n(with ddtrace)" as phpfpm
+    }
+
+    node "Apache + mod_php Stack" <<Docker Compose>> {
+        artifact "Apache 2.4\n(with ddtrace mod_php)" as apache
+    }
+}
+
+' ─────────────────────────────────────────────
+'  EXTERNAL SERVICES
+' ─────────────────────────────────────────────
+cloud "Datadog Cloud (APM + Metrics)" as datadogcloud
+cloud "Datadog Staging\n(datad0g.com)" as datadogstaging
+
+' ─────────────────────────────────────────────
+'  COMMUNICATION PATHS
+' ─────────────────────────────────────────────
+
+' PHP Extension → Datadog Agent (APM traces)
+phpext --> ddagent : "APM Traces\n(msgpack over HTTP :8126\nor Unix socket)"
+
+' PHP Extension → Datadog Agent (DogStatsD metrics)
+phpext --> ddagent : "DogStatsD Metrics\n(UDP / UDS)"
+
+' Datadog Agent → Datadog Cloud
+ddagent --> datadogcloud : "HTTPS\n(traces + metrics)"
+
+' Staging Agent → Datadog Staging
+stagingagent --> datadogstaging : "HTTPS\n(traces + metrics)"
+
+' PHP Extension → Request Replayer (CI tests)
+phpext --> replayer : "APM Traces / Stats\n(HTTP :8766)"
+
+' APM Test Agent → Request Replayer
+testagent --> replayer : "Forward traces\n(DD_TRACE_AGENT_URL)"
+
+' PHP Extension → APM Test Agent
+phpext --> testagent : "Trace validation\n(HTTP :9126)"
+
+' PHP Extension → Integration Services
+phpext --> mysql      : "MySQL :3306"
+phpext --> sqlsrv     : "T-SQL :1433"
+phpext --> redis      : "Redis"
+phpext --> memcached  : "Memcached"
+phpext --> mongodb    : "MongoDB :27017"
+phpext --> elastic    : "HTTP :9200"
+phpext --> rabbitmq   : "AMQP :5672"
+phpext --> kafka      : "Kafka :9092"
+phpext --> spanner    : "gRPC :9010"
+phpext --> httpbin    : "HTTP :8765"
+
+' Kafka depends on Zookeeper
+kafka --> zookeeper : ":2181"
+
+' Nginx/FPM example deployment
+nginx --> phpfpm : "FastCGI\n(PHP-FPM)"
+phpfpm --> ddagent : "APM Traces\n(HTTP :8126)"
+apache --> ddagent : "APM Traces\n(HTTP :8126)"
+
+' Packager mounts source
+packager ..> phpext : "builds & packages\nddtrace .so extension"
+
+@enduml

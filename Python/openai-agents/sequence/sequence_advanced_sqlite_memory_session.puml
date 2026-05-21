@@ -1,0 +1,297 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #DEE2E6
+    DividerBackgroundColor #CED4DA
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Advanced SQLite Memory Session\nStoring and Retrieving Conversation Items with Branch/Turn Tracking
+
+actor "Caller\n(Runner / User Code)" as Caller
+
+box "AdvancedSQLiteSession" #E8F4FD
+    participant "AdvancedSQLiteSession" as AdvSession
+    participant "SQLiteSession (base)" as BaseSession
+end box
+
+box "SQLite Database" #F0F4E8
+    participant "_locked_connection\n(SQLiteDB)" as LockConn
+    database "agent_sessions\nagent_messages" as MsgTable
+    database "message_structure\nturn_usage" as StructTable
+end box
+
+' ─────────────────────────────────────────────
+' 1. INITIALIZATION
+' ─────────────────────────────────────────────
+== Initialization ==
+
+Caller -> AdvSession : new AdvancedSQLiteSession(\n  session_id, db_path=":memory:",\n  create_tables=True, session_settings)
+activate AdvSession
+
+AdvSession -> BaseSession : super().__init__(\n  session_id, db_path, session_settings)
+activate BaseSession
+BaseSession -> LockConn : CREATE TABLE IF NOT EXISTS agent_sessions\nCREATE TABLE IF NOT EXISTS agent_messages
+activate LockConn
+LockConn --> BaseSession : tables ready
+deactivate LockConn
+BaseSession --> AdvSession : initialized
+deactivate BaseSession
+
+AdvSession -> AdvSession : _current_branch_id = "main"
+
+AdvSession -> LockConn : _init_structure_tables()
+activate LockConn
+LockConn -> StructTable : CREATE TABLE message_structure\n(session_id, message_id, branch_id,\n message_type, sequence_number,\n user_turn_number, branch_turn_number,\n tool_name, created_at)
+LockConn -> StructTable : CREATE TABLE turn_usage\n(session_id, branch_id, user_turn_number,\n requests, input/output/total_tokens,\n input_tokens_details JSON,\n output_tokens_details JSON)\nUNIQUE(session_id, branch_id, user_turn_number)
+LockConn -> StructTable : CREATE 5 indexes on\nmessage_structure and turn_usage
+LockConn --> AdvSession : structure tables ready
+deactivate LockConn
+
+AdvSession --> Caller : session instance (branch="main")
+deactivate AdvSession
+
+' ─────────────────────────────────────────────
+' 2. ADD ITEMS (async, atomic)
+' ─────────────────────────────────────────────
+== Add Items (Atomic Insert with Structure Metadata) ==
+
+Caller -> AdvSession : await add_items(items: list[TResponseInputItem])
+activate AdvSession
+
+AdvSession -> AdvSession : asyncio.to_thread(_add_items_sync)
+activate AdvSession
+
+AdvSession -> LockConn : acquire _locked_connection()
+activate LockConn
+
+AdvSession -> BaseSession : _insert_items(conn, items)
+activate BaseSession
+BaseSession -> MsgTable : INSERT INTO agent_messages\n(session_id, message_data JSON)\nfor each item
+MsgTable --> BaseSession : rows inserted
+BaseSession --> AdvSession : items stored
+deactivate BaseSession
+
+AdvSession -> LockConn : conn.commit()
+
+AdvSession -> AdvSession : _insert_structure_metadata(conn, items)
+activate AdvSession
+
+AdvSession -> MsgTable : SELECT id FROM agent_messages\nORDER BY id DESC LIMIT len(items)
+MsgTable --> AdvSession : last N message_ids
+
+AdvSession -> StructTable : SELECT MAX(sequence_number)\nFROM message_structure\nWHERE session_id=?
+StructTable --> AdvSession : current_max_seq
+
+AdvSession -> StructTable : SELECT MAX(user_turn_number),\n  MAX(branch_turn_number)\nFROM message_structure\nWHERE session_id=? AND branch_id=?
+StructTable --> AdvSession : current_turn_numbers
+
+loop for each item
+    AdvSession -> AdvSession : _classify_message_type(item)\n→ "user" | "assistant" | item.type | "other"
+    AdvSession -> AdvSession : _extract_tool_name(item)\n→ MCP: server_label.name\n   built-in: type string\n   function: qualified name | None
+    AdvSession -> AdvSession : _is_user_message(item)\n→ increments user_turn counter\n   updates item_turn / item_branch_turn
+end
+
+AdvSession -> StructTable : INSERT INTO message_structure executemany(\n  session_id, message_id, branch_id,\n  message_type, sequence_number,\n  user_turn_number, branch_turn_number,\n  tool_name)
+StructTable --> AdvSession : metadata rows inserted
+
+deactivate AdvSession
+
+AdvSession -> LockConn : conn.commit()
+LockConn --> AdvSession : transaction committed
+deactivate LockConn
+
+note right of AdvSession
+  **Atomicity guarantee:**
+  If _insert_structure_metadata fails,
+  _cleanup_orphaned_messages_sync(conn)
+  DELETEs the orphaned agent_messages rows
+  so the DB stays consistent.
+end note
+
+deactivate AdvSession
+AdvSession --> Caller : None (items stored)
+deactivate AdvSession
+
+' ─────────────────────────────────────────────
+' 3. GET ITEMS (branch-scoped query)
+' ─────────────────────────────────────────────
+== Get Items (Branch-Scoped Retrieval) ==
+
+Caller -> AdvSession : await get_items(limit=None, branch_id=None)
+activate AdvSession
+
+AdvSession -> AdvSession : resolve_session_limit(limit, session_settings)\n→ effective_limit
+AdvSession -> AdvSession : branch_id = branch_id or _current_branch_id
+
+AdvSession -> AdvSession : asyncio.to_thread(_get_items_sync)
+activate AdvSession
+
+AdvSession -> LockConn : _locked_connection()
+activate LockConn
+
+AdvSession -> MsgTable : SELECT m.message_data\nFROM agent_messages m\nJOIN message_structure s ON m.id = s.message_id\nWHERE s.session_id=? AND s.branch_id=?\nORDER BY s.sequence_number ASC\n[LIMIT effective_limit]
+MsgTable --> AdvSession : rows (message_data JSON blobs)
+deactivate LockConn
+
+alt limit was applied
+    AdvSession -> AdvSession : reverse rows\n(to maintain chronological order)
+end
+
+loop for each row
+    AdvSession -> AdvSession : json.loads(message_data) → item dict
+end
+
+deactivate AdvSession
+AdvSession --> Caller : list[TResponseInputItem]
+deactivate AdvSession
+
+' ─────────────────────────────────────────────
+' 4. STORE RUN USAGE
+' ─────────────────────────────────────────────
+== Store Run Usage (Per-Turn Token Analytics) ==
+
+Caller -> AdvSession : await store_run_usage(result: RunResult)
+activate AdvSession
+
+AdvSession -> AdvSession : check result.context_wrapper.usage is not None
+
+AdvSession -> LockConn : _get_current_turn_number()
+activate LockConn
+LockConn -> StructTable : SELECT MAX(user_turn_number)\nFROM message_structure\nWHERE session_id=? AND branch_id=?
+StructTable --> LockConn : current_turn
+LockConn --> AdvSession : current_turn_number
+deactivate LockConn
+
+AdvSession -> LockConn : _update_turn_usage_internal(\n  current_turn, usage: Usage)
+activate LockConn
+LockConn -> StructTable : INSERT OR REPLACE INTO turn_usage(\n  session_id, branch_id, user_turn_number,\n  requests, input_tokens, output_tokens,\n  total_tokens, input_tokens_details,\n  output_tokens_details)
+StructTable --> LockConn : upserted
+LockConn --> AdvSession : usage recorded
+deactivate LockConn
+
+AdvSession --> Caller : None
+deactivate AdvSession
+
+' ─────────────────────────────────────────────
+' 5. CONVERSATION BRANCHING
+' ─────────────────────────────────────────────
+== Conversation Branching ==
+
+Caller -> AdvSession : await create_branch_from_turn(\n  turn_number=2, branch_name=None)
+activate AdvSession
+
+AdvSession -> AdvSession : asyncio.to_thread(_validate_turn)
+AdvSession -> LockConn : SELECT message_data FROM message_structure\nJOIN agent_messages\nWHERE branch_turn_number=2\n  AND message_type="user"
+activate LockConn
+LockConn --> AdvSession : turn validated
+deactivate LockConn
+
+AdvSession -> AdvSession : branch_name = "branch_from_turn_2_{timestamp}"
+
+AdvSession -> AdvSession : _copy_messages_to_new_branch(\n  new_branch_id, from_turn_number=2)
+activate AdvSession
+
+AdvSession -> LockConn : SELECT ms.* FROM message_structure ms\nWHERE branch_turn_number < 2\nORDER BY sequence_number ASC
+activate LockConn
+LockConn --> AdvSession : ancestor message_structure rows
+deactivate LockConn
+
+note right of AdvSession
+  **Branch copy strategy:**
+  Only message_structure rows are duplicated
+  with the new branch_id.
+  The physical agent_messages rows are shared
+  (no data duplication).
+end note
+
+AdvSession -> StructTable : INSERT INTO message_structure\n(new rows with new_branch_id,\n renumbered sequence_numbers,\n same original message_ids)
+StructTable --> AdvSession : branch rows created
+
+deactivate AdvSession
+
+AdvSession -> AdvSession : _current_branch_id = "branch_from_turn_2_{timestamp}"
+AdvSession --> Caller : branch_name (new branch is now active)
+deactivate AdvSession
+
+' ─────────────────────────────────────────────
+' 6. BRANCH SWITCHING
+' ─────────────────────────────────────────────
+== Branch Switching ==
+
+Caller -> AdvSession : await switch_to_branch("main")
+activate AdvSession
+
+AdvSession -> AdvSession : asyncio.to_thread(_validate_branch)
+AdvSession -> LockConn : SELECT COUNT(*) FROM message_structure\nWHERE session_id=? AND branch_id="main"
+activate LockConn
+LockConn --> AdvSession : count > 0 (branch exists)
+deactivate LockConn
+
+AdvSession -> AdvSession : _current_branch_id = "main"
+AdvSession --> Caller : None (now on main branch)
+deactivate AdvSession
+
+' ─────────────────────────────────────────────
+' 7. DELETE BRANCH
+' ─────────────────────────────────────────────
+== Delete Branch ==
+
+Caller -> AdvSession : await delete_branch(\n  branch_id, force=False)
+activate AdvSession
+
+AdvSession -> AdvSession : guard: cannot delete "main" branch
+alt deleting current branch AND force=True
+    AdvSession -> AdvSession : await switch_to_branch("main")
+end
+
+AdvSession -> LockConn : DELETE FROM turn_usage\nWHERE session_id=? AND branch_id=?
+activate LockConn
+LockConn -> StructTable : rows deleted
+LockConn --> AdvSession : turn_usage cleared
+deactivate LockConn
+
+AdvSession -> LockConn : DELETE FROM message_structure\nWHERE session_id=? AND branch_id=?
+activate LockConn
+LockConn -> StructTable : rows deleted
+LockConn --> AdvSession : structure cleared
+deactivate LockConn
+
+note right of AdvSession
+  agent_messages rows are NOT deleted here.
+  They may still be referenced by other branches.
+  Orphan cleanup is handled separately via
+  _cleanup_orphaned_messages().
+end note
+
+AdvSession --> Caller : None (branch deleted)
+deactivate AdvSession
+
+@enduml

@@ -1,0 +1,181 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #F1F3F5
+    DividerBackgroundColor #DEE2E6
+    GroupBorderColor #ADB5BD
+    GroupBackgroundColor #F8F9FA
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Service Manager Boot and Initialization
+
+participant "Caller\n(initgui / Kernel)" as Caller
+participant "ServiceManager" as SM
+participant "AdvancedBase /\nFeatureBase" as FB
+participant "Service\n(factory / class)" as SvcClass
+participant "TService\n(trait interface)" as TService
+participant "ServiceFeature\n(HOOKS)" as SF
+participant "LaunchOnInitService" as LOIS
+
+== Construction ==
+
+Caller -> SM : new ServiceManager({ context })
+activate SM
+SM -> FB : super() — AdvancedBase constructor
+activate FB
+FB -> FB : FeatureBase.install_features()\n[NodeModuleDIFeature, PropertiesFeature,\n TraitsFeature, TopicsFeature]
+FB --> SM : features installed
+deactivate FB
+SM -> SM : init internal structures\n(services_l_[], services_m_{},\n waiting_{}, init_listeners_[])
+SM --> Caller : serviceManager instance
+deactivate SM
+
+== Service Registration Phase ==
+
+loop for each service to register
+    Caller -> SM : register(name, factory, options)
+    activate SM
+    SM -> SM : await setTimeout(0)\n[yield to event loop]
+    SM -> SvcClass : factory.create({ parameters, context })
+    activate SvcClass
+    SvcClass -> SvcClass : new this()  [constructor]
+    SvcClass -> FB : FeatureBase.install_features()\n[installs ServiceFeature]
+    activate FB
+    FB --> SvcClass : features installed
+    deactivate FB
+    SvcClass -> TService : ins.as(TService).construct(parameters)
+    activate TService
+    TService -> SvcClass : this.$parameters = parameters\nthis._construct()
+    TService --> SvcClass : constructed
+    deactivate TService
+    SvcClass --> SM : service instance
+    deactivate SvcClass
+    SM -> SM : push entry { name, instance,\n status: 'registering' }
+    SM -> SM : maybe_init_(name)
+    deactivate SM
+end
+
+== Dependency Check (maybe_init_) ==
+
+SM -> SM : maybe_init_(name)
+activate SM
+SM -> TService : entry.instance.as(TService).get_depends()
+activate TService
+TService -> SvcClass : [...constructor.DEPENDS,\n ...this.get_depends()]
+TService --> SM : dependencies[]
+deactivate TService
+SM -> SM : get_waiting_for_(depends)\n[check which deps are not 'running']
+
+alt All dependencies satisfied
+    SM -> SM : init_service_(name)
+else Some dependencies missing
+    SM -> SM : status = 'pending'\nadd name to waiting_[dependency]
+    note right of SM
+        Service waits here until
+        each missing dependency
+        reaches 'running' state
+    end note
+end
+deactivate SM
+
+== Service Initialization (init_service_) ==
+
+SM -> SM : init_service_(name)
+activate SM
+SM -> SM : entry.status = 'initializing'
+SM -> TService : entry.instance.as(TService).init()
+activate TService
+TService -> SF : run init_hooks[]\n[ServiceFeature subscribes\n HOOKS to topic events]
+activate SF
+SF --> TService : hooks installed
+deactivate SF
+TService -> SvcClass : this._init(...args)\n[subclass override]
+activate SvcClass
+
+opt Service is LaunchOnInitService
+    SvcClass -> LOIS : _init()
+    activate LOIS
+    LOIS -> LOIS : read gui_params.launch_options\n.on_initialized[]
+    loop for each command in on_initialized
+        LOIS -> LOIS : this.run_(command)
+        LOIS -> LOIS : window[fn_name](...args)\n[executes 'window-call' commands]
+    end
+    LOIS --> SvcClass : done
+    deactivate LOIS
+end
+
+SvcClass --> TService : _init complete
+deactivate SvcClass
+TService --> SM : init complete
+deactivate TService
+
+SM -> SM : entry.status = 'running'\nentry.statusStartTS = new Date()
+SM -> SM : iterate waiting_[name]\n→ maybe_init_(dependent)  [cascade]
+note right of SM
+    Each newly-running service
+    triggers dependents that
+    were in 'pending' state
+end note
+SM -> SM : notify init_listeners_[]\n[unblock aget() / wait_for_init() callers]
+deactivate SM
+
+== GUI-Specific Boot Sequence (initgui.js) ==
+
+note over Caller, LOIS
+    The GUI uses a simpler parallel launch_services() mechanism:
+    sequential two-phase construct → init (no dependency graph)
+end note
+
+Caller -> Caller : launch_services()
+activate Caller
+
+loop Phase 1 — construct all services
+    Caller -> SvcClass : instance.construct({ gui_params: options })
+    activate SvcClass
+    SvcClass -> SvcClass : this.$puter = options\nthis._construct()
+    SvcClass --> Caller : constructed
+    deactivate SvcClass
+end
+
+loop Phase 2 — init all services
+    Caller -> SvcClass : instance.init({ services: globalThis.services })
+    activate SvcClass
+    SvcClass -> SvcClass : this.services = services\nthis._init(...args)
+    SvcClass --> Caller : initialised
+    deactivate SvcClass
+end
+
+Caller -> Caller : svc_process.get_init()\n.chstatus(PROCESS_RUNNING)
+note right of Caller
+    GUI boot complete —
+    init process transitions
+    to RUNNING state
+end note
+deactivate Caller
+
+@enduml

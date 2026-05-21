@@ -1,0 +1,163 @@
+{
+  "scope": "streaming_response_handling",
+  "title": "Streaming Response Handling",
+  "diagram_type": "activity",
+  "description": "Handle streamed chat completion chunks: accumulate tokens, detect tool calls, emit events, finalize response",
+
+  "key_components": [
+    "ChatCmplStreamHandler (class, all methods are @classmethod)",
+    "StreamingState (dataclass, mutable accumulator per stream)",
+    "SequenceNumber (counter, monotonically incrementing)",
+    "TResponseStreamEvent (TypeAlias for OpenAI Responses API events)",
+    "StreamEvent (TypeAlias: RawResponsesStreamEvent | RunItemStreamEvent | AgentUpdatedStreamEvent)"
+  ],
+
+  "entry_point": "ChatCmplStreamHandler.handle_stream(response: Response, stream: AsyncStream[ChatCompletionChunk], model: str | None) -> AsyncIterator[TResponseStreamEvent]",
+
+  "streaming_state_fields": [
+    "started: bool — whether ResponseCreatedEvent has been emitted",
+    "text_content_index_and_output: tuple[int, ResponseOutputText] | None",
+    "refusal_content_index_and_output: tuple[int, ResponseOutputRefusal] | None",
+    "reasoning_content_index_and_output: tuple[int, ResponseReasoningItem] | None",
+    "active_reasoning_summary_index: int | None",
+    "reasoning_item_done: bool",
+    "function_calls: dict[int, ResponseFunctionToolCall] — keyed by tc_delta.index",
+    "function_call_streaming: dict[int, bool] — True once OutputItemAdded emitted",
+    "function_call_output_idx: dict[int, int] — output_index per function call",
+    "thinking_text: str — accumulated Anthropic thinking text",
+    "thinking_signature: str | None — Anthropic thinking signature",
+    "provider_data: dict[str, Any] — model, response_id for non-OpenAI endpoints"
+  ],
+
+  "activity_flow": [
+    "START",
+    "Initialize StreamingState(), SequenceNumber()",
+    "BEGIN LOOP: async for chunk in stream",
+    "  [First chunk only] yield ResponseCreatedEvent(response, type='response.created')",
+    "  Update usage if chunk.usage is not None",
+    "  GUARD: if no chunk.choices or no delta → CONTINUE",
+    "  Update provider_data (model, response_id) from chunk",
+    "  BRANCH A — Thinking blocks (Anthropic, delta.thinking_blocks exists):",
+    "    Accumulate state.thinking_text from block['thinking']",
+    "    Store state.thinking_signature from block['signature']",
+    "  BRANCH B — reasoning_content (OpenAI-style reasoning summary):",
+    "    If first occurrence: create ResponseReasoningItem, yield ResponseOutputItemAddedEvent",
+    "    If active_reasoning_summary_index is None: append Summary to item, yield ResponseReasoningSummaryPartAddedEvent",
+    "    yield ResponseReasoningSummaryTextDeltaEvent(delta=reasoning_content)",
+    "    Accumulate text into reasoning_item.summary[active_summary_index]",
+    "  BRANCH C — delta.reasoning (3rd-party reasoning text):",
+    "    If first occurrence: create ResponseReasoningItem with content=[], yield ResponseOutputItemAddedEvent",
+    "    yield ResponseReasoningTextDeltaEvent(delta=reasoning_text)",
+    "    Accumulate text into reasoning_item.content[0].text",
+    "  TRANSITION: If reasoning was active AND active_summary open AND new content/refusal/tool_calls arriving:",
+    "    Call _finish_reasoning_summary_part → yield ResponseReasoningSummaryPartDoneEvent",
+    "  BRANCH D — Regular text content (delta.content is not None):",
+    "    If first text chunk: compute content_index, create ResponseOutputText, create ResponseOutputMessage(status='in_progress')",
+    "      yield ResponseOutputItemAddedEvent (output_index = 0 or 1 based on reasoning)",
+    "      yield ResponseContentPartAddedEvent",
+    "    Convert logprobs via ChatCmplHelpers",
+    "    yield ResponseTextDeltaEvent(delta=delta.content, logprobs)",
+    "    Accumulate: state.text_content_index_and_output[1].text += delta.content",
+    "  BRANCH E — Refusal content (delta.refusal exists):",
+    "    If first refusal chunk: compute refusal_index, create ResponseOutputRefusal, create ResponseOutputMessage(status='in_progress')",
+    "      yield ResponseOutputItemAddedEvent",
+    "      yield ResponseContentPartAddedEvent",
+    "    yield ResponseRefusalDeltaEvent(delta=delta.refusal)",
+    "    Accumulate: state.refusal_content_index_and_output[1].refusal += delta.refusal",
+    "  BRANCH F — Tool calls (delta.tool_calls exists):",
+    "    For each tc_delta in delta.tool_calls:",
+    "      If new index: create ResponseFunctionToolCall(arguments='', name='', call_id='')",
+    "      Accumulate tc_function.arguments into function_calls[index].arguments",
+    "      Set function_calls[index].name from tc_function.name",
+    "      Set function_calls[index].call_id (clean Gemini suffix via ChatCmplHelpers.clean_gemini_tool_call_id)",
+    "      Capture provider_specific_fields / extra_content for Gemini thought_signature",
+    "      IF not yet streaming AND name AND call_id present:",
+    "        Compute output_index (offset by reasoning/text/refusal/already-streaming calls)",
+    "        Mark function_call_streaming[index]=True, store output_index",
+    "        yield ResponseOutputItemAddedEvent(item=ResponseFunctionToolCall(arguments=''), output_index)",
+    "      IF streaming AND tc_function.arguments:",
+    "        yield ResponseFunctionCallArgumentsDeltaEvent(delta=tc_function.arguments)",
+    "END LOOP",
+    "Call _finish_reasoning_item → may yield ResponseReasoningTextDoneEvent + ResponseOutputItemDoneEvent",
+    "If state.text_content_index_and_output:",
+    "  yield ResponseContentPartDoneEvent(part=accumulated_text_output)",
+    "If state.refusal_content_index_and_output:",
+    "  yield ResponseContentPartDoneEvent(part=accumulated_refusal_output)",
+    "For each function_call in state.function_calls:",
+    "  IF was streaming: yield ResponseOutputItemDoneEvent(item with full arguments)",
+    "  IF NOT streaming (fallback — name never arrived mid-stream):",
+    "    yield ResponseOutputItemAddedEvent",
+    "    yield ResponseFunctionCallArgumentsDeltaEvent(delta=all_arguments)",
+    "    yield ResponseOutputItemDoneEvent",
+    "Build outputs list: [reasoning_item?, assistant_message?, ...function_calls]",
+    "Attach thinking_text/thinking_signature to reasoning_item (Anthropic)",
+    "If text or refusal content: create final ResponseOutputMessage(status='completed'), yield ResponseOutputItemDoneEvent",
+    "Build final_response = response.model_copy() with output=outputs, usage=ResponseUsage(...)",
+    "yield ResponseCompletedEvent(response=final_response, type='response.completed')",
+    "END"
+  ],
+
+  "helper_methods": [
+    "_finish_reasoning_summary_part(state, sequence_number) -> Iterator[TResponseStreamEvent]: yields ResponseReasoningSummaryPartDoneEvent; resets active_reasoning_summary_index",
+    "_finish_reasoning_item(state, sequence_number) -> Iterator[TResponseStreamEvent]: calls _finish_reasoning_summary_part OR yields ResponseReasoningTextDoneEvent; then yields ResponseOutputItemDoneEvent; sets reasoning_item_done=True"
+  ],
+
+  "emitted_event_sequence": [
+    "ResponseCreatedEvent — once, on first chunk",
+    "ResponseOutputItemAddedEvent — per reasoning/assistant message/function call start",
+    "ResponseReasoningSummaryPartAddedEvent — per reasoning summary segment start",
+    "ResponseReasoningSummaryTextDeltaEvent / ResponseReasoningTextDeltaEvent — per reasoning chunk",
+    "ResponseReasoningSummaryPartDoneEvent — when reasoning summary segment ends",
+    "ResponseContentPartAddedEvent — when text or refusal output starts",
+    "ResponseTextDeltaEvent — per text token",
+    "ResponseRefusalDeltaEvent — per refusal token",
+    "ResponseFunctionCallArgumentsDeltaEvent — per argument chunk",
+    "ResponseReasoningTextDoneEvent — when 3rd-party reasoning ends",
+    "ResponseOutputItemDoneEvent — per reasoning item / function call / assistant message done",
+    "ResponseContentPartDoneEvent — when text/refusal content part closes",
+    "ResponseCompletedEvent — final event, carries full assembled Response"
+  ],
+
+  "stream_event_types": [
+    "RawResponsesStreamEvent(data: TResponseStreamEvent, type='raw_response_event') — raw LLM events passed through",
+    "RunItemStreamEvent(name, item: RunItem, type='run_item_stream_event') — higher-level item events",
+    "AgentUpdatedStreamEvent(new_agent: Agent, type='agent_updated_stream_event') — agent handoff notification"
+  ],
+
+  "run_item_stream_event_names": [
+    "message_output_created", "handoff_requested", "handoff_occured",
+    "tool_called", "tool_search_called", "tool_search_output_created",
+    "tool_output", "reasoning_item_created", "mcp_approval_requested",
+    "mcp_approval_response", "mcp_list_tools"
+  ],
+
+  "key_conditions_and_branches": [
+    "First chunk guard: state.started=False → emit ResponseCreatedEvent once",
+    "No choices/delta → skip chunk (continue)",
+    "Reasoning-to-content transition: close open reasoning summary part before text/refusal/tool",
+    "Function call streaming: only start streaming when BOTH name AND call_id are known",
+    "Function call fallback: if name never arrived, emit added+delta+done atomically after stream",
+    "Anthropic thinking: accumulate text+signature during stream, attach to reasoning_item at finalization",
+    "Content index offsets: text/refusal/function output_index offset = count of prior reasoning + text + refusal items"
+  ],
+
+  "provider_compatibility_notes": [
+    "OpenAI: standard ChatCompletion chunks with usage in last chunk",
+    "LiteLLM: may not set chunk.usage; delta.refusal may be missing",
+    "Anthropic (via LiteLLM): thinking_blocks on delta; needs signature in encrypted_content",
+    "Gemini (via LiteLLM): tool_call.id has __thought__ suffix; cleaned by ChatCmplHelpers.clean_gemini_tool_call_id; thought_signature in provider_specific_fields or extra_content"
+  ],
+
+  "dependencies": [
+    "ChatCmplStreamHandler uses ChatCmplHelpers (convert_logprobs_for_text_delta, convert_logprobs_for_output_text, clean_gemini_tool_call_id)",
+    "ChatCmplStreamHandler uses FAKE_RESPONSES_ID from fake_id module",
+    "ChatCmplStreamHandler yields TResponseStreamEvent (OpenAI Responses API event types)",
+    "stream_events.py imports from items (RunItem, TResponseStreamEvent) and agent (Agent)"
+  ],
+
+  "source_files_analyzed": [
+    "src/agents/models/chatcmpl_stream_handler.py",
+    "src/agents/stream_events.py",
+    "docs/streaming.md"
+  ]
+}

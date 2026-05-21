@@ -1,0 +1,181 @@
+{
+  "scope": "tracing_and_span_management",
+  "title": "Tracing and Span Management",
+  "diagram_type": "use_case",
+  "description": "Agent runs emit trace spans; processors record and export observability data to OpenAI backend or custom destinations.",
+
+  "actors": [
+    {
+      "name": "Developer",
+      "type": "primary",
+      "description": "Creates traces manually via trace(), wraps workflows, registers custom processors, disables tracing, calls flush_traces()"
+    },
+    {
+      "name": "Runner",
+      "type": "primary",
+      "description": "Automatically creates traces (TraceCtxManager) and emits spans per agent run, agent loop turn, LLM generation, tool call, handoff, guardrail, audio"
+    },
+    {
+      "name": "Agent",
+      "type": "primary",
+      "description": "Emits AgentSpanData, GenerationSpanData, FunctionSpanData, GuardrailSpanData, HandoffSpanData as part of run lifecycle"
+    },
+    {
+      "name": "OpenAI Backend",
+      "type": "external_system",
+      "description": "Receives batched span/trace payloads via POST https://api.openai.com/v1/traces/ingest (Bearer token auth)"
+    },
+    {
+      "name": "Custom Exporter",
+      "type": "external_system",
+      "description": "Third-party tracing backend (W&B, Langfuse, MLflow, etc.) receiving traces via TracingProcessor/TracingExporter interface"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC01",
+      "name": "Create and Manage Trace",
+      "actor": "Developer",
+      "description": "Call trace(workflow_name, trace_id?, group_id?, metadata?, disabled?) as context manager or manually start()/finish(). Trace stored in contextvar via Scope.",
+      "key_classes": ["trace() in create.py", "TraceImpl", "Scope"],
+      "notes": "TraceCtxManager wraps this for Runner-initiated traces; reattach_resumed_trace=True reuses existing trace_id across resumed runs"
+    },
+    {
+      "id": "UC02",
+      "name": "Create Typed Span",
+      "actor": "Runner / Agent",
+      "description": "Call *_span() helpers (agent_span, generation_span, function_span, guardrail_span, handoff_span, custom_span, transcription_span, speech_span) which delegate to DefaultTraceProvider.create_span(span_data).",
+      "key_classes": ["create.py span helpers", "DefaultTraceProvider.create_span()", "SpanImpl"],
+      "notes": "Parent resolved from Scope (current_span / current_trace) if not provided. Returns NoOpSpan when tracing disabled."
+    },
+    {
+      "id": "UC03",
+      "name": "Start and Finish Span Lifecycle",
+      "actor": "Runner / Agent",
+      "description": "SpanImpl.start() records started_at, calls processor.on_span_start(). SpanImpl.finish() records ended_at, calls processor.on_span_end(). Context manager automates this.",
+      "key_classes": ["SpanImpl.start()", "SpanImpl.finish()", "TracingProcessor.on_span_start/end()"]
+    },
+    {
+      "id": "UC04",
+      "name": "Record Span Error",
+      "actor": "Runner / Agent",
+      "description": "span.set_error({message, data}) attaches SpanError to SpanImpl. Exported in span payload under 'error' field.",
+      "key_classes": ["SpanImpl.set_error()", "SpanError TypedDict"]
+    },
+    {
+      "id": "UC05",
+      "name": "Export Trace/Span Data",
+      "actor": "BatchTraceProcessor",
+      "description": "Background worker thread drains queue every 5s (schedule_delay) or when queue > 70% full (export_trigger_ratio). Calls TracingExporter.export(items) with batches of up to 128 items.",
+      "key_classes": ["BatchTraceProcessor._run()", "BatchTraceProcessor._export_batches()", "TracingExporter.export()"],
+      "notes": "Traces enqueued on on_trace_start; spans enqueued on on_span_end. Max queue 8192. Drops items when full."
+    },
+    {
+      "id": "UC06",
+      "name": "Send Traces to OpenAI Backend",
+      "actor": "BackendSpanExporter",
+      "description": "HTTP POST to https://api.openai.com/v1/traces/ingest with Bearer API key. Exponential backoff retry (max 3, base 1s, max 30s). Sanitizes large fields (truncate >100KB) and invalid usage data before sending.",
+      "key_classes": ["BackendSpanExporter.export()", "BackendSpanExporter._sanitize_for_openai_tracing_api()"],
+      "notes": "Items grouped by tracing_api_key. 4xx = no retry. 5xx = retry."
+    },
+    {
+      "id": "UC07",
+      "name": "Register Additional Trace Processor",
+      "actor": "Developer",
+      "description": "Call add_trace_processor(processor) to append to SynchronousMultiTracingProcessor. Original processors (BatchTraceProcessor→BackendSpanExporter) remain active.",
+      "key_classes": ["DefaultTraceProvider.register_processor()", "SynchronousMultiTracingProcessor.add_tracing_processor()"]
+    },
+    {
+      "id": "UC08",
+      "name": "Replace Default Trace Processors",
+      "actor": "Developer",
+      "description": "Call set_trace_processors([...]) to replace all processors. Traces no longer sent to OpenAI unless a custom processor handles it.",
+      "key_classes": ["DefaultTraceProvider.set_processors()", "SynchronousMultiTracingProcessor.set_processors()"]
+    },
+    {
+      "id": "UC09",
+      "name": "Flush Traces Immediately",
+      "actor": "Developer",
+      "description": "Call flush_traces() to block until all buffered traces/spans exported. Propagates via DefaultTraceProvider.force_flush() → SynchronousMultiTracingProcessor.force_flush() → BatchTraceProcessor.force_flush() → _export_batches(force=True).",
+      "key_classes": ["flush_traces()", "DefaultTraceProvider.force_flush()", "BatchTraceProcessor.force_flush()"],
+      "notes": "Use after trace() context exits in long-running workers (Celery, FastAPI background tasks)"
+    },
+    {
+      "id": "UC10",
+      "name": "Disable Tracing",
+      "actor": "Developer",
+      "description": "Three methods: (1) env var OPENAI_AGENTS_DISABLE_TRACING=1, (2) set_tracing_disabled(True) via DefaultTraceProvider.set_disabled(), (3) RunConfig.tracing_disabled=True for single run. Returns NoOpTrace/NoOpSpan when disabled.",
+      "key_classes": ["DefaultTraceProvider.set_disabled()", "NoOpTrace", "NoOpSpan"]
+    },
+    {
+      "id": "UC11",
+      "name": "Reattach Resumed Trace",
+      "actor": "Runner",
+      "description": "TraceCtxManager with reattach_resumed_trace=True calls reattach_trace(trace_state) if matching trace_id was previously started and settings match (workflow_name, group_id, metadata, api_key hash).",
+      "key_classes": ["TraceCtxManager", "create_trace_for_run()", "_trace_state_matches_effective_settings()", "reattach_trace()"]
+    },
+    {
+      "id": "UC12",
+      "name": "Print Traces to Console",
+      "actor": "Developer",
+      "description": "Register ConsoleSpanExporter with a BatchTraceProcessor for local debugging. Prints trace_id/name or span.export() dict.",
+      "key_classes": ["ConsoleSpanExporter.export()"]
+    }
+  ],
+
+  "key_relationships": [
+    "DefaultTraceProvider composes SynchronousMultiTracingProcessor (fan-out to N processors)",
+    "SynchronousMultiTracingProcessor aggregates 1..N TracingProcessor instances",
+    "BatchTraceProcessor depends_on TracingExporter (strategy pattern)",
+    "BackendSpanExporter implements TracingExporter",
+    "ConsoleSpanExporter implements TracingExporter",
+    "SpanImpl depends_on TracingProcessor (calls on_span_start/end)",
+    "TraceImpl depends_on TracingProcessor (calls on_trace_start/end)",
+    "DefaultTraceProvider depends_on Scope (reads current_trace/current_span contextvar)",
+    "SpanImpl.start() sets Scope.current_span via contextvar token",
+    "TraceCtxManager wraps create_trace_for_run() + Trace.start()/finish()",
+    "NoOpTrace/NoOpSpan implement Trace/Span interfaces as null objects",
+    "SpanData subclasses (AgentSpanData, GenerationSpanData, etc.) implement SpanData.export()",
+    "setup.py GLOBAL_TRACE_PROVIDER lazily initialized with DefaultTraceProvider + default_processor()"
+  ],
+
+  "span_data_types": [
+    "AgentSpanData (name, handoffs, tools, output_type)",
+    "TaskSpanData (name, usage) — top-level Runner run",
+    "TurnSpanData (turn, agent_name, usage) — agent loop iteration",
+    "GenerationSpanData (input, output, model, model_config, usage)",
+    "ResponseSpanData (response_id, usage)",
+    "FunctionSpanData (name, input, output, mcp_data)",
+    "HandoffSpanData (from_agent, to_agent)",
+    "GuardrailSpanData (name, triggered)",
+    "CustomSpanData (name, data dict)",
+    "TranscriptionSpanData (input PCM, output text, model)",
+    "SpeechSpanData (input text, output PCM, model, first_content_at)",
+    "SpeechGroupSpanData (input)",
+    "MCPListToolsSpanData (server, result)"
+  ],
+
+  "important_notes": [
+    "All context propagation uses Python contextvars (Scope class) — async-safe automatically",
+    "BatchTraceProcessor uses daemon background thread started lazily on first span/trace",
+    "BackendSpanExporter groups exports by tracing_api_key; supports per-trace API keys",
+    "Sensitive data (LLM I/O, audio PCM) controlled by RunConfig.trace_include_sensitive_data and VoicePipelineConfig.trace_include_sensitive_audio_data",
+    "BackendSpanExporter sanitizes: truncates input/output fields >100KB, strips non-allowed usage keys, drops usage from non-generation spans",
+    "atexit handler registered once to call provider.shutdown() on process exit",
+    "ZDR (Zero Data Retention) orgs cannot use tracing"
+  ],
+
+  "source_files_analyzed": [
+    "src/agents/tracing/context.py",
+    "src/agents/tracing/processor_interface.py",
+    "src/agents/tracing/processors.py",
+    "src/agents/tracing/provider.py",
+    "src/agents/tracing/spans.py",
+    "src/agents/tracing/span_data.py",
+    "src/agents/tracing/setup.py",
+    "src/agents/tracing/create.py",
+    "src/agents/tracing/scope.py",
+    "docs/tracing.md"
+  ]
+}

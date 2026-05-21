@@ -1,0 +1,347 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+title Lyra-1 Training Utilities and Config System
+
+' ─── External base classes ────────────────────────────────────────────────────
+class "torch.nn.Module" as NNModule <<external>> {
+}
+
+' ─── Config Package ───────────────────────────────────────────────────────────
+package "cosmos_predict1.utils.config" {
+
+    class Config <<attrs, freezable>> {
+        +model: LazyDict
+        +optimizer: LazyDict
+        +scheduler: LazyDict
+        +dataloader_train: LazyDict
+        +dataloader_val: LazyDict
+        +job: JobConfig
+        +trainer: TrainerConfig
+        +model_parallel: ModelParallelConfig
+        +checkpoint: CheckpointConfig
+        --
+        +pretty_print(use_color: bool): str
+        +to_dict(): dict[str, Any]
+        +validate(): None
+    }
+
+    class JobConfig <<attrs, freezable>> {
+        +project: str
+        +group: str
+        +name: str
+        --
+        +path: str  <<property>>
+        +path_local: str  <<property>>
+    }
+
+    class EMAConfig <<attrs, freezable>> {
+        +enabled: bool
+        +beta: float
+        +torch_compile_buffer_renaming: bool
+    }
+
+    class TrainerConfig <<attrs, freezable>> {
+        +type: Type[Trainer]
+        +callbacks: LazyDict
+        +distributed_parallelism: str
+        +ddp: DDPConfig
+        +cudnn: CuDNNConfig
+        +seed: int
+        +max_iter: int
+        +max_val_iter: int
+        +logging_iter: int
+        +run_validation: bool
+        +validation_iter: int
+        +grad_accum_iter: int
+        +memory_format: torch.memory_format
+    }
+
+    class CheckpointConfig <<attrs, freezable>> {
+        +save_iter: int
+        +load_path: str
+        +load_training_state: bool
+        +strict_resume: bool
+        +verbose: bool
+        +jit: JITConfig
+        +dcp_async_mode_enabled: bool
+        +async_saving: bool
+        +load_ema_to_reg: bool
+        +keys_not_to_resume: list[str]
+        +broadcast_via_filesystem: bool
+    }
+
+    class DDPConfig <<attrs, freezable>> {
+        +find_unused_parameters: bool
+        +static_graph: bool
+        +broadcast_buffers: bool
+    }
+
+    class CuDNNConfig <<attrs, freezable>> {
+        +deterministic: bool
+        +benchmark: bool
+    }
+
+    class JITConfig <<attrs, freezable>> {
+        +enabled: bool
+        +input_shape: list[int]
+        +device: str
+        +dtype: str
+        +strict: bool
+    }
+}
+
+' ─── LazyConfig Package ───────────────────────────────────────────────────────
+package "cosmos_predict1.utils.lazy_config" {
+
+    class LazyCall {
+        -_target_: callable
+        --
+        +__init__(target)
+        +__call__(**kwargs): DictConfig
+    }
+    note right of LazyCall
+        Wraps a callable for deferred
+        instantiation; produces a DictConfig
+        with _target_ key (LazyDict alias)
+    end note
+
+    class LazyConfig <<utility>> {
+        +{static} load(filename: str, keys): DictConfig
+        +{static} load_rel(filename: str, keys): DictConfig
+        +{static} save_pkl(cfg, filename: str): str
+        +{static} save_yaml(cfg, filename: str): str
+    }
+    note right of LazyConfig
+        Supports .py and .yaml config files.
+        Uses _patch_import() for safe
+        relative imports in .py configs.
+    end note
+}
+
+' ─── Model Base ───────────────────────────────────────────────────────────────
+package "cosmos_predict1.utils.model" {
+
+    abstract class Model {
+        --
+        +__init__(): None
+        +init_optimizer_scheduler(optimizer_config: LazyDict,\n  scheduler_config: LazyDict): tuple[Optimizer, LRScheduler]
+        +{abstract} training_step(data_batch: dict, iteration: int): tuple[dict, Tensor]
+        +{abstract} validation_step(data_batch: dict, iteration: int): tuple[dict, Tensor]
+        +{abstract} forward(*args, **kwargs): Any
+        +on_model_init_start(set_barrier: bool): None
+        +on_model_init_end(set_barrier: bool): None
+        +on_train_start(memory_format): None
+        +on_before_zero_grad(optimizer, scheduler, iteration): None
+        +on_after_backward(iteration): None
+    }
+    note right of Model
+        Optionally holds:
+        ema: EMAModelTracker | FastEmaModelUpdater
+        (set externally by EMAModelCallback)
+    end note
+}
+
+' ─── Trainer ──────────────────────────────────────────────────────────────────
+package "cosmos_predict1.utils.trainer" {
+
+    class Trainer {
+        +config: Config
+        +callbacks: CallBackGroup
+        +checkpointer: Checkpointer
+        +training_timer: TrainingTimer
+        --
+        +__init__(config: Config)
+        +train(model: Model, dataloader_train: DataLoader,\n  dataloader_val: DataLoader): None
+    }
+}
+
+' ─── Callback Package ─────────────────────────────────────────────────────────
+package "cosmos_predict1.utils.callback" {
+
+    class CallBackGroup {
+        -_callbacks: list[Callback]
+        --
+        +__init__(config: Config, trainer: Trainer)
+        +__getattr__(method_name: str): Callable
+    }
+    note right of CallBackGroup
+        Instantiates Callback subclasses from
+        config.trainer.callbacks (LazyDict).
+        Proxies all lifecycle calls to each Callback.
+    end note
+
+    abstract class Callback {
+        --
+        +on_train_start(model, iteration)
+        +on_training_step_start(model, data, iteration)
+        +on_before_forward(iteration)
+        +on_after_forward(iteration)
+        +on_before_backward(model_ddp, loss, iteration)
+        +on_after_backward(model_ddp, iteration)
+        +on_before_dataloading(iteration)
+        +on_after_dataloading(iteration)
+        +on_optimizer_init_start()
+        +on_optimizer_init_end()
+        +on_before_optimizer_step(model_ddp, optimizer,\n  scheduler, grad_scaler, iteration)
+        +on_before_zero_grad(model_ddp, optimizer,\n  scheduler, iteration)
+        +on_training_step_end(model, data_batch,\n  output_batch, loss, iteration)
+        +on_validation_start(model, dataloader_val, iteration)
+        +on_validation_step_start(model, data, iteration)
+        +on_validation_step_end(model, data_batch,\n  output_batch, loss, iteration)
+        +on_validation_end(model, iteration)
+        +on_load_checkpoint(model, state_dict)
+        +on_save_checkpoint(model, state_dict)
+        +on_train_end(model, iteration)
+        +on_app_end()
+    }
+
+    class EMAModelCallback {
+        --
+        +on_train_start(model, iteration)
+        +on_training_step_end(model, data_batch,\n  output_batch, loss, iteration)
+    }
+
+    class ProgressBarCallback {
+        --
+        +on_train_start(model, iteration)
+        +on_training_step_end(model, data_batch,\n  output_batch, loss, iteration)
+        +on_validation_start(model, dataloader_val, iteration)
+        +on_validation_step_end(model, data_batch,\n  output_batch, loss, iteration)
+        +on_validation_end(model, iteration)
+        +on_train_end(model, iteration)
+    }
+    note bottom of ProgressBarCallback
+        All methods decorated
+        @distributed.rank0_only
+    end note
+
+    class IterationLoggerCallback {
+        --
+        +on_train_start(model, iteration)
+        +on_training_step_start(model, data, iteration)
+        +on_training_step_end(model, data_batch,\n  output_batch, loss, iteration)
+    }
+
+    class GradClipCallback {
+        +grad_clip_norm: float
+        --
+        +on_before_optimizer_step(model_ddp, optimizer,\n  scheduler, grad_scaler, iteration)
+    }
+
+    class LowPrecisionCallback {
+        +update_iter: int
+        +precision_type: torch.dtype
+        --
+        +on_train_start(model, iteration)
+        +on_training_step_start(model, data, iteration)
+        +on_validation_step_start(model, data, iteration)
+        +on_before_zero_grad(model_ddp, optimizer,\n  scheduler, iteration)
+    }
+}
+
+' ─── EMA Package ──────────────────────────────────────────────────────────────
+package "cosmos_predict1.utils.ema" {
+
+    class EMAModelTracker {
+        +beta: float
+        +torch_compile_buffer_renaming: bool
+        +collected_params: list
+        +is_cached: bool
+        --
+        +__init__(model: Model, beta, torch_compile_buffer_renaming)
+        +update_average(model: Model, iteration): None
+        +copy_to(model: Model): None
+        +cache(parameters, is_cpu: bool): None
+        +restore(parameters): None
+        +{static} initialize_multi_rank_ema(model, rate,\n  num, enabled): Optional[EMAModelTracker]
+    }
+    note right of EMAModelTracker
+        EMA weights stored as registered
+        buffers (param name '.' -> '-').
+        Suited for DDP training.
+    end note
+
+    class PowerEMATracker {
+        +exp: float
+        --
+        +__init__(model: Model, s, torch_compile_buffer_renaming)
+        +update_average(model: Model, iteration): None
+        +{static} initialize_multi_rank_ema(model, rate,\n  num, enabled): Optional[PowerEMATracker]
+    }
+    note right of PowerEMATracker
+        EDM2 power-EMA schedule.
+        beta = (1-1/i)^(exp+1),
+        recomputed each iteration.
+    end note
+
+    class FastEmaModelUpdater {
+        +is_cached: bool
+        +collected_params: list
+        --
+        +update_average(src_model, tgt_model, beta): None
+        +copy_to(src_model, tgt_model): None
+        +cache(parameters, is_cpu: bool): None
+        +restore(parameters): None
+    }
+    note right of FastEmaModelUpdater
+        No internal buffers; expects two
+        separate model instances.
+        Preferred for FSDP training.
+    end note
+}
+
+' ─── Inheritance Relationships ────────────────────────────────────────────────
+Model          --|> NNModule
+EMAModelTracker --|> NNModule
+PowerEMATracker --|> EMAModelTracker
+
+EMAModelCallback      --|> Callback
+ProgressBarCallback   --|> Callback
+IterationLoggerCallback --|> Callback
+GradClipCallback      --|> Callback
+LowPrecisionCallback  --|> Callback
+
+' ─── Config Composition ───────────────────────────────────────────────────────
+Config *-- JobConfig        : job
+Config *-- TrainerConfig    : trainer
+Config *-- CheckpointConfig : checkpoint
+
+TrainerConfig    *-- DDPConfig   : ddp
+TrainerConfig    *-- CuDNNConfig : cudnn
+CheckpointConfig *-- JITConfig   : jit
+
+' ─── Trainer Relationships ────────────────────────────────────────────────────
+Trainer *-- Config        : config
+Trainer *-- CallBackGroup : callbacks
+Trainer ..> Model         : trains >
+
+CallBackGroup o-- Callback : _callbacks[ ]
+
+' ─── EMA Relationships ────────────────────────────────────────────────────────
+Model o-- EMAModelTracker    : ema (optional)
+Model o-- FastEmaModelUpdater : ema (optional)
+
+EMAModelCallback ..> EMAModelTracker : calls update_average()
+
+' ─── LazyConfig Usage ─────────────────────────────────────────────────────────
+LazyConfig ..> LazyCall       : uses internally
+TrainerConfig ..> LazyCall    : callbacks via LazyDict
+CallBackGroup ..> LazyConfig  : instantiate() from LazyDict
+
+@enduml

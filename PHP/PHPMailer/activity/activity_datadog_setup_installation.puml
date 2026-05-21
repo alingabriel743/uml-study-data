@@ -1,0 +1,255 @@
+@startuml datadog_setup_installation
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #212529
+    EndColor #212529
+    BarColor #495057
+}
+
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+skinparam note {
+    BackgroundColor #D1ECF1
+    BorderColor #0C5460
+    FontColor #0C5460
+}
+
+title Datadog PHP Extension Installation\n<i>datadog-setup.php — CLI-driven install flow</i>
+
+|#E9ECEF|CLI / Entry Point|
+start
+
+:Invoke **datadog-setup.php**;
+
+if (DD_TEST_EXECUTION env set?) then (yes)
+    note right: Test guard — bypasses\nall execution
+    :Return early;
+    stop
+else (no)
+endif
+
+:parse_validate_user_options()\n— tokenise argv via parse_cli_arguments()\n— normalise OPT_PHP_BIN, OPT_INSTALL_DIR\n  (default /opt/datadog/dd-library)\n— normalise OPT_EXTENSION_DIR, OPT_PHP_INI\n— parse --enable-appsec, --enable-profiling\n— parse OPT_FILE, OPT_UNINSTALL;
+
+if (Command type?) then (--help / parse error)
+    :print_help();
+    stop
+elseif (CMD_CONFIG_GET) then (yes)
+    :cmd_config_get($options);
+    stop
+elseif (CMD_CONFIG_SET) then (yes)
+    :cmd_config_set($options);
+    stop
+elseif (CMD_CONFIG_LIST) then (yes)
+    :cmd_config_list($options);
+    stop
+elseif (--uninstall) then (yes)
+    :uninstall($options);
+    stop
+else (install — default)
+endif
+
+|#EBF5FB|Platform & Prerequisites|
+
+:Detect platform:\nget_architecture() + is_alpine()\n→ build platform string\n  e.g. **x86_64-linux-gnu** / **aarch64-linux-musl**;
+
+:check_library_prerequisite_or_exit('libcurl')\ncheck_library_prerequisite_or_exit('libgcc_s');
+note right
+  Alpine: find .so in /usr/local/lib, /usr/lib
+  Linux:  ldconfig -p | grep <lib>
+end note
+
+if (--enable-profiling AND NOT Alpine?) then (yes)
+    :Check libdl.so, libpthread, librt;
+    if (Any profiling library missing?) then (yes)
+        #FFD6D6:print_error_and_exit\n"Required profiling library not found";
+        stop
+    else (no)
+    endif
+else (skip)
+endif
+
+if (Any required library missing?) then (yes)
+    #FFD6D6:print_error_and_exit\n"Required library not found";
+    stop
+else (no)
+endif
+
+if (OPT_PHP_BIN value?) then (empty — interactive)
+    :search_php_binaries() on PATH;
+    :pick_binaries_interactive()\n→ present list to user;
+elseif (OPT_PHP_BIN = 'all') then (yes)
+    :search_php_binaries()\n(non-shebang only);
+else (explicit path(s))
+    :resolve_command_full_path()\nfor each specified binary;
+endif
+
+if (No PHP binaries found?) then (yes)
+    #FFD6D6:print_error_and_exit\n"No PHP binaries found";
+    stop
+else (no)
+endif
+
+:PRE-LOOP over selected binaries:\ncheck_php_ext_prerequisite_or_exit(binary, 'json')\nini_values(binary) →\n  PHP_API, PHP_VER, IS_DEBUG, THREAD_SAFETY\n  INI_SCANDIR, INI_MAIN, EXTENSION_DIR\nDerive extensionSuffix\n  (-debug | -zts | -debug-zts | '')\nCollect downloadVersions map;
+
+if (Any 'json' extension missing?) then (yes)
+    #FFD6D6:print_error_and_exit\n"Required PHP 'json' extension not found";
+    stop
+else (no)
+endif
+
+|#EBF7EE|Archive Acquisition|
+
+:Prepare tmp dir /tmp/dd-install\nRegister shutdown cleanup (rm -rf)\nClean any existing tmp contents;
+
+if (OPT_FILE set?) then (yes — local archive)
+    :print_warning "Using local file"\nUse local .tar.gz path;
+    note right: Skips download;\nsupports offline installs
+else (no — download)
+    :download() from RELEASE_URL_PREFIX\n(try ext-curl → CLI curl → file_get_contents);
+    if (HTTP 404 — version-specific suffix?) then (yes)
+        :Retry download without\nversion-specific suffix;
+    else (200 OK)
+    endif
+endif
+
+if (Download / file access failed?) then (yes)
+    #FFD6D6:print_error_and_exit\n"Failed to download archive";
+    stop
+else (no)
+endif
+
+if (OS = Windows, no tar?) then (yes)
+    :7z x — extract archive;
+else (Linux / macOS)
+    :tar -xf — extract archive;
+endif
+
+if (Archive extract failed?) then (yes)
+    #FFD6D6:print_error_and_exit\n"Failed to extract archive";
+    stop
+else (no)
+endif
+
+:Copy tracer sources:\nmkdir installDir/dd-trace-sources\ncp -r tmp/trace/src → installDir;
+
+if (Archive contains appsec directory?) then (yes)
+    :Copy appsec assets:\ncp lib/ + etc/ → installDir;
+else (no)
+endif
+
+|#F5EEF8|Extension Installation (per-binary loop)|
+
+note
+  Iterates over each **selectedBinary** in
+  the resolved command → fullPath map
+end note
+
+fork
+    :Process PHP Binary #1;
+fork again
+    :Process PHP Binary #N;
+end fork
+note right: Conceptual parallel\n(sequential in implementation)
+
+:check_php_ext_prerequisite_or_exit\n(fullPath, 'json');
+
+:Determine extension directory:\nOPT_EXTENSION_DIR (if set)\nor phpProperties[EXTENSION_DIR];
+
+:safe_copy_extension(\n  traceExtPath, extDir/**ddtrace.so**)\n— copy to .tmp then rename\n  (avoids segfault on live PHP processes);
+note right
+  Windows: moves old .so to TEMP first,
+  then copies new file into place
+end note
+
+if (datadog-profiling.so present in archive?) then (yes)
+    :safe_copy_extension(\n  profilingExtPath, extDir/**datadog-profiling.so**);
+else (no)
+    if (--enable-profiling flag set?) then (yes)
+        #FFD6D6:print_error_and_exit\n"Profiling not supported for this PHP build";
+        stop
+    else (no — skip profiling)
+    endif
+endif
+
+if (ddappsec.so present in archive?) then (yes)
+    :safe_copy_extension(\n  appsecExtPath, extDir/**ddappsec.so**);
+else (no)
+    if (--enable-appsec flag set?) then (yes)
+        #FFD6D6:print_error_and_exit\n"AppSec not supported for this PHP build";
+        stop
+    else (no — skip appsec)
+    endif
+endif
+
+|#FEF9E7|INI Configuration|
+
+:find_main_ini_files(phpProperties):\nResolve **98-ddtrace.ini** in INI_SCANDIR\nDetect Debian SAPI split\n  (cli / apache2 / fpm conf.d)\nFall back to INI_MAIN if no scan dir;
+
+if (INI_SCANDIR missing?) then (yes)
+    :print_warning\n"Fragile install — no scan dir found";
+else (no)
+endif
+
+if (No valid INI path found?) then (yes)
+    #FFD6D6:print_error_and_exit\n"Cannot determine INI file path";
+    stop
+else (no)
+endif
+
+:Build $replacements map:\n  extension=ddtrace\n  + datadog.trace.sources_path\n  + profiling extension line (if enabled)\n  + appsec extension + helper_path + rules_path (if enabled)\n  if --enable-appsec → datadog.appsec.enabled=On;
+
+:For each INI file path:;
+
+if (INI file exists?) then (no — create new)
+    :mkdir -p (parent dirs)\nCreate new 98-ddtrace.ini;
+else (yes — upgrade existing)
+    :Set up replacements:\n  update old hook names\n  update sources_path;
+endif
+
+:add_missing_ini_settings(\n  iniFilePath,\n  get_ini_settings($replacements),\n  $replacements)\n— apply regex replacements to file\n— append any missing settings;
+
+if (INI write failed?) then (yes)
+    #FFD6D6:print_error_and_exit\n"Failed to write INI file";
+    stop
+else (no)
+endif
+
+|CLI / Entry Point|
+
+:Print **SUCCESS**;
+
+if (Interactive mode?) then (yes)
+    :Print equivalent\nnon-interactive command;
+else (no)
+endif
+
+stop
+
+@enduml

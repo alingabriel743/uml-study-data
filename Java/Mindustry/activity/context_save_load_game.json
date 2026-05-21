@@ -1,0 +1,158 @@
+{
+  "scope": "save_load_game",
+  "title": "Save & Load Game State",
+  "diagram_type": "activity",
+  "subsystem": "Persistence",
+
+  "key_classes": [
+    "SaveIO — static facade: entry point for save/load; manages versioned SaveVersion registry (Save1..Save11)",
+    "SaveFileReader — abstract base: chunk/region read-write primitives, fallback name maps, CustomChunk interface",
+    "SaveVersion extends SaveFileReader — full serialisation logic per version; abstract read/write per region",
+    "SaveMeta — plain data holder: version, build, timestamp, timePlayed, map, wave, rules, tags, mods",
+    "NetworkIO — multiplayer world sync: delegates to SaveIO.getSaveWriter() for all region writes/reads"
+  ],
+
+  "save_activity_flow": [
+    "START: caller invokes SaveIO.save(Fi file)",
+    "  [exists?] → YES: backup current file via file.moveTo(backupFileFor(file))",
+    "  call SaveIO.write(file) → write(file, null)",
+    "  [exception?] → YES: restore backup → throw RuntimeException | NO: continue",
+    "  write(OutputStream os, StringMap tags):",
+    "    fire Events.SaveWriteEvent",
+    "    get latest SaveVersion via getVersion() [versionArray.peek() = Save11]",
+    "    write 4-byte header 'MSAV' to stream",
+    "    write version int to stream",
+    "    call SaveVersion.write(DataOutputStream, StringMap extraTags)",
+    "      writeRegion('meta')  → SaveVersion.writeMeta(stream, tags)",
+    "        [isCampaign?] → prepare sector info, saveInfo()",
+    "        flush TechNode progress (TechTree.all nodes)",
+    "        build StringMap: saved, playtime, build, mapname, wave, tick, wavetime, stats, rules, sectorPreset, locales, mods, controlGroups, width, height, viewpos, controlledType, nocores, playerteam",
+    "        writeStringMap(stream, result)",
+    "      writeRegion('content') → writeContentHeader(stream)",
+    "        iterate content map; write MappableContent type ordinals, counts, names",
+    "      writeRegion('patches') → writeContentPatches(stream)",
+    "        [patches exist?] → write byte count + each patch bytes | else write 0",
+    "      writeRegion('map')    → writeMap(stream)",
+    "        write world width/height (2x short)",
+    "        LOOP tiles: write floorID, overlayID + RLE consecutive byte",
+    "        LOOP tiles: write blockID, packed flags (entity|data bits)",
+    "          [hasData?] → write data, floorData, overlayData, extraData (7 bytes)",
+    "          [hasBuild & isCenter?] → writeChunk: version byte + tile.build.writeAll()",
+    "          [no entity & no data?] → write RLE consecutive byte",
+    "      writeRegion('entities') → writeEntities(stream)",
+    "        writeEntityMapping: write custom ID→name mapping",
+    "        writeTeamBlocks: write active team plans (BlockPlan x,y,rot,block,config)",
+    "        writeWorldEntities: write serialisable entity count; per entity writeChunk(classId, id, beforeWrite, write)",
+    "      writeRegion('markers') → state.markers.write(stream)",
+    "      writeRegion('custom')  → writeCustomChunks(stream, net=false)",
+    "        LOOP enabled CustomChunks: write name UTF + writeChunk(chunk.write())",
+    "END SAVE"
+  ],
+
+  "load_activity_flow": [
+    "START: caller invokes SaveIO.load(Fi file) or load(Fi file, WorldContext context)",
+    "  wrap file in InflaterInputStream (decompression)",
+    "  call load(InputStream is, WorldContext context)",
+    "    wrap in CounterInputStream + DataInputStream",
+    "    logic.reset()",
+    "    readHeader: verify 4-byte 'MSAV' magic → [mismatch?] throw IOException",
+    "    read version int → lookup SaveVersion in versions map",
+    "    [version unknown?] → throw IOException 'Unknown save version'",
+    "    call SaveVersion.read(DataInputStream, CounterInputStream, WorldContext)",
+    "      readRegion('meta')    → readMeta(stream, context)",
+    "        readStringMap → restore wave, wavetime, tick, stats, rules, mapLocales",
+    "        [hasSector?] → set sector, apply planet rules",
+    "        [!headless] → restore camera pos, player pos, controlledType, team, controlGroups",
+    "        resolve Map by name from maps registry",
+    "      readRegion('content') → readContentHeader(stream)",
+    "        read mapped content types; build MappableContent[][] temp mapper",
+    "        content.setTemporaryMapper(map)",
+    "        [version < 11] → fire ContentPatchLoadEvent manually; apply patches",
+    "      [version >= 11] readRegion('patches') → readContentPatches(stream)",
+    "        read patch byte arrays → fire ContentPatchLoadEvent → state.patcher.apply(patches)",
+    "      readRegion('map')     → readMap(stream, context)",
+    "        read width/height; context.begin() (if not already generating)",
+    "        context.resize(width, height)",
+    "        LOOP floor pass: readShort floorID, overlayID + RLE; context.create(x,y,...)",
+    "        LOOP block pass: read blockID, packed flags",
+    "          [hadData?] → read data/floorData/overlayData/extraData; context.onReadTileData()",
+    "          [hadEntity & isCenter & hasBuilding?] → readChunkReads: read revision byte, tile.build.readAll()",
+    "          [hadEntity & isCenter & !hasBuilding?] → skipChunk (obsolete entity)",
+    "          context.onReadBuilding()",
+    "          [no entity & no data?] → read RLE consecutives; setBlock for range",
+    "        context.end()",
+    "      readRegion('entities') → readEntities(stream)",
+    "        readEntityMapping → build Prov[] mapping (custom ID→name→Prov)",
+    "        readTeamBlocks → restore team BlockPlan queues",
+    "        readWorldEntities(stream, mapping):",
+    "          LOOP entities: readChunkReads → get typeid, create entity, entity.read(in), entity.add()",
+    "          handle duplicate IDs by reassigning new IDs",
+    "          Groups.all.each(afterReadAll)",
+    "      [version >= 8] readRegion('markers') → state.markers.read(stream)",
+    "      readRegion('custom')  → readCustomChunks(stream)",
+    "        LOOP: read name UTF; [known chunk?] readChunk(chunk.read) | skipChunk",
+    "    fire Events.SaveLoadEvent(context.isMap())",
+    "  FINALLY: world.setGenerating(false); content.setTemporaryMapper(null)",
+    "  [exception from primary?] → try backup file; [no backup?] rethrow SaveException",
+    "END LOAD"
+  ],
+
+  "network_world_sync_flow": [
+    "NetworkIO.writeWorld(Player player, OutputStream os) — server → joining client",
+    "  [isCampaign?] → populate state.rules.researched from unlocked content",
+    "  write rules JSON, mapLocales JSON, map tags StringMap",
+    "  write wave, wavetime, tick, rand seeds",
+    "  write player id + player.write()",
+    "  delegate: getSaveWriter().writeContentHeader, writeContentPatches, writeMap, writeTeamBlocks, writeMarkers, writeCustomChunks(net=true)",
+    "NetworkIO.loadWorld(InputStream is) — client receives world",
+    "  read rules, mapLocales, map tags",
+    "  read wave, wavetime, tick, seeds; Groups.clear(); player.reset()/read()/add()",
+    "  delegate: getSaveWriter().readContentHeader, readContentPatches, readMap, readTeamBlocks, readMarkers, readCustomChunks",
+    "  FINALLY: content.setTemporaryMapper(null)"
+  ],
+
+  "version_handling": [
+    "Versions Save1..Save11 registered at static init into IntMap<SaveVersion> versions",
+    "getSaveWriter() always returns Save11 (latest, versionArray.peek())",
+    "getMeta(stream): reads header → version int → delegates to SaveVersion.getMeta(stream) → returns SaveMeta",
+    "Read path: version < 8 skips markers region; version < 11 skips patches region (fires event from contentHeader instead)",
+    "SaveFileReader.fallback map handles legacy block/unit names for backward compat"
+  ],
+
+  "chunk_region_protocol": [
+    "writeRegion(name, stream, runner): wraps writeChunk; catches errors with region name context",
+    "readRegion(name, stream, counter, runner): resets CounterInputStream; reads chunk; validates byte count matches",
+    "writeChunk: writes int length prefix, then data bytes from ReusableByteOutStream",
+    "readChunk: reads int length, passes (stream, length) to runner",
+    "skipChunk: reads length, skipBytes(length)",
+    "Nesting: chunkNested flag switches between byteOutput/byteOutput2 for one level of nesting"
+  ],
+
+  "key_relationships": [
+    "SaveVersion extends SaveFileReader (inheritance)",
+    "SaveIO depends_on SaveVersion (uses versionArray/versions registry)",
+    "SaveIO depends_on SaveFileReader (via SaveVersion)",
+    "NetworkIO depends_on SaveIO (calls getSaveWriter() for all region IO)",
+    "SaveVersion.getMeta returns SaveMeta",
+    "SaveVersion reads/writes WorldContext (map tiles, buildings)",
+    "SaveVersion reads/writes Groups (entity serialisation)",
+    "CustomChunk interface (in SaveFileReader) allows mod extension points"
+  ],
+
+  "important_notes": [
+    "File format: deflated binary; header 'MSAV' + int version + regions",
+    "Backup strategy: on save, old file → '-backup' sibling; on load failure, fallback to backup",
+    "Content mapper: temporary ID→content mapper set during load, cleared in finally block",
+    "RLE compression used for floor tiles and non-entity blocks",
+    "Entity deduplication: duplicate IDs reassigned via EntityGroup.nextId()",
+    "Network sync (NetworkIO) reuses the same region writers but skips meta/entity world-entities regions; uses net=true flag to exclude non-net custom chunks"
+  ],
+
+  "source_files_analyzed": [
+    "core/src/mindustry/io/SaveIO.java",
+    "core/src/mindustry/io/SaveFileReader.java",
+    "core/src/mindustry/io/SaveVersion.java",
+    "core/src/mindustry/io/SaveMeta.java",
+    "core/src/mindustry/net/NetworkIO.java"
+  ]
+}

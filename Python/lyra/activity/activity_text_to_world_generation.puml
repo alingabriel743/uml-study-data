@@ -1,0 +1,154 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #212529
+    EndColor #212529
+    BarColor #495057
+}
+
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title Text-to-World Diffusion Generation
+
+|Caller\n(text2world.py)|
+start
+:Invoke pipeline.generate(prompt, negative_prompt,\nword_limit_to_skip_upsampler);
+
+|BaseWorldGenerationPipeline|
+if (disable_guardrail?) then (no)
+    :_run_guardrail_on_prompt_with_offload(prompt);
+    note right
+        run_text_guardrail(prompt, text_guardrail)
+    end note
+    if (is_safe?) then (no)
+        #FFCCCC:log.critical — unsafe input prompt;
+        stop
+    endif
+endif
+
+|DiffusionText2WorldGenerationPipeline|
+if (enable_prompt_upsampler?) then (yes)
+    :Count words in prompt;
+    if (word_count > word_limit_to_skip_upsampler?) then (yes — too long)
+        :Skip upsampler\n(log and continue);
+    else (no — short enough)
+        :_run_prompt_upsampler_on_prompt_with_offload(prompt);
+        note right
+            Optional: _load_prompt_upsampler_model()
+            create_prompt_upsampler(checkpoint_dir)
+            run_chat_completion(prompt_upsampler, prompt)
+            Optional: _offload_prompt_upsampler_model()
+        end note
+        :upsampled_prompt : str;
+    endif
+endif
+
+|BaseWorldGenerationPipeline|
+if (disable_guardrail?) then (no)
+    :_run_guardrail_on_prompt_with_offload(upsampled_prompt);
+    if (is_safe?) then (no)
+        #FFCCCC:log.critical — unsafe upsampled prompt;
+        stop
+    endif
+endif
+
+:Build prompts list\n[prompt] or [prompt, negative_prompt];
+:_run_text_embedding_on_prompt_with_offload(prompts);
+note right
+    Optional: _load_text_encoder_model()
+    CosmosT5TextEncoder.encode_prompts()
+    Optional: _offload_text_encoder_model()
+end note
+:(prompt_embedding, negative_prompt_embedding)\n: torch.Tensor;
+
+|DiffusionText2WorldGenerationPipeline|
+:_run_model_with_offload(prompt_embedding,\nnegative_prompt_embedding);
+note right
+    Optional: _load_network()
+    Optional: _load_tokenizer()
+end note
+
+fork
+    :get_video_batch(model, prompt_embedding,\nheight, width, fps, num_video_frames);
+    :(data_batch, state_shape);
+fork again
+    :Configure diffusion params\n(guidance=7.0, num_steps=35, seed);
+end fork
+
+:generate_world_from_text(model, state_shape,\ndata_batch, guidance, num_steps, seed);
+note right
+    DiffusionT2WModel (7B or 14B DiT)
+    T5-11B encoder, CV8x8x8 tokenizer
+    Multi-GPU via context parallel (Megatron)
+end note
+:sample : torch.Tensor [B, C, T, H, W];
+
+if (offload_network?) then (yes)
+    :_offload_network();
+endif
+
+:_run_tokenizer_decoding(sample);
+note right
+    DiffusionT2WModel.decode(sample)
+    clamp + normalize to [0, 255]
+    permute → [T, H, W, C]
+    .to(uint8).cpu().numpy()
+end note
+:video : np.ndarray [T, H, W, C] uint8;
+
+if (offload_tokenizer?) then (yes)
+    :_offload_tokenizer();
+endif
+
+|BaseWorldGenerationPipeline|
+if (disable_guardrail?) then (no)
+    :_run_guardrail_on_video_with_offload(video);
+    note right
+        run_video_guardrail(video, video_guardrail)
+    end note
+    if (video safe?) then (no)
+        #FFCCCC:log.critical — unsafe generated video;
+        stop
+    endif
+endif
+
+|DiffusionText2WorldGenerationPipeline|
+:Return (video: np.ndarray, prompt: str) to caller;
+
+|Caller\n(text2world.py)|
+fork
+    :save_video(video, fps, H, W, video_save_path)\n→ .mp4 file;
+fork again
+    :Write final prompt to .txt file;
+end fork
+
+stop
+
+@enduml

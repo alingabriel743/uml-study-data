@@ -1,0 +1,136 @@
+{
+  "scope": "text_to_world_multiview_generation",
+  "title": "Text-to-World Multiview Generation",
+  "diagram_type": "activity",
+  "pipeline_class": "DiffusionText2WorldMultiviewGenerationPipeline",
+  "class_hierarchy": [
+    "BaseWorldGenerationPipeline (ABC)",
+    "  └─ DiffusionText2WorldGenerationPipeline",
+    "       └─ DiffusionText2WorldMultiviewGenerationPipeline"
+  ],
+
+  "initialization_flow": [
+    "START: __init__(inference_type, checkpoint_dir, checkpoint_name, n_views=6, frame_repeat_negative_condition=10, ...)",
+    "  SET self.n_views, self.frame_repeat_negative_condition",
+    "  CALL super().__init__() → DiffusionText2WorldGenerationPipeline.__init__(enable_prompt_upsampler=False)",
+    "    SET model_name, guidance, num_steps, height, width, fps, num_video_frames, seed",
+    "    CALL BaseWorldGenerationPipeline.__init__()",
+    "      ALWAYS: _load_model() → load_model_by_config(DiffusionMultiviewT2WModel)",
+    "      IF NOT offload_text_encoder_model: _load_text_encoder_model() → CosmosT5TextEncoder",
+    "      IF NOT disable_guardrail AND NOT offload_guardrails:",
+    "        IF has_text_input: _load_text_guardrail()",
+    "        _load_video_guardrail()",
+    "      IF NOT offload_network: _load_network() → load_network_model(model, checkpoint_path/model.pt)",
+    "      IF NOT offload_tokenizer: _load_tokenizer() → load_tokenizer_model(model, Cosmos-Tokenize1-CV8x8x8-720p)"
+  ],
+
+  "generate_flow": [
+    "ENTRY: generate(prompt: dict)",
+    "  LOG 'Run with prompt'",
+    "  EXTRACT 6 prompts from dict:",
+    "    [front=prompt['prompt'], left=prompt['prompt_left'], right=prompt['prompt_right'],",
+    "     back=prompt['prompt_back'], back_left=prompt['prompt_back_left'], back_right=prompt['prompt_back_right']]",
+    "  CALL _run_text_embedding_on_prompt_with_offload(prompts) → prompt_embeddings, _",
+    "    IF offload_text_encoder_model: _load_text_encoder_model()",
+    "    FOR each prompt: text_encoder.encode_prompts([prompt]) → (embedding, mask)",
+    "    IF offload_text_encoder_model: _offload_text_encoder_model()",
+    "  LOG 'Finish text embedding on prompt'",
+    "  LOG 'Run generation'",
+    "  CALL _run_model_with_offload(prompt_embeddings) → videos",
+    "    IF offload_network: _load_network()",
+    "    IF offload_tokenizer: _load_tokenizer()",
+    "    CALL _run_model(prompt_embeddings) → sample (torch.Tensor latents)",
+    "      CALL get_video_batch_for_multiview_model(model, embedding, height, width, fps,",
+    "           num_video_frames * n_views, frame_repeat_negative_condition) → data_batch, state_shape",
+    "      CALL generate_world_from_text(model, state_shape, is_negative_prompt=False,",
+    "           data_batch, guidance, num_steps, seed) → sample",
+    "    IF offload_network: _offload_network()",
+    "    CALL _run_tokenizer_decoding(sample) → [grid_video, video]",
+    "      CALL model.decode(sample) → raw_video [B, 3, T, H, W]",
+    "      NORMALIZE: (1.0 + raw_video).clamp(0, 2) / 2",
+    "      REARRANGE: 'b c (v t) h w -> b c v t h w' with v=n_views(6)",
+    "      REORDER views: [1, 0, 2, 4, 3, 5] (left, front, right, back_left, back, back_right)",
+    "      REARRANGE to 2x3 grid: 'b c (h w) t h1 w1 -> b c t (h h1) (w w1)' h=2, w=3",
+    "      CONVERT grid_video to uint8 numpy [T, H*2, W*3, C]",
+    "      CONVERT video to uint8 numpy [T, H, W, C]",
+    "      RETURN [grid_video, video]",
+    "    IF offload_tokenizer: _offload_tokenizer()",
+    "  LOG 'Finish generation'",
+    "  RETURN (videos=[grid_video, video], prompt)"
+  ],
+
+  "demo_caller_flow": [
+    "demo(args):",
+    "  misc.set_random_seed(args.seed)",
+    "  validate_args(args, 'text2world')",
+    "  OPTIONAL: distributed init + context parallel (multi-GPU)",
+    "  INIT DiffusionText2WorldMultiviewGenerationPipeline(…)",
+    "  OPTIONAL: pipeline.model.net.enable_context_parallel(process_group)",
+    "  LOAD prompts from file OR build single 6-view prompt dict",
+    "  FOR each prompt_dict:",
+    "    CALL pipeline.generate(prompt_dict) → ([grid_video, video], prompt) OR None",
+    "    IF None: log guardrail block, continue",
+    "    save_video(video, H=480, W=848, fps) → {name}.mp4",
+    "    save_video(grid_video, H=960, W=2544, fps) → {name}_grid.mp4",
+    "    WRITE prompt keys/values → {name}.txt",
+    "  OPTIONAL: destroy parallel state"
+  ],
+
+  "key_methods": {
+    "_load_model": "load_model_by_config(model_class=DiffusionMultiviewT2WModel, config_file, config_job_name=self.model_name)",
+    "_run_model": "get_video_batch_for_multiview_model() + generate_world_from_text() → latent tensor",
+    "_run_tokenizer_decoding": "model.decode() + einops rearrange into n_views segments + 2x3 grid assembly → [grid_video, video]",
+    "generate": "extract 6 prompts → T5 embed → diffusion sample → tokenizer decode → return videos",
+    "_run_model_with_offload": "conditional load/offload network+tokenizer wrapping _run_model + _run_tokenizer_decoding"
+  },
+
+  "key_parameters": {
+    "n_views": 6,
+    "cameras": ["front", "left", "right", "back", "back_left", "back_right"],
+    "grid_layout": "2x3 (reordered: left|front|right / back_left|back|back_right)",
+    "num_video_frames_per_camera": 57,
+    "default_resolution": "480x848",
+    "frame_repeat_negative_condition": 10,
+    "guidance": 7.0,
+    "num_steps": 35,
+    "model_checkpoint": "Cosmos-Predict1-7B-Text2World-Sample-AV-Multiview",
+    "tokenizer_checkpoint": "Cosmos-Tokenize1-CV8x8x8-720p",
+    "text_encoder": "CosmosT5TextEncoder (google-t5/t5-11b)"
+  },
+
+  "key_conditions_and_branches": [
+    "offload_network: load network before _run_model, offload after",
+    "offload_tokenizer: load tokenizer before _run_tokenizer_decoding, offload after",
+    "offload_text_encoder_model: load T5 before embed, offload after",
+    "offload_guardrail_models: load guardrails on-demand per call",
+    "disable_guardrail: skip all guardrail checks (NOTE: generate() in multiview does NOT call guardrails)",
+    "num_gpus > 1: enable context parallel, destroy at end",
+    "batch_input_path: read multiple prompts from file vs single prompt dict"
+  ],
+
+  "guardrail_note": "DiffusionText2WorldMultiviewGenerationPipeline.generate() does NOT call guardrail checks (no _run_guardrail_on_prompt_with_offload), unlike the base DiffusionText2WorldGenerationPipeline.generate()",
+
+  "output_artifacts": [
+    "video: uint8 np.ndarray [T, H, W, C] — individual concatenated all-camera frames",
+    "grid_video: uint8 np.ndarray [T, H*2, W*3, C] — 2x3 camera grid mosaic",
+    "prompt: dict with 6 camera prompt strings"
+  ],
+
+  "dependencies": [
+    "DiffusionMultiviewT2WModel (model backbone)",
+    "CosmosT5TextEncoder (text → embeddings)",
+    "load_model_by_config, load_network_model, load_tokenizer_model (from inference_utils)",
+    "get_video_batch_for_multiview_model (from inference_utils)",
+    "generate_world_from_text (from inference_utils)",
+    "guardrail_presets (text/video safety — loaded but not called in generate())",
+    "einops (rearrange for multiview tensor ops)",
+    "save_video (from cosmos_predict1.utils.io)"
+  ],
+
+  "source_files_analyzed": [
+    "Lyra-1/cosmos_predict1/diffusion/inference/world_generation_pipeline.py (lines 694-882)",
+    "Lyra-1/cosmos_predict1/diffusion/inference/world_generation_pipeline.py (lines 60-325, base class)",
+    "Lyra-1/cosmos_predict1/utils/base_world_generation_pipeline.py",
+    "Lyra-1/cosmos_predict1/diffusion/inference/text2world_multiview.py"
+  ]
+}

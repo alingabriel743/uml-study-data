@@ -1,0 +1,143 @@
+{
+  "scope": "postgres_type_handling",
+  "title": "PostgreSQL Type Conversion Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "PostgresTypeMetadataPerf (JMH Benchmark)",
+    "AbstractReplicationMessageColumn",
+    "TypeMetadataImpl",
+    "PostgresType",
+    "TypeRegistry",
+    "PostgresValueConverter",
+    "PostgresConnectorConfig",
+    "AbstractRecordsProducerTest"
+  ],
+
+  "interaction_flow": [
+    "--- BENCHMARK FLOW (PostgresTypeMetadataPerf) ---",
+    "PostgresTypeMetadataPerf.setup() → createColumn(modifierIndex): creates AbstractReplicationMessageColumn with PostgresType.UNKNOWN + typeWithModifiers string",
+    "PostgresTypeMetadataPerf.columnMetadata(Blackhole) → Column.getTypeMetadata(): triggers lazy metadata parse",
+
+    "--- LAZY METADATA RESOLUTION (AbstractReplicationMessageColumn) ---",
+    "AbstractReplicationMessageColumn.getTypeMetadata(): if typeMetadata==null → initMetadata()",
+    "initMetadata() → new TypeMetadataImpl(columnName, type, typeWithModifiers, optional)",
+    "TypeMetadataImpl.<init>: modifierCache.computeIfAbsent(typeWithModifiers, mod → parseModifiers(mod, columnName))",
+    "TypeMetadataImpl.parseModifiers(typeWithModifiers, columnName): match TYPE_PATTERN regex → extract 'mod' group → split by TYPEMOD_PATTERN",
+    "TypeMetadataImpl.<init>: type.getDefaultLength() → PostgresType.getDefaultLength() [uses TypeInfo.getPrecision/getDisplaySize]",
+    "TypeMetadataImpl.<init>: type.getDefaultScale() → PostgresType.getDefaultScale() [uses TypeInfo.getScale]",
+    "TypeMetadataImpl.<init>: if modifiers[0] present → type.length(parseInt(mod)) + type.scale(parseInt(mod)) [OID-specific switch]",
+    "TypeMetadataImpl.<init>: if modifiers[1] present → scale = parseInt(modifiers[1])",
+
+    "--- TYPE REGISTRY INITIALIZATION ---",
+    "TypeRegistry.<init>(PostgresConnection) → prime()",
+    "prime(): execute SQL_TYPES query (pg_catalog.pg_type JOIN pg_namespace LEFT JOIN enum_values) → ResultSet",
+    "prime(): per row → createTypeBuilderFromResultSet(rs)",
+    "createTypeBuilderFromResultSet: new PostgresType.Builder(typeRegistry, name, oid, jdbcId, modifiers, typeInfo)",
+    "createTypeBuilderFromResultSet: if CATEGORY_ENUM → builder.enumValues(enumValues)",
+    "createTypeBuilderFromResultSet: if CATEGORY_ARRAY → builder.elementType(elementOid)",
+    "createTypeBuilderFromResultSet: builder.parentType(parentTypeOid) → returns TypeBuilderWithSchema",
+    "prime(): if no parentType/elementType → addType(builder.build(), schemaName) immediately",
+    "prime(): delayed builders (with parent/element refs) → resolve after first pass → addType()",
+    "addType(): oidToType.put + nameToType.put (qualified + unqualified) + special OID caching (geometryOid, hstoreOid, etc.)",
+
+    "--- TYPE LOOKUP ---",
+    "TypeRegistry.get(int oid): oidToType.get(oid) → if null → resolveUnknownType(oid) [SQL_OID_LOOKUP]",
+    "TypeRegistry.get(String name): nameToType.get(name) → strip quotes → qualified/unqualified fallback → resolveUnknownType(name) [SQL_NAME_LOOKUP]",
+    "TypeRegistry.get(String schema, String name): nameToType.get(qualified) → fallback get(name)",
+    "PostgresType.Builder.build(): typeRegistry.get(parentTypeOid) + typeRegistry.get(elementTypeOid) → new PostgresType(name,oid,jdbcId,modifiers,typeInfo,enumValues,parent,element)",
+
+    "--- SCHEMA BUILDING (PostgresValueConverter) ---",
+    "PostgresValueConverter.schemaBuilder(Column): switch(column.nativeType()/oid) → returns SchemaBuilder",
+    "  BIT/VARBIT: Bits.builder or SchemaBuilder.bool()",
+    "  NUMERIC: numericSchema(column) [checks decimalMode/scale]",
+    "  BYTEA: binaryMode.getSchema()",
+    "  TIMESTAMPTZ: ZonedTimestamp.builder(); TIMETZ: ZonedTime.builder()",
+    "  JSON/JSONB: Json.builder(); UUID: Uuid.builder(); POINT: Point.builder()",
+    "  default(unknown OID): typeRegistry.geometryOid() → Geometry.builder() / hstoreOid() → hstoreSchema() / ltreeOid() → Ltree.builder() / etc.",
+    "  array types: SchemaBuilder.array(elementSchema)",
+
+    "--- VALUE CONVERSION (PostgresValueConverter) ---",
+    "PostgresValueConverter.converter(Column, Field): switch(oid) → returns ValueConverter lambda",
+    "  NUMERIC: data → convertDecimal(column, fieldDefn, data, decimalMode)",
+    "  BYTEA: data → convertBinary(column, fieldDefn, data, binaryMode)",
+    "  hstoreOid: data → convertHStore(column, fieldDefn, data, hStoreMode)",
+    "  array OIDs: createArrayConverter(column, fieldDefn)",
+    "  geometryOid: data → convertGeometry; geographyOid: convertGeography",
+    "  enum types: data → convertString; unknown with JDBC fallback or convertBinary",
+
+    "convertHStore(column, fieldDefn, data, mode): if mode==JSON → convertHstoreToJsonString(); else → convertHstoreToMap()",
+    "createArrayConverter(column, fieldDefn): typeRegistry.get(oid) → arrayType.getElementType() → build elementColumn → schemaBuilder(elementColumn) → converter(elementColumn, elementField) → data → convertArray(..., elementConverter)",
+    "convertArray(column, fieldDefn, elementType, elementConverter, data): if List → stream map resolveArrayValue → elementConverter.convert; if PgArray → getArray() → loop elementConverter.convert",
+    "resolveArrayValue(value, elementType): special TZ re-offset for TIMETZ/TIMESTAMPTZ array elements; else pass-through",
+
+    "--- TEST VALIDATION (AbstractRecordsProducerTest) ---",
+    "AbstractRecordsProducerTest.schemasAndValuesForNumericType(): builds expected SchemaAndValueField list (INT16/INT32/INT64/FLOAT32/FLOAT64/BOOLEAN/NaN/Infinity)",
+    "schemasAndValuesForBigDecimalEncodedNumericTypes(): Decimal.builder(scale).parameter(PRECISION_KEY) + VariableScaleDecimal for variable-scale",
+    "schemasAndValuesForStringEncodedNumericTypes(): OPTIONAL_STRING_SCHEMA for all decimal fields incl NaN/Infinity",
+    "schemaAndValueFieldForMapEncodedHStoreType(): hstoreMapSchema()=SchemaBuilder.map(STRING,optional STRING) → Map<String,String>",
+    "schemaAndValueFieldForJsonEncodedHStoreType(): Json.builder() → JSON string",
+    "schemaAndValuesForDateTimeTypes(): MicroTimestamp/ZonedTimestamp/Date/MicroTime/ZonedTime/MicroDuration per column",
+    "schemaAndValuesForBinTypes(): Bits.builder(n) for bit-varying; OPTIONAL_BYTES for bytea",
+    "schemasAndValuesForStringTypesWithSourceColumnTypeInfo(): SchemaBuilder parameters TYPE_NAME/TYPE_LENGTH/TYPE_SCALE/COLUMN_NAME"
+  ],
+
+  "key_relationships": [
+    "AbstractReplicationMessageColumn implements ReplicationMessage.Column",
+    "AbstractReplicationMessageColumn has-inner TypeMetadataImpl implements ReplicationMessage.ColumnTypeMetadata",
+    "AbstractReplicationMessageColumn holds PostgresType (via field 'type')",
+    "TypeMetadataImpl caches parsed modifiers in static LRUCacheMap<String, String[]>",
+    "PostgresType holds: name, oid, jdbcId, modifiers, TypeInfo (from pgjdbc), parentType (UDT hierarchy), elementType (arrays), enumValues",
+    "PostgresType.Builder depends_on TypeRegistry (resolves parent/element OIDs during build())",
+    "TypeRegistry holds Map<String,PostgresType> nameToType + Map<Integer,PostgresType> oidToType",
+    "TypeRegistry depends_on PostgresConnection (for SQL_TYPES / SQL_OID_LOOKUP / SQL_NAME_LOOKUP queries)",
+    "TypeRegistry depends_on SqlTypeMapper (maps typeName → JDBC int)",
+    "PostgresValueConverter depends_on TypeRegistry (for dynamic OID checks: geometry, hstore, ltree, vector, etc.)",
+    "PostgresValueConverter depends_on PostgresConnectorConfig (HStoreHandlingMode, IntervalHandlingMode, DecimalMode, BinaryMode)",
+    "AbstractRecordsProducerTest extends AbstractAsyncEngineConnectorTest",
+    "AbstractRecordsProducerTest uses PostgresConnectorConfig enums (HStoreHandlingMode.MAP/JSON, DecimalMode)",
+    "PostgresTypeMetadataPerf (JMH) benchmarks AbstractReplicationMessageColumn.getTypeMetadata() call with LRUCache hot/cold paths"
+  ],
+
+  "config_enums": {
+    "HStoreHandlingMode": ["JSON (hstore→JSON string)", "MAP (hstore→Map<String,String>)"],
+    "IntervalHandlingMode": ["NUMERIC (microseconds)", "STRING (ISO 8601)"],
+    "SnapshotMode": ["ALWAYS", "INITIAL", "NO_DATA", "INITIAL_ONLY", "WHEN_NEEDED", "CONFIGURATION_BASED", "CUSTOM"],
+    "SnapshotIsolationMode": ["SERIALIZABLE", "REPEATABLE_READ", "READ_COMMITTED", "READ_UNCOMMITTED"],
+    "SecureConnectionMode": ["DISABLED", "PREFERRED", "REQUIRED", "VERIFY_CA", "VERIFY_FULL"]
+  },
+
+  "type_metadata_parsing": {
+    "regex": "^(?<schema>[^\\.\\(]+\\.)?(?<full>(?<base>[^(\\[]+)(?:\\((?<mod>.+)\\))?(?<suffix>.*?))(?<array>\\[\\])?$",
+    "cache": "Static LRUCacheMap<String, String[]>(128) keyed by typeWithModifiers string",
+    "examples": ["text → no modifiers", "character varying(255) → ['255']", "numeric(12,3) → ['12','3']", "timestamp (12) with time zone → ['12']", "int[] → array suffix, no mods", "myschema.geometry → schema prefix"],
+    "length_scale_resolution": "modifiers[0]=typmod for length/precision; modifiers[1] for scale; fallback to PostgresType.getDefaultLength/Scale via TypeInfo.getPrecision/getScale/getDisplaySize"
+  },
+
+  "special_type_oids": {
+    "dynamic_oids": ["geometryOid", "geographyOid", "citextOid", "hstoreOid", "ltreeOid", "isbnOid", "vectorOid", "halfVectorOid", "sparseVectorOid", "tsVectorOid"],
+    "array_dynamic_oids": ["geometryArrayOid", "geographyArrayOid", "hstoreArrayOid", "citextArrayOid", "ltreeArrayOid"],
+    "note": "Dynamic OIDs resolved at startup via TypeRegistry.prime() — not hardcoded, vary per PostgreSQL instance"
+  },
+
+  "important_notes": [
+    "TypeMetadataImpl is lazily constructed (first call to getTypeMetadata() triggers parse)",
+    "JMH benchmark specifically measures hot-path cost of getTypeMetadata() with LRUCache",
+    "TypeRegistry.prime() uses two-pass strategy: simple types first, then delayed builders with parent/element OID refs",
+    "PostgresType.getRootType() walks parentType chain to find base type (supports UDT hierarchies)",
+    "convertDecimal uses DecimalMode config: PRECISE→BigDecimal/Bytes, STRING→string, DOUBLE→float64",
+    "convertArray handles both List<> (streaming) and PgArray (snapshot JDBC) sources",
+    "TIMETZ/TIMESTAMPTZ array elements require special timezone re-offset (JVM TZ applied by PgArray driver)",
+    "HStore: MAP mode → Map<String,String> schema; JSON mode → Json.builder() string schema",
+    "AbstractRecordsProducerTest is abstract base test class; provides expected SchemaAndValueField lists for all PG type categories"
+  ],
+
+  "source_files_analyzed": [
+    "debezium-microbenchmark/src/main/java/io/debezium/performance/connector/postgres/PostgresTypeMetadataPerf.java",
+    "debezium-connector-postgres/src/test/java/io/debezium/connector/postgresql/AbstractRecordsProducerTest.java",
+    "debezium-connector-postgres/src/main/java/io/debezium/connector/postgresql/PostgresConnectorConfig.java",
+    "debezium-connector-postgres/src/main/java/io/debezium/connector/postgresql/PostgresType.java",
+    "debezium-connector-postgres/src/main/java/io/debezium/connector/postgresql/connection/AbstractReplicationMessageColumn.java",
+    "debezium-connector-postgres/src/main/java/io/debezium/connector/postgresql/TypeRegistry.java",
+    "debezium-connector-postgres/src/main/java/io/debezium/connector/postgresql/PostgresValueConverter.java"
+  ]
+}

@@ -1,0 +1,313 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+title Lyra-1 Guardrail and Content Safety
+
+' ─────────────────────────────────────────
+' External base
+' ─────────────────────────────────────────
+class "torch.nn.Module" as TorchModule <<external>> {
+}
+
+' ─────────────────────────────────────────
+' guardrail.common
+' ─────────────────────────────────────────
+package "guardrail.common" {
+
+    abstract class ContentSafetyGuardrail {
+        +{abstract} is_safe(**kwargs) : Tuple[bool, str]
+    }
+
+    abstract class PostprocessingGuardrail {
+        +{abstract} postprocess(frames: np.ndarray) : np.ndarray
+    }
+
+    class GuardrailRunner <<orchestrator>> {
+        +safety_models : list[ContentSafetyGuardrail] | None
+        +generic_block_msg : str
+        +generic_safe_msg : str
+        +postprocessors : list[PostprocessingGuardrail] | None
+        --
+        +__init__(safety_models, generic_block_msg, generic_safe_msg, postprocessors)
+        +run_safety_check(input: Any) : Tuple[bool, str]
+        +postprocess(frames: np.ndarray) : np.ndarray
+    }
+
+    class VideoData <<dataclass>> {
+        +frames : np.ndarray
+        +fps : int
+        +duration : int
+    }
+}
+
+' ─────────────────────────────────────────
+' guardrail.aegis
+' ─────────────────────────────────────────
+package "guardrail.aegis" {
+
+    class Aegis {
+        +checkpoint_dir : str
+        +device : str
+        +dtype : torch.bfloat16
+        +tokenizer : AutoTokenizer
+        +model : PeftModel
+        --
+        +__init__(checkpoint_dir, device)
+        +get_moderation_prompt(user_prompt: str) : str
+        +get_aegis_block_message(moderation_output: str) : str
+        +filter_aegis_output(prompt: str) : tuple[bool, str]
+        +is_safe(prompt: str) : tuple[bool, str]
+    }
+    note right of Aegis
+        LlamaGuard-7b base +
+        Aegis-AI-Content-Safety LoRA adapter.
+        Generates ≤100 tokens;
+        checks for "unsafe" in output.
+    end note
+}
+
+' ─────────────────────────────────────────
+' guardrail.blocklist
+' ─────────────────────────────────────────
+package "guardrail.blocklist" {
+
+    class Blocklist {
+        +checkpoint_dir : str
+        +guardrail_partial_match_min_chars : int = 6
+        +guardrail_partial_match_letter_count : float = 0.4
+        +lemmatizer : nltk.WordNetLemmatizer
+        +profanity : better_profanity.profanity
+        +blocklist_words : list[str]
+        +whitelist_words : list[str]
+        +exact_match_words : list[str]
+        --
+        +__init__(checkpoint_dir, ...)
+        +uncensor_whitelist(input_prompt, censored_prompt) : str
+        +censor_prompt(input_prompt: str) : tuple[bool, str]
+        +{static} check_partial_match(...) : tuple[bool, str]
+        +{static} check_against_whole_word_blocklist(...) : bool
+        +is_safe(input_prompt: str) : tuple[bool, str]
+    }
+    note right of Blocklist
+        3-stage pipeline:
+        (1) profanity censor on raw input
+        (2) censor on lemmatized tokens
+        (3) whole-word / partial match
+        against exact_match_words
+    end note
+}
+
+' ─────────────────────────────────────────
+' guardrail.llamaGuard3
+' ─────────────────────────────────────────
+package "guardrail.llamaGuard3" {
+
+    class LlamaGuard3 {
+        +checkpoint_dir : str
+        +device : str
+        +dtype : torch.bfloat16
+        +model : AutoModelForCausalLM
+        +tokenizer : AutoTokenizer
+        --
+        +__init__(checkpoint_dir, device)
+        +get_llamaGuard3_block_message(moderation_output: str) : str
+        +filter_llamaGuard3_output(prompt: str) : tuple[bool, str]
+        +is_safe(prompt: str) : tuple[bool, str]
+    }
+    note right of LlamaGuard3
+        meta-llama/Llama-Guard-3-8B.
+        Applies chat template with
+        UNSAFE_CATEGORIES. Generates
+        ≤100 tokens; checks for "unsafe".
+    end note
+}
+
+' ─────────────────────────────────────────
+' guardrail.video_content_safety_filter
+' ─────────────────────────────────────────
+package "guardrail.video_content_safety_filter" {
+
+    class VideoContentSafetyFilter {
+        +device : str
+        +dtype : torch.float32
+        +checkpoint_dir : str
+        +encoder : SigLIPEncoder
+        +model : VideoSafetyModel
+        --
+        +__init__(checkpoint_dir, device)
+        -__infer(pil_image: Image.Image) : int
+        +is_safe_file(filepath: str) : bool
+        +is_safe_frames(frames: Iterable) : bool
+        +is_safe(input: Union[str, Iterable]) : Tuple[bool, str]
+    }
+    note right of VideoContentSafetyFilter
+        7 classes: Safe(0), Sexual_Content(1),
+        Violence(2), Drugs(3), Child_Abuse(4),
+        Hate_and_Harassment(5), Self-Harm(6).
+        Samples video at 2 FPS;
+        any non-safe frame → unsafe.
+    end note
+
+    class SigLIPEncoder {
+        +checkpoint_dir : str
+        +device : str
+        +dtype : torch.float32
+        +model : SiglipModel
+        +processor : SiglipProcessor
+        --
+        +__init__(checkpoint_dir, model_name, device, dtype)
+        +encode_image(input_img: Image.Image) : torch.Tensor
+    }
+    note bottom of SigLIPEncoder
+        google/siglip-so400m-patch14-384.
+        Returns L2-normalized image features.
+    end note
+
+    class VideoSafetyModel {
+        +config : ModelConfig
+        +num_classes : int
+        +network : SafetyClassifier
+        --
+        +__init__(config: ModelConfig)
+        +forward(data_batch: dict) : dict[str, torch.Tensor]
+    }
+
+    class SafetyClassifier {
+        +input_size : int = 1024
+        +num_classes : int = 2
+        +layers : nn.Sequential
+        --
+        +__init__(input_size, num_classes)
+        +forward(x) : Tensor
+    }
+    note bottom of SafetyClassifier
+        Linear(in→512)→BN→ReLU→
+        Linear(512→256)→BN→ReLU→
+        Linear(256→num_classes)
+    end note
+
+    class ModelConfig <<dataclass>> {
+        +input_size : int = 1152
+        +num_classes : int = 7
+    }
+}
+
+' ─────────────────────────────────────────
+' guardrail.face_blur_filter
+' ─────────────────────────────────────────
+package "guardrail.face_blur_filter" {
+
+    class RetinaFaceFilter {
+        +checkpoint : str
+        +cfg : dict
+        +batch_size : int = 1
+        +confidence_threshold : float = 0.7
+        +device : str
+        +dtype : torch.float32
+        +net : RetinaFace
+        --
+        +__init__(checkpoint_dir, batch_size, confidence_threshold, device)
+        +preprocess_frames(frames: np.ndarray) : torch.Tensor
+        +blur_detected_faces(frames, batch_loc, batch_conf, ...) : list[np.ndarray]
+        +postprocess(frames: np.ndarray) : np.ndarray
+    }
+    note right of RetinaFaceFilter
+        RetinaFace (ResNet50) face detection.
+        Applies pixelate_face() to each face.
+        Confidence≥0.7, NMS=0.4,
+        TOP_K=5000, KEEP_TOP_K=750.
+    end note
+}
+
+' ─────────────────────────────────────────
+' cosmos_predict1.auxiliary
+' ─────────────────────────────────────────
+package "cosmos_predict1.auxiliary" {
+
+    class CosmosT5TextEncoder {
+        +tokenizer : T5TokenizerFast
+        +text_encoder : T5EncoderModel
+        +device : str
+        --
+        +__init__(model_name, device, cache_dir)
+        +encode_prompts(prompts, max_length: int = 512) : Tuple[Tensor, Tensor]
+    }
+    note right of CosmosT5TextEncoder
+        google-t5/t5-11b.
+        Returns (encoded_text [B,L,H],
+        attn_mask [B,L]). Pads to 512.
+    end note
+
+    class DummyT5TextEncoder {
+        +device : str
+        --
+        +__init__(device)
+        +encode_prompts(prompts, max_length: int = 512) : Tuple[Tensor, Tensor]
+    }
+    note right of DummyT5TextEncoder
+        Testing stub.
+        Returns zero embeddings
+        of shape (B, max_length, 1024).
+    end note
+}
+
+' ─────────────────────────────────────────
+' Factory functions (shown as a note)
+' ─────────────────────────────────────────
+note as FactoryNote
+    <b>guardrail.common.presets</b>
+    --
+    create_text_guardrail_runner(checkpoint_dir)
+      → GuardrailRunner(
+          safety_models=[Blocklist, LlamaGuard3])
+    create_video_guardrail_runner(checkpoint_dir)
+      → GuardrailRunner(
+          safety_models=[VideoContentSafetyFilter],
+          postprocessors=[RetinaFaceFilter])
+    run_text_guardrail(prompt, runner) → bool
+    run_video_guardrail(frames, runner) → np.ndarray | None
+end note
+
+' ─────────────────────────────────────────
+' Inheritance relationships
+' ─────────────────────────────────────────
+Aegis                  --|> ContentSafetyGuardrail
+Blocklist              --|> ContentSafetyGuardrail
+LlamaGuard3            --|> ContentSafetyGuardrail
+VideoContentSafetyFilter --|> ContentSafetyGuardrail
+RetinaFaceFilter       --|> PostprocessingGuardrail
+
+SigLIPEncoder          --|> TorchModule
+VideoSafetyModel       --|> TorchModule
+SafetyClassifier       --|> TorchModule
+CosmosT5TextEncoder    --|> TorchModule
+DummyT5TextEncoder     --|> TorchModule
+
+' ─────────────────────────────────────────
+' Composition relationships
+' ─────────────────────────────────────────
+GuardrailRunner        *-- "0..*" ContentSafetyGuardrail  : safety_models
+GuardrailRunner        *-- "0..*" PostprocessingGuardrail  : postprocessors
+
+VideoContentSafetyFilter *-- SigLIPEncoder  : encoder
+VideoContentSafetyFilter *-- VideoSafetyModel : model
+
+VideoSafetyModel       *-- ModelConfig       : config
+VideoSafetyModel       *-- SafetyClassifier  : network
+
+@enduml

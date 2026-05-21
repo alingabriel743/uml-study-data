@@ -1,0 +1,192 @@
+{
+  "scope": "mariadb_cdc_streaming",
+  "title": "MariaDB CDC Streaming",
+  "diagram_type": "use_case",
+  "description": "Actor interactions for streaming MariaDB binlog change events to Kafka",
+
+  "actors": [
+    {
+      "name": "KafkaConnect",
+      "type": "primary",
+      "description": "Kafka Connect platform that deploys and manages the connector lifecycle"
+    },
+    {
+      "name": "MariaDbConnector",
+      "type": "system",
+      "description": "Top-level Kafka Connect connector; extends BinlogConnector<MariaDbConnectorConfig>, implements ConfigDescriptor. Creates MariaDbConnectorTask."
+    },
+    {
+      "name": "MariaDbConnectorTask",
+      "type": "system",
+      "description": "Extends BinlogSourceTask. Bootstraps full CDC pipeline: validates binlog config, creates ChangeEventQueue, ErrorHandler, EventDispatcher, ChangeEventSourceCoordinator."
+    },
+    {
+      "name": "BinaryLogClient",
+      "type": "external",
+      "description": "shyiko mysql-binlog-connector library. Connects to MariaDB and streams raw binlog events."
+    },
+    {
+      "name": "MariaDbStreamingChangeEventSource",
+      "type": "system",
+      "description": "Extends BinlogStreamingChangeEventSource. Handles MariaDB-specific logic: MARIADB_GTID events, ANNOTATE_ROWS (SQL query capture), GTID set management, SSL mode mapping."
+    },
+    {
+      "name": "EventDispatcher",
+      "type": "system",
+      "description": "Routes parsed change events to ChangeEventQueue with topic naming, filters, heartbeat, and schema changes."
+    },
+    {
+      "name": "MariaDbErrorHandler",
+      "type": "system",
+      "description": "Extends ErrorHandler. Classifies IOException/SQLException as communication exceptions. Non-retriable: error code 1236 (ER_MASTER_FATAL_ERROR_READING_BINLOG)."
+    },
+    {
+      "name": "BinlogSourceInfo",
+      "type": "system",
+      "description": "Tracks current binlog position: file, pos, GTID, server_id, thread_id, query, tableIds, sourceTime."
+    },
+    {
+      "name": "Kafka",
+      "type": "external",
+      "description": "Target message broker receiving serialized change event records"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Deploy Connector",
+      "actor": "KafkaConnect",
+      "description": "KafkaConnect instantiates MariaDbConnector, calls taskClass() → returns MariaDbConnectorTask",
+      "system": "MariaDbConnector"
+    },
+    {
+      "id": "UC2",
+      "name": "Validate Binlog Configuration",
+      "actor": "MariaDbConnectorTask",
+      "description": "Calls validateBinlogConfiguration(snapshotter, connection): asserts binlog_format=ROW and binlog_row_image=FULL via BinlogConnectorConnection.isBinlogFormatRow() / isBinlogRowImageFull()",
+      "system": "BinlogSourceTask"
+    },
+    {
+      "id": "UC3",
+      "name": "Bootstrap CDC Pipeline",
+      "actor": "MariaDbConnectorTask",
+      "description": "start(): creates MariaDbConnectorConfig, MariaDbDatabaseSchema, ChangeEventQueue, MariaDbErrorHandler, EventDispatcher, BinaryLogClient, MariaDbStreamingChangeEventSourceMetrics, ChangeEventSourceCoordinator",
+      "system": "MariaDbConnectorTask"
+    },
+    {
+      "id": "UC4",
+      "name": "Connect to MariaDB Binlog",
+      "actor": "MariaDbStreamingChangeEventSource",
+      "description": "BinaryLogClient.connect() to MariaDB host:port with credentials. Sets mariaDbSlaveCapability=4 for GTID compatibility. Optionally enables ANNOTATE_ROWS (setUseSendAnnotateRowsEvent=true) when sql.query.include=true.",
+      "system": "BinaryLogClient"
+    },
+    {
+      "id": "UC5",
+      "name": "Stream Binlog Events",
+      "actor": "BinaryLogClient",
+      "description": "Delivers raw Event objects to registered EventListener in BinlogStreamingChangeEventSource.execute(). Dispatches to typed handlers: STOP, HEARTBEAT, ROTATE, TABLE_MAP, QUERY, WRITE_ROWS, UPDATE_ROWS, DELETE_ROWS, XID, TRANSACTION_PAYLOAD.",
+      "system": "MariaDbStreamingChangeEventSource"
+    },
+    {
+      "id": "UC6",
+      "name": "Handle GTID Transaction",
+      "actor": "MariaDbStreamingChangeEventSource",
+      "description": "handleGtidEvent(): extracts MariadbGtidEventData, constructs GTID string (domainId-serverId-sequence), updates MariaDbGtidSet, calls offsetContext.startGtid(), then handleTransactionBegin().",
+      "system": "MariaDbStreamingChangeEventSource"
+    },
+    {
+      "id": "UC7",
+      "name": "Track Binlog Position",
+      "actor": "MariaDbStreamingChangeEventSource",
+      "description": "BinlogSourceInfo.setBinlogPosition(file, pos) on ROTATE events. Stores file, pos, GTID, server_id, thread_id, query for offset commits.",
+      "system": "BinlogSourceInfo"
+    },
+    {
+      "id": "UC8",
+      "name": "Dispatch DML Change Events",
+      "actor": "MariaDbStreamingChangeEventSource",
+      "description": "handleInsert/handleUpdate/handleDelete(): parses WriteRowsEventData/UpdateRowsEventData/DeleteRowsEventData, emits Envelope.Operation.CREATE/UPDATE/DELETE via EventDispatcher.dispatchDataChangeEvent()",
+      "system": "EventDispatcher"
+    },
+    {
+      "id": "UC9",
+      "name": "Capture SQL Query (ANNOTATE_ROWS)",
+      "actor": "MariaDbStreamingChangeEventSource",
+      "description": "handleRecordingQuery(): extracts AnnotateRowsEventData.getRowsQuery(), skips signal-table queries, calls offsetContext.setQuery(query) for inclusion in change event source metadata.",
+      "system": "MariaDbStreamingChangeEventSource"
+    },
+    {
+      "id": "UC10",
+      "name": "Handle Schema Changes (DDL)",
+      "actor": "MariaDbStreamingChangeEventSource",
+      "description": "handleQueryEvent(): processes QUERY events containing DDL. Dispatches SchemaChangeEvent via EventDispatcher. Updates MariaDbDatabaseSchema.",
+      "system": "EventDispatcher"
+    },
+    {
+      "id": "UC11",
+      "name": "Handle Streaming Errors",
+      "actor": "MariaDbErrorHandler",
+      "description": "isRetriable(): walks throwable chain; returns false for SQLException error code 1236 (ER_MASTER_FATAL_ERROR_READING_BINLOG). communicationExceptions() covers IOException and SQLException for retry decisions.",
+      "system": "MariaDbErrorHandler"
+    },
+    {
+      "id": "UC12",
+      "name": "Publish Change Records to Kafka",
+      "actor": "EventDispatcher",
+      "description": "Enqueues DataChangeEvent into ChangeEventQueue. MariaDbConnectorTask.doPoll() calls queue.poll(), maps to SourceRecord list returned to KafkaConnect for Kafka publication.",
+      "system": "Kafka"
+    },
+    {
+      "id": "UC13",
+      "name": "Heartbeat / Keep-alive",
+      "actor": "MariaDbConnectorTask",
+      "description": "HeartbeatFactory creates scheduled heartbeat via MariaDbConnection. BinlogHeartbeatErrorHandler handles SQL errors 42000/3D000 during heartbeat queries.",
+      "system": "MariaDbStreamingChangeEventSource"
+    },
+    {
+      "id": "UC14",
+      "name": "Stop / Cleanup",
+      "actor": "KafkaConnect",
+      "description": "doStop(): closes BinlogConnectorConnection, beanRegistryJdbcConnection, MariaDbDatabaseSchema. BinaryLogClient disconnect handled by ChangeEventSourceCoordinator.",
+      "system": "MariaDbConnectorTask"
+    }
+  ],
+
+  "key_relationships": [
+    "MariaDbConnector extends BinlogConnector<MariaDbConnectorConfig>",
+    "MariaDbConnectorTask extends BinlogSourceTask<MariaDbPartition, MariaDbOffsetContext>",
+    "MariaDbStreamingChangeEventSource extends BinlogStreamingChangeEventSource<MariaDbPartition, MariaDbOffsetContext>",
+    "MariaDbErrorHandler extends ErrorHandler; non-retriable SQL error code 1236",
+    "MariaDbConnectorTask creates MariaDbChangeEventSourceFactory",
+    "MariaDbChangeEventSourceFactory creates MariaDbStreamingChangeEventSource (getStreamingChangeEventSource)",
+    "MariaDbStreamingChangeEventSource uses BinaryLogClient (shyiko) for raw event delivery",
+    "BinlogStreamingChangeEventSource.execute() registers EnumMap<EventType, BlockingConsumer<Event>> handlers",
+    "EventDispatcher dispatches to ChangeEventQueue; task polls queue for SourceRecords",
+    "BinlogSourceInfo tracks: file, pos, GTID, server_id, thread_id, query, tableIds"
+  ],
+
+  "important_notes": [
+    "MariaDB GTID format: domainId-serverId-sequence (not MySQL UUID format)",
+    "ANNOTATE_ROWS event = MariaDB equivalent of MySQL ROWS_QUERY; enabled via setUseSendAnnotateRowsEvent(true)",
+    "getGtidEventType() returns EventType.MARIADB_GTID; getIncludeQueryEventType() returns EventType.ANNOTATE_ROWS",
+    "Non-retriable binlog error: 1236 (ER_MASTER_FATAL_ERROR_READING_BINLOG)",
+    "configureReplicaCompatibility sets mariaDbSlaveCapability=4 for GTID over binlog",
+    "SSL modes mapped: DISABLE→DISABLED, TRUST→REQUIRED, VERIFY_CA→VERIFY_CA, VERIFY_FULL→VERIFY_IDENTITY",
+    "BinlogSourceTask.validateBinlogConfiguration enforces binlog_format=ROW and binlog_row_image=FULL",
+    "ChangeEventSourceCoordinator coordinates snapshot then streaming pipeline phases",
+    "MariaDbConnectorTask.start() also validates guardrail limits on captured table count",
+    "Optional event buffering: EventBuffer used when bufferSizeForStreamingChangeEventSource > 0"
+  ],
+
+  "source_files_analyzed": [
+    "debezium-connector-mariadb/src/main/java/io/debezium/connector/mariadb/MariaDbConnector.java",
+    "debezium-connector-mariadb/src/main/java/io/debezium/connector/mariadb/MariaDbConnectorTask.java",
+    "debezium-connector-mariadb/src/main/java/io/debezium/connector/mariadb/MariaDbStreamingChangeEventSource.java",
+    "debezium-connector-mariadb/src/main/java/io/debezium/connector/mariadb/MariaDbErrorHandler.java",
+    "debezium-connector-mariadb/src/main/java/io/debezium/connector/mariadb/MariaDbChangeEventSourceFactory.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogSourceTask.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogStreamingChangeEventSource.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogSourceInfo.java"
+  ]
+}

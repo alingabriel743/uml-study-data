@@ -1,0 +1,304 @@
+@startuml web_server_and_middleware
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam stereotypeCBackgroundColor #D0E8FF
+skinparam stereotypeABackgroundColor #FFE0B2
+skinparam stereotypeIBackgroundColor #D4EDDA
+skinparam note {
+    BackgroundColor #FFFDE7
+    BorderColor #F9A825
+}
+
+title Web Server, Middleware & Routers
+
+' ─────────────────────────────────────────
+' External / Base
+' ─────────────────────────────────────────
+package "Framework" {
+    abstract class BaseService {
+        +_init(): Promise<void>
+    }
+
+    class AuthService << (S,#ADD8E6) service >> {
+        +authenticate_from_token(token): Actor
+        +check_session(token): Session
+        +create_access_token(actor, permissions): Token
+    }
+}
+
+' ─────────────────────────────────────────
+' Web Server
+' ─────────────────────────────────────────
+package "Web Server" {
+    class WebServerService << (S,#C8E6C9) service >> {
+        -{static} CONCERN: string = "web"
+        -{static} MODULES: object
+        --
+        -app: Express
+        -server_: http.Server
+        -router_webhooks: express.Router
+        -middlewares: object
+        -allowedRoutesWithUndefinedOrigins: Array
+        -isDraining: boolean
+        -shutdownStarted: boolean
+        -shutdownForceExitTimer: Timeout | null
+        -shutdownCloseTimer: Timeout | null
+        -gracefulShutdownHandlersInstalled: boolean
+        --
+        +_init(): Promise<void>
+        +__on_boot.consolidation(): Promise<void>
+        +__on_boot.activation(): Promise<void>
+        +__on_start.webserver(): Promise<void>
+        +install_post_middlewares_(app): void
+        +get_server(): http.Server
+        +allow_undefined_origin(route): void
+        +registerGracefulShutdownHandlers(): void
+        +beginGracefulShutdown(signal): void
+        +drainCoreServicesForShutdown(signal): void
+    }
+}
+
+' ─────────────────────────────────────────
+' Middleware
+' ─────────────────────────────────────────
+package "Middleware" {
+    class ContextExpressMiddleware << (M,#FFD54F) middleware >> {
+        +handle(req, res, next): void
+        ' Installs per-request sub-context\n' (services, actor, user) for DI
+    }
+
+    class measure << (M,#FFD54F) middleware factory >> {
+        +(): AsyncRequestHandler
+        ' Tracks sz_incoming / sz_outgoing bytes\n' Resolves req.measurements TeePromise
+    }
+
+    class configurable_auth << (M,#FFD54F) middleware factory >> {
+        +options: object
+        +optional: boolean
+        +no_options_auth: boolean
+        +allow_cached_user: boolean
+        --
+        +(): AsyncRequestHandler
+        ' Token sources (priority order):\n' body.auth_token, Authorization Bearer,\n' cookie, query param, socket handshake
+    }
+
+    class auth2 << (M,#FFD54F) middleware >> {
+        ' Instance of configurable_auth({ optional: false })\n' Accepts any Actor type (user, app, access token)
+        +handle(req, res, next): void
+    }
+
+    class auth << (M,#FFD54F) middleware >> {
+        ' Wraps auth2; additionally enforces\n' UserActorType (session tokens only)
+        +handle(req, res, next): void
+    }
+
+    class subdomain << (M,#FFD54F) middleware factory >> {
+        +allowedSubdomains: string | string[]
+        --
+        +(): AsyncRequestHandler
+        ' Calls next("route") if subdomain\n' does not match allowed list
+    }
+
+    class abuse << (M,#FFD54F) middleware factory >> {
+        +options: object
+        --
+        +(): RequestHandler
+        ' Checks is_bot, is_puter_origin flags\n' Throws forbidden or calls shadow_ban_responder
+    }
+
+    class verified << (M,#FFD54F) middleware >> {
+        +handle(req, res, next): void
+        ' Requires req.user.email_confirmed\n' when strict_email_verification_required
+    }
+
+    class anticsrf << (M,#FFD54F) middleware factory >> {
+        +options: object
+        --
+        +(): AsyncRequestHandler
+        ' Validates body.anti_csrf token via\n' svc_antiCSRF.consume_token(user.uuid, token)
+    }
+}
+
+' ─────────────────────────────────────────
+' Route Factory
+' ─────────────────────────────────────────
+package "Route Factory" {
+    class eggspress << (F,#CE93D8) factory >> {
+        +route: string | RegExp | Array
+        +settings: EggspressSettings
+        +handler: RequestHandler
+        --
+        +subdomain: string
+        +abuse: object
+        +verified: boolean
+        +json: boolean
+        +jsonCanBeLarge: boolean
+        +auth: boolean
+        +auth2: boolean
+        +files: string[]
+        +multest: boolean
+        +parameters: Record<string, ParamDef>
+        +mw: RequestHandler[]
+        +allowedMethods: string[]
+        +alarm_timeout: number
+        +response_timeout: number
+        --
+        +(): express.Router
+        ' Pipeline: subdomain → abuse → verified\n' → json → auth/auth2 → files → parameters\n' → custom mw → handler
+    }
+}
+
+' ─────────────────────────────────────────
+' Routers
+' ─────────────────────────────────────────
+package "HTTP Routers" {
+    class AuthRouterGroup << (R,#B2EBF2) router >> {
+        ' Subdomain: api | Auth: auth2
+        --
+        +POST /auth/create-access-token
+        +POST /auth/revoke-access-token
+        +POST /auth/grant-user-app
+        +POST /auth/revoke-user-app
+        +POST /auth/grant-user-user
+        +POST /auth/revoke-user-user
+        +POST /auth/grant-user-group
+        +POST /auth/revoke-user-group
+        +POST /auth/grant-dev-app
+        +POST /auth/revoke-dev-app
+        +POST /auth/list-permissions
+        +POST /auth/check-permissions
+        +POST /auth/list-sessions
+        +POST /auth/revoke-session
+        +GET  /auth/app-uid-from-origin
+        +POST /auth/check-app
+        +GET  /auth/check-app-acl
+        +GET  /auth/get-user-app-token
+        +POST /auth/request-app-root-dir
+        +POST /auth/configure-2fa
+        +GET|POST /auth/oidc
+    }
+
+    class FilesystemAPIRouterGroup << (R,#B2EBF2) router >> {
+        ' Subdomain: api | Auth: auth2 + verified
+        --
+        +POST /up | /write
+        +POST /batch
+        +POST /read | /download
+        +POST /readdir
+        +POST /stat
+        +POST /mkdir
+        +POST /copy
+        +POST /move
+        +POST /delete
+        +POST /rename
+        +POST /search
+        +POST /touch
+        +POST /update
+        +POST /token-read
+        +GET  /cache
+        +GET  /readdir-subdomains
+    }
+
+    class PuterAIRouterGroup << (R,#B2EBF2) router >> {
+        ' Auth: auth2 | Cross-origin allowed
+        --
+        +POST /openai/v1/chat/completions
+        +POST /openai/v1/completions
+        +POST /openai/v1/responses
+        +POST /anthropic/v1/messages
+        +POST /video/proxy
+    }
+
+    class KVStoreRouterGroup << (R,#B2EBF2) router >> {
+        ' Legacy express.Router | Auth: auth
+        --
+        +POST /getItem
+        +POST /setItem
+        +POST /clearItems
+        +POST /listItems
+    }
+
+    class HostingRouterGroup << (R,#B2EBF2) router >> {
+        ' Subdomain: static_hosting_domain
+        --
+        +GET /*
+        ' Resolves site by subdomain or\n' custom domain; serves files via\n' LLRead from puter filesystem
+    }
+}
+
+' ─────────────────────────────────────────
+' Relationships
+' ─────────────────────────────────────────
+
+' Inheritance
+WebServerService --|> BaseService
+
+' WebServerService composition / usage
+WebServerService *-- ContextExpressMiddleware : installs (per-request context)
+WebServerService *-- measure               : installs (byte tracking)
+WebServerService ..> eggspress             : uses (route factory)
+WebServerService ..> auth                  : holds in middlewares
+WebServerService ..> AuthService           : sets up socket.io auth
+
+' Auth middleware chain
+auth       ..>  auth2            : delegates to\n(enforces UserActorType)
+auth2      ..>  configurable_auth : instance of\n(optional: false)
+configurable_auth ..> AuthService : authenticate_from_token()
+
+' eggspress composes middleware
+eggspress  ..>  subdomain  : injects (if subdomain set)
+eggspress  ..>  abuse      : injects (if abuse set)
+eggspress  ..>  verified   : injects (if verified: true)
+eggspress  ..>  auth       : injects (if auth: true)
+eggspress  ..>  auth2      : injects (if auth2: true)
+eggspress  ..>  anticsrf   : injects (if anticsrf: true)
+
+' Routers use eggspress
+AuthRouterGroup          ..> eggspress : built with\n(subdomain: api, auth2: true)
+FilesystemAPIRouterGroup ..> eggspress : built with\n(subdomain: api, auth2+verified: true)
+PuterAIRouterGroup       ..> eggspress : built with\n(auth2: true)
+KVStoreRouterGroup       ..> auth      : uses directly
+
+' WebServerService mounts routers
+WebServerService *-- AuthRouterGroup          : mounts
+WebServerService *-- FilesystemAPIRouterGroup : mounts
+WebServerService *-- PuterAIRouterGroup       : mounts
+WebServerService *-- KVStoreRouterGroup       : mounts
+WebServerService *-- HostingRouterGroup       : mounts
+
+' ─────────────────────────────────────────
+' Middleware pipeline note
+' ─────────────────────────────────────────
+note bottom of WebServerService
+  Global middleware pipeline order (abridged):
+  1. ContextExpressMiddleware
+  2. measure() — byte tracking
+  3. morgan — HTTP access logging
+  4. Hostname & Host header validation
+  5. IP validation & origin check
+  6. router_webhooks (raw body, pre-JSON)
+  7. express.json({ limit: 50mb })
+  8. cookie-parser, compression, helmet
+  9. CORS headers (COOP/COEP)
+  10. [event] install.middlewares.early/context-aware
+  11. [event] install.routes / install.routes-gui
+  12. OPTIONS catch-all → 200
+  13. 404 catch-all
+  14. api_error_handler (last)
+end note
+
+@enduml

@@ -1,0 +1,224 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    ActorBorderColor #495057
+    ActorBackgroundColor #F8F9FA
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #E9ECEF
+    NoteBackgroundColor #FFF3CD
+    NoteBorderColor #856404
+}
+
+title Exception Capture and Error Handling Flow\n<size:11>(Datadog PHP Tracer — ddtrace extension)</size>
+
+box "PHP Application" #E8F4FD
+    participant "PHP\nRuntime" as PHP
+    participant "User\nCode" as App
+end box
+
+box "DDTrace C Extension" #FFF0E8
+    participant "handlers_exception.c\nddtrace_exception_new()" as ExNew
+    participant "handlers_exception.c\nddtrace_find_active_exception()" as FindEx
+    participant "handlers_exception.c\ndd_check_exception_in_header()" as HeaderCheck
+    participant "handlers_exception.c\nExceptionOrErrorHandler::execute()" as ErrHandler
+    participant "serializer.c\nddtrace_save_active_error_to_metadata()" as Serializer
+end box
+
+box "DDTrace PHP API" #E8F8E8
+    participant "DDTrace\\SpanData\n(root_span)" as RootSpan
+    participant "DDTrace\\get_sanitized_exception_trace()" as Sanitizer
+    participant "DDTrace\\ExceptionSpanEvent" as ExSpanEvent
+end box
+
+box "OpenTelemetry Bridge (PHP)" #F3E8FF
+    participant "OTel\\Span\n::recordException()" as OTelSpan
+    participant "OTel\\SpanBuilder\n::recordException()" as OTelBuilder
+end box
+
+' ─────────────────────────────────────────────
+' FLOW 1: Exception Object Creation Interception
+' ─────────────────────────────────────────────
+== Flow 1: Exception Object Creation Interception ==
+
+note over PHP, ExNew
+  ddtrace hooks all Throwable create_object handlers at startup
+  (ddtrace_exception_handlers_startup) to intercept exception instantiation.
+end note
+
+App -> PHP : throw new \Exception(...)
+activate PHP
+PHP -> ExNew : ddtrace_exception_new(class_type)
+activate ExNew
+ExNew -> ExNew : ddtrace_fetch_debug_backtrace()\n[capture call stack + locals if DD_EXCEPTION_REPLAY_ENABLED]
+ExNew -> PHP : zend_update_property(trace, file, line)
+ExNew --> PHP : zend_object* (exception with backtrace)
+deactivate ExNew
+PHP --> App : exception propagates up call stack
+deactivate PHP
+
+' ─────────────────────────────────────────────
+' FLOW 2: Active Exception Detection via header() / HTTP 500
+' ─────────────────────────────────────────────
+== Flow 2: HTTP 500 Response — Active Exception Detection ==
+
+note over App, HeaderCheck
+  ddtrace wraps header() and http_response_code() to detect
+  when a 500-range response code is set during exception handling.
+end note
+
+App -> PHP : header("HTTP/1.1 500 ...") \nor http_response_code(500)
+activate PHP
+PHP -> HeaderCheck : ddtrace_header() / ddtrace_http_response_code()
+activate HeaderCheck
+HeaderCheck -> HeaderCheck : check new_response_code >= 500
+HeaderCheck -> Serializer : ddtrace_save_active_error_to_metadata()\n[persists active PHP error type+msg to span metadata]
+activate Serializer
+Serializer -> RootSpan : set error.type, error.msg, error.stack\non active span properties
+Serializer --> HeaderCheck : done
+deactivate Serializer
+HeaderCheck -> FindEx : ddtrace_find_active_exception()
+activate FindEx
+note right of FindEx
+  Walks PHP execute_data stack frames.
+  Searches try/catch opcodes to locate
+  an exception object still alive in
+  a catch block variable (CV).
+end note
+FindEx -> FindEx : iterate EG(current_execute_data)\ncheck try_catch_array opcodes
+FindEx --> HeaderCheck : zend_object* exception (or NULL)
+deactivate FindEx
+
+alt exception found
+    HeaderCheck -> RootSpan : ZVAL_OBJ_COPY(root_span->property_exception, ex)
+    note right of RootSpan
+      exception is attached to root span.
+      Will be serialized to error.type /
+      error.msg / error.stack at flush time.
+    end note
+end
+
+HeaderCheck --> PHP : return
+deactivate HeaderCheck
+PHP --> App : (header sent)
+deactivate PHP
+
+' ─────────────────────────────────────────────
+' FLOW 3: Uncaught Exception Handler Intercept
+' ─────────────────────────────────────────────
+== Flow 3: Uncaught Exception — Handler Wrapper ==
+
+note over PHP, ErrHandler
+  ddtrace wraps set_exception_handler() so DDTrace_ExceptionOrErrorHandler
+  is invoked first, before the user's registered handler.
+end note
+
+PHP -> ErrHandler : ExceptionOrErrorHandler::execute(exception)\n[uncaught exception propagates to handler]
+activate ErrHandler
+ErrHandler -> RootSpan : ZVAL_OBJ_COPY(root_span->property_exception, exception)\n[attach exception early, before user handler runs]
+activate RootSpan
+
+alt previous exception exists on root span
+    ErrHandler -> ErrHandler : chain old exception as $exception->previous\n(preserve exception history on root span)
+end
+
+ErrHandler -> App : call_user_function(user_exception_handler, exception)\n[delegate to original user handler]
+activate App
+App --> ErrHandler : handler return value
+deactivate App
+ErrHandler --> PHP : done
+deactivate ErrHandler
+deactivate RootSpan
+
+' ─────────────────────────────────────────────
+' FLOW 4: PHP Error Handler Intercept
+' ─────────────────────────────────────────────
+== Flow 4: PHP Error — Error Handler Wrapper ==
+
+PHP -> ErrHandler : ExceptionOrErrorHandler::execute(type, message, file, line)\n[PHP error raised]
+activate ErrHandler
+ErrHandler -> ErrHandler : DDTRACE_G(active_error).type = type\nDDTRACE_G(active_error).message = message
+note right of ErrHandler
+  Active error is stored globally.
+  ddtrace_save_active_error_to_metadata()
+  will later persist it to span metadata.
+end note
+ErrHandler -> App : call_user_function(user_error_handler, params)\n[delegate to original user error handler]
+activate App
+App --> ErrHandler : handler return value
+deactivate App
+ErrHandler -> ErrHandler : DDTRACE_G(active_error).type = 0\n[clear active error state]
+ErrHandler --> PHP : done
+deactivate ErrHandler
+
+' ─────────────────────────────────────────────
+' FLOW 5: Manual recordException via OTel Span API
+' ─────────────────────────────────────────────
+== Flow 5: OpenTelemetry Span::recordException() ==
+
+note over App, OTelSpan
+  Instrumented code (or user) explicitly records an exception
+  on an active OpenTelemetry-compatible span.
+end note
+
+App -> OTelSpan : recordException($exception, $attributes)
+activate OTelSpan
+OTelSpan -> Sanitizer : DDTrace\\get_sanitized_exception_trace($exception)\n[strip internal ddtrace frames, $skipFrames]
+activate Sanitizer
+Sanitizer --> OTelSpan : sanitized stack trace string
+deactivate Sanitizer
+OTelSpan -> OTelSpan : setAttribute(Tag::ERROR_STACK, sanitized_stack)\n[sets error.stack on DDTrace\\SpanData::$meta]
+OTelSpan -> ExSpanEvent : new ExceptionSpanEvent($exception, $attributes)
+activate ExSpanEvent
+ExSpanEvent --> OTelSpan : ExceptionSpanEvent instance
+deactivate ExSpanEvent
+OTelSpan -> RootSpan : $span->events[] = ExceptionSpanEvent\n[appended to SpanData::$events]
+OTelSpan --> App : $this (fluent)
+deactivate OTelSpan
+
+note over RootSpan, ExSpanEvent
+  On toSpanData() / updateSpanEvents(), the ExceptionSpanEvent is
+  converted to an OTel Event with standardized attributes:
+    • exception.message  → $exception->getMessage()
+    • exception.type     → get_class($exception)
+    • exception.stacktrace → get_sanitized_exception_trace($exception)
+end note
+
+' ─────────────────────────────────────────────
+' FLOW 6: Manual recordException via OTel SpanBuilder API
+' ─────────────────────────────────────────────
+== Flow 6: OpenTelemetry SpanBuilder::recordException() ==
+
+App -> OTelBuilder : recordException($exception, $attributes)
+activate OTelBuilder
+OTelBuilder -> Sanitizer : DDTrace\\get_sanitized_exception_trace($exception)
+activate Sanitizer
+Sanitizer --> OTelBuilder : sanitized stack trace string
+deactivate Sanitizer
+OTelBuilder -> OTelBuilder : build exceptionAttributes map:\n  exception.message, exception.type, exception.stacktrace
+OTelBuilder -> OTelBuilder : setAttribute(Tag::ERROR_STACK, stacktrace)
+OTelBuilder -> OTelBuilder : addEvent('exception', allAttributes)\n[span event recorded before span starts]
+OTelBuilder --> App : $this (fluent)
+deactivate OTelBuilder
+
+@enduml

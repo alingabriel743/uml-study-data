@@ -1,0 +1,160 @@
+{
+  "scope": "wasm_transforms",
+  "title": "WebAssembly (WASM) Transforms",
+  "diagram_type": "use_case",
+  "description": "Developer deploys WASM modules for custom event routing and filtering logic in Debezium CDC pipelines via Kafka Connect SMTs.",
+
+  "actors": [
+    "Developer (configures WASM-based SMTs)",
+    "Kafka Connect Runtime (invokes SMT pipeline)",
+    "WASM Module (compiled .wasm file on disk, loaded at configure time)"
+  ],
+
+  "use_cases": [
+    "Deploy WASM module for content-based topic routing (ContentBasedRouter)",
+    "Deploy WASM module for record filtering (Filter)",
+    "Configure SMT language as 'wasm.chicory' (compiled JIT) or 'wasm.chicory-interpreter' (interpreted)",
+    "Configure topic.expression with file: URI pointing to .wasm file",
+    "Configure condition expression with file: URI pointing to .wasm file",
+    "Restrict transform scope via topic.regex pattern",
+    "Handle null records: keep / drop / evaluate modes",
+    "Route record to new topic based on WASM evaluation result",
+    "Filter out records based on boolean WASM evaluation result",
+    "Access record fields: key, value, keySchema, valueSchema, topic, headers",
+    "Access nested struct fields via dot-path (e.g. value.before.id)",
+    "Access array elements (getArrayElem / getArraySize)",
+    "Access schema metadata (getSchemaName, getSchemaType)",
+    "Return null from WASM router to keep original topic",
+    "Fail fast on invalid WASM return type (DebeziumException)",
+    "Fail fast on unsupported WASM engine name",
+    "Fail fast on malformed .wasm file URI"
+  ],
+
+  "key_classes": [
+    {
+      "name": "ScriptingTransformation<R>",
+      "package": "io.debezium.transforms",
+      "type": "abstract class",
+      "implements": ["Transformation<R>", "Versioned", "ConfigDescriptor"],
+      "key_fields": ["Engine engine", "NullHandling nullHandling", "Pattern topicPattern"],
+      "key_methods": [
+        "configure(Map<String,?> configs) — selects Engine impl based on language prefix (jsr223.* / wasm.*), calls engine.configure(language, expression)",
+        "apply(R record) — topic regex gate, null-handling gate, delegates to doApply(record)",
+        "abstract doApply(R record)",
+        "abstract expressionField()"
+      ],
+      "config_fields": ["language (required)", "topic.regex (optional)", "null.handling.mode (drop|keep|evaluate, default keep)"]
+    },
+    {
+      "name": "ContentBasedRouter<R>",
+      "package": "io.debezium.transforms",
+      "extends": "ScriptingTransformation<R>",
+      "config_field": "topic.expression (required, file: URI to .wasm)",
+      "doApply": "topicName = engine.eval(record, String.class); return topicName==null ? record : record.newRecord(topicName, ...)"
+    },
+    {
+      "name": "Filter<R>",
+      "package": "io.debezium.transforms",
+      "extends": "ScriptingTransformation<R>",
+      "config_field": "condition (required, file: URI to .wasm)",
+      "doApply": "return engine.eval(record, Boolean.class) ? record : null"
+    },
+    {
+      "name": "WasmEngine",
+      "package": "io.debezium.transforms.scripting",
+      "implements": "Engine",
+      "key_methods": [
+        "configure(language, expression) — sets compiler flag, parses .wasm file via Parser.parse(Path.of(URI.create(expression))), builds ChicoryEngine",
+        "getBindings(record) — builds Map: key, value, keySchema, valueSchema, topic, header(Map<String,RecordHeader>)",
+        "eval(ConnectRecord, Class<T>) — calls engine.eval(bindings), validates return type"
+      ]
+    },
+    {
+      "name": "ChicoryEngine",
+      "package": "io.debezium.transforms.scripting.wasm",
+      "annotations": ["@HostModule(\"env\")"],
+      "key_methods": [
+        "eval(Object proxyObject) — registers root binding object, calls WASM export 'process(rootObjPtr)', returns result from objects list",
+        "get(proxyObjectRef, fieldNamePtr) — resolves dot-path field on Map/Struct/Schema/RecordHeader (@WasmExport)",
+        "getArrayElem(proxyObjectRef, elemIdx) — array element access (@WasmExport)",
+        "getArraySize(proxyObjectRef) — array size (@WasmExport)",
+        "getString/getBool/getInt8/getInt16/getInt32/getInt64/getFloat32/getFloat64/getBytes/getSchemaName/getSchemaType — type materialization (@WasmExport)",
+        "setString/setBool/setNull — write results back to host object store (@WasmExport)",
+        "isNull(proxyObjectRef) — null check (@WasmExport)"
+      ],
+      "execution_modes": [
+        "Compiler mode (wasm.chicory): MachineFactoryCompiler::compile — JIT to Java bytecode",
+        "Interpreter mode (wasm.chicory-interpreter): default Instance builder — interpreted"
+      ]
+    }
+  ],
+
+  "wasm_host_abi": {
+    "exported_by_host": ["get", "getArrayElem", "getArraySize", "getString", "getBool", "getInt8", "getInt16", "getInt32", "getInt64", "getFloat64", "getFloat32", "getBytes", "getSchemaName", "getSchemaType", "isNull", "setBool", "setString", "setNull"],
+    "called_by_host_on_wasm": ["process(rootObjPtr) → resultPtr", "malloc(size) → ptr", "free(ptr)"],
+    "memory": "ImportMemory 'env/memory', ByteArrayMemory, default max = MemoryLimits.MAX_PAGES"
+  },
+
+  "wasm_module_contracts": {
+    "router_wasm": "Must export 'process'; must return pointer to a string object (topic name) or null",
+    "filter_wasm": "Must export 'process'; must return pointer to a boolean object",
+    "field_access": "Accessed via 'get' host call with dot-path strings (e.g. 'value.before.id', 'header.idh.value')"
+  },
+
+  "test_scenarios_wasm_router": [
+    "shouldFailOnInvalidReturnValue — WASM returns boolean (not String) → DebeziumException",
+    "shouldRoute — value.before.id==1 routes to 'ones', else keeps original topic",
+    "shouldRouteMongoDbFormat — JSON after field matching, routes to 'kretchmar'",
+    "shouldApplyTopicRegex — only applies to topics matching 'orig.*'",
+    "shouldKeepNulls — null record keeps original topic (default null.handling.mode=keep)",
+    "shouldDropNulls — null record dropped with null.handling.mode=drop",
+    "shouldEvaluateNulls — null record evaluated; WASM returns 'nulls' topic",
+    "shouldRouteWithComplexCreate — nested create record routing"
+  ],
+
+  "test_scenarios_wasm_filter": [
+    "shouldFailOnUnkownLanguage — 'wasm.chasm' throws DebeziumException",
+    "shouldFailToParseCondition — bad URI 'ftp:/filter.wasm' throws DebeziumException",
+    "shouldProcessConditionWithWasmCompiler — filter1.wasm (compiler mode)",
+    "shouldProcessConditionWithWasmInterpreter — filter1.wasm (interpreter mode)",
+    "shouldProcessTopicWithWasm — topic=='dummy1' filter",
+    "shouldProcessHeader — header.idh.value==1 filter",
+    "shouldApplyTopicRegex — topic regex 'dum.*' scoping",
+    "shouldKeepNulls / shouldDropNulls / shouldEvaluateNulls — null handling modes",
+    "shouldRunFilterWithHeaderAndTopic — compound header+topic condition",
+    "shouldRunFilterWithComplexCreate — complex nested Struct",
+    "shouldRunFilterWithAllDataTypeSchemas — all primitive types",
+    "shouldRunFilterWithArraySchemas — array element access",
+    "shouldAccessSchemaFields — keySchema/valueSchema introspection"
+  ],
+
+  "key_relationships": [
+    "ContentBasedRouter extends ScriptingTransformation",
+    "Filter extends ScriptingTransformation",
+    "ScriptingTransformation creates WasmEngine (when language prefix = 'wasm.')",
+    "ScriptingTransformation creates GraalJsEngine (language = 'graal.js')",
+    "ScriptingTransformation creates Jsr223Engine (default jsr223.* prefix)",
+    "WasmEngine composes ChicoryEngine (builder pattern)",
+    "ChicoryEngine wraps Chicory Instance with @HostModule('env') host function bindings",
+    "ChicoryEngine uses MachineFactoryCompiler for compiler mode, default interpreter otherwise"
+  ],
+
+  "important_notes": [
+    "@Incubating on ContentBasedRouter, Filter, ChicoryEngine — feature is experimental",
+    "WASM files referenced via 'file:' URI in topic.expression / condition config properties",
+    "WASM module must export 'process', 'malloc', 'free' symbols",
+    "Host ABI uses integer object references (indices into a List<Object>); not direct memory pointers for Java objects",
+    "Compiler mode may fail for some WASM modules; fallback is 'wasm.chicory-interpreter'",
+    "Null routing: ContentBasedRouter returns null from WASM → original topic preserved (not dropped)"
+  ],
+
+  "source_files_analyzed": [
+    "debezium-scripting/debezium-scripting/src/test/java/io/debezium/transforms/wasm/WasmRouterTest.java",
+    "debezium-scripting/debezium-scripting/src/test/java/io/debezium/transforms/wasm/WasmFilterTest.java",
+    "debezium-scripting/debezium-scripting/src/main/java/io/debezium/transforms/ContentBasedRouter.java",
+    "debezium-scripting/debezium-scripting/src/main/java/io/debezium/transforms/Filter.java",
+    "debezium-scripting/debezium-scripting/src/main/java/io/debezium/transforms/ScriptingTransformation.java",
+    "debezium-scripting/debezium-scripting/src/main/java/io/debezium/transforms/scripting/WasmEngine.java",
+    "debezium-scripting/debezium-scripting/src/main/java/io/debezium/transforms/scripting/wasm/ChicoryEngine.java"
+  ]
+}

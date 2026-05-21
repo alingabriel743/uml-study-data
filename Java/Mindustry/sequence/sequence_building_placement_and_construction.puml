@@ -1,0 +1,218 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequenceArrowColor #495057
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceGroupBorderColor #6C757D
+skinparam sequenceGroupBackgroundColor #E9ECEF
+skinparam noteBorderColor #6C757D
+skinparam noteBackgroundColor #FFF9C4
+skinparam activationBarColor #DEE2E6
+skinparam activationBarBorderColor #495057
+
+title Building Placement and Construction Flow
+
+actor       "Player"          as player
+participant "DesktopInput"    as desktop   #D0E8FF
+participant "InputHandler"    as input     #D0E8FF
+participant "Build\n(static)" as build     #D6F5D6
+participant "Block"           as block     #D6F5D6
+participant "PlayerComp\n/ Unit" as unit   #FFF3CD
+participant "Tile"            as tile      #FFE0CC
+participant "BuildingComp\n(ConstructBuild)" as constructBuild #F5D0FF
+participant "ConstructBlock"  as cblock    #F5D0FF
+participant "BuildingComp\n(Real Building)"  as realBuilding   #C8E6C9
+
+' ══════════════════════════════════════════════
+' PHASE 1 — Input & Plan Queuing (client-side)
+' ══════════════════════════════════════════════
+== Phase 1: Input Capture & Plan Queuing (Client) ==
+
+player -> desktop : click at world position\n(Binding.select keyTap)
+activate desktop
+
+desktop -> desktop : isPlacing() check\nmode = placing\nselectX/Y = cursorX/Y\nupdateLine()
+
+note right of desktop
+  Render loop (every frame):
+  block.drawPlace(cursorX, cursorY, rot, valid)
+  → drawPotentialLinks()
+  → drawOverlay()
+end note
+
+player -> desktop : release click\n(Binding.select keyRelease)
+
+desktop -> input : flushPlans(linePlans)
+activate input
+
+loop for each BuildPlan in plans
+    input -> input : validPlace(x, y, block, rotation)
+    activate input
+    input -> build : validPlace(type, team, x, y, rotation)
+    activate build
+
+    build -> build : validPlaceIgnoreUnits()\n· isPlaceable()\n· canPlaceOn(tile, team, rot)\n· darkness / shallows check\n· tile occupancy check
+    build -> block : canPlaceOn(tile, team, rotation)
+    activate block
+    block --> build : true / false
+    deactivate block
+
+    build -> build : checkNoUnitOverlap(type, x, y)
+    build --> input : boolean valid
+    deactivate build
+    deactivate input
+
+    alt valid == true
+        input -> block : onNewPlan(plan)
+        activate block
+        block --> input : —
+        deactivate block
+
+        input -> unit : player.unit().addBuild(plan)
+        activate unit
+        unit -> input : playerPlanTree.insert(plan)
+        unit --> input : —
+        deactivate unit
+    else valid == false
+        note over input : plan shown red\nin drawBuildPlans();\nnot enqueued
+    end
+end
+
+deactivate input
+deactivate desktop
+
+' ══════════════════════════════════════════════
+' PHASE 2 — Unit Begins Building (server-authoritative)
+' ══════════════════════════════════════════════
+== Phase 2: Build.beginPlace — Server-Authoritative Placement ==
+
+unit -> build : beginPlace(unit, block, team,\nx, y, rotation, config)\n[@Remote Loc.server]
+activate build
+
+build -> build : re-validate via validPlace()
+
+alt block.instantBuild == true
+    build -> cblock : constructFinish(tile, block, unit,\nrotation, team, config)
+    note right : Skip ConstructBuild phase —\njump directly to finish
+else normal build path
+    build -> tile : setBlock(ConstructBlock.get(size),\nteam, rotation, entityprov)
+    activate tile
+
+    tile -> tile : changing = true\npreChanged()
+    tile -> tile : changeBuild(team, entityprov, rotation)
+    activate tile
+
+    tile -> constructBuild : [remove old build]\nbuild.remove()
+    tile -> constructBuild : entityprov.get() → new ConstructBuild\nbuilding.init(tile, team, true, rotation)
+    activate constructBuild
+
+    constructBuild -> constructBuild : create(ConstructBlock, team)\n· sets block / team\n· health / maxHealth\n· ItemModule, LiquidModule,\n  PowerModule (if needed)
+    constructBuild -> constructBuild : add()\n· if hasPower → graph.checkAdd()
+    constructBuild -> constructBuild : checkAllowUpdate()\ncreated()
+    constructBuild --> tile : Building (ConstructBuild)
+    deactivate constructBuild
+    deactivate tile
+
+    tile -> tile : changed()
+    tile -> constructBuild : updateProximity()
+    activate constructBuild
+    constructBuild -> constructBuild : clear proximity\nEdges.getEdges(block.size)
+    constructBuild -> constructBuild : onProximityAdded()\n→ updatePowerGraph() [if hasPower]
+    constructBuild -> constructBuild : onProximityUpdate() [self]
+    constructBuild -> constructBuild : onProximityUpdate() [each neighbour]
+    deactivate constructBuild
+
+    deactivate tile
+end
+
+deactivate build
+
+' ══════════════════════════════════════════════
+' PHASE 3 — Construction Progress → Finish
+' ══════════════════════════════════════════════
+== Phase 3: Construction Progress & Completion ==
+
+loop builder unit work tick (progress < 1.0)
+    unit -> constructBuild : contribute build progress\n(BuilderAI update)
+    activate constructBuild
+    constructBuild --> unit : progress += delta
+    deactivate constructBuild
+end
+
+unit -> cblock : constructed(tile, block, builder,\nrotation, team, config)
+activate cblock
+
+cblock -> cblock : Call.constructFinish(...)\n[@Remote server → all clients]
+activate cblock
+
+cblock -> tile : setBlock(realBlock, team, rotation, entityprov)
+activate tile
+
+tile -> tile : preChanged()
+tile -> tile : changeBuild(team, entityprov, rotation)
+activate tile
+tile -> constructBuild : [remove ConstructBuild]\nbuild.remove()
+tile -> realBuilding : entityprov.get() → new Building\nbuilding.init(tile, team, true, rotation)
+activate realBuilding
+
+realBuilding -> realBuilding : create(block, team)\n· block / team / health\n· modules wired up
+realBuilding -> realBuilding : add()\n· graph.checkAdd() [if hasPower]
+realBuilding -> realBuilding : checkAllowUpdate()\ncreated()
+realBuilding --> tile : Building (real)
+deactivate realBuilding
+deactivate tile
+
+tile -> tile : changed()
+tile -> realBuilding : updateProximity()
+activate realBuilding
+realBuilding -> realBuilding : Edges.getEdges(block.size)\nonProximityAdded()\n→ updatePowerGraph() [if hasPower]
+realBuilding -> realBuilding : onProximityUpdate() [self]\nonProximityUpdate() [each neighbour]
+note right of realBuilding
+  moduleBitmask() encodes
+  active modules (items |
+  power | liquids | consumers)
+  for serialization
+end note
+deactivate realBuilding
+
+deactivate tile
+
+alt builder == player.unit()
+    cblock -> realBuilding : tile.build.playerPlaced(config)
+    note right : Local UI feedback only
+end
+
+cblock -> cblock : placeEffect + placeSound
+
+deactivate cblock
+
+cblock -> realBuilding : tile.build.placed()
+activate realBuilding
+realBuilding -> realBuilding : if hasPower && connectedPower\n→ PowerNode.getNodeLinks()
+deactivate realBuilding
+
+cblock -> cblock : Events.fire(BlockBuildEndEvent)
+note over cblock : All listeners notified\n(pathfinder, UI, stats, etc.)
+
+deactivate cblock
+
+@enduml

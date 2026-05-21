@@ -1,0 +1,182 @@
+{
+  "scope": "plugin_lifecycle_flow",
+  "title": "Plugin Lifecycle Flow",
+  "diagram_type": "activity",
+  "primary_class": "Composer\\Plugin\\PluginManager",
+  "key_participants": [
+    "PluginManager",
+    "PluginInterface",
+    "InstallerInterface",
+    "EventDispatcher",
+    "InstallationManager",
+    "AutoloadGenerator",
+    "PackageSorter",
+    "RepositoryUtils"
+  ],
+
+  "activity_flows": [
+    {
+      "entry": "loadInstalledPlugins()",
+      "steps": [
+        "CHECK arePluginsDisabled('local') → if false: getLocalRepository() → loadRepository(repo, isGlobal=false, rootPackage)",
+        "CHECK globalComposer !== null AND !arePluginsDisabled('global') → loadRepository(globalRepo, isGlobal=true)"
+      ]
+    },
+    {
+      "entry": "loadRepository(repo, isGlobalRepo, rootPackage)",
+      "steps": [
+        "repo->getPackages()",
+        "BUILD weights: composer/installers or plugin-modifies-install-path → weight -10000",
+        "PackageSorter::sortPackages(packages, weights) → sorted by dependency order",
+        "IF !isGlobalRepo: RepositoryUtils::filterRequiredPackages() → requiredPackages",
+        "FOREACH sortedPackages:",
+        "  SKIP if not CompletePackage",
+        "  SKIP if type not in [composer-plugin, composer-installer]",
+        "  IF !isGlobalRepo AND package not in requiredPackages AND not isPluginAllowed(optional=true, prompt=false) → WARN + skip",
+        "  CALL registerPackage(package, failOnMissingClasses=false, isGlobalRepo)"
+      ]
+    },
+    {
+      "entry": "registerPackage(package, failOnMissingClasses, isGlobalPlugin)",
+      "steps": [
+        "CHECK arePluginsDisabled(isGlobal?'global':'local') → WARN + return",
+        "IF type === 'composer-plugin':",
+        "  FIND composer-plugin-api require link → if missing throw RuntimeException",
+        "  CHECK api version constraint match → if mismatch WARN + return",
+        "  SPECIAL CASE symfony/flex < 1.9.8 → WARN + return",
+        "CHECK isPluginAllowed(name, isGlobal, optional) → if not allowed: DEBUG log + return",
+        "CHECK registeredPlugins[name] already set → return (already registered)",
+        "READ extra['class'] → throw UnexpectedValueException if empty",
+        "BUILD installedRepo from localRepo + RootPackageRepository (files autoloads cleared)",
+        "collectDependencies(installedRepo, {package}, package) → autoloadPackages map",
+        "BUILD autoloads list:",
+        "  shouldAutoloadPackage(rootPackage, '') → add if true",
+        "  FOREACH autoloadPackages: getInstallPath() → shouldAutoloadPackage(pkg, path) OR pkg===pluginPkg → add",
+        "IF autoloads empty → throw LogicException",
+        "generator->parseAutoloads(autoloads, rootPackage) → map",
+        "generator->createLoader(map, vendor-dir) → classLoader->register(false)",
+        "FOREACH map['files']: composerRequire(fileId, file) [skip laminas bridge hack]",
+        "FOREACH classes:",
+        "  IF class_exists (already loaded): rename class with _composer_tmpN suffix via eval",
+        "  IF oldInstallerPlugin (composer-installer type):",
+        "    VALIDATE implements InstallerInterface → throw if not",
+        "    new $class(io, composer) → installationManager->addInstaller(installer)",
+        "    registeredPlugins[name][] = installer",
+        "  ELSE IF class_exists:",
+        "    VALIDATE implements PluginInterface → throw if not",
+        "    new $class() → addPlugin(plugin, isGlobal, package)",
+        "    registeredPlugins[name][] = plugin",
+        "  ELSE IF failOnMissingClasses → throw UnexpectedValueException"
+      ]
+    },
+    {
+      "entry": "shouldAutoloadPackage(package, path)",
+      "steps": [
+        "BUILD key = name:version:path",
+        "IF key in autoloadedPackages → return false (already processed, deduplication guard)",
+        "SET autoloadedPackages[key] = true",
+        "RETURN true"
+      ]
+    },
+    {
+      "entry": "addPlugin(plugin, isGlobalPlugin, sourcePackage)",
+      "steps": [
+        "CHECK arePluginsDisabled → return silently",
+        "IF sourcePackage === null → trigger E_USER_DEPRECATED warning",
+        "ELSE CHECK isPluginAllowed(sourcePackage->getName(), ...) → DEBUG log + return if not allowed",
+        "io->writeError DEBUG: 'Loading plugin ClassName (from pkg, installed globally)'",
+        "plugins[] = plugin",
+        "plugin->activate(composer, io)",
+        "IF plugin instanceof EventSubscriberInterface → eventDispatcher->addSubscriber(plugin)"
+      ]
+    },
+    {
+      "entry": "removePlugin(plugin)",
+      "steps": [
+        "array_search plugin in plugins[] → if not found return",
+        "io->writeError DEBUG: 'Unloading plugin ClassName'",
+        "unset plugins[index]",
+        "plugin->deactivate(composer, io)",
+        "eventDispatcher->removeListener(plugin)"
+      ]
+    },
+    {
+      "entry": "deactivatePackage(package)",
+      "steps": [
+        "CHECK registeredPlugins[name] exists → return if not",
+        "FOREACH plugins in registeredPlugins[name]:",
+        "  IF plugin instanceof InstallerInterface → installationManager->removeInstaller(plugin)",
+        "  ELSE → removePlugin(plugin)",
+        "unset registeredPlugins[name]"
+      ]
+    },
+    {
+      "entry": "deactivateInstalledPlugins()",
+      "steps": [
+        "CHECK !arePluginsDisabled('local') → deactivateRepository(localRepo, isGlobal=false)",
+        "CHECK globalComposer !== null AND !arePluginsDisabled('global') → deactivateRepository(globalRepo, isGlobal=true)"
+      ]
+    },
+    {
+      "entry": "deactivateRepository(repo, isGlobalRepo)",
+      "steps": [
+        "repo->getPackages()",
+        "array_reverse(PackageSorter::sortPackages(packages)) → reverse dependency order",
+        "FOREACH sortedPackages:",
+        "  SKIP if not CompletePackage",
+        "  IF type in [composer-plugin, composer-installer] → deactivatePackage(package)"
+      ]
+    },
+    {
+      "entry": "isPluginAllowed(package, isGlobal, optional, prompt)",
+      "steps": [
+        "SELECT rules = allowGlobalPluginRules or allowPluginRules",
+        "IF rules === null (legacy lock pre-2.2):",
+        "  IF !io->isInteractive() → throw RuntimeException (run composer update --lock)",
+        "  SET rules = [] (will prompt)",
+        "FOREACH rules: Preg::isMatch(pattern, package) → return allow true/false",
+        "SPECIAL: composer/package-versions-deprecated → always false",
+        "IF io->isInteractive() AND prompt → ask user y/n/d/?",
+        "  y/n → persist to rules[] AND composer.json allow-plugins config → return bool",
+        "  d → persist to rules[] only (discard from json) → return false",
+        "  ? → print help, increment attempts; after 5 attempts break",
+        "ELSE IF optional → return false",
+        "THROW PluginBlockedException"
+      ]
+    }
+  ],
+
+  "key_conditions": [
+    "arePluginsDisabled: disablePlugins===true OR disablePlugins===type ('local'|'global')",
+    "Plugin type check: 'composer-plugin' (PluginInterface) vs 'composer-installer' legacy (InstallerInterface)",
+    "API version mismatch → skip with warning (no exception)",
+    "symfony/flex < 1.9.8 → skip with warning",
+    "shouldAutoloadPackage: deduplication by name:version:path key, always loads the plugin package itself regardless",
+    "Class already loaded → eval rename trick with _composer_tmpN to avoid conflicts",
+    "loadRepository sorts by deps (required-by first), weights composer/installers to -10000 so it loads first",
+    "deactivateRepository uses reverse sort to unload dependents before dependencies"
+  ],
+
+  "key_relationships": [
+    "PluginManager owns plugins[] (PluginInterface[]) and registeredPlugins[name][] (PluginInterface|InstallerInterface)",
+    "PluginManager depends_on Composer (getRepositoryManager, getAutoloadGenerator, getInstallationManager, getEventDispatcher, getConfig)",
+    "PluginManager depends_on PartialComposer (globalComposer, nullable)",
+    "addPlugin → plugin->activate(composer, io)",
+    "removePlugin → plugin->deactivate(composer, io) + eventDispatcher->removeListener",
+    "uninstallPlugin → plugin->uninstall(composer, io)",
+    "installer path → installationManager->addInstaller / removeInstaller",
+    "EventSubscriberInterface plugins auto-subscribed via eventDispatcher->addSubscriber"
+  ],
+
+  "state_transitions": [
+    "unregistered → registered: registerPackage() completes, plugin added to registeredPlugins[name]",
+    "registered+active → inactive: deactivatePackage() → removePlugin() → plugin->deactivate()",
+    "registered+active → uninstalled: uninstallPackage() → removePlugin() + uninstallPlugin() → plugin->uninstall()"
+  ],
+
+  "important_notes": "Two plugin scopes: local (project) and global (~/.composer). Plugins can be individually disabled via disablePlugins='local'|'global'|true. allow-plugins config is security gate — missing/unlisted plugins either prompt user (interactive) or throw PluginBlockedException (non-interactive). Plugin class renaming via eval is used to avoid PHP class-already-defined errors when reloading. Root package files-autoload is intentionally cleared before plugin class loading to avoid loading files not yet available.",
+
+  "source_files_analyzed": [
+    "src/Composer/Plugin/PluginManager.php"
+  ]
+}

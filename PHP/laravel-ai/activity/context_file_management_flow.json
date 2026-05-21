@@ -1,0 +1,161 @@
+{
+  "scope": "file_management_flow",
+  "title": "File Upload & Management Flow",
+  "diagram_type": "activity",
+  "key_participants": [
+    "Caller",
+    "Files (static facade)",
+    "Ai (static facade)",
+    "FileProvider (interface + ManagesFiles trait)",
+    "FileGateway (interface)",
+    "OpenAiFileGateway",
+    "AnthropicFileGateway",
+    "GeminiFileGateway",
+    "PreparesStorableFiles (trait)",
+    "StorableFile (interface)",
+    "Base64Document",
+    "LocalDocument",
+    "StoredDocument",
+    "ProviderDocument",
+    "CanBeUploadedToProvider (trait)",
+    "CanBeRetrievedOrDeletedFromProvider (trait)",
+    "StoredFileResponse",
+    "FileResponse",
+    "EventDispatcher"
+  ],
+
+  "activities": {
+    "FILES_PUT": {
+      "entry": "Files::put(StorableFile|UploadedFile|string $file, ?mimeType, ?name, ?provider): StoredFileResponse",
+      "steps": [
+        "DECISION: is $file a string? → YES: wrap as Base64Document(base64_encode($file), $mimeType)->as($name)",
+        "DECISION: is $file an UploadedFile? → YES: wrap as Base64Document::fromUpload($file)->as($name ?? originalName)",
+        "Call Ai::fakeableFileProvider($provider) → resolves FileProvider (real or FakeFileGateway)",
+        "Call FileProvider::putFile($file) [ManagesFiles trait]",
+        "  Generate UUID7 invocationId",
+        "  DECISION: Ai::filesAreFaked()? → YES: Ai::recordFileUpload($file)",
+        "  Dispatch StoringFile(invocationId, provider, file) event",
+        "  Call fileGateway()->putFile($provider, $file) → OpenAiFileGateway / AnthropicFileGateway / GeminiFileGateway",
+        "    Call PreparesStorableFiles::prepareStorableFile($file) → [content(), mimeType() ?? 'application/octet-stream', name() ?? 'file']",
+        "    HTTP POST multipart/form-data to provider API (attach 'file' part)",
+        "    OpenAI: POST files with purpose='user_data'",
+        "    Anthropic: POST files (beta header 'files-api-2025-04-14')",
+        "    Gemini: POST /upload/v1beta/files with display_name",
+        "    Return StoredFileResponse($responseId)",
+        "  Dispatch FileStored(invocationId, provider, file, response) event",
+        "Return StoredFileResponse to caller"
+      ]
+    },
+    "FILES_PUT_FROM_PATH": {
+      "entry": "Files::putFromPath(string $path, ?mimeType, ?name, ?provider): StoredFileResponse",
+      "steps": [
+        "Create LocalDocument via Document::fromPath($path) → LocalDocument($path)",
+        "LocalDocument::content() reads file via file_get_contents($path)",
+        "LocalDocument::mimeType() uses Filesystem->mimeType($path)",
+        "LocalDocument::name() returns basename($path) unless overridden",
+        "Delegate to Files::put(LocalDocument, $mimeType, $name, $provider) → [follow FILES_PUT flow]"
+      ]
+    },
+    "FILES_PUT_FROM_STORAGE": {
+      "entry": "Files::putFromStorage(string $path, ?disk, ?name, ?provider): StoredFileResponse",
+      "steps": [
+        "Create StoredDocument via Document::fromStorage($path, $disk) → StoredDocument($path, $disk)",
+        "StoredDocument::content() reads via Storage::disk($disk)->get($path), throws RuntimeException if missing",
+        "StoredDocument::mimeType() uses Storage::disk($disk)->mimeType($path)",
+        "Delegate to Files::put(StoredDocument, null, $name, $provider) → [follow FILES_PUT flow]"
+      ]
+    },
+    "FILES_DELETE": {
+      "entry": "Files::delete(string $fileId, ?provider): void",
+      "steps": [
+        "Call Ai::fakeableFileProvider($provider) → resolves FileProvider",
+        "Call FileProvider::deleteFile($fileId) [ManagesFiles trait]",
+        "  Generate UUID7 invocationId",
+        "  DECISION: Ai::filesAreFaked()? → YES: Ai::recordFileDeletion($fileId)",
+        "  Call fileGateway()->deleteFile($provider, $fileId) → HTTP DELETE files/{fileId}",
+        "  Dispatch FileDeleted(invocationId, provider, fileId) event"
+      ]
+    },
+    "CAN_BE_UPLOADED_TO_PROVIDER_TRAIT": {
+      "description": "Trait used by Base64Document, LocalDocument, StoredDocument — allows file objects to upload themselves",
+      "entry": "$file->put(?mimeType, ?name, ?provider): StoredFileResponse",
+      "steps": [
+        "Calls Files::put($this, mimeType ?? $this->mimeType(), name ?? $this->name(), $provider)",
+        "Follows FILES_PUT activity flow"
+      ]
+    },
+    "CAN_BE_RETRIEVED_OR_DELETED_FROM_PROVIDER_TRAIT": {
+      "description": "Trait used by ProviderDocument, ProviderImage — allows provider-side file objects to retrieve or delete themselves",
+      "methods": [
+        "$file->get(?provider): FileResponse → Files::get($this->id, provider: $provider) → Ai::fakeableFileProvider()->getFile($fileId)",
+        "$file->delete(?provider): void → Files::delete($this->id, provider: $provider) → [follow FILES_DELETE flow]"
+      ]
+    }
+  },
+
+  "class_roles": {
+    "Files": "Static facade. Entry point for all file operations. Normalizes input types before delegating to FileProvider.",
+    "Ai": "Manager/registry. fakeableFileProvider() resolves named provider or returns FakeFileGateway when faking.",
+    "ManagesFiles": "Trait mixed into AnthropicProvider, OpenAiProvider, GeminiProvider. Implements FileProvider contract: wraps gateway calls with event dispatch and fake recording.",
+    "FileGateway (interface)": "Contract: getFile(provider, fileId), putFile(provider, file), deleteFile(provider, fileId)",
+    "FileProvider (interface)": "Contract: getFile(fileId), putFile(file), deleteFile(fileId), fileGateway(), useFileGateway()",
+    "OpenAiFileGateway": "Implements FileGateway. Uses OpenAI HTTP client. putFile POSTs with purpose='user_data'.",
+    "AnthropicFileGateway": "Implements FileGateway. Custom HTTP client with anthropic-beta header. Supports mime_type in getFile response.",
+    "GeminiFileGateway": "Implements FileGateway. Custom upload URL (/upload/v1beta/files). Normalizes fileId to 'files/{id}' prefix.",
+    "PreparesStorableFiles": "Trait on all gateways. prepareStorableFile() extracts [content, mimeType, name] from StorableFile.",
+    "StorableFile (interface)": "Contract: content(): string, mimeType(): ?string, name(): ?string. Implemented by Base64Document, LocalDocument, StoredDocument.",
+    "Base64Document": "StorableFile from in-memory base64 data or UploadedFile. Uses CanBeUploadedToProvider.",
+    "LocalDocument": "StorableFile from filesystem path. Uses CanBeUploadedToProvider.",
+    "StoredDocument": "StorableFile from Laravel Storage disk. Uses CanBeUploadedToProvider.",
+    "ProviderDocument": "Holds provider-side file ID. Uses CanBeRetrievedOrDeletedFromProvider to get/delete.",
+    "StoredFileResponse": "Value object: id (provider file ID). Implements HasProviderId.",
+    "FileResponse": "Value object: id, optional mimeType."
+  },
+
+  "events_dispatched": [
+    "StoringFile(invocationId, provider, file) — before upload",
+    "FileStored(invocationId, provider, file, StoredFileResponse) — after successful upload",
+    "FileDeleted(invocationId, provider, fileId) — after successful delete"
+  ],
+
+  "key_relationships": [
+    "Files static facade delegates to Ai::fakeableFileProvider() which returns FileProvider",
+    "AnthropicProvider / OpenAiProvider / GeminiProvider implement FileProvider via ManagesFiles trait",
+    "ManagesFiles delegates to FileGateway (openai/anthropic/gemini-specific) for actual HTTP calls",
+    "All gateways use PreparesStorableFiles trait to extract [content, mime, name] from StorableFile",
+    "Base64Document / LocalDocument / StoredDocument implement StorableFile + use CanBeUploadedToProvider (calls back to Files::put)",
+    "ProviderDocument / ProviderImage use CanBeRetrievedOrDeletedFromProvider (calls back to Files::get / Files::delete)",
+    "ManagesFiles wraps every operation with event dispatch (StoringFile, FileStored, FileDeleted)"
+  ],
+
+  "branching_conditions": [
+    "Files::put: string input → Base64Document conversion",
+    "Files::put: UploadedFile input → Base64Document::fromUpload() conversion",
+    "Files::put/delete: Ai::filesAreFaked() → record upload/deletion for test assertions instead of real HTTP call",
+    "GeminiFileGateway: fileId already prefixed with 'files/' → skip prefix",
+    "StoredDocument::content(): file missing on disk → throw RuntimeException",
+    "LocalDocument::content(): file_get_contents returns false → throw RuntimeException"
+  ],
+
+  "important_notes": "ManagesFiles is the central trait that adds file management to providers (Anthropic, OpenAI, Gemini). It does NOT add the StorableFile upload trait to Document subclasses — those use CanBeUploadedToProvider separately. The CanBeRetrievedOrDeletedFromProvider trait is only on ProviderDocument/ProviderImage (objects that already have a provider-side ID). GeminiFileGateway uses a special upload URL prefix. AnthropicFileGateway is the only one returning mimeType in getFile.",
+
+  "source_files_analyzed": [
+    "src/Files.php",
+    "src/Gateway/OpenAi/OpenAiFileGateway.php",
+    "src/Gateway/Anthropic/AnthropicFileGateway.php",
+    "src/Gateway/Gemini/GeminiFileGateway.php",
+    "src/Contracts/Gateway/FileGateway.php",
+    "src/Contracts/Providers/FileProvider.php",
+    "src/Providers/Concerns/ManagesFiles.php",
+    "src/Files/Concerns/CanBeUploadedToProvider.php",
+    "src/Files/Concerns/CanBeRetrievedOrDeletedFromProvider.php",
+    "src/Gateway/Concerns/PreparesStorableFiles.php",
+    "src/Files/File.php",
+    "src/Files/Document.php",
+    "src/Files/Base64Document.php",
+    "src/Files/LocalDocument.php",
+    "src/Files/StoredDocument.php",
+    "src/Files/ProviderDocument.php",
+    "src/Responses/StoredFileResponse.php"
+  ]
+}

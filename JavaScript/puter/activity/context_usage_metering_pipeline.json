@@ -1,0 +1,121 @@
+{
+  "scope": "usage_metering_pipeline",
+  "title": "Usage Metering Pipeline",
+  "diagram_type": "activity",
+  "subsystem": "Metering and billing",
+  "key_participants": ["Client", "UsageController", "MeteringService", "SUService", "DynamoKVStore", "BaseDatabaseAccessService"],
+
+  "controller_meta": {
+    "class": "UsageController",
+    "extends": "ExtensionController",
+    "decorator": "@Controller('/metering')",
+    "file": "extensions/metering/controllers/UsageController.ts",
+    "constructor_deps": ["MeteringService", "BaseDatabaseAccessService"],
+    "registered_via": "main.ts → new UsageController(meteringService, sqlClient).registerRoutes()"
+  },
+
+  "activities": [
+    {
+      "method": "getUsage",
+      "route": "GET api.*/metering/usage",
+      "activity_flow": [
+        "Receive GET /metering/usage",
+        "Check req.actor present → [missing] throw Error('actor not found in context')",
+        "Parallel: getActorCurrentMonthUsageDetails(actor) AND getAllowedUsage(actor)",
+        "Await Promise.all([actorUsage, allowanceInfo])",
+        "Return 200 JSON { ...actorUsage, allowanceInfo }"
+      ]
+    },
+    {
+      "method": "getUsageByApp",
+      "route": "GET api.*/metering/usage/:appIdOrName",
+      "activity_flow": [
+        "Receive GET /metering/usage/:appIdOrName",
+        "Check req.actor present → [missing] throw Error",
+        "Check appIdOrName present → [missing] return 400 { error: 'appId parameter is required' }",
+        "Check appIdOrName is string → [not string] return 400 { error: 'appId parameter must be a string' }",
+        "Validate UUID format: starts with 'app-' AND suffix is valid v4 UUID?",
+        "  [not UUID] → sqlClient.read('SELECT uid FROM apps WHERE name=? LIMIT 1', [appIdOrName])",
+        "    [found] appId = rows[0].uid",
+        "    [not found] return 404 { error: 'App not found' }",
+        "  [is UUID] appId = appIdOrName (use as-is)",
+        "meteringService.getActorCurrentMonthAppUsageDetails(actor, appId)",
+        "Return 200 JSON appUsage"
+      ]
+    },
+    {
+      "method": "getGlobalUsage",
+      "route": "GET api.*/metering/globalUsage",
+      "guard": "allowedGlobalUsageUsers list (from extension.config)",
+      "activity_flow": [
+        "Receive GET /metering/globalUsage",
+        "Guard: check actor is in allowedGlobalUsageUsers → [unauthorized] reject",
+        "Check req.actor present → [missing] throw Error",
+        "meteringService.getGlobalUsage()",
+        "Return 200 JSON globalUsage"
+      ]
+    }
+  ],
+
+  "metering_service_internals": {
+    "getActorCurrentMonthUsageDetails": [
+      "Validate actor.type.user.uuid present",
+      "Compute currentMonth string (YYYY-MM)",
+      "sudo: kvStore.get([actorUsageKey, actorAppTotalsKey])",
+      "If appId present on actor: filter appTotals to own app + aggregate others",
+      "Return { usage, appTotals }"
+    ],
+    "getActorCurrentMonthAppUsageDetails": [
+      "Validate actor.type.user.uuid present",
+      "Resolve appId (param → actor app → GLOBAL_APP_KEY)",
+      "sudo: kvStore.get(actorAppUsageKey)",
+      "If actorAppId present and differs from requested appId (and not GLOBAL_APP_KEY): throw Error",
+      "Return usage or { total: 0 }"
+    ],
+    "getAllowedUsage": [
+      "Parallel: getActorSubscription(actor), getActorAddons(actor), getActorCurrentMonthUsageDetails(actor)",
+      "Compute remaining = max(0, monthAllowance + purchasedCredits - totalUsed - consumedCredits)",
+      "Return { remaining, monthUsageAllowance, addons }"
+    ],
+    "getGlobalUsage": [
+      "Compute currentMonth string",
+      "sudo: build keys for all 10,000 shards + legacy unsharded key",
+      "kvStore.get(allKeys) → array of UsageByType",
+      "Aggregate totals and per-type records across all shards",
+      "Return aggregatedUsage"
+    ]
+  },
+
+  "key_relationships": [
+    "UsageController extends ExtensionController",
+    "UsageController depends_on MeteringService (injected via constructor)",
+    "UsageController depends_on BaseDatabaseAccessService/sqlClient (injected via constructor, used for app name→uid lookup)",
+    "MeteringService depends_on DynamoKVStore (metrics storage)",
+    "MeteringService depends_on SUService (elevated sudo reads/writes)",
+    "MeteringService depends_on AlarmService (abuse/overuse alerts)",
+    "MeteringService depends_on EventService (subscription policy hooks)"
+  ],
+
+  "branching_conditions": [
+    "actor missing → throw / error response",
+    "appIdOrName missing → 400",
+    "appIdOrName not a string → 400",
+    "appIdOrName is UUID → use directly; else → DB lookup",
+    "app not found in DB → 404",
+    "actor app scoped → filter appTotals to own app + others",
+    "getGlobalUsage: guarded by allowedGlobalUsageUsers whitelist"
+  ],
+
+  "data_stores": {
+    "DynamoKVStore": "Holds per-actor monthly usage, per-actor-per-app usage, global sharded usage, actor app totals, addon credits",
+    "SQL (apps table)": "Used only in getUsageByApp for name→uid resolution"
+  },
+
+  "important_notes": "Global usage sharded across 10,000 keys (murmurhash mod). All KV reads/writes wrapped in SUService.sudo(). Allowance check: subscription monthUsageAllowance + purchasedCredits - consumed. Extension loaded via main.ts; routes registered via controller.registerRoutes().",
+
+  "source_files_analyzed": [
+    "extensions/metering/controllers/UsageController.ts",
+    "extensions/metering/main.ts",
+    "src/backend/src/services/MeteringService/MeteringService.ts"
+  ]
+}

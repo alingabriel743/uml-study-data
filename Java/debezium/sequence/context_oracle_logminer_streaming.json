@@ -1,0 +1,225 @@
+{
+  "scope": "oracle_logminer_streaming",
+  "title": "Oracle LogMiner Streaming Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Connector (execute caller)",
+    "AbstractLogMinerStreamingChangeEventSource",
+    "UnbufferedLogMinerStreamingChangeEventSource",
+    "LogMinerSessionContext",
+    "LogFileCollector",
+    "OracleConnection (JDBC)",
+    "OracleDB (DBMS_LOGMNR)",
+    "LogMinerEventRow",
+    "LogMinerDmlParser",
+    "EventDispatcher",
+    "OracleOffsetContext",
+    "LogMinerStreamingChangeEventSourceMetrics"
+  ],
+
+  "interaction_flow": [
+    "=== INITIALIZATION ===",
+    "Connector → AbstractLogMinerStreamingChangeEventSource: execute(context, partition, offsetContext)",
+    "AbstractLogMinerStreamingChangeEventSource → OracleConnection: prepareJdbcConnection(false) [setNlsSessionParameters, setHashSortArea]",
+    "AbstractLogMinerStreamingChangeEventSource → OracleConnection: checkDatabaseAndTableState(), logOnlineRedoLogSizes()",
+    "AbstractLogMinerStreamingChangeEventSource → OracleOffsetContext: getScn(), getSnapshotScn()",
+    "AbstractLogMinerStreamingChangeEventSource → OracleConnection: getCurrentScn() → firstScn",
+    "AbstractLogMinerStreamingChangeEventSource → self: computeStartScnForFirstMiningSession(firstScn, offsetScn, snapshotScn)",
+    "AbstractLogMinerStreamingChangeEventSource → UnbufferedLogMinerStreamingChangeEventSource: executeLogMiningStreaming() [abstract dispatch]",
+
+    "=== MAIN STREAMING LOOP (per iteration) ===",
+    "UnbufferedLogMinerStreamingChangeEventSource → OracleConnection: getDatabaseSystemTime() → metrics.setDatabaseTimeDifference()",
+    "UnbufferedLogMinerStreamingChangeEventSource → OracleConnection: getCurrentScn() → currentScn",
+    "UnbufferedLogMinerStreamingChangeEventSource → LogMinerStreamingChangeEventSourceMetrics: setCurrentScn(currentScn)",
+
+    "=== LOG FILE COLLECTION ===",
+    "UnbufferedLogMinerStreamingChangeEventSource → AbstractLogMinerStreamingChangeEventSource: collectLogs(minLogScn, currentScn)",
+    "AbstractLogMinerStreamingChangeEventSource → LogFileCollector: getLogs(lowerBoundsScn) → List<LogFile>",
+    "AbstractLogMinerStreamingChangeEventSource → OracleConnection: redoLogStatusQuery() → metrics.setRedoLogStatuses()",
+
+    "=== LOG SWITCH CHECK ===",
+    "AbstractLogMinerStreamingChangeEventSource → OracleConnection: currentRedoLogSequenceQuery() → sequences",
+    "[if log switch] → AbstractLogMinerStreamingChangeEventSource: endMiningSession(), needsNewSession=true",
+
+    "=== DICTIONARY WRITE (CATALOG_IN_REDO strategy only) ===",
+    "AbstractLogMinerStreamingChangeEventSource → LogMinerSessionContext: writeDataDictionaryToRedoLogs()",
+    "LogMinerSessionContext → OracleConnection: executeWithoutCommitting('BEGIN DBMS_LOGMNR_D.BUILD(...)')",
+
+    "=== SCN WINDOW CALCULATION ===",
+    "UnbufferedLogMinerStreamingChangeEventSource → AbstractLogMinerStreamingChangeEventSource: calculateUpperBounds(minLogScn, prevUpperBounds, currentScn)",
+    "AbstractLogMinerStreamingChangeEventSource → OracleConnection: getRedoThreadState() → minOpenRedoThreadLastScn",
+    "AbstractLogMinerStreamingChangeEventSource → LogMinerStreamingChangeEventSourceMetrics: setOffsetScn(minLogScn)",
+
+    "=== APPLY LOGS TO SESSION ===",
+    "UnbufferedLogMinerStreamingChangeEventSource → AbstractLogMinerStreamingChangeEventSource: applyLogsToSession()",
+    "AbstractLogMinerStreamingChangeEventSource → LogMinerSessionContext: removeAllLogFilesFromSession()",
+    "LogMinerSessionContext → OracleConnection: removeAllLogFilesFromLogMinerSession()",
+    "AbstractLogMinerStreamingChangeEventSource → LogMinerSessionContext: addLogFiles(sessionLogFiles)",
+    "LogMinerSessionContext → OracleDB: executeWithoutCommitting('BEGIN sys.dbms_logmnr.add_logfile(LOGFILENAME=>..., OPTIONS=>DBMS_LOGMNR.ADDFILE)')",
+    "AbstractLogMinerStreamingChangeEventSource → LogMinerStreamingChangeEventSourceMetrics: setMinedLogFileNames(), setCurrentLogFileNames()",
+
+    "=== START MINING SESSION ===",
+    "UnbufferedLogMinerStreamingChangeEventSource → AbstractLogMinerStreamingChangeEventSource: startMiningSession(minLogScn, Scn.NULL, attempts)",
+    "AbstractLogMinerStreamingChangeEventSource → LogMinerStreamingChangeEventSourceMetrics: setLastMiningSessionRange(startScn, endScn)",
+    "AbstractLogMinerStreamingChangeEventSource → LogMinerSessionContext: startSession(startScn, endScn, committedDataOnly)",
+    "LogMinerSessionContext → OracleDB: executeWithoutCommitting('BEGIN sys.dbms_logmnr.start_logmnr(startScn, endScn, options=>...)')",
+    "LogMinerSessionContext → AbstractLogMinerStreamingChangeEventSource: return (sessionStarted=true, lastSessionStartTime recorded)",
+    "AbstractLogMinerStreamingChangeEventSource → LogMinerStreamingChangeEventSourceMetrics: setLastMiningSessionStartDuration()",
+
+    "=== QUERY EXECUTION & ROW PROCESSING ===",
+    "UnbufferedLogMinerStreamingChangeEventSource: process(minCommitScn, upperBoundsScn) → executeAndProcessQuery(PreparedStatement)",
+    "AbstractLogMinerStreamingChangeEventSource → OracleDB: statement.executeQuery() → ResultSet",
+    "AbstractLogMinerStreamingChangeEventSource → LogMinerStreamingChangeEventSourceMetrics: setLastDurationOfFetchQuery(duration)",
+    "  [LOOP: while running && resultSet.next()]",
+    "  AbstractLogMinerStreamingChangeEventSource → LogMinerStreamingChangeEventSourceMetrics: setLastResultSetNextDuration()",
+    "  AbstractLogMinerStreamingChangeEventSource → BatchMetrics: rowObserved()",
+    "  AbstractLogMinerStreamingChangeEventSource → LogMinerEventRow: fromResultSet(resultSet, schema, config)",
+    "  LogMinerEventRow → ResultSet: read 26 columns (SCN, SQL_REDO, OPERATION_CODE, CHANGE_TIME, TX_ID, CSF, TABLE_NAME, etc.)",
+    "  LogMinerEventRow → OracleDatabaseSchema: resolveTableId(catalog, tablespace, tableName) [if tableName != null]",
+    "  LogMinerEventRow: getSqlRedo() — assembles multi-row SQL (CSF continuation flag loop, max 25 rows = 100KB)",
+    "  AbstractLogMinerStreamingChangeEventSource → self: processEvent(event)",
+
+    "=== EVENT ROUTING (processEvent switch on EventType) ===",
+    "  [START] → handleStartEvent(event) [abstract, impl-specific buffering]",
+    "  [COMMIT] → handleCommitEvent(event) [abstract — UnbufferedImpl flushes TransactionCommitConsumer]",
+    "  [ROLLBACK] → handleRollbackEvent(event) [abstract]",
+    "  [DDL] → handleSchemaChangeEvent(event) → dispatchSchemaChangeEventInternal(event)",
+    "    dispatchSchemaChangeEventInternal → OracleOffsetContext: setEventScn(), setRedoThread(), setRsId()",
+    "    dispatchSchemaChangeEventInternal → EventDispatcher: dispatchSchemaChangeEvent(partition, offset, tableId, OracleSchemaChangeEventEmitter)",
+    "    BatchMetrics: schemaChangeObserved()",
+    "  [INSERT/UPDATE/DELETE] → handleDataChangeEvent(event)",
+    "    handleDataChangeEvent → self: getTableForDataEvent(event) → OracleDatabaseSchema.tableFor(tableId)",
+    "    handleDataChangeEvent → self: parseDmlStatement(event, table) → LogMinerDmlParser.parse(sql, table)",
+    "    handleDataChangeEvent → self: dispatchDataChangeEventInternal(event, table)",
+    "    dispatchDataChangeEventInternal → self: enqueueEvent(event, DmlEvent/RedoSqlDmlEvent) [abstract]",
+    "    metrics: incrementTotalChangesCount()",
+    "    BatchMetrics: dataChangeEventObserved(eventType)",
+    "  [SELECT_LOB_LOCATOR] → handleSelectLobLocatorEvent → selectLobParser.parse() → enqueueEvent(SelectLobLocatorEvent)",
+    "  [LOB_WRITE] → handleLobWriteEvent → LobWriteParser.parse() → enqueueEvent(LobWriteEvent)",
+    "  [XML_BEGIN/WRITE/END] → handleXmlBeginEvent/handleXmlWriteEvent/handleXmlEndEvent → enqueueEvent(XmlEvent)",
+    "  [MISSING_SCN] → log warning",
+    "  [UNSUPPORTED] → log warning",
+
+    "=== POST-BATCH METRICS UPDATE ===",
+    "AbstractLogMinerStreamingChangeEventSource → BatchMetrics: updateStreamingMetrics()",
+    "BatchMetrics → LogMinerStreamingChangeEventSourceMetrics: setLastCapturedDmlCount(), setLastProcessedRowsCount(), setLastBatchJdbcRows()",
+    "AbstractLogMinerStreamingChangeEventSource → OffsetActivityMonitor: checkForStaleOffsets(getActiveTransactionIds)",
+
+    "=== MEMORY STATS & PAUSE ===",
+    "UnbufferedLogMinerStreamingChangeEventSource → AbstractLogMinerStreamingChangeEventSource: captureJdbcSessionMemoryStatistics()",
+    "AbstractLogMinerStreamingChangeEventSource → OracleConnection: getSessionStatisticByName('session uga/pga memory')",
+    "AbstractLogMinerStreamingChangeEventSource → LogMinerStreamingChangeEventSourceMetrics: setUserGlobalAreaMemory(), setProcessGlobalAreaMemory()",
+    "AbstractLogMinerStreamingChangeEventSource → LogMinerStreamingChangeEventSourceMetrics: setLastBatchProcessingDuration()",
+    "AbstractLogMinerStreamingChangeEventSource → Metronome: pauseBetweenMiningSessions() [sleep sleepTime ms]",
+
+    "=== SCN ADVANCEMENT ===",
+    "UnbufferedLogMinerStreamingChangeEventSource: minLogScn = computeResumeScnAndUpdateOffsets(minLogScn, minCommitScn)",
+    "minCommitScn returned from process() reflects last committed SCN",
+
+    "=== SESSION END ===",
+    "[on log switch or max session timeout] → endMiningSession()",
+    "AbstractLogMinerStreamingChangeEventSource → LogMinerSessionContext: endMiningSession()",
+    "LogMinerSessionContext → OracleDB: executeWithoutCommitting('BEGIN SYS.DBMS_LOGMNR.END_LOGMNR()')",
+    "LogMinerSessionContext: sessionStarted=false, currentSessionStartScn=Scn.NULL, currentSessionEndScn=Scn.NULL"
+  ],
+
+  "key_relationships": [
+    "UnbufferedLogMinerStreamingChangeEventSource extends AbstractLogMinerStreamingChangeEventSource",
+    "BufferedLogMinerStreamingChangeEventSource extends AbstractLogMinerStreamingChangeEventSource",
+    "AbstractLogMinerStreamingChangeEventSource implements StreamingChangeEventSource<OraclePartition, OracleOffsetContext>",
+    "AbstractLogMinerStreamingChangeEventSource composes LogMinerSessionContext (1:1)",
+    "AbstractLogMinerStreamingChangeEventSource composes LogFileCollector (1:1)",
+    "AbstractLogMinerStreamingChangeEventSource composes LogMinerStreamingChangeEventSourceMetrics (1:1)",
+    "AbstractLogMinerStreamingChangeEventSource composes LogMinerDmlParser, LogMinerColumnResolverDmlParser",
+    "AbstractLogMinerStreamingChangeEventSource composes SelectLobParser, ExtendedStringParser, XmlBeginParser",
+    "AbstractLogMinerStreamingChangeEventSource depends_on OracleConnection (JDBC)",
+    "AbstractLogMinerStreamingChangeEventSource depends_on EventDispatcher<OraclePartition, TableId>",
+    "AbstractLogMinerStreamingChangeEventSource depends_on OracleDatabaseSchema",
+    "AbstractLogMinerStreamingChangeEventSource depends_on OracleOffsetContext (effectiveOffset)",
+    "LogMinerSessionContext depends_on OracleConnection (executes DBMS_LOGMNR calls)",
+    "LogMinerEventRow reads ResultSet (26 columns, handles CSF multi-row SQL continuation)",
+    "LogMinerEventRow depends_on OracleDatabaseSchema (resolveTableId)",
+    "LogMinerEventRow depends_on OracleConnectorConfig (getCatalogName, isLogMiningBufferTrackRsId)",
+    "LogMinerStreamingChangeEventSourceMetrics extends AbstractOracleStreamingChangeEventSourceMetrics",
+    "LogMinerStreamingChangeEventSourceMetrics composes BatchMetrics (inner class)",
+    "BatchMetrics.updateStreamingMetrics() → calls back to parent LogMinerStreamingChangeEventSourceMetrics"
+  ],
+
+  "abstract_methods_in_base": [
+    "executeLogMiningStreaming() — main iteration loop, impl-specific",
+    "enqueueEvent(LogMinerEventRow, LogMinerEvent) — buffered vs unbuffered dispatch",
+    "handleStartEvent(LogMinerEventRow) — transaction start handling",
+    "handleCommitEvent(LogMinerEventRow) — transaction commit + event flush",
+    "handleRollbackEvent(LogMinerEventRow) — rollback handling",
+    "handleSchemaChangeEvent(LogMinerEventRow) — DDL events",
+    "handleReplicationMarkerEvent(LogMinerEventRow)",
+    "handleTruncateEvent(LogMinerEventRow)",
+    "isNoDataProcessedInBatchAndAtEndOfArchiveLogs()"
+  ],
+
+  "logminer_session_options": {
+    "strategies": ["ONLINE_CATALOG (default)", "CATALOG_IN_REDO (+ DDL_DICT_TRACKING)", "DICTIONARY_FROM_FILE"],
+    "modes": ["COMMITTED_DATA_ONLY (unbuffered mode)", "CONTINUOUS_MINE (optional)", "NO_ROWID_IN_STMT (always)"],
+    "retry_on": ["ORA-01291 (missing log)", "ORA-00310 (log sequence gap)"],
+    "max_start_retries": 5
+  },
+
+  "logminer_event_row_columns": {
+    "total_columns": 26,
+    "key_columns": {
+      "1": "SCN", "2": "SQL_REDO", "3": "OPERATION_CODE", "4": "CHANGE_TIME",
+      "5": "TX_ID", "6": "CSF (continuation flag)", "7": "TABLE_NAME",
+      "8": "TABLESPACE_NAME", "9": "OPERATION", "10": "USERNAME",
+      "11": "ROW_ID", "12": "ROLLBACK_FLAG", "13": "RS_ID", "14": "STATUS",
+      "15": "INFO", "16": "SSN", "17": "THREAD", "18": "OBJECT_ID",
+      "19": "OBJECT_VERSION", "20": "OBJECT_DATA_ID", "21": "CLIENT_ID",
+      "22": "START_SCN", "23": "COMMIT_SCN", "24": "START_TIMESTAMP",
+      "25": "COMMIT_TIMESTAMP", "26": "SEQUENCE"
+    },
+    "multi_row_sql": "CSF=1 means SQL_REDO continues in next row; loop assembles up to MAX_SQL_CONTINUATIONS=25 rows (100KB); throws LogMinerEventRowTooLargeException on integer overflow",
+    "singleton_pattern": "fromResultSet() reuses a single instance via new LogMinerEventRow() per call to avoid GC pressure"
+  },
+
+  "metrics_key_setters": [
+    "setCurrentScn(Scn) — database current SCN",
+    "setOffsetScn(Scn) — connector resume position",
+    "setCommitScn(Scn) — high-watermark commit SCN",
+    "setOldestScnDetails(Scn, Instant) — oldest in-flight transaction SCN",
+    "setLastMiningSessionRange(lowerBounds, upperBounds) — SCN window for session",
+    "setLastMiningFetchRange(lowerBounds, upperBounds) — SCN window for query",
+    "setLastMiningSessionStartDuration(Duration)",
+    "setLastDurationOfFetchQuery(Duration) — also increments logMinerQueryCount",
+    "setLastBatchProcessingDuration(Duration) — also updates maxBatchProcessingThroughput",
+    "setDatabaseTimeDifference(OffsetDateTime) — calculates lag offset",
+    "calculateLagFromSource(Instant) — event-level lag",
+    "setUserGlobalAreaMemory / setProcessGlobalAreaMemory",
+    "setMinedLogFileNames / setCurrentLogFileNames / setRedoLogStatuses",
+    "BatchMetrics.updateStreamingMetrics() → proxies to parent metrics"
+  ],
+
+  "scn_advancement_logic": {
+    "lower_bound": "minLogScn = computeResumeScnAndUpdateOffsets(); begins at offsetContext.getScn()",
+    "upper_bound": "calculateUpperBounds() considers: batchSize, currentScn, previousUpperBounds, redo thread state, SCN gap detection, deviation config",
+    "batch_size_auto_tune": "incrementBatchSize() when db is ahead; decrementBatchSize() when batch overshoots; incrementSleepTime()/decrementSleepTime() for throttling",
+    "scn_freeze_detection": "OffsetActivityMonitor tracks iterations without SCN movement, increments metrics.scnFreezeCount"
+  },
+
+  "important_notes": [
+    "Two concrete impls: Buffered (default, buffers transactions in memory/ehcache/infinispan) and Unbuffered (COMMITTED_DATA_ONLY mode, no buffering)",
+    "LogMinerSessionContext is AutoCloseable; close() calls endMiningSession()",
+    "Session restart triggers: log switch detected, max session duration exceeded, ORA-00310 from ResultSet traversal",
+    "CATALOG_IN_REDO strategy requires writeDataDictionaryToRedoLogs() before each new session",
+    "Archive log only mode adds waitForRangeAvailabilityInArchiveLogs() gate before each iteration",
+    "Hybrid strategy uses LogMinerColumnResolverDmlParser for tables unknown to the schema",
+    "LOB/XML handling gated by connectorConfig.isLobEnabled()",
+    "includeRedoSql config wraps DmlEvent in RedoSqlDmlEvent with raw SQL attached"
+  ],
+
+  "source_files_analyzed": [
+    "debezium-connector-oracle/src/main/java/io/debezium/connector/oracle/logminer/AbstractLogMinerStreamingChangeEventSource.java",
+    "debezium-connector-oracle/src/main/java/io/debezium/connector/oracle/logminer/events/LogMinerEventRow.java",
+    "debezium-connector-oracle/src/main/java/io/debezium/connector/oracle/logminer/LogMinerStreamingChangeEventSourceMetrics.java",
+    "debezium-connector-oracle/src/main/java/io/debezium/connector/oracle/logminer/LogMinerSessionContext.java",
+    "debezium-connector-oracle/src/main/java/io/debezium/connector/oracle/logminer/unbuffered/UnbufferedLogMinerStreamingChangeEventSource.java"
+  ]
+}

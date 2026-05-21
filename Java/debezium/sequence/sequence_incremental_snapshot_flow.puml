@@ -1,0 +1,265 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #E9ECEF
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+    DividerBackgroundColor #DEE2E6
+    GroupBackgroundColor #EDF2FF
+    GroupBorderColor #4C6EF5
+}
+
+title Incremental Snapshot Flow\n<size:11>(Non-blocking incremental snapshot: watermark management, chunk reading, and deduplication with streaming events)</size>
+
+participant "Caller /\nSignalAction" as Caller
+participant "AbstractIncremental\nSnapshotChangeEventSource" as AbstractSource
+participant "BinlogReadOnly\nIncrementalSnapshotChangeEventSource" as BinlogSource
+participant "MySqlReadOnly\nIncrementalSnapshotChangeEventSource" as MySqlSource
+participant "BinlogReadOnly\nIncrementalSnapshotContext" as BinlogCtx
+participant "JdbcConnection" as Jdbc
+participant "ChunkQueryBuilder" as ChunkQB
+participant "EventDispatcher" as Dispatcher
+participant "NotificationService" as NotifSvc
+participant "OffsetContext" as OffsetCtx
+
+== SNAPSHOT INITIATION ==
+
+Caller -> AbstractSource : addDataCollectionNamesToSnapshot(\n  signalPayload, snapshotConfiguration)
+activate AbstractSource
+
+AbstractSource -> BinlogCtx : addDataCollectionNamesToSnapshot(\n  correlationId, expandedIds,\n  conditions, surrogateKey)
+activate BinlogCtx
+BinlogCtx --> AbstractSource : collections queued
+deactivate BinlogCtx
+
+AbstractSource -> NotifSvc : notifyStarted(context, partition, offsetContext)
+activate NotifSvc
+NotifSvc --> AbstractSource
+deactivate NotifSvc
+
+AbstractSource -> AbstractSource : readChunk(partition, offsetContext)
+
+== CHUNK READING ==
+
+AbstractSource -> AbstractSource : preReadChunk(context)
+AbstractSource -> Jdbc : commit()
+activate Jdbc
+Jdbc --> AbstractSource
+deactivate Jdbc
+
+AbstractSource -> BinlogCtx : startNewChunk()
+activate BinlogCtx
+BinlogCtx --> AbstractSource
+deactivate BinlogCtx
+
+AbstractSource -> BinlogSource : emitWindowOpen(partition, offsetContext)
+activate BinlogSource
+
+note right of BinlogSource
+  Set low watermark via
+  getExecutedGtidSet callback
+end note
+
+BinlogSource -> MySqlSource : getExecutedGtidSet(\n  context::setLowWatermark)
+activate MySqlSource
+MySqlSource -> Jdbc : query("SHOW MASTER STATUS")
+activate Jdbc
+Jdbc --> MySqlSource : executed_gtid_set
+deactivate Jdbc
+MySqlSource -> BinlogCtx : setLowWatermark(gtidSet)
+activate BinlogCtx
+BinlogCtx --> MySqlSource
+deactivate BinlogCtx
+MySqlSource --> BinlogSource
+deactivate MySqlSource
+BinlogSource --> AbstractSource : window opened
+deactivate BinlogSource
+
+AbstractSource -> Jdbc : tableFor(currentTableId) via DatabaseSchema
+activate Jdbc
+Jdbc --> AbstractSource : table
+deactivate Jdbc
+
+AbstractSource -> ChunkQB : prepareTable(context, table)
+activate ChunkQB
+ChunkQB --> AbstractSource
+deactivate ChunkQB
+
+AbstractSource -> Jdbc : queryAndMap(buildMaxPrimaryKeyQuery())
+activate Jdbc
+Jdbc --> AbstractSource : maximumKey: Object[]
+deactivate Jdbc
+
+AbstractSource -> BinlogCtx : maximumKey(maximumKey)
+activate BinlogCtx
+BinlogCtx --> AbstractSource
+deactivate BinlogCtx
+
+== DATA EVENTS FOR TABLE (createDataEventsForTable) ==
+
+AbstractSource -> ChunkQB : buildChunkQuery(\n  context, table, additionalCondition)
+activate ChunkQB
+ChunkQB --> AbstractSource : selectStatement
+deactivate ChunkQB
+
+AbstractSource -> ChunkQB : readTableChunkStatement(\n  context, table, selectStatement)
+activate ChunkQB
+ChunkQB --> AbstractSource : preparedStatement
+deactivate ChunkQB
+
+loop for each row in JDBC ResultSet
+    AbstractSource -> Jdbc : rs.next() → rowToArray(table, rs, columnArray)
+    activate Jdbc
+    Jdbc --> AbstractSource : row: Object[]
+    deactivate Jdbc
+    AbstractSource -> AbstractSource : tableSchema.keyFromColumnData(row) → keyStruct
+    AbstractSource -> AbstractSource : window.put(keyStruct, row)
+end
+
+AbstractSource -> BinlogCtx : nextChunkPosition(lastKey)
+activate BinlogCtx
+BinlogCtx --> AbstractSource
+deactivate BinlogCtx
+
+alt window not empty (rows buffered)
+    AbstractSource -> NotifSvc : notifyInProgress(context, partition, offsetContext)
+    activate NotifSvc
+    NotifSvc --> AbstractSource
+    deactivate NotifSvc
+else window empty (table fully scanned)
+    AbstractSource -> AbstractSource : nextDataCollection()
+    AbstractSource -> NotifSvc : notifyTableScanCompleted(SUCCEEDED)
+    activate NotifSvc
+    NotifSvc --> AbstractSource
+    deactivate NotifSvc
+    AbstractSource -> NotifSvc : notifyCompleted(context, partition, offsetContext)
+    activate NotifSvc
+    NotifSvc --> AbstractSource
+    deactivate NotifSvc
+end
+
+== CLOSE WINDOW & HIGH WATERMARK ==
+
+AbstractSource -> BinlogSource : emitWindowClose(partition, offsetContext)
+activate BinlogSource
+
+BinlogSource -> MySqlSource : getExecutedGtidSet(\n  context::setHighWatermark)
+activate MySqlSource
+MySqlSource -> Jdbc : query("SHOW MASTER STATUS")
+activate Jdbc
+Jdbc --> MySqlSource : executed_gtid_set
+deactivate Jdbc
+MySqlSource -> BinlogCtx : setHighWatermark(gtidSet)
+activate BinlogCtx
+BinlogCtx --> MySqlSource
+deactivate BinlogCtx
+MySqlSource --> BinlogSource
+deactivate MySqlSource
+
+opt hasServerIdentifierChanged() == true
+    note over BinlogSource
+      Multiple server UUIDs detected
+      in watermarks → redo chunk
+    end note
+    BinlogSource -> BinlogSource : rereadChunk(partition, offsetContext)\n  [window.clear + context.revertChunk\n   + readChunk]
+end
+
+BinlogSource --> AbstractSource : window closed
+deactivate BinlogSource
+deactivate AbstractSource
+
+== STREAMING: processMessage (binlog event received) ==
+
+note over BinlogSource
+  Binlog streaming thread
+  delivers events asynchronously
+end note
+
+[-> BinlogSource : processMessage(partition, offsetContext, dataCollectionId, key, value)
+activate BinlogSource
+
+BinlogSource -> BinlogCtx : updateWindowState(offsetContext)
+activate BinlogCtx
+BinlogCtx --> BinlogSource : windowClosed: boolean
+deactivate BinlogCtx
+
+alt windowClosed == true
+    BinlogSource -> BinlogSource : sendWindowEvents(partition, offsetContext)
+    BinlogSource -> BinlogSource : readChunk(partition, offsetContext)
+else windowClosed == false AND deduplicationNeeded
+    note right of BinlogSource
+      Event occurred between
+      low/high watermarks → deduplicate
+    end note
+    BinlogSource -> BinlogSource : deduplicateWindow(\n  dataCollectionId, key)\n  → window.remove(keyStruct)
+end
+
+deactivate BinlogSource
+
+== STREAMING: processHeartbeat ==
+
+[-> BinlogSource : processHeartbeat(partition, offsetContext)
+activate BinlogSource
+
+BinlogSource -> BinlogSource : readUntilGtidChange(\n  partition, offsetContext)
+BinlogSource -> BinlogCtx : getCurrentGtid(offsetContext)
+activate BinlogCtx
+BinlogCtx --> BinlogSource : currentGtid
+deactivate BinlogCtx
+
+loop while snapshotRunning AND reachedHighWatermark(currentGtid)
+    BinlogSource -> BinlogCtx : closeWindow()
+    activate BinlogCtx
+    BinlogCtx --> BinlogSource
+    deactivate BinlogCtx
+    BinlogSource -> BinlogSource : sendWindowEvents(\n  partition, offsetContext)
+    BinlogSource -> BinlogSource : readChunk(\n  partition, offsetContext)
+end
+
+deactivate BinlogSource
+
+== SEND WINDOW EVENTS (sendWindowEvents) ==
+
+AbstractSource -> OffsetCtx : incrementalSnapshotEvents()
+activate AbstractSource
+activate OffsetCtx
+OffsetCtx --> AbstractSource
+deactivate OffsetCtx
+
+loop for each (keyStruct, row) in window
+    AbstractSource -> BinlogCtx : sendEvent(keyFromRow(row))
+    activate BinlogCtx
+    BinlogCtx --> AbstractSource
+    deactivate BinlogCtx
+    AbstractSource -> OffsetCtx : event(dataCollectionId, instant)
+    activate OffsetCtx
+    OffsetCtx --> AbstractSource
+    deactivate OffsetCtx
+    AbstractSource -> Dispatcher : dispatchSnapshotEvent(\n  partition, tableId,\n  SnapshotChangeRecordEmitter, receiver)
+    activate Dispatcher
+    Dispatcher --> AbstractSource : event dispatched
+    deactivate Dispatcher
+end
+
+AbstractSource -> OffsetCtx : postSnapshotCompletion()
+activate OffsetCtx
+OffsetCtx --> AbstractSource
+deactivate OffsetCtx
+
+AbstractSource -> AbstractSource : window.clear()
+deactivate AbstractSource
+
+@enduml

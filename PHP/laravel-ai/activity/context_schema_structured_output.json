@@ -1,0 +1,144 @@
+{
+  "scope": "schema_structured_output",
+  "title": "Schema-Based Structured Output",
+  "diagram_type": "activity",
+  "key_participants": [
+    "Agent (HasStructuredOutput)",
+    "GeneratesText (Provider Trait)",
+    "TextGateway (Interface)",
+    "ComposesSchemaInstructions (Trait)",
+    "ObjectSchema",
+    "ConcreteGateway (OpenAi/Groq/Anthropic/etc.)",
+    "ParsesTextResponses (Trait)",
+    "StructuredTextResponse",
+    "StructuredAgentResponse",
+    "FakeTextGateway",
+    "generate_fake_data_for_json_schema_type"
+  ],
+
+  "activity_flow": [
+    "START: Agent implements HasStructuredOutput",
+    "GeneratesText::prompt() checks: agent instanceof HasStructuredOutput?",
+    "  [YES] → call agent->schema(new JsonSchemaTypeFactory) → returns array<string, Type>",
+    "  [NO]  → schema = null",
+    "GeneratesText calls TextGateway::generateText(provider, model, instructions, messages, tools, schema, TextGenerationOptions, timeout)",
+
+    "=== INSIDE ConcreteGateway::generateText ===",
+    "FORK: Which gateway / schema strategy?",
+
+    "  [Groq/DeepSeek/Mistral/Ollama – uses ComposesSchemaInstructions] ──────",
+    "    CHECK: has tools AND has schema?",
+    "      [YES – inline schema] → ComposesSchemaInstructions::composeInstructions(instructions, schema)",
+    "        → new ObjectSchema(schema)->toSchema() → JSON-encodes schema",
+    "        → appends JSON schema mandate to system instructions string",
+    "        → returns merged instructions; body uses no response_format field",
+    "      [NO – native schema] → buildResponseFormat(schema)",
+    "        → new ObjectSchema(schema)->toSchema()",
+    "        → sets body['response_format'] = { type:'json_schema', json_schema:{name, schema, strict:true} }",
+
+    "  [OpenAI/AzureOpenAI/OpenRouter] ──────",
+    "    CHECK: schema filled?",
+    "      [YES] → buildSchemaFormat(schema)",
+    "        → new ObjectSchema(schema) → toSchema() → Arr::except(['name'])",
+    "        → sets body['text']['format'] = { type:'json_schema', name, schema, strict:true }",
+    "      [NO]  → no format field",
+
+    "  [Anthropic] ──────",
+    "    CHECK: schema filled?",
+    "      [YES] CHECK: supportsNativeStructuredOutput? (beta header contains 'structured-outputs')",
+    "        [YES – native] → body['output_config']['format'] = { type:'json_schema', schema: ObjectSchema->toSchema() }",
+    "        [NO  – tool fallback] → buildStructuredOutputTool(schema)",
+    "          → new ObjectSchema(schema)->toSchema()",
+    "          → synthetic tool: { name:'output_structured_data', input_schema:{properties, required} }",
+    "          → resolveToolChoice() → forced to { type:'tool', name:'output_structured_data' } (unless thinking mode)",
+
+    "  [FakeTextGateway – testing path] ──────",
+    "    generateText → nextResponse → marshalResponse",
+    "    CHECK: no pre-configured response AND schema is set?",
+    "      [YES] → generate_fake_data_for_json_schema_type(new ObjectType(schema))",
+    "        → recursively match type:",
+    "          ObjectType  → iterate properties, recurse each",
+    "          ArrayType   → random_int(minItems,maxItems) items, recurse items type",
+    "          StringType  → format-aware (date/email/uuid/url) OR Str::random(minLength..maxLength)",
+    "          IntegerType → random_int(min, max)",
+    "          NumberType  → random float in [min, max]",
+    "          BooleanType → random_int(0,1)===0",
+    "          enum set    → array_rand(enum)",
+    "          default set → return default value",
+    "        → returns array → marshalled as StructuredTextResponse(array, json_encode(array))",
+
+    "=== RESPONSE PARSING ===",
+    "Provider HTTP call returns raw API response JSON",
+    "ParsesTextResponses::processResponse(data, provider, structured=true, ...)",
+    "  → extractText(output) → raw JSON string",
+    "  → extractUsage(data) → Usage object",
+    "  → extractFinishReason(data) → FinishReason enum",
+    "  CHECK: structured === true",
+    "    [YES] → json_decode(text, true) → structuredData array",
+    "           → new StructuredTextResponse(structuredData, text, usage, meta)",
+    "           → withToolCallsAndResults() → withSteps()",
+    "    [NO]  → new TextResponse(text, usage, meta)",
+
+    "=== BACK IN GeneratesText::prompt ===",
+    "CHECK: schema was not empty?",
+    "  [YES] → new StructuredAgentResponse(invocationId, response->structured, response->text, usage, meta)",
+    "  [NO]  → new AgentResponse(invocationId, response->text, usage, meta)",
+    "dispatch AgentPrompted event",
+    "RETURN AgentResponse | StructuredAgentResponse",
+    "END"
+  ],
+
+  "key_classes": {
+    "HasStructuredOutput": "interface; schema(JsonSchemaTypeFactory): array<string,Type>",
+    "TextGenerationOptions": "readonly DTO: maxSteps, maxTokens, temperature, agent; static forAgent(Agent) reads PHP attributes",
+    "ComposesSchemaInstructions": "trait; composeInstructions(?string $instructions, ?array $schema): ?string — creates ObjectSchema, JSON-encodes, appends mandate to instructions",
+    "ObjectSchema": "extends Schema, implements HasSchemaType; wraps ObjectType with additionalProperties:false recursively; toSchema() returns flat array",
+    "StructuredTextResponse": "extends TextResponse, implements ArrayAccess; holds structured array + raw text; __toString() = json_encode(structured)",
+    "StructuredStep": "extends Step; adds public array $structured field",
+    "generate_fake_data_for_json_schema_type": "global function; recursively builds fake data from Illuminate JsonSchema Type tree"
+  },
+
+  "key_relationships": [
+    "GeneratesText depends_on TextGateway (interface call)",
+    "GeneratesText depends_on HasStructuredOutput (agent contract)",
+    "GeneratesText depends_on TextGenerationOptions (builds via forAgent)",
+    "Groq/DeepSeek/Mistral BuildsTextRequests uses ComposesSchemaInstructions (trait composition)",
+    "ComposesSchemaInstructions depends_on ObjectSchema",
+    "OpenAI/Anthropic BuildsTextRequests depends_on ObjectSchema (no ComposesSchemaInstructions)",
+    "ParsesTextResponses produces StructuredTextResponse when structured=true",
+    "StructuredTextResponse extends TextResponse",
+    "StructuredStep extends Step",
+    "FakeTextGateway implements TextGateway",
+    "FakeTextGateway depends_on generate_fake_data_for_json_schema_type (fallback fake data)"
+  ],
+
+  "branching_conditions": [
+    "agent instanceof HasStructuredOutput → determines schema presence",
+    "schema blank/null → bypass all schema logic, return plain TextResponse/AgentResponse",
+    "gateway has tools AND schema → Groq/similar uses inline schema-in-instructions (ComposesSchemaInstructions), not response_format",
+    "Anthropic beta 'structured-outputs' header → native output_config vs synthetic tool fallback",
+    "Anthropic thinking mode providerOptions → force tool_choice=auto (no forced tool)",
+    "structured=true in parseTextResponse → json_decode text into StructuredTextResponse",
+    "FakeTextGateway: response null + schema set → generate_fake_data_for_json_schema_type",
+    "FakeTextGateway: preventStrayPrompts + null response → throw RuntimeException"
+  ],
+
+  "important_notes": "ComposesSchemaInstructions is used by providers that lack native JSON-schema support (Groq, Mistral, DeepSeek, Ollama) when tools are also present, injecting the schema directly into the system prompt. Providers with native schema support (OpenAI, Anthropic, Gemini) bypass it entirely. ObjectSchema recursively disables additionalProperties on all nested objects for strict validation. StructuredAgentResponse is returned to callers (not StructuredTextResponse) — the gateway response is wrapped. The fake path (generate_fake_data_for_json_schema_type) fully mirrors the real schema structure using type-dispatch recursion.",
+
+  "source_files_analyzed": [
+    "src/Gateway/Concerns/ComposesSchemaInstructions.php",
+    "src/Contracts/Gateway/TextGateway.php",
+    "src/Gateway/TextGenerationOptions.php",
+    "src/Gateway/OpenAi/Concerns/BuildsTextRequests.php",
+    "src/Gateway/OpenAi/Concerns/ParsesTextResponses.php",
+    "src/Gateway/Anthropic/Concerns/BuildsTextRequests.php",
+    "src/Gateway/Groq/Concerns/BuildsTextRequests.php",
+    "src/Gateway/FakeTextGateway.php",
+    "src/ObjectSchema.php",
+    "src/Contracts/HasStructuredOutput.php",
+    "src/Responses/StructuredTextResponse.php",
+    "src/Responses/Data/StructuredStep.php",
+    "src/Providers/Concerns/GeneratesText.php",
+    "functions.php"
+  ]
+}

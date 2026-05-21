@@ -1,0 +1,157 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title REPL Demo Loop
+
+actor "User (stdin)" as User
+participant "run_demo_loop\n(repl.py)" as REPL
+participant "Runner" as Runner
+participant "RunResultStreaming" as Streaming
+participant "stream_events()\n(AsyncIterator)" as Events
+participant "Console (stdout)" as Console
+
+note over REPL
+  State: current_agent, input_items[]
+  stream=True (default)
+end note
+
+== Session Initialisation ==
+
+[-> REPL: run_demo_loop(agent, stream=True, context, max_turns)
+activate REPL
+note right of REPL: current_agent = agent\ninput_items = []
+
+== REPL Interaction Loop ==
+
+loop Each user turn
+
+    REPL -> Console: print(" > ")
+    activate Console
+    Console --> User: prompt displayed
+    deactivate Console
+
+    User -> REPL: user_input (string via input())
+    activate REPL
+
+    alt EOFError or KeyboardInterrupt (Ctrl-D / Ctrl-C)
+        REPL -> Console: print()
+        REPL -> REPL: break — exit loop
+    else user_input in {"exit", "quit"}
+        REPL -> REPL: break — exit loop
+    else user_input is empty
+        REPL -> REPL: continue — re-prompt (skip turn)
+    else valid user input
+        REPL -> REPL: input_items.append({role:"user", content:user_input})
+
+        alt stream = True (default path)
+
+            REPL -> Runner: run_streamed(current_agent,\n  input=input_items,\n  context=context,\n  max_turns=max_turns)
+            activate Runner
+            note right of Runner: Starts background\nrun_loop_task (asyncio.Task)
+            Runner --> Streaming **: create RunResultStreaming\n(run_loop_task started)
+            Runner --> REPL: returns RunResultStreaming (synchronous)
+            deactivate Runner
+
+            REPL -> Streaming: stream_events()
+            activate Streaming
+            note right of Streaming: Drains _event_queue\n(asyncio.Queue[StreamEvent\n| QueueCompleteSentinel])\nChecks errors each iteration
+
+            loop Consuming stream_events() until exhausted
+
+                Streaming -> Events: yield StreamEvent
+                activate Events
+                Events --> REPL: StreamEvent
+                deactivate Events
+
+                alt RawResponsesStreamEvent\n+ data is ResponseTextDeltaEvent
+                    REPL -> Console: print(event.data.delta, end="", flush=True)
+                    note right of Console: Token-by-token\nstreamed output
+                else RunItemStreamEvent\n+ item.type == "tool_call_item"
+                    REPL -> Console: print("\\n[tool called]")
+                else RunItemStreamEvent\n+ item.type == "tool_call_output_item"
+                    REPL -> Console: print(f"\\n[tool output: {event.item.output}]")
+                else AgentUpdatedStreamEvent\n(handoff occurred)
+                    REPL -> Console: print(f"\\n[Agent updated: {event.new_agent.name}]")
+                    note right of Console: Signals agent handoff
+                end
+
+            end
+
+            note right of Streaming: QueueCompleteSentinel received:\nawaits _input_guardrails_task,\nchecks MaxTurnsExceeded /\nGuardrailTripwireTriggered,\nsets is_complete=True
+            Streaming --> REPL: async iterator exhausted
+            deactivate Streaming
+
+            REPL -> Console: print() — newline after streamed response
+
+            REPL -> Streaming: result.last_agent
+            Streaming --> REPL: current_agent (may differ after handoff)
+            note right of REPL: Tracks handoffs:\ncurrent_agent updated
+
+            REPL -> Streaming: result.to_input_list()
+            Streaming --> REPL: input_items (full conversation history)
+            note right of REPL: Conversation history\npersists across turns
+
+        else stream = False (non-streaming path)
+
+            REPL -> Runner: await Runner.run(current_agent,\n  input_items,\n  context=context,\n  max_turns=max_turns)
+            activate Runner
+            Runner --> REPL: RunResult
+            deactivate Runner
+
+            alt result.final_output is not None
+                REPL -> Console: print(result.final_output)
+            end
+
+            REPL -> Runner: result.last_agent
+            Runner --> REPL: current_agent
+            REPL -> Runner: result.to_input_list()
+            Runner --> REPL: input_items
+
+        end
+
+    end
+
+    deactivate REPL
+
+end
+
+== Session End ==
+
+REPL --> [: return (session terminated)
+deactivate REPL
+
+note over User, Console
+  Exit triggers: "exit"/"quit" input, empty Enter (skip/continue),
+  EOFError (Ctrl-D), or KeyboardInterrupt (Ctrl-C)
+end note
+
+@enduml

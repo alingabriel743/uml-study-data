@@ -1,0 +1,82 @@
+{
+  "scope": "agent_handoff_flow",
+  "title": "Agent Handoff Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "RunLoop",
+    "execute_tools_and_side_effects",
+    "ProcessedResponse",
+    "execute_handoffs",
+    "_resolve_server_managed_handoff_behavior",
+    "Handoff",
+    "HandoffInputData",
+    "RunHooks",
+    "AgentHooks",
+    "HandoffInputFilter",
+    "nest_handoff_history",
+    "SingleStepResult"
+  ],
+  "interaction_flow": [
+    "RunLoop → execute_tools_and_side_effects(bindings: AgentBindings, processed_response, context_wrapper, run_config, ...)",
+    "execute_tools_and_side_effects: checks processed_response.handoffs → if run_handoffs is non-empty, calls execute_handoffs()",
+    "execute_handoffs: if multiple handoffs detected → emit ToolCallOutputItem 'Multiple handoffs detected, ignoring this one' for each after first",
+    "execute_handoffs: picks actual_handoff = run_handoffs[0]",
+    "execute_handoffs → opens handoff_span(from_agent=public_agent.name)",
+    "execute_handoffs → handoff.on_invoke_handoff(context_wrapper, tool_call.arguments) → returns new_agent: Agent",
+    "handoff.on_invoke_handoff: if input_type set → validates JSON args via TypeAdapter → calls on_handoff(ctx, validated_input)",
+    "handoff.on_invoke_handoff: if no input_type but on_handoff → calls on_handoff(ctx)",
+    "handoff.on_invoke_handoff: always returns the captured agent",
+    "execute_handoffs: span_handoff.span_data.to_agent = new_agent.name",
+    "execute_handoffs → appends HandoffOutputItem(source_agent=public_agent, target_agent=new_agent) to new_step_items",
+    "execute_handoffs → asyncio.gather(hooks.on_handoff(context, from_agent, to_agent), public_agent.hooks.on_handoff(ctx, agent=new_agent, source=public_agent))",
+    "execute_handoffs: resolves input_filter = handoff.input_filter OR run_config.handoff_input_filter",
+    "execute_handoffs: resolves should_nest_history = handoff.nest_handoff_history OR run_config.nest_handoff_history",
+    "execute_handoffs → _resolve_server_managed_handoff_behavior(handoff, from_agent, to_agent, run_config, server_manages_conversation, input_filter, should_nest_history)",
+    "_resolve_server_managed_handoff_behavior: if server_manages_conversation is False → return (input_filter, should_nest_history) unchanged",
+    "_resolve_server_managed_handoff_behavior: if server_manages_conversation AND input_filter set → raise UserError",
+    "_resolve_server_managed_handoff_behavior: if server_manages_conversation AND should_nest_history → log warning, return (input_filter, False)",
+    "execute_handoffs: if input_filter or should_nest_history → builds HandoffInputData(input_history, pre_handoff_items, new_items, run_context)",
+    "execute_handoffs: if input_filter → calls input_filter(handoff_input_data) [sync or async] → filtered: HandoffInputData",
+    "execute_handoffs: applies filtered.input_history, pre_handoff_items, new_items; if filtered.input_items set → session_step_items=new_items, new_step_items=input_items",
+    "execute_handoffs: elif should_nest_history → nest_history(handoff_input_data, run_config.handoff_history_mapper) → nested HandoffInputData with collapsed transcript",
+    "execute_handoffs: returns SingleStepResult(original_input, model_response, pre_step_items, new_step_items, next_step=NextStepHandoff(new_agent), session_step_items)"
+  ],
+  "key_relationships": [
+    "AgentBindings contains public_agent: Agent and execution_agent: Agent (frozen dataclass)",
+    "execute_tools_and_side_effects depends_on execute_handoffs",
+    "execute_handoffs depends_on Handoff.on_invoke_handoff",
+    "execute_handoffs depends_on _resolve_server_managed_handoff_behavior",
+    "execute_handoffs depends_on HandoffInputFilter (optional)",
+    "execute_handoffs depends_on nest_handoff_history (from handoffs.history)",
+    "execute_handoffs calls RunHooks.on_handoff and AgentHooks.on_handoff",
+    "Handoff.on_invoke_handoff wraps user-supplied on_handoff callback",
+    "Handoff dataclass: tool_name, tool_description, input_json_schema, on_invoke_handoff, agent_name, input_filter, nest_handoff_history, is_enabled",
+    "HandoffInputData: input_history, pre_handoff_items, new_items, run_context, input_items (immutable frozen dataclass with clone())",
+    "SingleStepResult.next_step = NextStepHandoff(new_agent) signals run loop to switch to new agent",
+    "handoff() factory function creates Handoff and stores weakref to target agent"
+  ],
+  "key_data_types": {
+    "ToolRunHandoff": "wraps handoff object + tool_call with call_id and arguments from model",
+    "HandoffInputData": "frozen dataclass carrying input_history, pre_handoff_items, new_items, run_context, input_items",
+    "SingleStepResult": "output of turn; next_step=NextStepHandoff(new_agent) triggers agent switch",
+    "AgentBindings": "frozen dataclass with public_agent + execution_agent (split for sandbox/clone scenarios)",
+    "HandoffInputFilter": "Callable[[HandoffInputData], MaybeAwaitable[HandoffInputData]]",
+    "HandoffHistoryMapper": "Callable[[list[TResponseInputItem]], list[TResponseInputItem]]"
+  },
+  "conditions_and_branches": [
+    "Multiple handoffs in same turn: only first is executed; rest get 'Multiple handoffs detected' tool output",
+    "input_type present: JSON args validated → on_handoff(ctx, parsed_input); absent: on_handoff(ctx) or no callback",
+    "server_manages_conversation=True + input_filter set → UserError raised",
+    "server_manages_conversation=True + nest_history=True → warning logged, nest disabled",
+    "input_filter takes precedence over should_nest_history",
+    "filtered.input_items present: session history kept as new_items, model input narrowed to input_items",
+    "is_enabled can be bool or async callable checked per handoff at tool-exposure time (disabled = hidden from LLM)"
+  ],
+  "important_notes": "Handoffs are exposed to the LLM as tools named transfer_to_<agent_name>. The handoff() factory always returns a fixed target agent; on_handoff is for side-effects only. input_filter and nest_handoff_history control what conversation history the receiving agent sees. Server-managed conversations (conversation_id, previous_response_id, auto_previous_response_id) are incompatible with input_filter. Tracing uses handoff_span with from_agent/to_agent. Handoffs stay within a single Runner.run() call; input guardrails only apply to first agent, output guardrails to the final agent.",
+  "source_files_analyzed": [
+    "src/agents/run_internal/turn_resolution.py",
+    "src/agents/handoffs/__init__.py",
+    "src/agents/run_internal/agent_bindings.py",
+    "docs/handoffs.md"
+  ]
+}

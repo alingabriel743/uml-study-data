@@ -1,0 +1,176 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam noteBackgroundColor #FFF9C4
+skinparam noteBorderColor #F9A825
+
+title WordPress REST Settings Read/Write Flow\n(WP_REST_Settings_Controller — wp/v2/settings)
+
+|Client / WP_REST_Server|
+start
+:Incoming HTTP Request\n**GET**, **PATCH**, or **PUT** /wp/v2/settings;
+
+|WP_REST_Settings_Controller|
+:get_item_permissions_check($request);
+if (current_user_can('manage_options')?) then (false)
+    :Return **403 Forbidden**;
+    stop
+else (true)
+endif
+
+if (Request Method?) then (GET)
+
+    |WP_REST_Settings_Controller|
+    :get_item($request);
+    :get_registered_options();
+
+    |WordPress Settings API|
+    :get_registered_settings()\n→ all WP Settings API options;
+
+    |WP_REST_Settings_Controller|
+    :Filter options:\n  — skip if show_in_rest not set\n  — skip if schema type missing\n  — skip if type not in\n    {number, integer, string, boolean, array, object};
+    note right
+      rest_default_additional_properties_to_false()
+      applied to each schema (since WP 6.1.0).
+      set_additional_properties_to_false() deprecated.
+    end note
+    :Return $rest_options map;
+
+    repeat
+        :For each registered option (name → args);
+
+        |WordPress Options API|
+        :apply_filters(\n  'rest_pre_get_setting',\n  null, $name, $args);
+
+        |WP_REST_Settings_Controller|
+        if (Filter returned non-null value?) then (yes)
+            :Use filter value directly\n(short-circuit);
+        else (no)
+            |WordPress Options API|
+            :get_option(\n  $args['option_name'],\n  $schema['default']);
+
+            |WP_REST_Settings_Controller|
+            :prepare_value($value, $schema);
+
+            |JSON Schema Validator|
+            :rest_validate_value_from_schema\n($value, $schema);
+
+            |WP_REST_Settings_Controller|
+            if (Validation returns WP_Error?) then (yes)
+                :Set value = **null**\n(non-destructive — no data lost);
+                note right
+                  Null in response signals
+                  invalid/non-scalar stored data,
+                  NOT a deletion.
+                end note
+            else (no)
+                |JSON Schema Validator|
+                :rest_sanitize_value_from_schema\n($value, $schema);
+
+                |WP_REST_Settings_Controller|
+                :Return sanitized value;
+            endif
+        endif
+
+        :Store result in response[$name];
+    repeat while (More options?) is (yes)
+    -> no;
+
+    |Client / WP_REST_Server|
+    :Return **200 OK**\nJSON response with all\nexposed settings values;
+    stop
+
+else (PATCH / PUT)
+
+    |WP_REST_Settings_Controller|
+    :update_item($request);
+    :get_registered_options();
+    :$request->get_params()\n→ submitted parameter map;
+
+    repeat
+        :For each registered option (name → args);
+
+        if (Option key NOT in request params?) then (yes)
+            :Skip (continue);
+        else (no)
+            |WordPress Options API|
+            :apply_filters(\n  'rest_pre_update_setting',\n  false, $name, $value, $args);
+
+            |WP_REST_Settings_Controller|
+            if (Filter returned true\n(externally handled)?) then (yes)
+                :Skip (continue);
+            else (no)
+                if (Request value is null?) then (yes)
+                    note right
+                      Null = client requests
+                      option reset/deletion.
+                    end note
+
+                    |WordPress Options API|
+                    :get_option($args['option_name'], false)\n→ fetch currently stored value;
+
+                    |JSON Schema Validator|
+                    :rest_validate_value_from_schema\n(stored_value, $schema);
+
+                    |WP_REST_Settings_Controller|
+                    if (Stored value is WP_Error\n(invalid schema)?) then (yes)
+                        :Return **WP_Error**\n'rest_invalid_stored_value'\n**HTTP 500**;
+                        stop
+                    else (no)
+                        |WordPress Options API|
+                        :delete_option($args['option_name']);
+                    endif
+
+                else (no — value provided)
+                    |WordPress Options API|
+                    :update_option(\n  $args['option_name'],\n  $request[$name]);
+                endif
+            endif
+        endif
+
+    repeat while (More options?) is (yes)
+    -> no;
+
+    |WP_REST_Settings_Controller|
+    :Call get_item($request)\n→ re-read all settings from DB;
+    note right
+      Response always reflects
+      actual persisted state,
+      not the submitted payload.
+    end note
+
+    |Client / WP_REST_Server|
+    :Return **200 OK**\nFresh settings JSON\n(post-update state);
+    stop
+
+endif
+
+@enduml

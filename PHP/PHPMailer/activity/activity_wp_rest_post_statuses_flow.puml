@@ -1,0 +1,175 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #212529
+    EndColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+skinparam note {
+    BackgroundColor #D1ECF1
+    BorderColor #0C5460
+    FontColor #0C5460
+}
+
+title WordPress REST Post Statuses Flow\n<size:11><color:#6C757D>WP_REST_Post_Statuses_Controller — namespace: wp/v2, rest_base: statuses</color></size>
+
+|REST Client|
+start
+:Incoming GET Request;
+if (Route matches?) then (GET /wp/v2/statuses/{status})
+    |WP_REST_Post_Statuses_Controller|
+    note right
+      **Single-Item Flow**
+      get_item_permissions_check()
+      then get_item()
+    end note
+    :get_item_permissions_check($request);
+    :get_post_status_object($request['status'])\n→ $status;
+    if ($status is null/empty?) then (yes)
+        :Return WP_Error\n'rest_status_invalid' [404];
+        |REST Client|
+        :404 Not Found Response;
+        stop
+    else (no)
+        |WP_REST_Post_Statuses_Controller|
+        :check_read_permission($status);
+        if (Permission denied?) then (yes)
+            :Return WP_Error\n'rest_cannot_read_status'\n[401 / 403];
+            |REST Client|
+            :401/403 Unauthorized Response;
+            stop
+        else (no)
+            |WP_REST_Post_Statuses_Controller|
+            :Permission check returns true;
+            :get_item($request);
+            :get_post_status_object($request['status'])\n→ $obj;
+            if ($obj is null/empty?) then (yes)
+                :Return WP_Error\n'rest_status_invalid' [404];
+                |REST Client|
+                :404 Not Found Response;
+                stop
+            else (no)
+                |WP_REST_Post_Statuses_Controller|
+                :prepare_item_for_response($obj, $request);
+                :get_fields_for_response($request) → $fields;
+                :Build $data array\n(name, slug, public, queryable,\nprotected, private, show_in_list,\ndate_floating — per context);
+                :add_additional_fields_to_object($data, $request);
+                :filter_response_by_context($data, $context);
+                :rest_ensure_response($data) → $response;
+                :Add HAL link 'archives'\n→ rest_url for post type items\n(append ?status=X if not 'publish');
+                :apply_filters('rest_prepare_status',\n$response, $status, $request);
+                :rest_ensure_response($data)\n→ WP_REST_Response;
+                |REST Client|
+                :200 OK — Single Status Object;
+                stop
+            endif
+        endif
+    endif
+else (GET /wp/v2/statuses)
+    |WP_REST_Post_Statuses_Controller|
+    note right
+      **List Flow**
+      get_items_permissions_check()
+      then get_items()
+    end note
+    :get_items_permissions_check($request);
+    if (context == 'edit'?) then (yes)
+        :get_post_types(show_in_rest=true)\n→ iterate REST-enabled post types;
+        if (current_user_can('edit_posts')\nfor any post type?) then (yes)
+            :Permission check returns true;
+        else (no)
+            :Return WP_Error\n'rest_cannot_view' [403];
+            |REST Client|
+            :403 Forbidden Response;
+            stop
+        endif
+    else (no — 'view' context)
+        :Return true\n(view context always permitted);
+    endif
+    |WP_REST_Post_Statuses_Controller|
+    :get_items($request);
+    :get_post_stati(internal=false, 'object')\n→ $statuses;
+    :Append 'trash' status via\nget_post_status_object('trash');
+    note right
+      'trash' is explicitly included
+      even though it is internal
+    end note
+    :Initialize $data = [];
+    fork
+        :Iterate each $status in $statuses;
+    fork again
+        note right
+          Parallel conceptual grouping —
+          each status processed independently
+        end note
+    end fork
+    while (More statuses to process?) is (yes)
+        :check_read_permission($status);
+        if (status->public == true?) then (yes)
+            :Read permitted — public status;
+        else (no)
+            if (status->internal == false\nOR name == 'trash'?) then (yes)
+                :get_post_types(show_in_rest=true)\n→ iterate types;
+                if (current_user_can('edit_posts')?) then (yes)
+                    :Read permitted — privileged user;
+                else (no)
+                    :check_read_permission → false;
+                    :Skip status (continue loop);
+                    note right
+                      Internal statuses (except trash)
+                      are never exposed via API
+                    end note
+                endif
+            else (no — internal & not trash)
+                :check_read_permission → false;
+                :Skip status (continue loop);
+            endif
+        endif
+        :prepare_item_for_response($status, $request);
+        :get_fields_for_response($request) → $fields;
+        :Build $data array\n(name, slug, public, queryable,\nprotected, private, show_in_list,\ndate_floating — per context);
+        note right
+          Schema fields are context-gated:
+          private, protected, show_in_list
+          only included in 'edit' context
+        end note
+        :add_additional_fields_to_object($data, $request);
+        :filter_response_by_context($data, $context);
+        :rest_ensure_response($data) → $response;
+        :Add HAL link 'archives'\n→ rest_url for post type items;
+        :apply_filters('rest_prepare_status',\n$response, $status, $request);
+        :prepare_response_for_collection($status_response);
+        :Append to $data[$status->name];
+    endwhile (no)
+    :rest_ensure_response($data)\n→ WP_REST_Response (collection);
+    |REST Client|
+    :200 OK — Post Statuses Collection;
+    stop
+endif
+
+@enduml

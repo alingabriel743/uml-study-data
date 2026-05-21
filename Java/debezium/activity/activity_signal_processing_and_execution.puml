@@ -1,0 +1,164 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #212529
+    EndColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #F9A825
+    FontColor #212529
+}
+
+title Signal Processing and Execution
+
+|#E8F4FD|Connector Bootstrap|
+start
+:Instantiate SignalProcessor\n(connector, config, signalActions,\nchannelReaders, docReader, partitionOffsets);
+:Filter signalChannelReaders\nby connectorConfig.getEnabledChannels()\n→ enabledChannelReaders;
+:forEach enabledChannelReader:\nreader.init(connectorConfig);
+:signalActions.putAll(providedActions);
+:Create ScheduledExecutorService\nvia Threads.newSingleThreadScheduledExecutor();
+
+|#E8FDF0|Lifecycle Management|
+:start();
+:scheduleAtFixedRate(\n  this::process,\n  delay=0,\n  interval=signalPollInterval ms\n);
+
+|#FDF8E8|Scheduler Thread — process()|
+:executeWithSemaphore(lambda);
+:semaphore.tryAcquire(10 seconds);
+if (Semaphore acquired?) then (no)
+    #FFCCCC:throw DebeziumException\n"Semaphore not acquired";
+    stop
+else (yes)
+endif
+:Iterate enabledChannelReaders;
+:forEach reader → reader.read()\n→ List<SignalRecord>;
+:flatMap all records\nfrom all channels;
+:forEach signalRecord:\nprocessSignal(signalRecord, null);
+note right
+  knownPartition = null
+  for periodic polling
+end note
+:finally: semaphore.release();
+
+|#FDE8F8|Streaming Thread — processSourceSignal()|
+:processSourceSignal(P partition)\n[called by connector streaming thread];
+:executeWithSemaphore(lambda);
+:semaphore.tryAcquire(10 seconds);
+if (Semaphore acquired?) then (no)
+    #FFCCCC:throw DebeziumException\n"Semaphore not acquired";
+    stop
+else (yes)
+endif
+:Filter enabledChannelReaders\nto SourceSignalChannel only;
+:forEach matching reader:\nreader.read() → List<SignalRecord>;
+:forEach signalRecord:\nprocessSignal(signalRecord, partition);
+note right
+  knownPartition = partition
+  (streaming thread context)
+end note
+:finally: semaphore.release();
+
+|#E8F4FD|SourceSignalChannel — CDC Event Handling|
+:Streaming thread receives CDC event\nfrom signaling table\nSourceSignalChannel.process(Struct value);
+if (Operation type?) then (DELETE)
+    :parseSignallingMessage(value, BEFORE)\n→ CloseIncrementalSnapshotWindow signal;
+else (INSERT / UPDATE)
+    :parseSignallingMessage(value, AFTER)\n→ SignalRecord(id, type, data);
+endif
+:signals.add(signalRecord)\n[ConcurrentLinkedQueue — thread-safe enqueue];
+note right
+  Later: processSourceSignal()
+  calls read() → signals.poll()
+end note
+
+|#F8F9FA|Signal Processing — processSignal()|
+:processSignal(SignalRecord, P knownPartition);
+:action = signalActions.get(signalRecord.getType());
+if (Action found?) then (no)
+    #FFF3CD:WARN: Unknown signal type\nSkip signal;
+    stop
+else (yes)
+endif
+:documentReader.read(signalRecord.getData())\n→ Document jsonData;
+if (Parse OK?) then (no — IOException)
+    #FFF3CD:WARN: Unparseable signal data\nSkip signal;
+    stop
+else (yes)
+endif
+:getOffsets(knownPartition, jsonData)\n→ Offsets<P, O>;
+if (knownPartition != null?) then (yes)
+    :Return Offsets.of(\n  knownPartition,\n  partitionOffsets.get(knownPartition)\n);
+else (no)
+    if (partitionOffsets.size() == 1?) then (yes)
+        :Return Offsets.of(partitionOffsets)\n[single-partition shortcut];
+    else (no)
+        :extractPartitionFromData(jsonData);
+        :Read "data-collections" array\nfrom jsonData;
+        if (data-collections empty or null?) then (yes)
+            :targetPartition = Optional.empty()\n→ Broadcast to all;
+        else (no)
+            :forEach entry: split on '.'\nextract databaseName (parts[0]);
+            :forEach partition in partitionOffsets:\nmatchesDatabase(partition, databaseName)\n[compare loggingContext DATABASE_NAME,\ncase-insensitive];
+            if (Match found?) then (yes)
+                :targetPartition = Optional.of(matchedPartition);
+            else (no)
+                :targetPartition = Optional.empty()\n→ Broadcast to all;
+            endif
+        endif
+        if (targetPartition present?) then (yes)
+            if (Offset found for partition?) then (yes)
+                :Return Offsets.of(partition, offset);
+            else (no)
+                #FFF3CD:WARN: No offset for partition\nReturn Offsets.of(Map.of());
+            endif
+        else (no)
+            :Broadcast: Return Offsets.of(partitionOffsets)\n[all partitions];
+        endif
+    endif
+endif
+
+:forEach (partition, offset) in finalOffsets:\nexecuteSignal(action, signalRecord,\n  jsonData, partition, offset);
+:Build SignalPayload(\n  partition, id, type, jsonData,\n  offset, additionalData\n);
+:action.arrived(payload)\n[SignalAction.arrived()];
+if (Exception thrown?) then (InterruptedException)
+    #FFF3CD:WARN: Signal action interrupted\nThread.currentThread().interrupt();
+elseif (Exception thrown?) then (other Exception)
+    #FFF3CD:WARN: Signal action failed;
+else (success)
+    :Signal executed successfully;
+endif
+
+|#E8FDF0|Lifecycle Management|
+:stop();
+:Submit task to executor:\nforEach enabledChannelReaders → reader.close();
+:executor.shutdown();
+:awaitTermination(executorShutdownTimeout ms);
+if (Shutdown in time?) then (no)
+    #FFF3CD:WARN: Executor did not terminate;
+    :Thread.interrupted();
+    :executor.shutdownNow();
+    :awaitTermination(again);
+else (yes)
+endif
+stop
+
+@enduml

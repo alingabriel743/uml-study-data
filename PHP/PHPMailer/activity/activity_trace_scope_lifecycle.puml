@@ -1,0 +1,199 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    DiamondFontColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam note {
+    BackgroundColor #E8F4F8
+    BorderColor #5B9BD5
+    FontColor #1A3C5E
+}
+
+title DDTrace Scope & Span Lifecycle
+
+|Caller (User Code)|
+start
+:Obtain or create a **Span**;
+:Call **scopeManager.activate(span, finishSpanOnClose)**;
+note right
+  DEFAULT_FINISH_SPAN_ON_CLOSE = true
+  Callers may explicitly pass false
+  to keep the span alive after close
+end note
+
+|ScopeManager|
+:Instantiate **new Scope**(scopeManager=this, span, finishSpanOnClose);
+if (span instanceof DDTrace\\Span\nAND ObjectKVStore key present?) then (yes)
+  :ObjectKVStore::put(\n  span.internalSpan,\n  'ddtrace_scope_activated', **true**);
+  note right
+    Marks this span as userland-activated.
+    Key = 'ddtrace_scope_activated'
+    false = deactivated; null = never activated via userland
+  end note
+endif
+:Push **Scope** onto **$scopes[]** stack;
+if (span.context.isHostRoot()?) then (yes)
+  :Push **Scope** onto **$hostRootScopes[]**;
+  note right
+    Tracks distributed tracing root spans.
+    ScopeManager::close() will
+    terminate all host root scopes
+    at request end.
+  end note
+endif
+
+|Caller (User Code)|
+:Receive **Scope** instance;
+:Call **scopeManager.getActive()**;
+
+|ScopeManager|
+' ── reconcileInternalAndUserland() ──────────────────────────────────────
+:► **reconcileInternalAndUserland()**;
+note right
+  Also called by getPrimaryRoot()
+  and getTopScope(). Never called
+  by activate() or deactivate().
+end note
+:Walk **$scopes[]** top-down\nRemove each scope where\n**span.isFinished() == true**;
+if (**$scopes[]** is now empty?) then (yes)
+  :Call C-ext **root_span()**;
+
+  |C-Extension (DDTrace)|
+  :Return internal root span\n(or null);
+
+  |ScopeManager|
+  if (root_span() exists?) then (yes)
+    :Call C-ext **trace_id()**;
+    :Build **SpanContext**(traceId, rootSpan.id, parentId\nfrom rootContext);
+    :Create **Scope** wrapping new **Span**(internalRootSpan,\nSpanContext), finishSpanOnClose=**false**;
+    note right
+      Bootstrap: synthetic root scope
+      injected so userland stack is
+      never empty when a C-ext span
+      is live.
+    end note
+    :Set as **$scopes[0]**;
+  else (no)
+    :Return **null** — no active trace;
+    stop
+  endif
+endif
+:Walk **C-ext active_span()** chain downward;
+
+|C-Extension (DDTrace)|
+:Traverse active span chain\nfrom current active → root;
+
+|ScopeManager|
+:Stop walk when span.id matches\n**top userland scope's** spanId;
+if (Gap spans found between\nuserland stack and C-ext chain?) then (yes)
+  :Create **Scope** wrapper for each gap span\n(finishSpanOnClose=**true**);
+  :Collect new scopes in reverse order\n(oldest-first);
+  :Set **parentContext** links to chain\nscopes correctly;
+  :Push new scopes onto **$scopes[]**;
+  note right
+    Gaps arise when the C-extension
+    creates spans internally that
+    userland code never explicitly
+    activated. These synthetic scopes
+    are auto-cleaned when finished.
+  end note
+endif
+' ── End reconcile ────────────────────────────────────────────────────────
+
+:Iterate **$scopes[]** from **top → bottom**;
+repeat
+  if (span is NOT DDTrace\\Span\n(pure userland span)?) then (yes)
+    :Return this **Scope** as active;
+    note right: Userland-only spans are\nalways considered active.
+  else (no DDTrace\\Span)
+    :ObjectKVStore.get(\n  span.internalSpan,\n  'ddtrace_scope_activated',\n  default=**true**);
+    if (value == **true**?) then (yes)
+      :Return this **Scope** as active;
+    else (no — value is false)
+      :Skip — scope was deactivated\nContinue iterating down stack;
+    endif
+  endif
+repeat while (More scopes in stack?) is (yes)
+->no;
+:Return **null** (no active scope found);
+
+|Caller (User Code)|
+:Receive active **Scope** / **Span**;
+:Instrument work within span;
+:Call **scope.close()**;
+
+|Scope|
+if (**finishSpanOnClose** == true?) then (yes)
+  :Call **span.finish()**;
+  note right
+    Records end timestamp and
+    flushes span data to the
+    Datadog Agent.
+  end note
+endif
+:Call **scopeManager.deactivate(this)**;
+
+|ScopeManager|
+:Search for scope in **$scopes[]**\nby object identity;
+if (Scope found in stack?) then (yes)
+  :Remove scope via **array_splice**;
+  if (span instanceof DDTrace\\Span\nAND ObjectKVStore key present?) then (yes)
+    :ObjectKVStore::put(\n  span.internalSpan,\n  'ddtrace_scope_activated', **false**);
+    note right
+      Explicitly set to **false** (not null).
+      false = was userland-activated and
+      is now deactivated.
+      null = was never userland-activated.
+    end note
+  endif
+  if (span.context.isHostRoot()?) then (yes)
+    :► **deactivateHostRoot(scope)**;
+    :Search & remove scope from\n**$hostRootScopes[]** by identity;
+  endif
+else (no — not found)
+  :No-op (scope already removed\nor never registered);
+endif
+
+|Caller (User Code)|
+:Request / transaction ends;
+:Call **scopeManager.close()**;
+
+|ScopeManager|
+:Iterate all scopes in **$hostRootScopes[]**;
+:For each host root scope,\ncall **scope.close()**;
+note right
+  Triggers span.finish() +
+  deactivate() for every
+  distributed-tracing root span,
+  ensuring no spans leak at
+  request teardown.
+end note
+stop
+
+@enduml

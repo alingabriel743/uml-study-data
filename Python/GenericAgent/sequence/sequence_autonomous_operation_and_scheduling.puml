@@ -1,0 +1,174 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipantBackgroundColor #F8F9FA
+skinparam sequenceParticipantBorderColor #495057
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceGroupBackgroundColor #E9ECEF
+skinparam sequenceGroupBorderColor #6C757D
+skinparam sequenceGroupFontColor #212529
+skinparam sequenceBoxBackgroundColor #DEE2E6
+skinparam sequenceBoxBorderColor #6C757D
+skinparam noteBorderColor #ADB5BD
+skinparam noteBackgroundColor #FFF3CD
+
+title Autonomous Operation and Scheduling
+
+participant "ReflectLoop\n(agentmain)" as RL
+participant "scheduler\n.check()" as SCH
+participant "autonomous\n.check()" as AUTO
+participant "compress_session\n(L4 cron)" as CS
+participant "GeneraticAgent" as GA
+participant "agent_runner_loop" as ARL
+participant "helper\n(autonomous_sop)" as HLP
+participant "FileSystem" as FS
+
+note over RL : INTERVAL scheduler=120s\nINTERVAL autonomous=1800s\nONCE=False → infinite loop
+
+== Scheduler Check Cycle (every 120 s) ==
+
+loop every 120 s
+    RL -> RL : time.sleep(120)
+    activate RL
+
+    RL -> SCH : check()
+    activate SCH
+
+    alt L4 cron due (every 12 h)
+        SCH -> CS : batch_process(raw_dir, dry_run=False)
+        activate CS
+        CS -> FS : glob model_responses_*.txt\n(skip files < 2 h old)
+        activate FS
+        FS --> CS : file list
+        deactivate FS
+        loop per raw session file
+            CS -> CS : compress_session(src, dst_dir)\n[strip sys-prompt / assistant echo,\nrename MMDD_HHMM-MMDD_HHMM.txt]
+        end
+        CS -> FS : append session blocks → all_histories.txt
+        CS -> FS : archive compressed files → YYYY-MM.zip
+        CS -> FS : delete processed raw files
+        CS --> SCH : stats {processed, skipped, errors,\nnew_sessions, deleted_raw}
+        deactivate CS
+    end
+
+    SCH -> FS : scan sche_tasks/*.json\n(filter enabled + schedule + cooldown)
+    activate FS
+    FS --> SCH : enabled task configs
+    deactivate FS
+
+    SCH -> SCH : _parse_cooldown(repeat)\n→ cooldown timedelta
+    SCH -> FS : _last_run(tid, done_files)\n→ find latest done/{ts}_{tid}.md
+    activate FS
+    FS --> SCH : last run timestamp
+    deactivate FS
+
+    alt task is due (within max_delay_hours=6)
+        SCH --> RL : task prompt string
+    else no task due
+        SCH --> RL : None
+    end
+    deactivate SCH
+
+    alt task prompt returned
+        RL -> GA : put_task(task, source='reflect')
+        activate GA
+        note right of GA : enqueues\n{query, source, images,\noutput: Queue}
+        GA --> RL : display_queue
+        GA -> ARL : agent_runner_loop(llmclient,\nsys_prompt, user_input,\nhandler, TOOLS_SCHEMA,\nmax_turns=40)
+        activate ARL
+        ARL --> GA : yield chunks →\ndisplay_queue.put({'done': full_resp})
+        deactivate ARL
+        deactivate GA
+        RL -> FS : write reflect_logs/{script}_{date}.log
+        RL -> RL : mod.on_done(result) [optional callback]
+    end
+
+    deactivate RL
+end
+
+== Autonomous Path (user absent > 30 min, every 1800 s) ==
+
+loop every 1800 s
+    RL -> RL : time.sleep(1800)
+    activate RL
+
+    RL -> AUTO : check()
+    activate AUTO
+    AUTO --> RL : '[AUTO]🤖 用户已离开超过30分钟...' prompt
+    deactivate AUTO
+
+    RL -> GA : put_task(autonomous_prompt, source='reflect')
+    activate GA
+    GA -> ARL : agent_runner_loop(llmclient,\nsys_prompt, autonomous_prompt,\nhandler, TOOLS_SCHEMA, max_turns=40)
+    activate ARL
+
+    == Agent Task Execution (inside agent_runner_loop) ==
+
+    ARL -> FS : read autonomous_operation_sop\n(system prompt / SOP file)
+    activate FS
+    FS --> ARL : sop content
+    deactivate FS
+
+    ARL -> HLP : get_todo()
+    activate HLP
+    HLP -> FS : read temp/TODO.txt
+    activate FS
+    FS --> HLP : todo lines
+    deactivate FS
+    HLP --> ARL : todo list
+    deactivate HLP
+
+    ARL -> HLP : get_history(n=20)
+    activate HLP
+    HLP -> FS : read temp/autonomous_reports/history.txt\n(first n lines, newest-first)
+    activate FS
+    FS --> HLP : history lines
+    deactivate FS
+    HLP --> ARL : history (n lines)
+    deactivate HLP
+
+    note over ARL : Agent executes task using tools\n(up to 40 turns)
+
+    ARL -> HLP : complete_task(taskname, historyline, report_path)
+    activate HLP
+    HLP -> FS : mv report → autonomous_reports/R{N}_{taskname}.md
+    activate FS
+    FS --> HLP : ok
+    deactivate FS
+    HLP -> FS : prepend 'R{N} | {date} | {line}' → history.txt\n[rollback on failure]
+    activate FS
+    FS --> HLP : ok
+    deactivate FS
+    HLP --> ARL : '✅ 报告已保存 + 改TODO指令'
+    deactivate HLP
+
+    ARL -> FS : update TODO.txt — mark task [x] R{N}
+    activate FS
+    FS --> ARL : ok
+    deactivate FS
+
+    ARL --> GA : yield final chunks → display_queue.put({'done': response})
+    deactivate ARL
+    GA --> RL : display_queue result consumed
+    deactivate GA
+
+    RL -> FS : write reflect_logs/{script}_{date}.log
+    deactivate RL
+end
+
+@enduml

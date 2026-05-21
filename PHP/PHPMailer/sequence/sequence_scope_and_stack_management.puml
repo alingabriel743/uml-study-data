@@ -1,0 +1,293 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipantBorderColor #495057
+skinparam sequenceParticipantBackgroundColor #F8F9FA
+skinparam sequenceParticipantFontColor #212529
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceGroupBorderColor #6C757D
+skinparam sequenceGroupBackgroundColor #E9ECEF
+skinparam noteBackgroundColor #FFF9C4
+skinparam noteBorderColor #F0AD4E
+
+title Scope and Span Stack Management\n(DDTrace PHP — Two-Layer Architecture: PHP Userland + C Extension)
+
+actor Caller
+
+participant "ScopeManager" as SM #D6EAF8
+participant "Scope" as SC #D5F5E3
+participant "Span" as SP #FDEBD0
+participant "SpanContext" as CTX #F9EBEA
+participant "ObjectKVStore" as KV #EBF5FB
+participant "C Extension\n(SpanStack)" as CExt #E8DAEF
+
+note over SM, CExt
+  Two-layer architecture:
+  PHP userland (ScopeManager + Scope) wraps
+  C-extension SpanStack (active_span, root_span, etc.)
+  reconcileInternalAndUserland() is the bridge.
+end note
+
+== 1. Activate Span: Creating and Pushing a Scope onto the Stack ==
+
+Caller -> SM : activate(span, finishSpanOnClose=true)
+activate SM
+
+SM -> SC ** : new Scope(this, span, finishSpanOnClose)
+activate SC
+
+SM -> KV : get(span.internalSpan, 'ddtrace_scope_activated')
+activate KV
+KV --> SM : flag value (null | true | false)
+deactivate KV
+
+alt flag != null (span already tracked)
+    SM -> KV : put(span.internalSpan, 'ddtrace_scope_activated', true)
+    activate KV
+    KV --> SM : ok
+    deactivate KV
+end
+
+SM -> SM : scopes[count] = scope\n[push onto ordered scopes array]
+
+SM -> SP : getContext()
+activate SP
+SP --> SM : SpanContext
+deactivate SP
+
+SM -> CTX : isHostRoot()
+activate CTX
+CTX --> SM : bool
+deactivate CTX
+
+alt isHostRoot() == true
+    SM -> SM : hostRootScopes[] = scope\n[track as distributed-tracing entry point]
+    note right of SM
+      hostRootScopes tracks request-level root
+      spans — the service's entry point in
+      distributed tracing.
+    end note
+end
+
+SM --> Caller : Scope
+deactivate SC
+deactivate SM
+
+== 2. Get Active Scope: Reconciling C-Extension Spans with PHP Userland ==
+
+Caller -> SM : getActive()
+activate SM
+
+SM -> SM : reconcileInternalAndUserland()
+activate SM
+
+note right of SM
+  reconcileInternalAndUserland() bridges
+  C-extension SpanStack with PHP scopes[].
+  It auto-wraps C-level spans (e.g., from
+  DDTrace hooks) into PHP Scope objects
+  so the OpenTracing API stays consistent.
+end note
+
+loop iterate scopes[] from end (LIFO)
+    SM -> SC : getSpan().isFinished()?
+    activate SC
+    SC --> SM : bool
+    deactivate SC
+    alt span is finished
+        SM -> SM : unset(scopes[i])\n[remove stale finished span]
+    end
+end
+
+alt scopes[] is empty
+    SM -> CExt : root_span()
+    activate CExt
+    CExt --> SM : RootSpanData | null
+    deactivate CExt
+
+    alt root span exists
+        SM -> CExt : trace_id()
+        activate CExt
+        CExt --> SM : traceId
+        deactivate CExt
+
+        SM -> CTX ** : new SpanContext(traceId, rootSpan.id, parentId, [])
+        SM -> SP ** : new Span(rootSpanData, context)
+        SM -> SC ** : new Scope(this, span, finishSpanOnClose=false)
+        note right of SM
+          finishSpanOnClose=false for root spans
+          (DD_TRACE_GENERATE_ROOT_SPAN=true scenario)
+        end note
+        SM -> SM : scopes[0] = scope\n[seed the stack with root span]
+    else no root span
+        SM --> Caller : null
+    end
+end
+
+SM -> CExt : active_span()
+activate CExt
+CExt --> SM : SpanData (active C-level span)
+deactivate CExt
+
+loop walk span.parent chain until currentSpanId found
+    SM -> SC ** : new Scope(this, new Span(cSpan, new SpanContext(...)), true)
+    note right of SM
+      Untracked C spans (e.g., created by DDTrace
+      hooks) are wrapped in new Scope objects
+      and pushed as newScopes[].
+    end note
+end
+
+loop foreach newScopes[] in reverse order
+    SM -> CTX : parentContext = end(scopes).getSpan().getContext()
+    activate CTX
+    CTX --> SM : linked
+    deactivate CTX
+    SM -> SM : scopes[count] = scope\n[push reconciled scope onto stack]
+end
+
+SM --> SM : return topNewScope or existing topScope
+deactivate SM
+
+loop iterate scopes[] from end (LIFO)
+    SM -> KV : get(span.internalSpan, 'ddtrace_scope_activated', default=true)
+    activate KV
+    KV --> SM : flag (null→true, true, false)
+    deactivate KV
+    alt flag is truthy (not explicitly deactivated)
+        SM --> Caller : Scope (active scope)
+        note right of SM
+          ObjectKVStore flag semantics:
+          null  → not tracked (treat as active)
+          true  → explicitly activated
+          false → explicitly deactivated (skip)
+        end note
+    end
+end
+
+SM --> Caller : null (no active scope)
+deactivate SM
+
+== 3. Close Scope: Finishing Span and Deactivating from Stack ==
+
+Caller -> SC : close()
+activate SC
+
+alt finishSpanOnClose == true
+    SC -> SP : finish()
+    activate SP
+    SP --> SC : ok
+    deactivate SP
+end
+
+SC -> SM : deactivate(this)
+activate SM
+
+SM -> SM : array_search(scope, scopes)\n[locate index i]
+
+alt scope found in scopes[]
+    SM -> SM : array_splice(scopes, i, 1)\n[remove from stack]
+
+    SM -> KV : get(span.internalSpan, 'ddtrace_scope_activated')
+    activate KV
+    KV --> SM : flag
+    deactivate KV
+
+    alt flag != null (span was tracked)
+        SM -> KV : put(span.internalSpan, 'ddtrace_scope_activated', false)
+        activate KV
+        KV --> SM : ok
+        deactivate KV
+    end
+
+    SM -> CTX : isHostRoot()
+    activate CTX
+    CTX --> SM : bool
+    deactivate CTX
+
+    alt isHostRoot() == true
+        SM -> SM : deactivateHostRoot(scope)
+        SM -> SM : array_splice(hostRootScopes, i, 1)\n[remove from distributed-tracing root list]
+    end
+end
+
+SM --> SC : ok
+deactivate SM
+SC --> Caller : ok
+deactivate SC
+
+== 4. Close All Host Root Scopes (End of Request) ==
+
+Caller -> SM : close()
+activate SM
+
+loop foreach hostRootScopes as scope
+    SM -> SC : close()
+    activate SC
+    note right of SC : triggers full deactivate\nchain (see flow above)
+    SC --> SM : ok
+    deactivate SC
+end
+
+SM --> Caller : ok
+deactivate SM
+
+== 5. C-Extension SpanStack Operations ==
+
+note over Caller, CExt
+  The C extension manages SpanStack objects directly.
+  PHP userland calls these functions to inspect or switch the active span context.
+end note
+
+Caller -> CExt : active_stack()
+activate CExt
+CExt --> Caller : SpanStack | null\n[copy of currently active SpanStack]
+deactivate CExt
+
+Caller -> CExt : create_stack()
+activate CExt
+note right of CExt
+  New SpanStack is created.
+  parent = currently active stack.
+  spanCreationObservers inherited BY REFERENCE
+  so observer removal propagates to parent stacks.
+end note
+CExt --> Caller : SpanStack\n[new child stack, parent-linked]
+deactivate CExt
+
+Caller -> CExt : switch_stack(SpanData | SpanStack | null)
+activate CExt
+alt argument is SpanData or SpanStack
+    CExt -> CExt : set active context\nto given stack/span
+else argument is null
+    CExt -> CExt : switch to parent of\ncurrently active stack
+end
+CExt --> Caller : SpanStack | null | false\n[previous active stack, or false on failure]
+deactivate CExt
+
+Caller -> CExt : active_span()
+activate CExt
+CExt --> Caller : SpanData | null\n[SpanStack.active of current stack]
+deactivate CExt
+
+Caller -> CExt : root_span()
+activate CExt
+CExt --> Caller : RootSpanData | null\n[root span of the active stack]
+deactivate CExt
+
+@enduml

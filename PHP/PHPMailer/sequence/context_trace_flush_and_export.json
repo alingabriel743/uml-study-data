@@ -1,0 +1,87 @@
+{
+  "scope": "trace_flush_and_export",
+  "title": "Trace Flush and Export Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Application",
+    "DDTrace\\Tracer",
+    "DDTrace\\Transport (interface)",
+    "DDTrace\\Transport\\Internal",
+    "DDTrace\\Transport\\Noop",
+    "DDTrace\\Tests\\DebugTransport",
+    "DDTrace C Extension (background writer thread)",
+    "Datadog Agent"
+  ],
+  "interaction_flow": [
+    "1. Application → DDTrace\\Tracer: flush() [triggered at request end or manually]",
+    "2. DDTrace\\Tracer::flush() → checks: config['enabled'], if false → return early",
+    "3. DDTrace\\Tracer::flush() → (web only) addUrlAsResourceNameToSpan(rootSpan) if DD_TRACE_URL_AS_RESOURCE_NAMES_ENABLED",
+    "4. DDTrace\\Tracer::flush() → logDebug('Flushing {count} traces, {spanCount} spans') using dd_trace_closed_spans_count(): int",
+    "5. DDTrace\\Tracer::flush() → transport->send($this) [delegates to configured Transport impl]",
+    "6. DDTrace\\Tracer::flush() → scopeManager->close()",
+    "--- Transport::Internal path (default, background writer) ---",
+    "7. Internal::send(TracerInterface $tracer) → checks DD_TRACE_GENERATE_ROOT_SPAN env config",
+    "8. Internal::send() → (if !DD_TRACE_GENERATE_ROOT_SPAN) DDTrace\\flush() [C extension call, closes all spans & sends]",
+    "9. DDTrace\\flush() [C ext] → serializes spans, buffers via dd_trace_buffer_span(array $traceArray): bool",
+    "10. DDTrace\\flush() [C ext] → triggers background writer: dd_trace_coms_trigger_writer_flush(): int",
+    "11. BackgroundWriterThread → serializes buffered spans to msgpack payload",
+    "12. BackgroundWriterThread → dd_trace_send_traces_via_thread(int $numTraces, array $curlHeaders, string $payload): bool",
+    "13. BackgroundWriterThread → HTTP POST to Datadog Agent (application/msgpack, /v0.4/traces)",
+    "--- DebugTransport path (test/debug only) ---",
+    "14. DebugTransport::send(Tracer $tracer) → $tracer->getTracesAsArray()",
+    "15. DDTrace\\Tracer::getTracesAsArray() → dd_trace_serialize_closed_spans(): array [C ext, auto-closes open spans]",
+    "16. DebugTransport::send() → array_merge($this->traces, tracesArray) [stores locally for test assertions]",
+    "--- Synchronous flush alternative ---",
+    "17. Application → dd_trace_synchronous_flush(int $timeout = 100): void [blocking, waits up to $timeout ms]",
+    "--- Force-close all spans variant ---",
+    "18. Application → dd_trace_close_all_spans_and_flush(): void [drops/closes open spans depending on DD_AUTOFINISH_SPANS, then flushes]"
+  ],
+  "key_relationships": [
+    "DDTrace\\Tracer implements DDTrace\\Contracts\\Tracer (interface with flush(), getTracesAsArray())",
+    "DDTrace\\Transport\\Internal implements DDTrace\\Transport (interface: send(), setHeader())",
+    "DDTrace\\Tests\\DebugTransport implements DDTrace\\Transport",
+    "DDTrace\\Transport\\Noop implements DDTrace\\Transport (no-op)",
+    "DDTrace\\Tracer depends_on DDTrace\\Transport (injected, configurable)",
+    "DDTrace\\Transport\\Internal delegates_to C extension DDTrace\\flush()",
+    "DebugTransport depends_on DDTrace\\Contracts\\Tracer (calls getTracesAsArray())",
+    "DDTrace\\Tracer::getTracesAsArray() wraps dd_trace_serialize_closed_spans() C ext function"
+  ],
+  "key_functions": {
+    "DDTrace\\flush()": "C ext. Closes all spans and force-sends finished traces to agent. Part of DDTrace namespace.",
+    "dd_trace_buffer_span(array $traceArray): bool": "Internal C ext. Serializes and buffers spans for background writer. Input is dd_trace_serialize_closed_spans() format.",
+    "dd_trace_coms_trigger_writer_flush(): int": "Internal C ext. Signals background writer to flush buffered spans to agent.",
+    "dd_trace_send_traces_via_thread(int $numTraces, array $curlHeaders, string $payload): bool": "Internal C ext. Sends msgpack-encoded payload to background sender buffer. Only supports exactly 1 trace per call.",
+    "dd_trace_closed_spans_count(): int": "C ext. Returns count of closed (completed) spans tracked by tracer. Used for debug logging.",
+    "dd_trace_serialize_closed_spans(): array": "C ext. Serializes closed spans as arrays; auto-closes any open spans (destroys open span stack).",
+    "dd_trace_synchronous_flush(int $timeout = 100): void": "Blocking synchronous flush. Waits up to $timeout ms for all spans to be sent.",
+    "dd_trace_close_all_spans_and_flush(): void": "Force-finishes all spans and flushes. Drops open spans if DD_AUTOFINISH_SPANS=false, else closes them.",
+    "dd_trace_internal_fn(string $functionName, mixed ...$args)": "Executes internal writer functions: init_and_start_writer, shutdown_writer, synchronous_flush, set_writer_send_on_flush, etc."
+  },
+  "transport_implementations": {
+    "Internal": "Default transport. Delegates to C extension DDTrace\\flush(). setHeader() is no-op (background sender ignores headers). Only flushes if !DD_TRACE_GENERATE_ROOT_SPAN.",
+    "DebugTransport": "Test transport in DDTrace\\Tests namespace. Accumulates traces in-memory ($traces array) via getTracesAsArray(). Supports setHeader()/getHeaders() for assertion. No actual HTTP call.",
+    "Noop": "Silent no-op transport for disabled tracing."
+  },
+  "serialization": "Spans are encoded as msgpack (application/msgpack). dd_trace_serialize_msgpack(array): bool|string is used for manual msgpack serialization. SpanData::meta_struct values are double-encoded (msgpack inside msgpack).",
+  "auto_flush_config": "datadog.trace.auto_flush_enabled INI setting controls whether flush is triggered automatically at request end. Set to 1 by integrations like Laravel, Symfony, Roadrunner, Frankenphp for long-running processes.",
+  "background_writer_internals": "C-level background thread. Internal API: init_and_start_writer, ddtrace_coms_next_group_id, ddtrace_coms_buffer_span, ddtrace_coms_buffer_data, shutdown_writer, set_writer_send_on_flush, test_consumer, test_writers, test_msgpack_consumer, synchronous_flush, root_span_add_tag.",
+  "important_notes": [
+    "flush() is no-op if tracer is disabled (config['enabled']=false)",
+    "dd_trace_serialize_closed_spans() destroys the open span stack — must be called only at end of trace lifecycle",
+    "dd_trace_send_traces_via_thread only supports exactly 1 trace per call (limitation noted in docblock)",
+    "DebugTransport is for testing only; it stores traces in memory for assertion via getTraces()",
+    "Synchronous flush is blocking and accepts a timeout in milliseconds (default 100ms)",
+    "dd_trace_close_all_spans_and_flush behavior depends on DD_AUTOFINISH_SPANS: false=drop open spans, true=close them",
+    "Internal transport setHeader() is a no-op; background sender does not accept custom HTTP headers",
+    "OpenTracer1\\Tracer::flush() and OpenTracer\\Tracer::flush() both delegate to the inner DDTrace\\Tracer::flush()"
+  ],
+  "source_files_analyzed": [
+    "ext/ddtrace.stub.php",
+    "tests/DebugTransport.php",
+    "src/DDTrace/Tracer.php",
+    "src/DDTrace/Transport/Internal.php",
+    "src/DDTrace/Transport/Noop.php",
+    "src/api/Transport.php",
+    "src/api/Contracts/Tracer.php"
+  ]
+}

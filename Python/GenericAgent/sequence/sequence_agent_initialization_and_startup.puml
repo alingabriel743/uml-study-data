@@ -1,0 +1,203 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipantBackgroundColor #F8F9FA
+skinparam sequenceParticipantBorderColor #495057
+skinparam sequenceLifeLineBorderColor #ADB5BD
+skinparam sequenceGroupBackgroundColor #E9ECEF
+skinparam sequenceGroupBorderColor #6C757D
+skinparam noteBorderColor #6C757D
+skinparam noteBackgroundColor #FFF9C4
+
+title Agent Initialization and Startup
+
+actor "__main__" as main
+participant "agentmain\n(module)" as agentmain
+participant "GeneraticAgent" as agent
+participant "llmcore\n(module)" as llmcore
+participant "_load_mykeys" as loadkeys
+participant "BaseSession\n(subclass)" as basesession
+participant "NativeToolClient /\nToolClient" as toolclient
+participant "MixinSession" as mixin
+participant "agent.run()\n(daemon thread)" as agentrun
+participant "ga\n(module)" as ga
+
+== Module Import: agentmain ==
+
+main -> agentmain : import agentmain
+activate agentmain
+
+agentmain -> agentmain : load_tool_schema(suffix='')
+note right: Opens assets/tools_schema.json\nReplaces 'powershell'→'bash'\non non-Windows; sets\nglobal TOOLS_SCHEMA
+
+agentmain -> agentmain : os.makedirs(mem_dir, exist_ok=True)
+agentmain -> agentmain : os.makedirs(mem_txt, exist_ok=True)
+agentmain -> agentmain : os.makedirs(mem_insight, exist_ok=True)
+
+agentmain -> agentmain : init CDP config\n(assets/tmwd_cdp_bridge/config.js)\nif missing
+
+agentmain --> main : module ready\n(TOOLS_SCHEMA populated)
+deactivate agentmain
+
+== Agent Construction ==
+
+main -> agent : GeneraticAgent.__init__()
+activate agent
+
+agent -> agent : os.makedirs('temp', exist_ok=True)
+
+agent -> llmcore : access mykeys\n(llmcore.mykeys)
+activate llmcore
+note right of llmcore: Lazy-loaded via\n__getattr__('mykeys')
+
+llmcore -> loadkeys : _load_mykeys()
+activate loadkeys
+loadkeys -> loadkeys : try: import mykey module
+alt mykey module found
+    loadkeys --> llmcore : keys dict from module
+else ImportError
+    loadkeys -> loadkeys : open('mykey.json')
+    loadkeys --> llmcore : keys dict from JSON
+end
+deactivate loadkeys
+
+llmcore -> llmcore : resolve proxy from mk.get('proxy')
+llmcore -> llmcore : set globals: mykeys, proxies
+llmcore --> agent : mykeys dict
+deactivate llmcore
+
+== Session Construction Loop ==
+
+loop for k, cfg in mykeys.items() [filtered: 'api'|'config'|'cookie' in k]
+
+    alt 'native' in k and 'claude' in k
+        agent -> basesession : NativeClaudeSession(cfg).__init__()
+        activate basesession
+        basesession -> basesession : super(BaseSession).__init__(cfg)\n→ api_key, model, context_win=28000\n  history=[], system='', name, proxies
+        basesession -> basesession : _session_id=UUID, _account_uuid=UUID\n_device_id=hex128
+        basesession --> agent : NativeClaudeSession instance
+        deactivate basesession
+        agent -> toolclient : NativeToolClient(backend).__init__()
+        activate toolclient
+        toolclient -> toolclient : _thinking_prompt()\n→ THINKING_PROMPT_EN or _ZH\n  (based on GA_LANG env var)
+        toolclient -> toolclient : backend.system = thinking_prompt
+        toolclient -> toolclient : self._pending_tool_ids = []
+        toolclient --> agent : NativeToolClient wrapping session
+        deactivate toolclient
+
+    else 'native' in k and 'oai' in k
+        agent -> basesession : NativeOAISession(cfg).__init__()
+        activate basesession
+        basesession -> basesession : NativeClaudeSession.__init__(cfg)
+        basesession --> agent : NativeOAISession instance
+        deactivate basesession
+        agent -> toolclient : NativeToolClient(backend).__init__()
+        activate toolclient
+        toolclient -> toolclient : backend.system = thinking_prompt
+        toolclient --> agent : NativeToolClient wrapping session
+        deactivate toolclient
+
+    else 'claude' in k
+        agent -> basesession : ClaudeSession(cfg).__init__()
+        activate basesession
+        basesession -> basesession : BaseSession.__init__(cfg)
+        basesession --> agent : ClaudeSession instance
+        deactivate basesession
+        agent -> toolclient : ToolClient(backend, auto_save_tokens=True).__init__()
+        activate toolclient
+        toolclient -> toolclient : self.backend = backend\nself.last_tools = ''\nself.total_cd_tokens = 0
+        toolclient --> agent : ToolClient wrapping session
+        deactivate toolclient
+
+    else 'oai' in k
+        agent -> basesession : LLMSession(cfg).__init__()
+        activate basesession
+        basesession -> basesession : BaseSession.__init__(cfg)
+        basesession --> agent : LLMSession instance
+        deactivate basesession
+        agent -> toolclient : ToolClient(backend, auto_save_tokens=True).__init__()
+        activate toolclient
+        toolclient --> agent : ToolClient wrapping session
+        deactivate toolclient
+
+    else 'mixin' in k
+        agent -> agent : append {'mixin_cfg': cfg}\nplaceholder to llm_sessions
+    end
+
+end
+
+== Mixin Session Resolution ==
+
+opt any mixin placeholders present
+    agent -> mixin : MixinSession(all_sessions, mixin_cfg).__init__()
+    activate mixin
+    mixin -> mixin : select backend sessions by llm_nos
+    mixin -> mixin : validate same session group
+    mixin -> mixin : patch primary.raw_ask with _raw_ask\n(fallback/retry logic)
+    mixin --> agent : MixinSession instance
+    deactivate mixin
+    agent -> toolclient : wrap MixinSession in\nNativeToolClient or ToolClient
+    activate toolclient
+    toolclient --> agent : wrapped MixinSession client
+    deactivate toolclient
+end
+
+== Finalise Agent State ==
+
+agent -> agent : self.llmclients = [all ToolClient/NativeToolClient]
+agent -> agent : self.llmclient = self.llmclients[0]
+agent -> agent : lock=threading.Lock()\nhistory=[], task_queue=Queue()\nis_running=False, stop_sig=False\nllm_no=0, handler=None, verbose=True
+agent --> main : GeneraticAgent instance ready
+deactivate agent
+
+== LLM Selection & Thread Start ==
+
+main -> agent : agent.next_llm(args.llm_no)
+activate agent
+agent -> agent : rotate llm_no\ncopy backend.history to new client
+alt model name contains 'glm'|'minimax'|'kimi'
+    agent -> agentmain : load_tool_schema('_cn')
+else standard model
+    agent -> agentmain : load_tool_schema('')
+end
+note right: TOOLS_SCHEMA refreshed\nfor selected LLM
+agent --> main : llm switched
+deactivate agent
+
+main -> agentrun : threading.Thread(\n  target=agent.run,\n  daemon=True\n).start()
+activate agentrun
+note right of agentrun: Agent is now READY\nto receive tasks
+
+== First Task Execution ==
+
+main -> agent : agent.set_task(user_input, handler)
+agent -> agentrun : task enqueued in task_queue
+
+agentrun -> ga : get_system_prompt()
+activate ga
+ga -> ga : read assets/sys_prompt{lang}.txt
+ga -> ga : append Today date string
+ga -> ga : get_global_memory()
+ga --> agentrun : full system_prompt string
+deactivate ga
+
+agentrun -> agentrun : agent_runner_loop(\n  llmclient, system_prompt,\n  user_input, handler,\n  TOOLS_SCHEMA, max_turns=40\n)
+note right of agentrun: Agent loop begins;\nready to process\nLLM responses & tool calls
+
+deactivate agentrun
+
+@enduml

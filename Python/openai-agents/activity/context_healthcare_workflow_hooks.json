@@ -1,0 +1,130 @@
+{
+  "scope": "healthcare_workflow_hooks",
+  "title": "Healthcare Workflow Agent and Tool Hooks",
+  "diagram_type": "activity",
+  "key_participants": [
+    "Runner",
+    "WorkflowHooks",
+    "HealthcareSupportContext",
+    "Agent (orchestrator / memory_recap_agent / policy_sandbox_agent)",
+    "Tool (sandbox_policy_tool / any function tool)"
+  ],
+
+  "class_hierarchy": [
+    "RunHooksBase[TContext, TAgent]  ← base (lifecycle.py)",
+    "RunHooks = RunHooksBase[TContext, Agent]  ← type alias",
+    "WorkflowHooks(RunHooks[HealthcareSupportContext])  ← concrete impl (workflow.py)"
+  ],
+
+  "hook_methods": [
+    {
+      "method": "on_agent_start(context: AgentHookContext[HealthcareSupportContext], agent: Agent) -> None",
+      "trigger": "Called before each agent turn (each time current agent changes)",
+      "action": "context.context.emit('agent_start', agent=agent.name)"
+    },
+    {
+      "method": "on_agent_end(context: RunContextWrapper[HealthcareSupportContext], agent: Agent, output: Any) -> None",
+      "trigger": "Called when agent produces a final output",
+      "action": "context.context.emit('agent_end', agent=agent.name, output=_to_jsonable(output))"
+    },
+    {
+      "method": "on_tool_start(context: RunContextWrapper[HealthcareSupportContext], agent: Agent, tool: Tool) -> None",
+      "trigger": "Called immediately before a local tool is invoked",
+      "action": "cast context to ToolContext; emit('tool_start', agent, tool.name, call_id, arguments)"
+    },
+    {
+      "method": "on_tool_end(context: RunContextWrapper[HealthcareSupportContext], agent: Agent, tool: Tool, result: str) -> None",
+      "trigger": "Called immediately after a local tool returns",
+      "action": "cast context to ToolContext; emit('tool_end', agent, tool.name, call_id, output=_to_jsonable(result))"
+    }
+  ],
+
+  "base_hooks_not_overridden": [
+    "on_llm_start(context, agent, system_prompt, input_items) — no-op in WorkflowHooks",
+    "on_llm_end(context, agent, response) — no-op in WorkflowHooks",
+    "on_handoff(context, from_agent, to_agent) — no-op in WorkflowHooks"
+  ],
+
+  "activity_flow": [
+    "START: run_healthcare_support_workflow() called",
+    "  → emit('scenario_loaded', scenario_id, description, transcript)",
+    "  → Create SQLiteSession (conversation_session)",
+    "  → emit('memory_ready', session_id)",
+    "  → Instantiate WorkflowHooks()",
+    "  → Create UnixLocalSandboxClient + sandbox with manifest",
+    "  → emit('sandbox_ready', backend, workspace)",
+    "  → build_policy_sandbox_agent() → wrapped as sandbox_policy_tool (hooks=hooks)",
+    "  → build_orchestrator(sandbox_policy_tool) → orchestrator agent",
+    "  → emit('trace_ready', trace_id, trace_url)",
+    "  AGENT LOOP — Runner.run(orchestrator, prompt, context, session, hooks=hooks):",
+    "    → [HOOK] WorkflowHooks.on_agent_start → emit('agent_start', agent.name)",
+    "    → Runner calls LLM for agent turn",
+    "    DECISION: LLM output type?",
+    "      [tool call] →",
+    "        → [HOOK] WorkflowHooks.on_tool_start → emit('tool_start', agent, tool, call_id, args)",
+    "        → Tool executes",
+    "        → [HOOK] WorkflowHooks.on_tool_end  → emit('tool_end', agent, tool, call_id, output)",
+    "        → Append tool result, re-run loop",
+    "      [handoff] → update current agent, re-run loop (on_agent_start fires again)",
+    "      [final_output] →",
+    "        → [HOOK] WorkflowHooks.on_agent_end → emit('agent_end', agent.name, output)",
+    "        → Exit agent loop",
+    "  INTERRUPTION LOOP — _resolve_interruptions():",
+    "    WHILE result.interruptions:",
+    "      → emit('human_approval_requested', request)",
+    "      DECISION: approval_handler?",
+    "        [None] → auto-approve",
+    "        [handler] → await approval_handler(request)",
+    "      IF approved: state.approve(interruption); emit('human_approval_resolved', approved=True)",
+    "      ELSE: state.reject(interruption); emit('human_approval_resolved', approved=False)",
+    "      → Runner.run(orchestrator, state, session, hooks=hooks)  [hooks fire again per above]",
+    "  POST-LOOP:",
+    "  → result.final_output_as(CaseResolution)",
+    "  → _copy_output_files() → copy sandbox output artifacts + fallback docs",
+    "  → emit('artifacts_ready', files)",
+    "  → Runner.run(memory_recap_agent, recap_prompt, context, session, hooks=hooks)",
+    "    → [HOOK] on_agent_start / on_tool_start / on_tool_end / on_agent_end fire as above",
+    "  → memory_result.final_output_as(MemoryRecap)",
+    "  → Build payload dict",
+    "  → emit('workflow_complete', payload)",
+    "FINALLY: sandbox_client.delete(sandbox); emit('sandbox_stopped')",
+    "END"
+  ],
+
+  "helper_function": {
+    "name": "_to_jsonable(value: Any) -> Any",
+    "purpose": "Serialize hook output to JSON-safe value; handles Pydantic BaseModel, primitives, dicts/lists, and fallback str()",
+    "used_by": ["on_agent_end (output)", "on_tool_end (result)"]
+  },
+
+  "context_emit_events": [
+    "scenario_loaded", "memory_ready", "sandbox_ready", "trace_ready",
+    "agent_start", "agent_end", "tool_start", "tool_end",
+    "human_approval_requested", "human_approval_resolved",
+    "artifacts_ready", "workflow_complete", "sandbox_stopped"
+  ],
+
+  "hooks_attachment_points": [
+    "Runner.run(orchestrator, prompt, ..., hooks=hooks)  — main run",
+    "Runner.run(orchestrator, state, ..., hooks=hooks)   — resume after interruption",
+    "Runner.run(memory_recap_agent, ..., hooks=hooks)    — memory recap run",
+    "policy_agent.as_tool(..., hooks=hooks)              — sandbox policy sub-agent as tool"
+  ],
+
+  "key_relationships": [
+    "WorkflowHooks extends RunHooks[HealthcareSupportContext]",
+    "WorkflowHooks depends_on HealthcareSupportContext (via context.context.emit)",
+    "WorkflowHooks depends_on ToolContext (cast for tool_call_id, tool_arguments)",
+    "WorkflowHooks depends_on _to_jsonable helper for serialization",
+    "run_healthcare_support_workflow creates and owns WorkflowHooks instance",
+    "Runner consumes WorkflowHooks via hooks= parameter",
+    "WorkflowHooks is shared across orchestrator, memory_recap, and sandbox_policy_tool runs"
+  ],
+
+  "important_notes": "WorkflowHooks overrides only 4 of 7 RunHooksBase methods (no on_llm_start, on_llm_end, on_handoff). All hooks are async. Each hook emits a named event via HealthcareSupportContext.emit(), enabling UI/frontend observability. on_tool_start/end cast context to ToolContext to access tool_call_id and tool_arguments. Interruption loop capped at 5 approval rounds.",
+
+  "source_files_analyzed": [
+    "examples/sandbox/healthcare_support/workflow.py",
+    "src/agents/lifecycle.py"
+  ]
+}

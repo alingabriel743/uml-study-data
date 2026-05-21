@@ -1,0 +1,134 @@
+{
+  "scope": "user_signup_and_email_verification",
+  "title": "User Signup and Email Verification Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Client",
+    "SignupRouter (POST /signup)",
+    "EdgeRateLimitService",
+    "AuthAuditService",
+    "EventService",
+    "CleanEmailService",
+    "Database (DB_WRITE)",
+    "GroupService",
+    "AuthService",
+    "SessionService",
+    "TokenService",
+    "EmailService",
+    "UserService",
+    "ReferralCodeService"
+  ],
+  "interaction_flow": [
+    "Client → SignupRouter: POST /signup { username, email, password, is_temp, referral_code, send_confirmation_code }",
+    "SignupRouter → EdgeRateLimitService: check('signup') → 429 if rate-limited",
+    "SignupRouter → AuthAuditService: record({ action: 'signup:real' | 'signup:temp', body })",
+    "SignupRouter → EventService: emit('puter.signup', event) → check event.allow",
+    "SignupRouter [if is_temp && cookie present] → AuthService: check_session(cookie_token) → return existing user",
+    "SignupRouter → SignupRouter: validate username, email, password (regex, length, reserved words)",
+    "SignupRouter → CleanEmailService: clean(email), validate(clean_email)",
+    "SignupRouter → Database: SELECT EXISTS ... WHERE email/clean_email AND email_confirmed=1 (duplicate check)",
+    "SignupRouter → Database: SELECT * FROM user WHERE email=? AND password IS NULL (pseudo-user lookup)",
+    "SignupRouter [if no pseudo_user] → Database: INSERT INTO user (username, email, clean_email, password=bcrypt, uuid, email_confirm_code, email_confirm_token, free_storage, ...)",
+    "SignupRouter → Database: UPDATE user SET last_activity_ts=now() WHERE id=?",
+    "SignupRouter → GroupService: add_users({ uid: default_user_group | default_temp_group, users: [username] })",
+    "SignupRouter → EventService: emit('puter.signup.success', { user_id, user_uuid, email, username })",
+    "SignupRouter [if pseudo_user] → Database: UPDATE user SET username, password, uuid, email_confirm_code, email_confirm_token, requires_email_confirmation=1 WHERE id=pseudo_user.id",
+    "SignupRouter [if pseudo_user] → GroupService: remove_users(default_temp_group), add_users(default_user_group)",
+    "SignupRouter → Database: SELECT * FROM user WHERE id=? (fetch created user)",
+    "SignupRouter → AuthService: create_session_token(user, { req })",
+    "AuthService → AuthService: create_session_(user, meta) — extracts IP, user-agent, host from req",
+    "AuthService → SessionService: create_session(user, meta)",
+    "SessionService → Database: INSERT INTO sessions (uuid, user_id, meta, last_activity, created_at)",
+    "SessionService → Redis: SET session-cache:{uuid} (TTL 300s), SADD user-sessions:{user_id}",
+    "SessionService → AuthService: return session { uuid, user_uid, user_id, meta }",
+    "AuthService → TokenService: sign('auth', { type:'session', uuid, user_uid }) → session_token (JWT)",
+    "AuthService → SignupRouter: return { session, token: session_token }",
+    "SignupRouter → AuthService: create_gui_token(user, session)",
+    "AuthService → TokenService: sign('auth', { type:'gui', uuid:session.uuid, user_uid }) → gui_token",
+    "AuthService → SignupRouter: return gui_token",
+    "SignupRouter [if email_confirmation_required OR requires_email_confirmation] → EmailService: send_email_verification_code(email_confirm_code, email) OR send_email_verification_token(email_confirm_token, email, user_uuid)",
+    "SignupRouter → ReferralCodeService: gen_referral_code(user) [optional service]",
+    "SignupRouter → UserService: generate_default_fsentries({ user })",
+    "SignupRouter → EventService: emit('user.save_account', { user }) [if not temp]",
+    "SignupRouter → Client: Set-Cookie: session_token (HttpOnly), return { token: gui_token, user: { username, uuid, email, email_confirmed, requires_email_confirmation, is_temp, taskbar_items, referral_code } }"
+  ],
+  "email_verification_details": {
+    "send_email_verification_code": {
+      "signature": "send_email_verification_code(email_confirm_code, email)",
+      "source": "helpers.js:1686",
+      "flow": "→ EmailService.send_email({ email }, 'email_verification_code', { code: hyphenize_confirm_code(code) })",
+      "trigger": "when send_confirmation_code=true OR requires_email_confirmation=true"
+    },
+    "send_email_verification_token": {
+      "signature": "send_email_verification_token(email_confirm_token, email, user_uuid)",
+      "source": "helpers.js:1693",
+      "flow": "→ EmailService.send_email({ email }, 'email_verification_link', { link: `${config.origin}/confirm-email-by-token?user_uuid=&token=` })",
+      "trigger": "when send_confirmation_code=false AND email_confirmation_required"
+    },
+    "code_generation": "email_confirm_code = Math.floor(100000 + Math.random() * 900000) (6-digit code)",
+    "token_generation": "email_confirm_token = uuidv4()"
+  },
+  "signup_create_new_user_oidc": {
+    "file": "src/backend/src/routers/signup_create_new_user.js",
+    "signature": "async signup_create_new_user(services, options: { providerId, userinfo })",
+    "purpose": "OIDC-based new user creation; form-signup path not yet implemented here",
+    "flow": [
+      "Validate providerId + userinfo (returns null if missing)",
+      "Get database, group, user, oidc services",
+      "Sanitize username from claims.name or claims.email; generate_identifier() fallback",
+      "Check duplicate clean_email → return null if exists",
+      "Generate user_uuid (uuidv4), email_confirm_code (6-digit), email_confirm_token (uuidv4)",
+      "INSERT INTO user (username, email, clean_email, password=null, uuid, email_confirm_code, email_confirm_token, free_storage, email_confirmed=1, requires_email_confirmation=0)",
+      "SELECT id FROM user WHERE uuid=?",
+      "svc_oidc.linkProviderToUser(user_id, providerId, claims.sub, null)",
+      "svc_group.add_users({ uid: config.default_user_group, users: [username] })",
+      "SELECT * FROM user WHERE id=? (fetch full user, parse metadata)",
+      "svc_user.generate_default_fsentries({ user })",
+      "return user"
+    ],
+    "note": "OIDC path sets email_confirmed=1 and requires_email_confirmation=0 — no email verification email sent"
+  },
+  "session_service_key_methods": {
+    "create_session": "async create_session(user, meta) → INSERT sessions + Redis cache → return session object",
+    "getSession": "async getSession(uuid) → Redis cache → DB fallback → update last_touch → return cleaned session",
+    "cacheSession": "async cacheSession(session, { flushState }) → Redis SET with 300s TTL + SADD user-sessions set",
+    "invalidateCachedSession": "async invalidateCachedSession(uuid, userId) → Redis DEL + SREM",
+    "remove_session": "async remove_session(uuid) → invalidate cache + DELETE FROM sessions WHERE uuid=?",
+    "get_user_sessions": "async get_user_sessions(user) → Redis SMEMBERS user-sessions:{id} → getCachedSession each"
+  },
+  "auth_service_key_methods": {
+    "create_session_token": "async create_session_token(user, meta) → create_session_(user, meta) → tokenService.sign('auth', {type:'session', uuid, user_uid}) → return { session, token }",
+    "create_gui_token": "create_gui_token(user, session) → tokenService.sign('auth', {type:'gui', uuid:session.uuid, user_uid}) → return JWT",
+    "check_session": "async check_session(cur_token, meta) → tokenService.verify → sessionService.getSession → return { user, token: gui_token }"
+  },
+  "key_conditions": [
+    "is_temp=true → skip email/password validation, generate random username & dummy email, no email confirmation",
+    "is_temp=false AND (email_confirmation_required OR requires_email_confirmation) → send email verification",
+    "send_confirmation_code=true → send_email_verification_code; else → send_email_verification_token",
+    "pseudo_user exists → UPDATE existing user record instead of INSERT",
+    "OIDC path (signup_create_new_user.js) → auto-confirmed, no email sent",
+    "Duplicate email (email_confirmed=1) → 400 error",
+    "Rate limit exceeded → 429",
+    "Bot trap (p102xyzname != '') → silent drop"
+  ],
+  "key_relationships": [
+    "SignupRouter depends_on AuthService (create_session_token, create_gui_token)",
+    "SignupRouter depends_on SessionService (via AuthService)",
+    "AuthService depends_on SessionService (create_session)",
+    "AuthService depends_on TokenService (sign, verify)",
+    "SessionService depends_on Redis (cache layer)",
+    "SessionService depends_on Database (persistence)",
+    "SignupRouter depends_on EmailService (via send_email_verification_code/token helpers)",
+    "SignupRouter depends_on GroupService (add_users/remove_users)",
+    "SignupRouter depends_on UserService (generate_default_fsentries)",
+    "signup_create_new_user.js depends_on OIDCService (linkProviderToUser)"
+  ],
+  "important_notes": "Two signup paths: (1) POST /signup in signup.js for form/temp users — full validation, conditional email confirmation; (2) signup_create_new_user.js for OIDC users — auto-confirmed. Session tokens are JWT (HTTP-only cookie), GUI tokens are separate JWT for client-side use. SessionService uses Redis as primary cache with DB flush loop (5–60s random interval). Email codes are 6-digit; email tokens are UUID-based links.",
+  "source_files_analyzed": [
+    "src/backend/src/routers/signup.js",
+    "src/backend/src/routers/signup_create_new_user.js",
+    "src/backend/src/services/SessionService.js",
+    "src/backend/src/helpers.js (send_email_verification_code, send_email_verification_token)",
+    "src/backend/src/services/auth/AuthService.js (create_session_token, create_gui_token, create_session_, check_session)"
+  ]
+}

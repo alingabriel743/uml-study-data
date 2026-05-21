@@ -1,0 +1,272 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #F9A825
+}
+
+title Core Agent Model
+
+' ─────────────────────────────────────────────────
+' Package: agent.py — core agent definitions
+' ─────────────────────────────────────────────────
+package "agents.agent" {
+
+    class AgentBase <<dataclass, Generic[TContext]>> {
+        +name: str
+        +handoff_description: str | None
+        +tools: list[Tool]
+        +mcp_servers: list[MCPServer]
+        +mcp_config: MCPConfig
+        --
+        +get_mcp_tools(run_context: RunContextWrapper[TContext]): list[Tool] <<async>>
+        +get_all_tools(run_context: RunContextWrapper[TContext]): list[Tool] <<async>>
+    }
+
+    class Agent <<dataclass, Generic[TContext]>> {
+        +instructions: str | Callable | None
+        +prompt: Prompt | DynamicPromptFunction | None
+        +handoffs: list[Agent | Handoff[TContext]]
+        +model: str | Model | None
+        +model_settings: ModelSettings
+        +input_guardrails: list[InputGuardrail[TContext]]
+        +output_guardrails: list[OutputGuardrail[TContext]]
+        +output_type: type | AgentOutputSchemaBase | None
+        +hooks: AgentHooks[TContext] | None
+        +tool_use_behavior: Literal | StopAtTools | ToolsToFinalOutputFunction
+        +reset_tool_choice: bool
+        --
+        +__post_init__(): void
+        +clone(**kwargs): Agent[TContext]
+        +as_tool(tool_name, tool_description, ...): FunctionTool
+        +get_system_prompt(run_context: RunContextWrapper[TContext]): str | None <<async>>
+        +get_prompt(run_context: RunContextWrapper[TContext]): ResponsePromptParam | None <<async>>
+    }
+
+    class StopAtTools <<TypedDict>> {
+        +stop_at_tool_names: list[str]
+    }
+
+    class MCPConfig <<TypedDict>> {
+        +convert_schemas_to_strict: NotRequired[bool]
+        +failure_error_function: NotRequired[ToolErrorFunction | None]
+    }
+
+    class AgentToolStreamEvent <<TypedDict>> {
+        +event: StreamEvent
+        +agent: Agent[Any]
+        +tool_call: ResponseFunctionToolCall | None
+    }
+
+    class ToolsToFinalOutputResult <<dataclass>> {
+        +is_final_output: bool
+        +final_output: Any | None
+    }
+
+}
+
+' ─────────────────────────────────────────────────
+' Package: agent_output.py — output schema
+' ─────────────────────────────────────────────────
+package "agents.agent_output" {
+
+    abstract class AgentOutputSchemaBase <<ABC>> {
+        {abstract} +is_plain_text(): bool
+        {abstract} +name(): str
+        {abstract} +json_schema(): dict[str, Any]
+        {abstract} +is_strict_json_schema(): bool
+        {abstract} +validate_json(json_str: str): Any
+    }
+
+    class AgentOutputSchema <<dataclass>> {
+        +output_type: type[Any]
+        -_type_adapter: TypeAdapter[Any]
+        -_is_wrapped: bool
+        -_output_schema: dict[str, Any]
+        -_strict_json_schema: bool
+        --
+        +__init__(output_type: type[Any], strict_json_schema: bool): void
+        +is_plain_text(): bool
+        +is_strict_json_schema(): bool
+        +json_schema(): dict[str, Any]
+        +validate_json(json_str: str): Any
+        +name(): str
+    }
+
+}
+
+' ─────────────────────────────────────────────────
+' Package: lifecycle.py — hooks
+' ─────────────────────────────────────────────────
+package "agents.lifecycle" {
+
+    class RunHooksBase <<Generic[TContext, TAgent]>> {
+        +on_agent_start(context: AgentHookContext, agent: TAgent): None <<async>>
+        +on_agent_end(context: AgentHookContext, agent: TAgent, output: Any): None <<async>>
+        +on_handoff(context: RunContextWrapper, from_agent: TAgent, to_agent: TAgent): None <<async>>
+        +on_llm_start(context: RunContextWrapper, agent: Agent, system_prompt: str | None, input_items: list): None <<async>>
+        +on_llm_end(context: RunContextWrapper, agent: Agent, response: ModelResponse): None <<async>>
+        +on_tool_start(context: RunContextWrapper, agent: TAgent, tool: Tool): None <<async>>
+        +on_tool_end(context: RunContextWrapper, agent: TAgent, tool: Tool, result: str): None <<async>>
+    }
+
+    class AgentHooksBase <<Generic[TContext, TAgent]>> {
+        +on_start(context: AgentHookContext, agent: TAgent): None <<async>>
+        +on_end(context: AgentHookContext, agent: TAgent, output: Any): None <<async>>
+        +on_handoff(context: RunContextWrapper, agent: TAgent, source: TAgent): None <<async>>
+        +on_tool_start(context: RunContextWrapper, agent: TAgent, tool: Tool): None <<async>>
+        +on_tool_end(context: RunContextWrapper, agent: TAgent, tool: Tool, result: str): None <<async>>
+        +on_llm_start(context: RunContextWrapper, agent: Agent, system_prompt: str | None, input_items: list): None <<async>>
+        +on_llm_end(context: RunContextWrapper, agent: Agent, response: ModelResponse): None <<async>>
+    }
+
+}
+
+' ─────────────────────────────────────────────────
+' Package: agent_tool_state.py — ephemeral run cache
+' ─────────────────────────────────────────────────
+package "agents.agent_tool_state" {
+
+    class AgentToolState <<module>> {
+        -{static} _agent_tool_run_results_by_obj: dict[int, RunResult | RunResultStreaming]
+        -{static} _agent_tool_run_results_by_signature: dict[ScopedToolCallSignature, set[int]]
+        -{static} _agent_tool_run_result_signature_by_obj: dict[int, ScopedToolCallSignature]
+        -{static} _agent_tool_call_refs_by_obj: dict[int, weakref.ReferenceType]
+        --
+        +{static} get_agent_tool_state_scope(context: Any): str | None
+        +{static} set_agent_tool_state_scope(context: Any, scope_id: str | None): None
+        +{static} record_agent_tool_run_result(tool_call, run_result, scope_id): None
+        +{static} consume_agent_tool_run_result(tool_call, scope_id): RunResult | None
+        +{static} peek_agent_tool_run_result(tool_call, scope_id): RunResult | None
+        +{static} drop_agent_tool_run_result(tool_call, scope_id): None
+    }
+
+}
+
+' ─────────────────────────────────────────────────
+' Package: _public_agent.py — identity preservation
+' ─────────────────────────────────────────────────
+package "agents._public_agent" {
+
+    class PublicAgentHelper <<module>> {
+        +{static} _PUBLIC_AGENT_ATTR: str = "_agents_public_agent"
+        --
+        +{static} set_public_agent(execution_agent: Agent, public_agent: Agent): Agent
+        +{static} get_public_agent(agent: Agent): Agent
+    }
+
+}
+
+' ─────────────────────────────────────────────────
+' Relationships
+' ─────────────────────────────────────────────────
+
+' Inheritance
+Agent --|> AgentBase : extends
+AgentOutputSchema --|> AgentOutputSchemaBase : extends
+
+' Agent compositions
+Agent *-- MCPConfig : mcp_config
+Agent *-- ModelSettings : model_settings
+Agent o-- AgentHooksBase : hooks (0..1)
+Agent o-- AgentOutputSchemaBase : output_type (0..1)
+Agent o-- StopAtTools : tool_use_behavior (0..1)
+Agent o-- ToolsToFinalOutputResult : <<produces via\nas_tool()>>
+
+' as_tool creates FunctionTool
+Agent ..> FunctionTool : <<creates via as_tool()>>
+
+' AgentHooksBase attached per-agent
+AgentHooksBase ..> Agent : observes specific agent
+
+' RunHooksBase covers whole Runner.run() invocation
+RunHooksBase ..> Agent : observes runner invocation
+
+' AgentToolState caches nested run results
+AgentToolState ..> Agent : tracks RunResult\nby tool_call ref
+
+' PublicAgentHelper wraps execution clones
+PublicAgentHelper ..> Agent : preserves public identity
+
+' AgentToolStreamEvent references Agent
+AgentToolStreamEvent o-- Agent : nested agent
+
+' ─────────────────────────────────────────────────
+' External stubs referenced in relationships
+' ─────────────────────────────────────────────────
+class ModelSettings <<dataclass>> {
+    +temperature: float | None
+    +top_p: float | None
+    +tool_choice: str | None
+    ..
+}
+
+class FunctionTool {
+    +name: str
+    +description: str
+}
+
+' ─────────────────────────────────────────────────
+' Type alias notes
+' ─────────────────────────────────────────────────
+note top of RunHooksBase
+  <b>RunHooks</b> = RunHooksBase[TContext, Agent]
+  Observes the entire Runner.run() invocation,
+  including handoffs between multiple agents.
+  Register via: Runner.run(..., hooks=RunHooks())
+end note
+
+note top of AgentHooksBase
+  <b>AgentHooks</b> = AgentHooksBase[TContext, Agent]
+  Attached to a specific Agent instance via agent.hooks.
+  Scoped only to that agent's lifecycle events.
+end note
+
+note bottom of Agent
+  <b>Key design notes:</b>
+  • Generic[TContext]: context is user-supplied DI object
+  • instructions can be static str or async callable(ctx, agent)->str
+  • tool_use_behavior modes: 'run_llm_again' (default),
+    'stop_on_first_tool', StopAtTools, or ToolsToFinalOutputFunction
+  • reset_tool_choice=True prevents infinite tool-call loops
+  • as_tool() enables manager/orchestrator pattern
+    (vs handoffs which pass full conversation history)
+  • clone() performs shallow copy via dataclasses.replace
+end note
+
+note bottom of AgentOutputSchema
+  Non-BaseModel/dict types are wrapped in a
+  TypedDict { response: T } for JSON Schema
+  object compatibility (_is_wrapped=True).
+  validate_json() unwraps the wrapper dict.
+end note
+
+note bottom of AgentToolState
+  Ephemeral per-run cache.
+  Links nested agent RunResults to their originating
+  ResponseFunctionToolCall for human-in-the-loop resume.
+  Weakref on tool_call triggers GC cleanup.
+end note
+
+note bottom of PublicAgentHelper
+  Runner may clone agents for execution.
+  _public_agent attribute preserves the original
+  user-visible identity for hooks and results.
+end note
+
+@enduml

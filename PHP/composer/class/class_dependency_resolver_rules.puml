@@ -1,0 +1,284 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam abstractClass {
+    BackgroundColor #FFF3CD
+    BorderColor #856404
+}
+skinparam interface {
+    BackgroundColor #D1ECF1
+    BorderColor #0C5460
+}
+
+title Dependency Resolver — Rules & Watch Graph\n<size:11>(Composer\\DependencyResolver)</size>
+
+' ─────────────────────────────────────────────────────────────
+' External dependencies (abbreviated stubs)
+' ─────────────────────────────────────────────────────────────
+package "External Dependencies" <<Rectangle>> {
+
+    interface PolicyInterface {
+        +selectPreferredPackages(...)
+    }
+
+    class Pool {
+        +whatProvides(string $name): BasePackage[]
+        +literalToPackage(int $literal): BasePackage
+    }
+
+    class Request {
+        +getFixedPackagesById(): array
+        +getRequires(): array
+    }
+
+    class Decisions {
+        +decide(int $literal, int $level, Rule $rule): void
+        +satisfy(int $literal): bool
+        +conflict(int $literal): bool
+        +decisionLevel(int $literal): int
+    }
+
+    class BasePackage {
+        +id: int
+        +getName(): string
+    }
+}
+
+' ─────────────────────────────────────────────────────────────
+' Core Rule hierarchy
+' ─────────────────────────────────────────────────────────────
+package "Composer\\DependencyResolver" <<Rectangle>> {
+
+    abstract class Rule {
+        ' Type constants
+        +{static} RULE_ROOT_REQUIRE: int = 2
+        +{static} RULE_FIXED: int = 3
+        +{static} RULE_PACKAGE_CONFLICT: int = 6
+        +{static} RULE_PACKAGE_REQUIRES: int = 7
+        +{static} RULE_PACKAGE_SAME_NAME: int = 10
+        +{static} RULE_LEARNED: int = 12
+        +{static} RULE_PACKAGE_ALIAS: int = 13
+        +{static} RULE_PACKAGE_INVERSE_ALIAS: int = 14
+        ' Bitfield offsets (private)
+        -{static} BITFIELD_TYPE: int = 0
+        -{static} BITFIELD_REASON: int = 8
+        -{static} BITFIELD_DISABLED: int = 16
+        ' Properties
+        #bitfield: int
+        #request: Request
+        #reasonData: ReasonData
+        ' Abstract interface
+        +{abstract} getLiterals(): list<int>
+        +{abstract} getHash(): int|string
+        +{abstract} __toString(): string
+        +{abstract} equals(Rule $rule): bool
+        +{abstract} isAssertion(): bool
+        ' Concrete behaviour
+        +__construct($reason, $reasonData)
+        +getReason(): int
+        +getReasonData(): ReasonData
+        +getRequiredPackage(): ?string
+        +setType(int $type): void
+        +getType(): int
+        +disable(): void
+        +enable(): void
+        +isDisabled(): bool
+        +isEnabled(): bool
+        +isCausedByLock(RepositorySet, Request, Pool): bool
+        +getSourcePackage(Pool): BasePackage
+        +getPrettyString(RepositorySet, Request, Pool, bool, array, array): string
+        #formatPackagesUnique(Pool, array, bool, ?ConstraintInterface, bool): string
+        -deduplicateDefaultBranchAlias(BasePackage): BasePackage
+    }
+
+    class GenericRule {
+        ' note: used for require rules (n literals) and install-one-of
+        #literals: list<int>
+        +__construct(list<int> $literals, $reason, $reasonData)
+        +getLiterals(): list<int>
+        +getHash(): int
+        +equals(Rule $rule): bool
+        +isAssertion(): bool
+        +__toString(): string
+    }
+
+    class Rule2Literals {
+        ' note: optimized 2-literal conflict rule
+        #literal1: int
+        #literal2: int
+        +__construct(int $literal1, int $literal2, $reason, $reasonData)
+        +getLiterals(): non-empty-list<int>
+        +getHash(): string
+        +equals(Rule $rule): bool
+        +isAssertion(): false
+        +__toString(): string
+    }
+
+    class MultiConflictRule {
+        ' note: 3+ literal conflict; cannot be disabled; all literals watched
+        #literals: non-empty-list<int>
+        +__construct(non-empty-list<int> $literals, $reason, $reasonData)
+        +getLiterals(): non-empty-list<int>
+        +getHash(): int
+        +equals(Rule $rule): bool
+        +isAssertion(): false
+        +disable(): never
+        +__toString(): string
+    }
+
+    ' ─── RuleSet ───────────────────────────────────────────
+    class RuleSet <<final>> {
+        +{static} TYPE_PACKAGE: int = 0
+        +{static} TYPE_REQUEST: int = 1
+        +{static} TYPE_LEARNED: int = 4
+        +{static} TYPES: array
+        +ruleById: array<int, Rule>
+        #rules: array<int, Rule[]>
+        #nextRuleId: int = 0
+        #rulesByHash: array<int|string, Rule|Rule[]>
+        +__construct()
+        +add(Rule $rule, int $type): void
+        +count(): int
+        +ruleById(int $id): Rule
+        +getRules(): array
+        +getIterator(): RuleSetIterator
+        +getIteratorFor(int|array $types): RuleSetIterator
+        +getIteratorWithout(int|array $types): RuleSetIterator
+        +getTypes(): array
+        +getPrettyString(...): string
+        +__toString(): string
+    }
+
+    class RuleSetIterator {
+        ' iterates in order: PACKAGE(0) → REQUEST(1) → LEARNED(4)
+        #rules: array<int, Rule[]>
+        #types: array<int>
+        #currentOffset: int
+        #currentType: int
+        #currentTypeOffset: int
+        +__construct(array $rules)
+        +current(): Rule
+        +key(): int
+        +next(): void
+        +rewind(): void
+        +valid(): bool
+    }
+
+    ' ─── RuleSetGenerator ──────────────────────────────────
+    class RuleSetGenerator {
+        #policy: PolicyInterface
+        #pool: Pool
+        #rules: RuleSet
+        #addedMap: array<int, BasePackage>
+        #addedPackagesByNames: array<string, BasePackage[]>
+        +__construct(PolicyInterface $policy, Pool $pool)
+        +getRulesFor(Request $request, ?PlatformRequirementFilterInterface): RuleSet
+        #addRulesForRequest(Request, PlatformRequirementFilterInterface): void
+        #addRulesForPackage(BasePackage, PlatformRequirementFilterInterface): void
+        #addRulesForRootAliases(PlatformRequirementFilterInterface): void
+        #addConflictRules(PlatformRequirementFilterInterface): void
+        #createRequireRule(BasePackage, BasePackage[], int, $reasonData): ?Rule
+        #createInstallOneOfRule(BasePackage[], int, $reasonData): Rule
+        #createRule2Literals(BasePackage, BasePackage, int, $reasonData): ?Rule
+        #createMultiConflictRule(BasePackage[], int, $reasonData): Rule
+        -addRule(int $type, ?Rule $rule): void
+    }
+
+    ' ─── Watch Graph ───────────────────────────────────────
+    class RuleWatchGraph {
+        ' 2-watched-literal propagation (DPLL/CDCL style)
+        #watchChains: array<int, RuleWatchChain>
+        +insert(RuleWatchNode $node): void
+        +propagateLiteral(int $decidedLiteral, int $level, Decisions $decisions): ?Rule
+        #moveWatch(int $fromLiteral, int $toLiteral, RuleWatchNode $node): void
+    }
+
+    class RuleWatchNode {
+        +watch1: int
+        +watch2: int
+        #rule: Rule
+        +__construct(Rule $rule)
+        +watch2OnHighest(Decisions $decisions): void
+        +getRule(): Rule
+        +getOtherWatch(int $literal): int
+        +moveWatch(int $from, int $to): void
+    }
+
+    class RuleWatchChain {
+        ' extends SplDoublyLinkedList — per-literal linked list of watching nodes
+        +seek(int $offset): void
+        +remove(): void
+    }
+
+}
+
+' ─────────────────────────────────────────────────────────────
+' PHP SPL base
+' ─────────────────────────────────────────────────────────────
+class "SplDoublyLinkedList<RuleWatchNode>" as SplDoublyLinkedList <<SPL>> {
+}
+
+' ─────────────────────────────────────────────────────────────
+' PHP standard interfaces
+' ─────────────────────────────────────────────────────────────
+interface "IteratorAggregate<Rule>" as IteratorAggregate <<PHP>>
+interface "Countable" as Countable <<PHP>>
+interface "Iterator<Rule>" as Iterator <<PHP>>
+
+' ─────────────────────────────────────────────────────────────
+' Inheritance / Implementation
+' ─────────────────────────────────────────────────────────────
+GenericRule       --|> Rule
+Rule2Literals     --|> Rule
+MultiConflictRule --|> Rule
+
+RuleSet ..|> IteratorAggregate
+RuleSet ..|> Countable
+RuleSetIterator ..|> Iterator
+
+RuleWatchChain --|> SplDoublyLinkedList
+
+' ─────────────────────────────────────────────────────────────
+' Composition / Aggregation
+' ─────────────────────────────────────────────────────────────
+RuleSet         *-- "many" Rule         : stores (by type & hash)
+RuleSet         ..> RuleSetIterator     : <<creates>>
+
+RuleSetGenerator *-- RuleSet            : owns $rules
+RuleSetGenerator ..> GenericRule        : <<creates>>
+RuleSetGenerator ..> Rule2Literals      : <<creates>>
+RuleSetGenerator ..> MultiConflictRule  : <<creates>>
+
+RuleWatchGraph  *-- "0..*" RuleWatchChain : watchChains[literal]
+RuleWatchChain  o-- "0..*" RuleWatchNode  : linked list nodes
+RuleWatchNode   *-- Rule                  : wraps
+
+' ─────────────────────────────────────────────────────────────
+' Dependencies on external types
+' ─────────────────────────────────────────────────────────────
+RuleSetGenerator ..> PolicyInterface : uses
+RuleSetGenerator ..> Pool            : uses
+RuleSetGenerator ..> Request         : uses
+
+RuleWatchGraph  ..> Decisions        : uses (propagate)
+RuleWatchNode   ..> Decisions        : uses (watch2OnHighest)
+
+Rule            ..> Request          : holds ref
+Rule            ..> Pool             : uses (pretty-print)
+Rule            ..> BasePackage      : uses
+
+@enduml

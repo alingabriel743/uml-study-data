@@ -1,0 +1,295 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #212529
+    EndColor #212529
+    BarColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title GitLab CI Pipeline Generation\n(dd-trace-php — PHP 7.0–8.5)
+
+|#E8F4FD| Common Foundation\n(generate-common.php) |
+start
+
+:Load generate-common.php;
+note right
+  Shared foundation included
+  by ALL generator scripts
+end note
+
+:Define PHP version matrix\n(7.0 → 8.5, 11 versions + ABI map);
+
+fork
+  :Build all_minor_major_targets\n(PHP 7.0–8.5);
+fork again
+  :Build asan_minor_major_targets\n(PHP 7.4–8.5);
+fork again
+  :Build windows_minor_major_targets\n(PHP 7.2–8.5);
+fork again
+  :Build profiler_minor_major_targets\n(PHP 7.1–8.5);
+end fork
+
+:Define arch targets [amd64, arm64];
+
+:Register shared service definitions\n(test-agent, request-replayer, httpbin,\nmysql, elasticsearch, kafka, redis,\nmemcache, amqp, mongodb, sqlsrv, googlespanner);
+
+:Define global retry policy\n(max:2 on unknown/data/runner/scheduler/\napi/timeout failures);
+
+:Export helper functions\n(unset_dd_runner_env_vars,\ndockerdhub_login,\nwindows_git_setup,\nwindows_git_setup_with_packages);
+
+|#E8F5E9| Tracer Generator\n(generate-tracer.php) |
+
+:Include generate-common.php;
+:Declare stages:\ncompile → test → integrations test\n→ web test → aggregate versions;
+:Define base templates\n(.base_test, .asan_test, .debug_test,\n.cli_integration_test);
+
+:Parse Makefile for TEST_INTEGRATIONS_*\nand TEST_WEB_* targets (via regex);
+
+fork
+  |#E8F5E9| Tracer Generator\n(generate-tracer.php) |
+  :Loop: asan_minor_major_targets × arch_targets;
+  :Emit ASAN jobs\n(test_c, internal api randomized,\ninit hook tests, opcache tests);
+  if (PHP >= 8.0?) then (yes)
+    :Emit ASAN test_c\nwith multiple observers;
+  endif
+
+fork again
+  |#E8F5E9| Tracer Generator\n(generate-tracer.php) |
+  :Loop: all_minor_major_targets;
+  if (PHP >= 7.4?) then (yes)
+    :Emit Debug jobs with parallelism=8\n(test_extension_ci, Unit tests,\nAPI unit tests, Disabled test_c,\nOpcache tests);
+    if (PHP >= 8.2?) then (yes)
+      :Disable DD_INSTRUMENTATION_TELEMETRY_ENABLED\nin PHP Language Tests;
+    else (no)
+      :Emit PHP Language Tests\n(with telemetry enabled);
+    endif
+  else (no)
+    :Emit Debug jobs (no ASAN/parallelism)\n(test_extension_ci, Unit tests,\nAPI unit tests);
+  endif
+
+fork again
+  |#E8F5E9| Tracer Generator\n(generate-tracer.php) |
+  :Loop: Makefile integration/web targets;
+  if (PHP >= 7.2?) then (yes)
+    :Emit web jobs for SAPIs:\n[cli-server, cgi-fcgi, apache2handler];
+  else (no)
+    :Emit CLI-only web jobs;
+  endif
+  :Inject services based on\ntarget name substring\n(kafka→kafka+zookeeper,\nelasticsearch8→elasticsearch7, etc.);
+
+end fork
+
+:Emit specific CLI jobs\n(test_auto_instrumentation, test_composer,\ntest_integration, test_distributed_tracing);
+:Emit xDebug matrix jobs\n(fixed version pairs: 7.0+2.7.2 → 8.4+3.4.0);
+
+if (Master branch?) then (yes)
+  :Emit aggregate tested versions job\n(interruptible=false; calls\ncreate_or_update_supported_versions_pr.sh);
+else (no)
+  :Emit aggregate tested versions job\n(manual + allow_failure);
+endif
+
+:Write tracer pipeline YAML;
+
+|#FFF8E1| Package Generator\n(generate-package.php) |
+
+:Include generate-common.php;
+:Include one-pipeline.locked.yml\nand benchmarks.yml;
+:Declare stages:\nprepare → profiler → appsec → tracing\n→ packaging → benchmarks → gate\n→ notify → verify → shared-pipeline\n→ pre-release → release;
+
+:Emit PREPARE stage\n('prepare code': composer update + make generate;\n'cache cargo deps' per linux platform);
+
+fork
+  |#FFF8E1| Package Generator\n(generate-package.php) |
+  :Loop: platforms × profiler_minor_major_targets;
+  :Emit 'compile profiler extension'\n(NTS + ZTS builds via build-profiler.sh);
+  note right
+    Artifact: datadog-profiling/
+    (per triplet/ABI)
+  end note
+
+fork again
+  |#FFF8E1| Package Generator\n(generate-package.php) |
+  :Loop: platforms × all_php_versions;
+  if (Alpine platform?) then (yes)
+    :Add 'apk add cmake gcc g++ git\npython3 autoconf coreutils'\nto before_script;
+  endif
+  :Emit 'compile appsec extension'\n(build-appsec.sh or build-appsec.sh-alpine);
+  :Emit 'compile appsec helper' (C, amd64+arm64);
+  :Emit 'compile appsec helper rust';
+  note right
+    Artifact: appsec_* files
+  end note
+
+fork again
+  |#FFF8E1| Package Generator\n(generate-package.php) |
+  :Emit 'pecl build' job;
+  :Loop: platforms × all_php_versions;
+  :Emit 'compile tracing extension'\n(build-tracing.sh);
+  :Emit 'aggregate tracing extension'\nper arch;
+  :Emit 'compile tracing sidecar'\nper platform (build-sidecar.sh);
+  :Emit 'link tracing extension'\nper platform\n(depends on sidecar + all tracing exts);
+  :Emit 'compile tracing extension asan'\n(ASAN platforms);
+  :Loop: windows_platforms × windows_php_versions;
+  :Emit 'compile extension windows'\n(build-tracing-windows.sh);
+  :Emit 'compile loader'\nper platform (build-loader.sh);
+  note right
+    Artifacts: extensions_*, standalone_*,
+    ddtrace_*.ldflags, libddtrace_php_*.*,
+    dd_library_loader-*.so,
+    extensions_x86_64/ (Windows)
+  end note
+
+end fork
+
+:Emit PACKAGING stage\n(.package_extension_base + per-platform packaging jobs);
+:Emit one-pipeline overrides\n(validate_supported_configurations,\nupdate_central_configurations,\nconfigure_system_tests, package-oci);
+:Write package pipeline YAML;
+
+|#FCE4EC| AppSec Generator\n(generate-appsec.php) |
+
+:Include generate-common.php;
+:Declare stages: test → docker-build;
+
+fork
+  |#FCE4EC| AppSec Generator\n(generate-appsec.php) |
+  :Loop: all_minor_major_targets × arch_targets\n× [debug, debug-zts, debug-zts-asan];
+  :Emit 'test appsec extension'\n(cmake + make xtest; boost cache);
+
+fork again
+  |#FCE4EC| AppSec Generator\n(generate-appsec.php) |
+  :Emit appsec integration tests\n(Gradle docker-in-docker;\ntargets test{7.0..8.5}-release[-zts|-musl]);
+  :Emit appsec integration tests (ssi)\n(test8.3-release-ssi);
+  :Emit appsec integration tests (helper-rust)\n(-PuseHelperRust on 4 selected versions);
+
+fork again
+  |#FCE4EC| AppSec Generator\n(generate-appsec.php) |
+  :Emit helper-rust build and test\n(./gradlew testHelperRust);
+  :Emit helper-rust code coverage\n(coverageHelperRust + codecov upload);
+  :Emit helper-rust integration coverage\n(buildHelperRustWithCoverage);
+
+fork again
+  |#FCE4EC| AppSec Generator\n(generate-appsec.php) |
+  :Emit appsec code coverage\n(llvm-profdata-17 + llvm-cov-17\n→ lcov → codecov + Datadog CI upload);
+  :Emit appsec lint\n(clang-format-17 + clang-tidy);
+  :Emit 'test appsec helper asan'\n(cmake ASAN build + run helper tests);
+
+fork again
+  |#FCE4EC| AppSec Generator\n(generate-appsec.php) |
+  :Emit 'push appsec images'\n(./gradlew pushAll — manual);
+  :Emit 'push appsec docker images multiarch'\n(./gradlew pushMultiArch);
+  note right
+    before_script inlines
+    ECR login via AWS STS
+    assume-role
+  end note
+
+end fork
+
+:Emit 'check libxml2 version'\n(Python script vs GNOME GitLab tags);
+:Write appsec pipeline YAML;
+
+|#EDE7F6| Profiler Generator\n(generate-profiler.php) |
+
+:Include generate-common.php;
+:Declare stages: test;
+
+fork
+  |#EDE7F6| Profiler Generator\n(generate-profiler.php) |
+  :Loop: profiler_minor_major_targets × arch_targets\n× [alpine image, centos-7 image];
+  :Emit 'profiling tests'\n(switch-php NTS → cargo build\n--all-features → run phpt NTS;\ntouch build.rs → switch ZTS\n→ cargo build → run phpt ZTS);
+  if (centos-7 image?) then (yes)
+    :Skip JUnit upload in after_script\n(old glibc/OpenSSL);
+  else (no)
+    :Upload JUnit artifacts;
+  endif
+
+fork again
+  |#EDE7F6| Profiler Generator\n(generate-profiler.php) |
+  :Loop: profiler_minor_major_targets (bookworm);
+  :Emit 'clippy NTS' jobs\n(switch-php nts, sed Cargo.toml to rlib,\ncargo clippy -D warnings);
+
+fork again
+  |#EDE7F6| Profiler Generator\n(generate-profiler.php) |
+  :Emit 'Cargo test' job\n(php-8.5_bookworm-7, switch-php nts,\ncargo test --all-features);
+
+end fork
+
+:Write profiler pipeline YAML;
+
+|#E0F2F1| Shared Generator\n(generate-shared.php) |
+
+:Include generate-common.php;
+:Declare stages: build → test;
+:Define switch_php_versions\n[debug, debug-zts-asan, nts, zts];
+
+fork
+  |#E0F2F1| Shared Generator\n(generate-shared.php) |
+  :Emit 'C components ASAN' jobs\nper [centos-7, alpine, bookworm-7]\n(cmake ASAN toolchain → make all + test);
+  :Emit 'C components UBSAN' job\n(bookworm-7, repeat-until-fail:10);
+
+fork again
+  |#E0F2F1| Shared Generator\n(generate-shared.php) |
+  :Loop: all_minor_major_targets × switch_php_versions;
+  if (PHP < 7.4 + debug-zts-asan?) then (yes)
+    :Skip ASAN variant\n(no_asan_minor_major_targets);
+  else (no)
+    :Emit 'Build & Test Tea'\n(build-tea.sh $SWITCH_PHP_VERSION\n→ cmake Tea + make test);
+  endif
+
+fork again
+  |#E0F2F1| Shared Generator\n(generate-shared.php) |
+  :Loop: all_minor_major_targets × switch_php_versions;
+  :Emit 'Zend Abstract Interface Tests'\n(depends on Build & Test Tea;\ncmake ZAI + make test;\nasan toolchain for debug-zts-asan,\nubsan toolchain for debug on >=7.4);
+  :Emit 'ZAI Shared Tests'\n(PHP 7.4 + 8.0, shared-ext image, nts,\n-DRUN_SHARED_EXTS_TESTS=1);
+
+fork again
+  |#E0F2F1| Shared Generator\n(generate-shared.php) |
+  :Loop: all_minor_major_targets × switch_php_versions;
+  :Emit 'Extension Tea Tests'\n(make install ddtrace.so\n→ cmake tests/tea + make test);
+
+end fork
+
+:Emit 'Configuration Consistency' job\n(generate + diff\nmetadata/supported-configurations.json);
+:Write shared pipeline YAML;
+
+|#E8F4FD| Common Foundation\n(generate-common.php) |
+
+note
+  All generated YAML scripts append:
+  ASSERT_NO_MEMLEAKS check
+  (grep for "Total N memory leaks detected")
+end note
+
+:All pipeline YAML files generated\nand committed to repository;
+
+stop
+
+@enduml

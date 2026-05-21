@@ -1,0 +1,318 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #E9ECEF
+    GroupBorderColor #495057
+    GroupBackgroundColor #DEE2E6
+    DividerBackgroundColor #CED4DA
+    DividerBorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF3CD
+    BorderColor #856404
+    FontColor #333333
+}
+
+title Oracle LogMiner Streaming Flow
+
+actor "Connector" as Connector
+participant "UnbufferedLogMiner\nStreamingChangeEventSource" as Unbuffered
+participant "AbstractLogMiner\nStreamingChangeEventSource" as Abstract
+participant "LogMiner\nSessionContext" as SessionCtx
+participant "LogFileCollector" as LogFileColl
+participant "OracleConnection\n(JDBC)" as OracleConn
+participant "OracleDB\n(DBMS_LOGMNR)" as OracleDB
+participant "LogMinerEventRow" as EventRow
+participant "LogMinerDmlParser" as DmlParser
+participant "EventDispatcher" as Dispatcher
+participant "OracleOffsetContext" as OffsetCtx
+participant "LogMinerStreamingChange\nEventSourceMetrics" as Metrics
+
+' ─────────────────────────────────────────────────────
+== INITIALIZATION ==
+' ─────────────────────────────────────────────────────
+
+Connector -> Abstract : execute(context, partition, offsetContext)
+activate Abstract
+
+Abstract -> OracleConn : prepareJdbcConnection(false)\n[setNlsSessionParameters, setHashSortArea]
+activate OracleConn
+OracleConn --> Abstract : connection ready
+deactivate OracleConn
+
+Abstract -> OracleConn : checkDatabaseAndTableState()\nlogOnlineRedoLogSizes()
+activate OracleConn
+OracleConn --> Abstract : ok
+deactivate OracleConn
+
+Abstract -> OffsetCtx : getScn(), getSnapshotScn()
+activate OffsetCtx
+OffsetCtx --> Abstract : offsetScn, snapshotScn
+deactivate OffsetCtx
+
+Abstract -> OracleConn : getCurrentScn()
+activate OracleConn
+OracleConn --> Abstract : firstScn
+deactivate OracleConn
+
+Abstract -> Abstract : computeStartScnForFirstMiningSession\n(firstScn, offsetScn, snapshotScn)
+
+Abstract -> Unbuffered : executeLogMiningStreaming()
+activate Unbuffered
+
+' ─────────────────────────────────────────────────────
+== MAIN STREAMING LOOP (per iteration) ==
+' ─────────────────────────────────────────────────────
+
+loop while running
+
+    Unbuffered -> OracleConn : getDatabaseSystemTime()
+    activate OracleConn
+    OracleConn --> Unbuffered : dbTime
+    deactivate OracleConn
+
+    Unbuffered -> Metrics : setDatabaseTimeDifference(dbTime)
+
+    Unbuffered -> OracleConn : getCurrentScn()
+    activate OracleConn
+    OracleConn --> Unbuffered : currentScn
+    deactivate OracleConn
+
+    Unbuffered -> Metrics : setCurrentScn(currentScn)
+
+    ' ─── Log File Collection ───
+    group Log File Collection
+        Unbuffered -> Abstract : collectLogs(minLogScn, currentScn)
+        activate Abstract
+        Abstract -> LogFileColl : getLogs(lowerBoundsScn)
+        activate LogFileColl
+        LogFileColl --> Abstract : List<LogFile>
+        deactivate LogFileColl
+        Abstract -> OracleConn : redoLogStatusQuery()
+        activate OracleConn
+        OracleConn --> Abstract : redoLogStatuses
+        deactivate OracleConn
+        Abstract -> Metrics : setRedoLogStatuses(statuses)
+        deactivate Abstract
+    end
+
+    ' ─── Log Switch Check ───
+    group Log Switch Check
+        Abstract -> OracleConn : currentRedoLogSequenceQuery()
+        activate OracleConn
+        OracleConn --> Abstract : sequences
+        deactivate OracleConn
+        alt log switch detected
+            Abstract -> SessionCtx : endMiningSession()
+            activate SessionCtx
+            SessionCtx -> OracleDB : executeWithoutCommitting\n('BEGIN SYS.DBMS_LOGMNR.END_LOGMNR()')
+            activate OracleDB
+            OracleDB --> SessionCtx : ok
+            deactivate OracleDB
+            SessionCtx --> Abstract : sessionStarted=false
+            deactivate SessionCtx
+            note right of Abstract : needsNewSession = true
+        end
+    end
+
+    ' ─── Dictionary Write (CATALOG_IN_REDO only) ───
+    opt CATALOG_IN_REDO strategy
+        Abstract -> SessionCtx : writeDataDictionaryToRedoLogs()
+        activate SessionCtx
+        SessionCtx -> OracleConn : executeWithoutCommitting\n('BEGIN DBMS_LOGMNR_D.BUILD(...)')
+        activate OracleConn
+        OracleConn --> SessionCtx : ok
+        deactivate OracleConn
+        deactivate SessionCtx
+    end
+
+    ' ─── SCN Window Calculation ───
+    group SCN Window Calculation
+        Unbuffered -> Abstract : calculateUpperBounds\n(minLogScn, prevUpperBounds, currentScn)
+        activate Abstract
+        Abstract -> OracleConn : getRedoThreadState()
+        activate OracleConn
+        OracleConn --> Abstract : minOpenRedoThreadLastScn
+        deactivate OracleConn
+        Abstract -> Metrics : setOffsetScn(minLogScn)
+        Abstract --> Unbuffered : upperBoundsScn
+        deactivate Abstract
+    end
+
+    ' ─── Apply Logs to Session ───
+    group Apply Logs to Session
+        Unbuffered -> Abstract : applyLogsToSession()
+        activate Abstract
+        Abstract -> SessionCtx : removeAllLogFilesFromSession()
+        activate SessionCtx
+        SessionCtx -> OracleConn : removeAllLogFilesFromLogMinerSession()
+        activate OracleConn
+        OracleConn --> SessionCtx : ok
+        deactivate OracleConn
+        deactivate SessionCtx
+        Abstract -> SessionCtx : addLogFiles(sessionLogFiles)
+        activate SessionCtx
+        loop for each log file
+            SessionCtx -> OracleDB : executeWithoutCommitting\n('BEGIN sys.dbms_logmnr.add_logfile\n(LOGFILENAME=>..., OPTIONS=>ADDFILE)')
+            activate OracleDB
+            OracleDB --> SessionCtx : ok
+            deactivate OracleDB
+        end
+        deactivate SessionCtx
+        Abstract -> Metrics : setMinedLogFileNames()\nsetCurrentLogFileNames()
+        deactivate Abstract
+    end
+
+    ' ─── Start Mining Session ───
+    group Start Mining Session
+        Unbuffered -> Abstract : startMiningSession\n(minLogScn, Scn.NULL, attempts)
+        activate Abstract
+        Abstract -> Metrics : setLastMiningSessionRange(startScn, endScn)
+        Abstract -> SessionCtx : startSession(startScn, endScn, committedDataOnly)
+        activate SessionCtx
+        SessionCtx -> OracleDB : executeWithoutCommitting\n('BEGIN sys.dbms_logmnr.start_logmnr\n(startScn, endScn, options=>...)')
+        activate OracleDB
+        OracleDB --> SessionCtx : ok
+        deactivate OracleDB
+        SessionCtx --> Abstract : sessionStarted=true
+        deactivate SessionCtx
+        Abstract -> Metrics : setLastMiningSessionStartDuration()
+        deactivate Abstract
+    end
+
+    ' ─── Query Execution & Row Processing ───
+    group Query Execution & Row Processing
+        Unbuffered -> Abstract : executeAndProcessQuery\n(PreparedStatement, minCommitScn, upperBoundsScn)
+        activate Abstract
+
+        Abstract -> OracleDB : statement.executeQuery()\n[SELECT * FROM V$LOGMNR_CONTENTS]
+        activate OracleDB
+        OracleDB --> Abstract : ResultSet
+        deactivate OracleDB
+
+        Abstract -> Metrics : setLastDurationOfFetchQuery(duration)
+
+        loop while running && resultSet.next()
+            Abstract -> Metrics : setLastResultSetNextDuration()
+            Abstract -> EventRow : fromResultSet(resultSet, schema, config)
+            activate EventRow
+            note right of EventRow
+                Reads 26 columns:
+                SCN, SQL_REDO, OPERATION_CODE,
+                CHANGE_TIME, TX_ID, CSF,
+                TABLE_NAME, TABLESPACE_NAME, etc.
+                CSF=1 → assembles multi-row SQL
+                (up to 25 continuations / 100KB)
+            end note
+            EventRow --> Abstract : LogMinerEventRow
+            deactivate EventRow
+
+            Abstract -> Abstract : processEvent(event)
+
+            alt START transaction
+                Abstract -> Abstract : handleStartEvent(event)
+            else COMMIT
+                Abstract -> Abstract : handleCommitEvent(event)\n[UnbufferedImpl flushes TransactionCommitConsumer]
+                Abstract -> OffsetCtx : setCommitScn(commitScn)
+                Abstract -> Metrics : setCommitScn(commitScn)
+            else ROLLBACK
+                Abstract -> Abstract : handleRollbackEvent(event)
+            else DDL (schema change)
+                Abstract -> OffsetCtx : setEventScn()\nsetRedoThread()\nsetRsId()
+                Abstract -> Dispatcher : dispatchSchemaChangeEvent\n(partition, offset, tableId, emitter)
+                activate Dispatcher
+                Dispatcher --> Abstract : ok
+                deactivate Dispatcher
+            else DML (INSERT / UPDATE / DELETE)
+                Abstract -> Abstract : getTableForDataEvent(event)
+                Abstract -> DmlParser : parse(sqlRedo, table)
+                activate DmlParser
+                DmlParser --> Abstract : DmlEvent
+                deactivate DmlParser
+                Abstract -> Dispatcher : dispatchDataChangeEvent\n(partition, offset, tableId, emitter)
+                activate Dispatcher
+                Dispatcher --> Abstract : ok
+                deactivate Dispatcher
+                Abstract -> Metrics : incrementTotalChangesCount()
+            else LOB / XML events
+                Abstract -> Abstract : handleSelectLobLocatorEvent /\nhandleLobWriteEvent /\nhandleXmlBeginEvent etc.
+            end
+        end
+
+        Abstract -> Metrics : updateStreamingMetrics()\n[setLastCapturedDmlCount, setLastProcessedRowsCount]
+        Abstract -> Abstract : checkForStaleOffsets(getActiveTransactionIds)
+        Abstract --> Unbuffered : minCommitScn
+        deactivate Abstract
+    end
+
+    ' ─── Memory Stats & Pause ───
+    group Memory Stats & Pause
+        Unbuffered -> Abstract : captureJdbcSessionMemoryStatistics()
+        activate Abstract
+        Abstract -> OracleConn : getSessionStatisticByName\n('session uga/pga memory')
+        activate OracleConn
+        OracleConn --> Abstract : ugaMemory, pgaMemory
+        deactivate OracleConn
+        Abstract -> Metrics : setUserGlobalAreaMemory()\nsetProcessGlobalAreaMemory()
+        deactivate Abstract
+        Abstract -> Metrics : setLastBatchProcessingDuration()
+        Abstract -> Abstract : pauseBetweenMiningSessions()\n[Metronome.sleep(sleepTimeMs)]
+    end
+
+    ' ─── SCN Advancement ───
+    group SCN Advancement
+        Unbuffered -> Unbuffered : minLogScn =\ncomputeResumeScnAndUpdateOffsets\n(minLogScn, minCommitScn)
+        note right of Unbuffered
+            Auto-tuning:
+            incrementBatchSize() if DB is ahead
+            decrementBatchSize() if batch overshoots
+            incrementSleepTime() / decrementSleepTime()
+        end note
+    end
+
+end
+
+' ─────────────────────────────────────────────────────
+== SESSION END ==
+' ─────────────────────────────────────────────────────
+
+Abstract -> SessionCtx : endMiningSession()
+activate SessionCtx
+SessionCtx -> OracleDB : executeWithoutCommitting\n('BEGIN SYS.DBMS_LOGMNR.END_LOGMNR()')
+activate OracleDB
+OracleDB --> SessionCtx : ok
+deactivate OracleDB
+SessionCtx --> Abstract : sessionStarted=false\ncurrentSessionStartScn=Scn.NULL\ncurrentSessionEndScn=Scn.NULL
+deactivate SessionCtx
+
+Unbuffered --> Abstract : streaming complete
+deactivate Unbuffered
+Abstract --> Connector : done
+deactivate Abstract
+
+@enduml

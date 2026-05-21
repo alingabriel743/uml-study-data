@@ -1,0 +1,225 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #F1F3F5
+    NoteBackgroundColor #FFF3CD
+    NoteBorderColor #FFCA2C
+}
+
+title Trace Creation for Agent Run
+
+participant "Runner" as runner
+participant "TraceCtxManager" as ctx_mgr
+participant "create_trace_for_run()" as create_trace
+participant "Scope\n(contextvar)" as scope
+participant "trace()" as trace_fn
+participant "DefaultTraceProvider" as provider
+participant "TraceImpl / NoOpTrace" as trace_impl
+participant "SpanImpl / NoOpSpan" as span_impl
+participant "OpenAIChatCompletionsModel" as llm_model
+participant "OpenAISTTModel" as stt_model
+participant "SynchronousMultiTracingProcessor" as multi_proc
+
+== Resolve Trace Settings ==
+
+runner -> runner: _run_impl()
+activate runner
+
+runner -> runner: resolve_trace_settings(run_state, run_config)
+note right of runner
+  Returns: workflow_name, trace_id,
+  group_id, metadata, trace_config
+end note
+
+== Enter Trace Context ==
+
+runner -> ctx_mgr: __enter__(workflow_name, trace_id,\ngroup_id, metadata, tracing,\ndisabled, trace_state, reattach_resumed_trace)
+activate ctx_mgr
+
+ctx_mgr -> create_trace: create_trace_for_run(workflow_name, trace_id,\ngroup_id, metadata, tracing,\ndisabled, trace_state, reattach_resumed_trace)
+activate create_trace
+
+create_trace -> scope: get_current_trace()
+activate scope
+scope --> create_trace: current_trace (or None)
+deactivate scope
+
+alt current trace already active
+    create_trace --> ctx_mgr: None\n(skip — prevents double-wrapping)
+else reattach_resumed_trace AND trace_id was previously started
+    create_trace -> create_trace: reattach_trace(trace_state, tracing_api_key)
+    create_trace --> ctx_mgr: existing Trace (reattached)
+else create new trace
+    create_trace -> trace_fn: trace(workflow_name, trace_id,\ngroup_id, metadata, tracing, disabled)
+    activate trace_fn
+
+    trace_fn -> provider: get_current_trace() [warns if already active]
+    activate provider
+
+    provider -> provider: create_trace(name, trace_id,\ngroup_id, metadata, tracing, disabled)
+    provider -> provider: _refresh_disabled_flag()\n(checks OPENAI_AGENTS_DISABLE_TRACING env\nor set_tracing_disabled() flag)
+
+    alt tracing disabled (env / RunConfig / manual flag)
+        provider --> trace_fn: NoOpTrace()
+    else tracing enabled
+        provider -> provider: trace_id = trace_id or gen_trace_id()\n(format: "trace_<32hex>")
+        provider --> trace_fn: TraceImpl(name, trace_id, group_id,\nmetadata, processor=_multi_processor, tracing_api_key)
+        note right of provider
+          TraceImpl holds reference to
+          SynchronousMultiTracingProcessor
+          for fan-out to all registered
+          tracing processors
+        end note
+    end
+
+    deactivate provider
+    trace_fn --> create_trace: Trace (TraceImpl or NoOpTrace)
+    deactivate trace_fn
+
+    create_trace --> ctx_mgr: Trace
+end
+
+deactivate create_trace
+
+ctx_mgr -> trace_impl: trace.start(mark_as_current=True)
+activate trace_impl
+note right of trace_impl
+  Registers trace in Scope contextvar.
+  trace_id format: "trace_<32hex>"
+  (uuid4().hex)
+end note
+trace_impl -> scope: set_current_trace(self)
+deactivate trace_impl
+
+deactivate ctx_mgr
+
+== Create task_span (immediately after entry) ==
+
+runner -> provider: create_span(TaskSpanData(name=workflow_name))
+activate provider
+provider -> scope: get_current_trace() / get_current_span()
+scope --> provider: current trace context
+provider --> runner: SpanImpl (task_span)
+deactivate provider
+
+runner -> span_impl: task_span.start(mark_as_current=True)
+activate span_impl
+span_impl -> scope: set_current_span(task_span)
+note right of span_impl
+  span_id format: "span_<24hex>"
+  (uuid4().hex[:24])
+end note
+deactivate span_impl
+
+== Agent Loop: Create agent_span ==
+
+loop for each agent execution (when current_span is None)
+    runner -> provider: agent_span(name=agent.name,\nhandoffs=[...], tools=[...], output_type)
+    activate provider
+
+    provider -> scope: resolve parent span from contextvar
+    scope --> provider: parent (task_span or current_span)
+
+    alt parent is NoOpTrace or NoOpSpan
+        provider --> runner: NoOpSpan(AgentSpanData)
+    else tracing enabled
+        provider --> runner: SpanImpl(trace_id, span_id, parent_id,\nprocessor=_multi_processor,\nAgentSpanData, tracing_api_key, trace_metadata)
+    end
+    deactivate provider
+
+    runner -> span_impl: agent_span.start(mark_as_current=True)
+    activate span_impl
+    span_impl -> scope: set_current_span(agent_span)
+    deactivate span_impl
+
+    == LLM Call: Create generation_span ==
+
+    runner -> llm_model: get_response(...)
+    activate llm_model
+
+    llm_model -> provider: generation_span(model, input,\noutput, model_config, usage)
+    activate provider
+    note right of provider
+      Child of current agent_span.
+      Captures LLM inputs/outputs —
+      suppressible via RunConfig.
+      trace_include_sensitive_data
+    end note
+    provider --> llm_model: SpanImpl (generation_span)
+    deactivate provider
+
+    llm_model -> span_impl: generation_span.start(mark_as_current=True)
+    llm_model --> runner: response
+    deactivate llm_model
+
+    == Audio Input: Create transcription_span (voice pipelines only) ==
+
+    opt voice pipeline — audio input present
+        runner -> stt_model: transcribe() / _start_turn()
+        activate stt_model
+
+        stt_model -> provider: transcription_span(model, input,\ninput_format="pcm", output, model_config)
+        activate provider
+        note right of provider
+          Child of current span.
+          Input stored as base64 PCM —
+          suppressible via VoicePipelineConfig.
+          trace_include_sensitive_audio_data
+        end note
+        provider --> stt_model: SpanImpl (transcription_span)
+        deactivate provider
+
+        stt_model -> span_impl: transcription_span.start(mark_as_current=True)
+        stt_model --> runner: transcription result
+        deactivate stt_model
+    end
+end
+
+== Exit Trace Context ==
+
+runner -> ctx_mgr: __exit__()
+activate ctx_mgr
+ctx_mgr -> trace_impl: trace.finish(reset_current=True)
+activate trace_impl
+trace_impl -> scope: reset_current_trace(token)
+trace_impl -> multi_proc: on_trace_end(trace)\n(fan-out to all registered processors)
+note right of multi_proc
+  BatchTraceProcessor batches and exports
+  spans to OpenAI backend asynchronously.
+  Call flush_traces() for immediate delivery.
+end note
+deactivate trace_impl
+deactivate ctx_mgr
+deactivate runner
+
+note over runner, multi_proc
+  **Span Hierarchy:**  Trace → task_span → agent_span → generation_span | transcription_span
+  **Disable tracing:**  OPENAI_AGENTS_DISABLE_TRACING=1 | set_tracing_disabled(True) | RunConfig.tracing_disabled=True
+  **Context propagation:**  Python contextvar (Scope) — concurrency-safe for async/await
+end note
+
+@enduml

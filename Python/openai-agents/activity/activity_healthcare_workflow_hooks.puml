@@ -1,0 +1,244 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontStyle bold
+    TitleFontColor #212529
+}
+
+title Healthcare Workflow Agent and Tool Hooks
+
+|Workflow|
+start
+:run_healthcare_support_workflow(scenario_id, approval_handler);
+
+|HealthcareSupportContext|
+:emit("scenario_loaded", scenario_id, description, transcript);
+
+|Workflow|
+:Create SQLiteSession (conversation_session);
+
+|HealthcareSupportContext|
+:emit("memory_ready", session_id);
+
+|Workflow|
+:Instantiate **WorkflowHooks()**
+ — WorkflowHooks extends RunHooks[HealthcareSupportContext];
+:Create UnixLocalSandboxClient
+ + sandbox with Manifest (case, policies, output);
+
+|HealthcareSupportContext|
+:emit("sandbox_ready", backend="unix_local", workspace);
+
+|Workflow|
+:build_policy_sandbox_agent(skills_root)
+ → policy_agent.as_tool(hooks=hooks)
+ — sandbox_policy_packet tool;
+:build_orchestrator(sandbox_policy_tool)
+ → orchestrator agent;
+
+|HealthcareSupportContext|
+:emit("trace_ready", trace_id, trace_url);
+
+|Runner|
+note right
+  **hooks= parameter shared across:**
+  • Runner.run(orchestrator, ...)
+  • Runner.run(orchestrator, state, ...)  [resume]
+  • Runner.run(memory_recap_agent, ...)
+  • policy_agent.as_tool(hooks=hooks)
+end note
+:Runner.run(orchestrator, prompt, context,
+ session, hooks=hooks);
+
+|WorkflowHooks|
+:**[HOOK] on_agent_start**
+(AgentHookContext[HealthcareSupportContext], agent);
+
+|HealthcareSupportContext|
+:emit("agent_start", agent=agent.name);
+
+|Runner|
+:Invoke LLM for current agent turn;
+
+repeat
+  if (LLM output type?) then (tool_call)
+
+    |WorkflowHooks|
+    :**[HOOK] on_tool_start**
+    (RunContextWrapper → cast ToolContext,
+     agent, tool);
+
+    |HealthcareSupportContext|
+    :emit("tool_start",
+     agent, tool.name,
+     call_id=tool_context.tool_call_id,
+     arguments=tool_context.tool_arguments);
+
+    |Runner|
+    :Execute tool
+    (sandbox_policy_tool / function tool);
+
+    |WorkflowHooks|
+    :**[HOOK] on_tool_end**
+    (RunContextWrapper → cast ToolContext,
+     agent, tool, result);
+
+    |HealthcareSupportContext|
+    :emit("tool_end",
+     agent, tool.name,
+     call_id=tool_context.tool_call_id,
+     output=_to_jsonable(result));
+
+    |Runner|
+    :Append tool result to conversation;
+    :Invoke LLM again (next turn);
+
+  elseif (LLM output type?) then (handoff)
+
+    |Runner|
+    :Update current agent to handoff target;
+    note right
+      on_handoff() is **not overridden**
+      in WorkflowHooks — no-op.
+      on_agent_start fires for new agent.
+    end note
+
+    |WorkflowHooks|
+    :**[HOOK] on_agent_start**
+    (AgentHookContext, new_agent);
+
+    |HealthcareSupportContext|
+    :emit("agent_start", agent=new_agent.name);
+
+    |Runner|
+    :Invoke LLM for new agent turn;
+
+  else (final_output)
+  endif
+
+repeat while (LLM output is tool_call or handoff?) is (yes)
+->no (final_output);
+
+|WorkflowHooks|
+:**[HOOK] on_agent_end**
+(RunContextWrapper[HealthcareSupportContext],
+ agent, output);
+note right
+  _to_jsonable(output):
+  • Pydantic BaseModel → model_dump(mode="json")
+  • dict/list/str/int/float/bool/None → as-is
+  • fallback → json.loads(json.dumps(..., default=str))
+end note
+
+|HealthcareSupportContext|
+:emit("agent_end",
+ agent=agent.name,
+ output=_to_jsonable(output));
+
+|Workflow|
+:result ← RunResult (may have interruptions);
+
+' ── INTERRUPTION RESOLUTION LOOP ──────────────────────────────
+while (result.interruptions present?) is (yes — max 5 rounds)
+
+  |Workflow|
+  :state = result.to_state()
+  Save pending_state.json;
+
+  |HealthcareSupportContext|
+  :emit("human_approval_requested",
+   request={agent, tool, arguments});
+
+  |Workflow|
+  if (approval_handler provided?) then (no — auto-approve)
+    :approved = True (auto);
+  else (yes)
+    :approved = await approval_handler(request);
+  endif
+
+  if (approved?) then (yes)
+    :context.human_handoff_approved = True
+     state.approve(interruption);
+
+    |HealthcareSupportContext|
+    :emit("human_approval_resolved",
+     approved=True, request=request);
+
+  else (no)
+    |Workflow|
+    :context.human_handoff_approved = False
+     state.reject(interruption);
+
+    |HealthcareSupportContext|
+    :emit("human_approval_resolved",
+     approved=False, request=request);
+  endif
+
+  |Runner|
+  :Runner.run(orchestrator, state,
+   session, hooks=hooks)
+   [WorkflowHooks fire again as in Agent Loop above];
+
+endwhile (no interruptions)
+
+' ── POST-LOOP ─────────────────────────────────────────────────
+|Workflow|
+:resolution = result.final_output_as(CaseResolution);
+:_copy_output_files()
+ — copy sandbox output/ artifacts
+ — generate fallback docs if missing
+   (policy_findings.md, human_review_checklist.md);
+
+|HealthcareSupportContext|
+:emit("artifacts_ready", files=[...]);
+
+|Runner|
+:Runner.run(memory_recap_agent, recap_prompt,
+ context, session, hooks=hooks)
+ [WorkflowHooks on_agent_start / on_tool_start /
+  on_tool_end / on_agent_end fire as above];
+
+|Workflow|
+:recap = memory_result.final_output_as(MemoryRecap);
+:Build payload dict
+ {scenario_id, resolution, memory_recap,
+  artifacts, trace_id, session_memory_items};
+
+|HealthcareSupportContext|
+:emit("workflow_complete", payload=payload);
+
+' ── FINALLY ───────────────────────────────────────────────────
+|Workflow|
+:finally: sandbox_client.delete(sandbox);
+
+|HealthcareSupportContext|
+:emit("sandbox_stopped", backend="unix_local");
+
+|Workflow|
+stop
+
+@enduml

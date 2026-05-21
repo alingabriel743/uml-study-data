@@ -1,0 +1,257 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 2
+skinparam sequenceParticipantBackgroundColor #F8F9FA
+skinparam sequenceParticipantBorderColor #495057
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceGroupBackgroundColor #E9ECEF
+skinparam sequenceGroupBorderColor #6C757D
+skinparam sequenceGroupFontColor #212529
+skinparam noteBorderColor #ADB5BD
+skinparam noteBackgroundColor #FFF9E6
+
+title Memory, OCR, and UI Detection Flow
+
+participant "Caller\n(Agent / Tool)" as Caller #D4EDDA
+participant "procmem_scanner" as PMS #F8F9FA
+participant "ocr_utils" as OCR #F8F9FA
+participant "ui_detect" as UID #F8F9FA
+participant "adb_ui" as ADB #F8F9FA
+participant "ljqCtrl" as LJQ #F8F9FA
+participant "YARA" as YARA #FFF3CD
+participant "kernel32\n(WinAPI)" as K32 #FFF3CD
+participant "RapidOCR\nEngine" as ROCR #FFF3CD
+participant "YOLO\nModel" as YOLO #FFF3CD
+participant "uiautomator2\n/ ADB shell" as U2 #FFF3CD
+participant "win32api /\nwin32gui" as W32 #FFF3CD
+participant "PIL.ImageGrab\n/ cv2" as PIL #FFF3CD
+
+== Memory Scan Path (Windows, 64-bit) ==
+
+Caller -> PMS: scan_memory(pid, pattern, context_size=256,\nmode='auto', llm_mode=True)
+activate PMS
+
+PMS -> YARA: build_rules(pattern, mode)
+activate YARA
+note right of YARA: Compiles hex or\nstring YARA rule
+YARA --> PMS: rules
+deactivate YARA
+
+PMS -> K32: OpenProcess(PROCESS_QUERY|VM_READ, pid)
+activate K32
+K32 --> PMS: h_proc
+deactivate K32
+
+loop for each memory region
+    PMS -> K32: VirtualQueryEx(h_proc, curr_addr)
+    activate K32
+    K32 --> PMS: MEMORY_BASIC_INFORMATION\n{BaseAddress, RegionSize, State, Protect}
+    deactivate K32
+
+    PMS -> K32: ReadProcessMemory(h_proc, BaseAddress, buf, RegionSize)
+    activate K32
+    K32 --> PMS: raw bytes
+    deactivate K32
+
+    PMS -> YARA: rules.match(data=raw_bytes)
+    activate YARA
+    YARA --> PMS: matches [{offset, matched_data}]
+    deactivate YARA
+
+    PMS -> PMS: format_llm_context(data, offset,\nbase_addr, length=64)
+    note right of PMS: Produces:\n{address, offset,\nhex, ascii, hit_pos}
+end
+
+PMS -> K32: CloseHandle(h_proc)
+activate K32
+K32 --> PMS: ok
+deactivate K32
+
+PMS --> Caller: list[dict{address, offset, hex, ascii, hit_pos}]
+deactivate PMS
+
+== Screen OCR Path ==
+
+Caller -> OCR: ocr_screen(bbox=None|tuple)
+activate OCR
+
+OCR -> PIL: ImageGrab.grab(bbox)
+activate PIL
+PIL --> OCR: PIL Image
+deactivate PIL
+
+OCR -> OCR: ocr_image(img, enhance=False)
+activate OCR
+OCR -> OCR: _get_rapid() — lazy init singleton
+OCR -> ROCR: engine(np.array(img))
+activate ROCR
+ROCR --> OCR: (result, elapse)
+deactivate ROCR
+OCR -> OCR: _strip_cjk_spaces(joined_lines)
+OCR --> OCR: {text, lines, details}
+deactivate OCR
+
+OCR --> Caller: {text: str, lines: [str],\ndetails: [{bbox, text, conf: float}]}
+deactivate OCR
+
+== Window OCR Path (RDP-safe) ==
+
+Caller -> OCR: ocr_window(hwnd)
+activate OCR
+
+OCR -> W32: GetWindowRect(hwnd)
+activate W32
+W32 --> OCR: (left, top, right, bottom)
+deactivate W32
+
+OCR -> W32: user32.PrintWindow(hwnd, hdc, 3)
+activate W32
+note right of W32: RDP-safe capture;\navoiding ImageGrab
+W32 --> OCR: bitmap bits
+deactivate W32
+
+OCR -> PIL: Image.frombuffer('RGB', size, bits)
+activate PIL
+PIL --> OCR: PIL Image
+deactivate PIL
+
+OCR -> OCR: ocr_image(img) — delegates to _ocr_rapid
+activate OCR
+OCR --> OCR: {text, lines, details}
+deactivate OCR
+
+OCR --> Caller: {text: str, lines: [str], details: [...]}
+deactivate OCR
+
+== YOLO UI Element Detection Path ==
+
+Caller -> UID: detect_ui_elements(image_path,\nmodel_path, conf_threshold=0.25)
+activate UID
+
+UID -> YOLO: YOLO(model_path)
+activate YOLO
+note right of YOLO: Loads OmniParser\nicon_detect weights
+YOLO --> UID: model instance
+deactivate YOLO
+
+UID -> YOLO: model(image_path, conf=threshold, verbose=False)
+activate YOLO
+YOLO --> UID: results
+deactivate YOLO
+
+UID -> UID: extract boxes from results
+UID --> Caller: detections: [{bbox:[x1,y1,x2,y2],\nconfidence, class}]
+deactivate UID
+
+opt HAS_OCR is True
+    Caller -> UID: ocr_text(image_path)
+    activate UID
+    UID -> ROCR: ocr_engine(image_path)
+    activate ROCR
+    ROCR --> UID: (result, _)
+    deactivate ROCR
+    UID --> Caller: [{text, bbox, confidence}]
+    deactivate UID
+end
+
+Caller -> UID: visualize(image_path, detections,\nocr_results, output_path)
+activate UID
+UID -> UID: draw red rects (UI boxes)\n+ blue polygons (OCR text)
+note right of UID: Saves annotated\nPNG + JSON sidecar
+UID --> Caller: saved visualization files
+deactivate UID
+
+== Android ADB UI Dump Path ==
+
+Caller -> ADB: ui(keyword=None, clickable_only=False, raw=False)
+activate ADB
+
+alt uiautomator2 available
+    ADB -> U2: u2.connect() → d.dump_hierarchy()
+    activate U2
+    U2 --> ADB: xml_str (UI hierarchy)
+    deactivate U2
+else fallback to native ADB
+    ADB -> U2: adb shell uiautomator dump\n+ adb pull ui.xml
+    activate U2
+    U2 --> ADB: xml_str
+    deactivate U2
+end
+
+ADB -> ADB: _parse_xml(xml_str, keyword, clickable_only, raw)
+note right of ADB: ET.fromstring → iter('node')\nfilter by pkg/clickable/keyword\nparse bounds regex → cx,cy
+
+ADB --> Caller: print nodes OR [{text, click, edit,\ncx, cy, cls, rid}]
+deactivate ADB
+
+Caller -> ADB: tap(cx, cy)
+activate ADB
+ADB -> U2: adb shell input tap x y
+activate U2
+U2 --> ADB: ok
+deactivate U2
+ADB --> Caller: (done)
+deactivate ADB
+
+== ljqCtrl Mouse/Keyboard Control Path ==
+
+Caller -> LJQ: FindBlock(template_fn, wrect=region_str|bbox)
+activate LJQ
+
+LJQ -> LJQ: GetWRect(region_str) → [l, u, r, b]
+LJQ -> PIL: ImageGrab.grab(wrect)
+activate PIL
+PIL --> LJQ: screen PIL Image
+deactivate PIL
+
+LJQ -> PIL: cv2.matchTemplate(screen_bgr, template_bgr,\nTM_CCOEFF_NORMED)
+activate PIL
+PIL --> LJQ: max_val, max_loc
+deactivate PIL
+
+LJQ --> Caller: (obj_center_physical, max_val > threshold)
+deactivate LJQ
+
+Caller -> LJQ: Click(x, y)
+activate LJQ
+LJQ -> W32: win32api.SetCursorPos\n((x*dpi_scale, y*dpi_scale))
+activate W32
+W32 --> LJQ: ok
+deactivate W32
+LJQ -> W32: win32api.mouse_event(LEFTDOWN)\n+ mouse_event(LEFTUP)
+activate W32
+W32 --> LJQ: ok
+deactivate W32
+LJQ --> Caller: (done)
+deactivate LJQ
+
+Caller -> LJQ: Press(cmd='ctrl+v', staytime=0)
+activate LJQ
+note right of LJQ: Parses 'ctrl+v' via\nVK_CODE dict lookup
+LJQ -> W32: keybd_event(VK_CODE[key], 0, 0, 0)\nfor each key in cmd.split('+')
+activate W32
+W32 --> LJQ: ok
+deactivate W32
+LJQ -> W32: keybd_event(VK_CODE[key], 0,\nKEYEVENTF_KEYUP, 0) in reverse
+activate W32
+W32 --> LJQ: ok
+deactivate W32
+LJQ --> Caller: (done)
+deactivate LJQ
+
+@enduml

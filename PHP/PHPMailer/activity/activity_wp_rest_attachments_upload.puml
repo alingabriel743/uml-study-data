@@ -1,0 +1,349 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #F9A825
+    FontColor #212529
+}
+skinparam ArrowColor #495057
+skinparam partition {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+title WordPress REST Attachments Upload & Processing\n<size:11>(WP_REST_Attachments_Controller — WordPress 4.7.0+)</size>
+
+'──────────────────────────────────────────────────────────────
+'  FLOW 1 — POST /wp/v2/media  →  create_item()
+'──────────────────────────────────────────────────────────────
+
+|#DDEEFF|Client|
+start
+:POST /wp/v2/media;
+
+|#F0F4F0|WP_REST_Attachments_Controller|
+:create_item_permissions_check($request);
+
+if (User logged in with\nbase post permissions?) then (no)
+    #FFCCCC:WP_Error: rest_cannot_create\n(HTTP 400);
+    stop
+else (yes)
+endif
+
+if (current_user_can\n('upload_files')?) then (no)
+    #FFCCCC:WP_Error: rest_cannot_create\n(HTTP 400);
+    stop
+else (yes)
+endif
+
+if (request['post'] set?) then (yes)
+    if (current_user_can\n('edit_post', post_id)?) then (no)
+        #FFCCCC:WP_Error: rest_cannot_edit\n(HTTP 403);
+        stop
+    else (yes)
+    endif
+else (no)
+endif
+
+if (Parent post type is\n'revision' or 'attachment'?) then (yes)
+    #FFCCCC:WP_Error: rest_invalid_param\n(HTTP 400);
+    stop
+else (no)
+endif
+
+:insert_attachment($request);
+note right
+  Delegates upload handling and
+  DB record creation to sub-routine
+end note
+
+'── insert_attachment internal ──
+
+:get_file_params() → $files\nget_headers() → $headers;
+
+if ($files not empty?\n(multipart/form-data)) then (yes — multipart upload)
+
+    '── upload_from_file ──
+    :upload_from_file($files, $headers);
+
+    if (Content-MD5 header\npresent?) then (yes)
+        :md5_file($files['file']['tmp_name']);
+        if (Hash matches\nContent-MD5?) then (no)
+            #FFCCCC:WP_Error: rest_upload_hash_mismatch\n(HTTP 412);
+            stop
+        else (yes)
+        endif
+    else (no)
+    endif
+
+    :check_upload_size($files['file']);
+    note right: Enforces multisite\nstorage quota
+
+    if (Quota exceeded?) then (yes)
+        #FFCCCC:WP_Error: upload quota exceeded;
+        stop
+    else (no)
+    endif
+
+    |#FFF5E6|WP Core Functions|
+    :wp_handle_upload($files['file'], $overrides);
+
+    if (Upload error?) then (yes)
+        #FFCCCC:WP_Error: rest_upload_unknown_error\n(HTTP 500);
+        stop
+    else (no)
+    endif
+
+    :Return {file, url, type};
+
+else (no — raw body upload)
+
+    '── upload_from_data ──
+    |#F0F4F0|WP_REST_Attachments_Controller|
+    :upload_from_data($request->get_body(), $headers);
+
+    if (Body data empty?) then (yes)
+        #FFCCCC:WP_Error: rest_upload_no_data\n(HTTP 400);
+        stop
+    else (no)
+    endif
+
+    if (Content-Type header\nmissing?) then (yes)
+        #FFCCCC:WP_Error: rest_upload_no_content_type\n(HTTP 400);
+        stop
+    else (no)
+    endif
+
+    if (Content-Disposition\nheader missing?) then (yes)
+        #FFCCCC:WP_Error: rest_upload_no_content_disposition\n(HTTP 400);
+        stop
+    else (no)
+    endif
+
+    :get_filename_from_disposition\n($headers['content_disposition']);
+    note right
+      Static method — iterates disposition values,
+      splits on ';', parses key=value attributes,
+      unquotes filename per RFC 6266
+    end note
+
+    if (Filename extracted\nsuccessfully?) then (no)
+        #FFCCCC:WP_Error: rest_upload_invalid_disposition\n(HTTP 400);
+        stop
+    else (yes)
+    endif
+
+    if (Content-MD5 header\npresent?) then (yes)
+        :md5($data);
+        if (Hash matches\nContent-MD5?) then (no)
+            #FFCCCC:WP_Error: rest_upload_hash_mismatch\n(HTTP 412);
+            stop
+        else (yes)
+        endif
+    else (no)
+    endif
+
+    :check_upload_size($file_data);
+    if (Quota exceeded?) then (yes)
+        #FFCCCC:WP_Error: upload quota exceeded;
+        stop
+    else (no)
+    endif
+
+    |#FFF5E6|WP Core Functions|
+    :wp_tempnam($filename) → $tmpfname;
+    :fopen($tmpfname, 'w+') → write body → fclose;
+
+    if (Cannot open temp\nfile handle?) then (yes)
+        #FFCCCC:WP_Error: rest_upload_file_error\n(HTTP 500);
+        stop
+    else (no)
+    endif
+
+    :wp_handle_sideload($file_data,\n{test_form: false});
+
+    if (Sideload error?) then (yes)
+        :unlink($tmpfname);
+        #FFCCCC:WP_Error: rest_upload_sideload_error\n(HTTP 500);
+        stop
+    else (no)
+    endif
+
+    :Return {file, url, type};
+
+endif
+
+'── back in insert_attachment ──
+
+|#F0F4F0|WP_REST_Attachments_Controller|
+:wp_basename(file) → $name\npathinfo($name) → $name_parts;
+:Extract $url, $type, $file from upload result;
+
+|#FFF5E6|WP Core Functions|
+:wp_read_image_metadata($file)\n→ $image_meta (EXIF / IPTC);
+
+|#F0F4F0|WP_REST_Attachments_Controller|
+if (Image metadata\npresent?) then (yes)
+    :Auto-populate request['title'] and\nrequest['caption'] from EXIF/IPTC\n(if fields are currently empty);
+else (no)
+endif
+
+:prepare_item_for_database($request)\n→ $attachment stdClass;
+:Set $attachment->post_mime_type = $type\nSet $attachment->guid = $url;
+
+if (post_title empty?) then (yes)
+    :Derive title from filename\nvia preg_replace (strip extension);
+else (no)
+endif
+
+|#FFF5E6|WP Core Functions|
+:wp_insert_attachment(\n  wp_slash($attachment), $file,\n  $parent=0, $wp_error=true, $fire_after=false\n) → $id;
+
+if (WP_Error returned?) then (yes)
+    if (db_update_error?) then (yes)
+        #FFCCCC:WP_Error (HTTP 500 — DB failure);
+    else (no)
+        #FFCCCC:WP_Error (HTTP 400 — bad params);
+    endif
+    stop
+else (no)
+endif
+
+:get_post($id) → $attachment;
+
+|#F0F4F0|WP_REST_Attachments_Controller|
+:fire do_action('rest_insert_attachment',\n  attachment, request, is_new=true);
+note right
+  Attachment DB record created.
+  Hooks may extend metadata at this point.
+end note
+
+:Return {attachment_id: $id, file: $file}\nto create_item();
+
+'── back in create_item ──
+if (request['alt_text'] set?) then (yes)
+    |#FFF5E6|WP Core Functions|
+    :update_post_meta(id,\n'_wp_attachment_image_alt', alt_text);
+    |#F0F4F0|WP_REST_Attachments_Controller|
+else (no)
+endif
+
+if (Schema has 'meta' &&\nrequest['meta'] set?) then (yes)
+    :meta->update_value(\n  request['meta'], attachment_id);
+else (no)
+endif
+
+:update_additional_fields_for_object\n(attachment, request);
+:fire do_action('rest_after_insert_attachment',\n  attachment, request, is_new=true);
+
+|#FFF5E6|WP Core Functions|
+:wp_after_insert_post(attachment, false, null);
+
+|#F0F4F0|WP_REST_Attachments_Controller|
+if (REST_REQUEST constant\ndefined?) then (yes)
+    :Set response header:\nX-WP-Upload-Attachment-ID: {id};
+    note right
+      Enables client-side recovery
+      if a fatal error occurs during
+      image sub-size generation
+    end note
+else (no)
+endif
+
+|#FFF5E6|WP Core Functions|
+:Include wp-admin/includes/media.php\nand image.php;
+:wp_generate_attachment_metadata\n(attachment_id, file);
+:wp_update_attachment_metadata\n(attachment_id, metadata);
+
+|#F0F4F0|WP_REST_Attachments_Controller|
+:prepare_item_for_response(attachment, request);
+:rest_ensure_response(response);
+:Set response status = 201\nSet Location header;
+
+|#DDEEFF|Client|
+#CCFFCC:Receive WP_REST_Response\n(HTTP 201 Created)\n+ X-WP-Upload-Attachment-ID header;
+note right
+  Response body contains
+  full attachment object
+  (fields, meta, links)
+end note
+
+stop
+
+'──────────────────────────────────────────────────────────────
+'  FLOW 2 — POST /wp/v2/media/{id}/post-process  →  post_process_item()
+'──────────────────────────────────────────────────────────────
+
+|#DDEEFF|Client|
+start
+:POST /wp/v2/media/{id}/post-process\n(action: "create-image-subsizes");
+note right
+  Used to retry or resume sub-size
+  generation after a PHP fatal — client
+  uses X-WP-Upload-Attachment-ID to
+  know which ID to retry
+end note
+
+|#F0F4F0|WP_REST_Attachments_Controller|
+:post_process_item_permissions_check($request)\n→ delegates to update_item_permissions_check;
+
+if (User can edit\nthis attachment?) then (no)
+    #FFCCCC:Return 403 Forbidden;
+    stop
+else (yes)
+endif
+
+if (request['action'] ==\n'create-image-subsizes'?) then (yes)
+
+    |#FFF5E6|WP Core Functions|
+    :Include wp-admin/includes/image.php;
+    :wp_update_image_subsizes(request['id']);
+    note right
+      Generates all registered
+      thumbnail / sub-sizes for
+      the attachment (images, PDFs)
+    end note
+
+else (no — unknown action)
+    |#F0F4F0|WP_REST_Attachments_Controller|
+endif
+
+|#F0F4F0|WP_REST_Attachments_Controller|
+:Set request['context'] = 'edit';
+:prepare_item_for_response(\n  get_post(request['id']), request);
+:Return WP_REST_Response;
+
+|#DDEEFF|Client|
+#CCFFCC:Receive WP_REST_Response\n(attachment data in edit context);
+stop
+
+@enduml

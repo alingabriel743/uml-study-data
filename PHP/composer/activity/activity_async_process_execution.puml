@@ -1,0 +1,152 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title Async Process Execution & Job Queue
+
+|Caller|
+start
+:Create Loop(HttpDownloader, ProcessExecutor);
+
+|Loop|
+:Loop::__construct()\nCall enableAsync() on ProcessExecutor & HttpDownloader;
+
+|ProcessExecutor|
+:enableAsync()\nSet allowAsync = true\nRead maxJobs from COMPOSER_MAX_PARALLEL_PROCESSES\n(clamped 1–50, default 10);
+
+|Caller|
+:Call executeAsync(command, cwd);
+
+|ProcessExecutor|
+if (allowAsync === false?) then (yes)
+    #FFCCCC:Throw LogicException\n"executeAsync requires a Loop-bound executor";
+    kill
+else (no)
+endif
+
+:Assign job ID (idGen++)\nCreate job:\n  {id, status=QUEUED, command, cwd};
+
+|React\\Promise|
+:new Promise(resolver, canceler)\n— resolver captures resolve/reject into job\n— canceler:\n  QUEUED → ABORTED (immediate)\n  STARTED → ABORTED + SIGINT + stop(1);
+
+|ProcessExecutor|
+:Attach .then() handlers\non resolve → check exit code\n    → COMPLETED or FAILED\n    → markJobDone() [runningJobs--]\non reject  → FAILED\n    → markJobDone() [runningJobs--];
+:Append job to $jobs[id];
+
+if (runningJobs < maxJobs?) then (yes)
+    :startJob(id);
+    if (job.status != QUEUED?) then (yes)
+        :Return (no-op guard);
+    else (no)
+        :Set job.status = STARTED\nrunningJobs++;
+        :Log async command (if IOInterface debug);
+        :Create Symfony\\Process\n(fromShellCommandline or new Process)\nwith command + cwd;
+        if (Process construction threw?) then (yes)
+            :job.reject(exception)\n[triggers FAILED path];
+        else (no)
+            :Store process in job['process'];
+            :process.start()  — non-blocking launch;
+            if (process.start() threw?) then (yes)
+                :job.reject(exception)\n[triggers FAILED path];
+            else (no)
+                :Process running\nJob is now STARTED;
+            endif
+        endif
+    endif
+else (no)
+    :Job stays QUEUED\n(will be auto-promoted\non next countActiveJobs() tick);
+endif
+
+:Return PromiseInterface<Process> to Caller;
+
+|Caller|
+:Accumulate promises[] from all executeAsync calls;
+:Call Loop::wait(promises[], ?ProgressBar);
+
+|Loop|
+:React\\Promise\\all(promises)\n— aggregate into single joined promise;
+:Register currentPromises[waitIndex] = promises;
+
+if (ProgressBar provided?) then (yes)
+    :Init ProgressBar\n(total = current active jobs);
+else (no)
+endif
+
+repeat
+
+    |ProcessExecutor|
+    note right
+      countActiveJobs() is the tick function.
+      Called each iteration — it both resolves
+      finished processes AND promotes queued jobs.
+    end note
+    :Iterate over all $jobs:;
+    if (status == STARTED\nAND process.isRunning() == false?) then (yes)
+        :Call job['resolve'](process)\n→ .then() fires:\n    exitCode 0 → resolve → COMPLETED\n    exitCode != 0 → resolve → FAILED\n    markJobDone() → runningJobs--;
+    else (no)
+    endif
+    if (status == STARTED?) then (yes)
+        :process.checkTimeout()\n(throws on timeout);
+    else (no)
+    endif
+    if (runningJobs < maxJobs\nAND status == QUEUED?) then (yes)
+        :startJob(job.id)\n[auto-promote queued job];
+    else (no)
+    endif
+    :Unset completed/failed jobs from $jobs[]\n(GC when no specific index queried)\nReturn count of jobs with status < COMPLETED;
+
+    |Loop|
+    :activeJobs =\n  httpDownloader.countActiveJobs()\n  + processExecutor.countActiveJobs();
+    if (ProgressBar AND ~0.1s elapsed?) then (yes)
+        :Update ProgressBar progress;
+    else (no)
+    endif
+
+repeat while (activeJobs == 0?) is (no)
+-> yes;
+
+if (ProgressBar?) then (yes)
+    :ProgressBar.finish();
+else (no)
+endif
+:unset currentPromises[waitIndex];
+
+if (Uncaught exception captured?) then (yes)
+    #FFCCCC:Re-throw exception to Caller;
+    kill
+else (no)
+endif
+
+|Caller|
+:All async jobs drained\n(each promise resolved COMPLETED or FAILED);
+stop
+
+@enduml

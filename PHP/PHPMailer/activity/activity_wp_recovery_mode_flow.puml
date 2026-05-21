@@ -1,0 +1,321 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #198754
+    EndColor #DC3545
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+skinparam note {
+    BackgroundColor #FFF3CD
+    BorderColor #856404
+}
+
+title WordPress Recovery Mode End-to-End Flow\n(Since WordPress 5.2.0)
+
+|#E8F4FD|Admin / Browser|
+|#EAF7EA|WP_Recovery_Mode\n(Orchestrator)|
+|#FFF8E1|WP_Recovery_Mode_Link_Service|
+|#F3E5F5|WP_Recovery_Mode_Key_Service|
+|#FCE4EC|WP_Recovery_Mode_Cookie_Service|
+|#E0F2F1|WordPress DB|
+
+' ─────────────────────────────────────────────
+' PHASE 1: Generate Recovery URL
+' ─────────────────────────────────────────────
+
+|WP_Recovery_Mode\n(Orchestrator)|
+start
+:WP detects fatal error\nduring bootstrap;
+note right
+  Triggered by WP_Fatal_Error_Handler
+  when a recoverable PHP fatal occurs
+end note
+:email_service->maybe_send_recovery_mode_email();
+:link_service->generate_url();
+
+|WP_Recovery_Mode_Link_Service|
+:generate_url() invoked;
+
+|WP_Recovery_Mode_Key_Service|
+:generate_recovery_mode_token()
+→ wp_generate_password(22, false)
+→ $token (22-char, no special chars);
+
+:generate_and_store_recovery_mode_key($token)
+→ wp_generate_password(22, false)
+→ $key (plaintext);
+:PasswordHash->HashPassword($key) → $hashed;
+
+|WordPress DB|
+:get_option('recovery_keys', []) → $records;
+
+|WP_Recovery_Mode_Key_Service|
+:$records[$token] = {
+  hashed_key: $hashed,
+  created_at: time()
+};
+:do_action('generate_recovery_mode_key', $token, $key);
+
+|WordPress DB|
+:update_option('recovery_keys', $records);
+
+|WP_Recovery_Mode_Link_Service|
+:get_recovery_mode_begin_url($token, $key)
+→ wp_login_url() + ?action=enter_recovery_mode
+  &rm_token={token}&rm_key={key};
+:apply_filters('recovery_mode_begin_url', $url);
+note right
+  URL Format:
+  wp-login.php?action=enter_recovery_mode
+  &rm_token=X&rm_key=Y
+end note
+
+|Admin / Browser|
+:Receive recovery URL via email\n(sent by WP_Recovery_Mode_Email_Service);
+:Admin clicks recovery link;
+
+' ─────────────────────────────────────────────
+' PHASE 2: Handle Begin Link
+' ─────────────────────────────────────────────
+
+|WP_Recovery_Mode_Link_Service|
+:handle_begin_link($ttl) invoked;
+
+if (pagenow == 'wp-login.php'?) then (no)
+    :Abort — not on login page;
+    note right: Guard: handle_begin_link only\nexecutes on wp-login.php
+    stop
+else (yes)
+endif
+
+if (action='enter_recovery_mode'\n& rm_token & rm_key present?) then (no)
+    :Abort — missing or invalid params;
+    stop
+else (yes)
+endif
+
+:Ensure wp_generate_password() available\n(require pluggable.php if needed);
+
+|WP_Recovery_Mode_Key_Service|
+:validate_recovery_mode_key($token, $key, $ttl);
+
+|WordPress DB|
+:get_option('recovery_keys') → $records;
+
+|WP_Recovery_Mode_Key_Service|
+if ($token in $records?) then (no)
+    :WP_Error('token_not_found');
+    :wp_die() — show error page;
+    stop
+else (yes)
+endif
+
+:remove_key($token)\n→ consume key (ONE-TIME USE);
+
+|WordPress DB|
+:update_option('recovery_keys', $records_without_token);
+
+|WP_Recovery_Mode_Key_Service|
+if (record has hashed_key & created_at?) then (no)
+    :WP_Error('invalid_recovery_key_format');
+    :wp_die() — show error page;
+    stop
+else (yes)
+endif
+
+if (wp_check_password($key, $hashed_key)?) then (no)
+    :WP_Error('hash_mismatch');
+    :wp_die() — show error page;
+    stop
+else (yes)
+endif
+
+if (time() > created_at + $ttl?) then (yes)
+    :WP_Error('key_expired');
+    :wp_die() — show error page;
+    note right: TTL enforced at validation time;\nkeys expire based on created_at
+    stop
+else (no)
+endif
+
+:return true — key valid;
+
+|WP_Recovery_Mode_Cookie_Service|
+:set_cookie() invoked;
+
+:generate_cookie()
+→ to_sign = 'recovery_mode|{time()}|{rand20}'
+→ signed = hash_hmac('sha1', to_sign, AUTH_KEY+AUTH_SALT)
+→ return base64_encode('{to_sign}|{signed}');
+note right
+  Cookie format:
+  base64('recovery_mode|{iat}|{rand20}|{hmac_sha1}')
+  Signed with AUTH_KEY + AUTH_SALT
+end note
+
+:apply_filters('recovery_mode_cookie_length',\nWEEK_IN_SECONDS) → $length;
+:$expire = time() + $length;
+:setcookie(RECOVERY_MODE_COOKIE, $value,\n$expire, COOKIEPATH, COOKIE_DOMAIN,\nis_ssl=true, httponly=true);
+
+if (COOKIEPATH != SITECOOKIEPATH?) then (yes)
+    :setcookie again for SITECOOKIEPATH;
+else (no)
+endif
+
+|WP_Recovery_Mode_Link_Service|
+:wp_redirect(wp_login_url()\n?action=entered_recovery_mode);
+:die() — session started, cookie set;
+
+|Admin / Browser|
+:Browser follows redirect
+→ wp-login.php?action=entered_recovery_mode;
+note right
+  Admin is now authenticated
+  in Recovery Mode session
+end note
+
+' ─────────────────────────────────────────────
+' PHASE 3: Cookie Validation on Subsequent Requests
+' ─────────────────────────────────────────────
+
+|Admin / Browser|
+:Admin makes subsequent request\n(with RECOVERY_MODE_COOKIE);
+
+|WP_Recovery_Mode\n(Orchestrator)|
+:WP bootstrap → initialize();
+
+if (is_initialized?) then (yes)
+    :Return early — already done;
+    stop
+else (no)
+endif
+
+:link_service->handle_begin_link($ttl)\n(runs Phase 2 if URL params present);
+
+|WP_Recovery_Mode_Cookie_Service|
+:is_cookie_set()
+→ !empty($_COOKIE[RECOVERY_MODE_COOKIE]);
+
+|WP_Recovery_Mode\n(Orchestrator)|
+if (cookie set?) then (no)
+    :$is_active = false;
+    :Recovery mode inactive for this request;
+    stop
+else (yes)
+endif
+
+|WP_Recovery_Mode_Cookie_Service|
+:validate_cookie()
+→ read $_COOKIE[RECOVERY_MODE_COOKIE];
+
+if (cookie present?) then (no)
+    :WP_Error('no_cookie');
+    stop
+else (yes)
+endif
+
+:parse_cookie($cookie)
+→ base64_decode
+→ explode('|') → [recovery_mode, created_at, random, signature];
+
+if (parts count == 4?) then (no)
+    :WP_Error('invalid_format');
+    stop
+else (yes)
+endif
+
+if (created_at is numeric?) then (no)
+    :WP_Error('invalid_created_at');
+    stop
+else (yes)
+endif
+
+:apply_filters('recovery_mode_cookie_length',\nWEEK_IN_SECONDS) → $length;
+
+if (time() > created_at + $length?) then (yes)
+    :WP_Error('expired');
+    stop
+else (no)
+endif
+
+:to_sign = 'recovery_mode|{created_at}|{random}'
+→ recovery_mode_hash(to_sign)
+→ hash_hmac('sha1', to_sign, AUTH_KEY+AUTH_SALT);
+
+if (hash_equals(signature, computed_hash)?) then (no)
+    :WP_Error('signature_mismatch');
+    stop
+else (yes)
+endif
+
+:return true — cookie valid;
+
+:get_session_id_from_cookie()
+→ parse_cookie() → extract $random (3rd part)
+→ return sha1($random);
+note right
+  Session ID = sha1(random part of cookie)
+  Stable across requests for same session
+end note
+
+|WP_Recovery_Mode\n(Orchestrator)|
+:$this->session_id = session_id;
+:$this->is_active = true;
+:$this->is_initialized = true;
+
+|Admin / Browser|
+:Recovery Mode ACTIVE for this request\n→ Admin can fix broken plugins/themes;
+
+' ─────────────────────────────────────────────
+' PHASE 4: Exit Recovery Mode
+' ─────────────────────────────────────────────
+
+:Admin clicks "Exit Recovery Mode";
+
+|WP_Recovery_Mode\n(Orchestrator)|
+:handle_exit_recovery_mode()\n→ exit_recovery_mode();
+
+|WP_Recovery_Mode_Cookie_Service|
+:clear_cookie()
+→ setcookie(RECOVERY_MODE_COOKIE, ' ',
+  time() - YEAR_IN_SECONDS, COOKIEPATH);
+:setcookie(RECOVERY_MODE_COOKIE, ' ',
+  time() - YEAR_IN_SECONDS, SITECOOKIEPATH);
+note right
+  Setting expiry in the past
+  immediately invalidates the cookie
+end note
+
+|WP_Recovery_Mode\n(Orchestrator)|
+:$is_active = false;
+
+|Admin / Browser|
+:Redirect — Recovery Mode session ended;
+stop
+
+@enduml

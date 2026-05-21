@@ -1,0 +1,224 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title MySQL Streaming Pipeline\n(MySqlStreamingChangeEventSource — Binlog CDC Flow)
+
+|MySqlStreamingChangeEventSource|
+start
+
+:execute(context, partition, offsetContext);
+
+:schema.assureNonEmptySchema()\n(skip if NeverSnapshotter);
+
+:Determine skippedOperations\nfrom connectorConfig;
+
+|MySqlStreamingChangeEventSource|
+:Register Event Handlers (eventHandlers.put):\n  STOP → handleServerStop\n  HEARTBEAT → handleServerHeartbeat\n  INCIDENT → handleServerIncident\n  ROTATE → handleRotateLogsEvent\n  TABLE_MAP → handleUpdateTableMetadata\n  QUERY → handleQueryEvent\n  TRANSACTION_PAYLOAD → handleTransactionPayload\n  XID → handleTransactionCompletion;
+
+if (CREATE / UPDATE / DELETE not skipped?) then (yes)
+    :Register DML handlers:\n  WRITE_ROWS / EXT_WRITE_ROWS → handleInsert\n  UPDATE_ROWS / EXT_UPDATE_ROWS → handleUpdate\n  DELETE_ROWS / EXT_DELETE_ROWS → handleDelete;
+endif
+
+if (GTID mode AND shouldRecoverUsingGtid?) then (yes)
+    :Register GTID handler:\n  GTID → handleGtidEvent;
+endif
+
+if (isSqlQueryIncluded?) then (yes)
+    :Register ROWS_QUERY handler:\n  ROWS_QUERY → handleRecordingQuery;
+endif
+
+|BinaryLogClient|
+if (bufferSizeForStreaming > 0?) then (yes)
+    :Configure EventBuffer listener\n(compressed transaction support);
+else (no)
+    :Configure direct EventListener;
+endif
+:client.registerEventListener(listener);
+:client.registerLifecycleListener\n(ReaderThreadLifecycleListener);
+
+|MySqlOffsetContext|
+if (GTID mode enabled AND shouldRecoverUsingGtid?) then (yes)
+    :Fetch knownGtidSet + purgedGtidSet\nfrom connection;
+    :connection.filterGtidSet(\n  gtidSourceFilter, offsetContext.gtidSet,\n  available, purged);
+    if (filteredGtidSet != null?) then (yes)
+        :client.setGtidSet(filteredGtidSet)\noffsetContext.setCompletedGtidSet()\ninitializeGtidSet();
+    else (no)
+        :client.setBinlogFilename()\nclient.setBinlogPosition()\n(handle purged GTID edge case);
+    endif
+else (no)
+    :client.setBinlogFilename\n(offsetContext.getSource().binlogFilename())\nclient.setBinlogPosition();
+endif
+
+:initialEventsToSkip = offsetContext.eventsToSkipUponRestart()\nstartingRowNumber = offsetContext.rowsToSkipUponRestart()\nskipEvent = false;
+
+|BinaryLogClient|
+if (context.isRunning()?) then (yes)
+    :client.connect(timeout);
+    if (Connection succeeds?) then (yes)
+        if (client.isKeepAlive()?) then (yes)
+            :Poll binaryLogClientThreads\nfor keepalive thread\n(up to 50 attempts × 100ms);
+        endif
+    else (no — exception)
+        if (TimeoutException AND duration > 0.9 × timeout?) then (yes)
+            :throw DebeziumException\n(Connection timed out);
+            |MySqlErrorHandler|
+            :setProducerThrowable(exception);
+            stop
+        elseif (AuthenticationException?) then
+            :throw DebeziumException\n(Authentication failed);
+            |MySqlErrorHandler|
+            :setProducerThrowable(exception);
+            stop
+        else (other Throwable)
+            :throw DebeziumException\n(Connection failed);
+            |MySqlErrorHandler|
+            :setProducerThrowable(exception);
+            stop
+        endif
+    endif
+else (no)
+    stop
+endif
+
+|MySqlStreamingChangeEventSource|
+while (context.isRunning()?) is (yes)
+    :Thread.sleep(100ms)\nwaitWhenStreamingPaused(context);
+    note right
+      Main polling loop —
+      events arrive asynchronously
+      via registered listener
+    end note
+endwhile (no)
+
+|MySqlStreamingChangeEventSource|
+fork
+    |MySqlStreamingChangeEventSource|
+    :handleEvent(partition, offsetContext, context, event);
+    :offsetContext.setBinlogServerId\n(eventHeader.getServerId());
+
+    if (EventType == ROTATE?) then (yes)
+        :offsetContext.setBinlogStartPoint\n(filename, position);
+    elseif (EventHeaderV4 AND position > 0?) then
+        :offsetContext.setEventPosition\n(position, length);
+    endif
+
+    :waitWhenStreamingPaused(context);
+    :eventHandlers.getOrDefault(eventType, ignoreEvent).accept(event);
+
+    fork
+        :→ GTID Event:
+        GtidEventData.getGtid()
+        gtidSet.add(gtid)
+        offsetContext.startGtid(gtid, gtidSet)
+        if (gtidSourceFilter != null AND UUID filtered?) then (yes)
+            :setIgnoreDmlEventByGtidSource(true)\n(skip DML for this GTID source);
+        else (no)
+            :setIgnoreDmlEventByGtidSource(false);
+        endif
+        :metrics.onGtidChange(gtid);
+    fork again
+        :→ QUERY Event:
+        if (sql == BEGIN?) then (yes)
+            :handleTransactionBegin\n(partition, offsetContext, event, threadId);
+        elseif (sql == COMMIT?) then
+            :handleTransactionCompletion\n(partition, offsetContext, event);
+        else (DDL)
+            :Dispatch schema change event\nvia EventDispatcher;
+        endif
+    fork again
+        :→ TABLE_MAP Event:
+        schema.assignTableNumber(tableNumber, tableId);
+        if (tableId unknown?) then (yes)
+            :informAboutUnknownTableIfRequired;
+        endif
+    fork again
+        :→ WRITE_ROWS / INSERT Event:;
+        |EventDispatcher|
+        :dispatchDataChangeEvent\n(partition, tableId,\nBinlogChangeRecordEmitter[CREATE]);
+    fork again
+        :→ UPDATE_ROWS Event:;
+        |EventDispatcher|
+        :dispatchDataChangeEvent\n(partition, tableId,\nBinlogChangeRecordEmitter[UPDATE]);
+    fork again
+        :→ DELETE_ROWS Event:;
+        |EventDispatcher|
+        :dispatchDataChangeEvent\n(partition, tableId,\nBinlogChangeRecordEmitter[DELETE]);
+    fork again
+        :→ XID (Transaction Commit) Event:;
+        |EventDispatcher|
+        :dispatchTransactionCommittedEvent\n(partition, offsetContext, timestamp);
+        |MySqlOffsetContext|
+        :offsetContext.commitTransaction()\noffsetContext.setBinlogThread(-1L)\nskipEvent = false\nignoreDmlEventByGtidSource = false;
+    fork again
+        :→ ROTATE Event:
+        schema.clearTableMappings();
+    fork again
+        :→ ROWS_QUERY Event:
+        RowsQueryEventData.getQuery()
+        offsetContext.setQuery(query);
+    end fork
+
+    |EventDispatcher|
+    :dispatchHeartbeatEvent\n(partition, offsetContext);
+
+    |MySqlOffsetContext|
+    :offsetContext.completeEvent();
+
+fork again
+    |MySqlErrorHandler|
+    :isRetriable(throwable)?;
+    :Walk exception cause chain;
+    if (SQLException errorCode == 1236\n(ER_MASTER_FATAL_ERROR_READING_BINLOG)?) then (yes)
+        :Return false\n(NON-RETRIABLE — binlog purged);
+        :queue.producerException\n(ConnectException)\n→ Connector STOP;
+        stop
+    else (no)
+        if (IOException or other SQLException?) then (yes)
+            :Return true (RETRIABLE);
+            if (hasMoreRetries()?) then (yes)
+                :queue.producerException\n(RetriableException)\n→ Connector RESTART;
+            else (no)
+                :queue.producerException\n(ConnectException)\n→ Connector STOP;
+                stop
+            endif
+        else (no)
+            :Delegate to super.isRetriable();
+        endif
+    endif
+end fork
+
+|BinaryLogClient|
+:client.disconnect()\n(finally block — always executed);
+
+stop
+
+@enduml

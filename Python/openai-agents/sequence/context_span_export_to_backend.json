@@ -1,0 +1,108 @@
+{
+  "scope": "span_export_to_backend",
+  "title": "Span Export to Backend",
+  "diagram_type": "sequence",
+  "description": "Collecting finished spans, sanitizing large payloads, and exporting trace data to the OpenAI tracing API",
+
+  "key_participants": [
+    "Caller",
+    "set_tracing_export_api_key (tracing/__init__.py)",
+    "default_exporter() (processors.py)",
+    "BackendSpanExporter (processors.py)",
+    "BatchTraceProcessor (processors.py)",
+    "Span / Trace (spans.py / traces.py)",
+    "httpx.Client",
+    "OpenAI Tracing API (https://api.openai.com/v1/traces/ingest)"
+  ],
+
+  "interaction_flow": [
+    "--- API Key Setup ---",
+    "Caller → set_tracing_export_api_key(api_key): public helper in tracing/__init__.py",
+    "set_tracing_export_api_key → default_exporter(): lazy-init singleton BackendSpanExporter",
+    "default_exporter → BackendSpanExporter.__init__(): create httpx.Client(timeout=60s, connect=5s) if not exists",
+    "set_tracing_export_api_key → BackendSpanExporter.set_api_key(api_key): clear cached 'api_key' property, store _api_key",
+
+    "--- Span Lifecycle (queuing) ---",
+    "Agent runtime → BatchTraceProcessor.on_trace_start(trace): _ensure_thread_started(), queue.put_nowait(trace)",
+    "Agent runtime → BatchTraceProcessor.on_span_end(span): _ensure_thread_started(), queue.put_nowait(span)",
+    "BatchTraceProcessor._ensure_thread_started(): double-checked lock, spawns daemon Thread(_run)",
+
+    "--- Background Export Loop ---",
+    "Thread → BatchTraceProcessor._run(): loop until shutdown_event",
+    "_run → _export_batches(force=False): triggered when time >= next_export_time OR qsize >= export_trigger_size (70% of max_queue_size=8192)",
+    "_export_batches → queue.get_nowait(): drain up to max_batch_size=128 items per batch",
+    "_export_batches → BackendSpanExporter.export(items: list[Trace | Span])",
+
+    "--- export() internals ---",
+    "BackendSpanExporter.export: group items by item.tracing_api_key (per-item key overrides global)",
+    "BackendSpanExporter.export: for each item → item.export() → dict payload",
+    "BackendSpanExporter.export → _should_sanitize_for_openai_tracing_api(): True if endpoint == default ingest URL",
+    "BackendSpanExporter.export → _sanitize_for_openai_tracing_api(exported): sanitize span_data fields",
+    "BackendSpanExporter.export: build payload = {data: [sanitized_dicts]}, headers = {Authorization, Content-Type, OpenAI-Beta}",
+    "BackendSpanExporter.export → httpx.Client.post(url, headers, json=payload): HTTP POST",
+    "httpx.Client → OpenAI Tracing API: POST /v1/traces/ingest",
+    "OpenAI Tracing API → httpx.Client: HTTP response",
+    "BackendSpanExporter.export: if status<300 → success; if 4xx → log error, no retry; if 5xx → exponential backoff+jitter, max_retries=3",
+
+    "--- Sanitization detail ---",
+    "_sanitize_for_openai_tracing_api(payload_item): inspect span_data dict",
+    "_sanitize_for_openai_tracing_api → _truncate_span_field_value(span_data['input']): if >100KB, sanitize & truncate",
+    "_sanitize_for_openai_tracing_api → _truncate_span_field_value(span_data['output']): if >100KB, sanitize & truncate",
+    "_truncate_span_field_value → _sanitize_json_compatible_value(value): strip non-serializable types recursively",
+    "_truncate_span_field_value → _truncate_json_value_for_limit(value, 100_000): delegate to string/dict/list truncator",
+    "_sanitize_for_openai_tracing_api: remove 'usage' field unless span_data.type == 'generation'",
+    "_sanitize_for_openai_tracing_api → _sanitize_generation_usage_for_openai_tracing_api(usage): keep only input_tokens, output_tokens, details",
+
+    "--- Force Flush ---",
+    "Caller → flush_traces() (tracing/__init__.py)",
+    "flush_traces → get_trace_provider().force_flush()",
+    "TraceProvider.force_flush → BatchTraceProcessor.force_flush()",
+    "BatchTraceProcessor.force_flush → _export_batches(force=True): drain entire queue synchronously"
+  ],
+
+  "key_relationships": [
+    "BatchTraceProcessor implements TracingProcessor (abc)",
+    "BackendSpanExporter implements TracingExporter (abc)",
+    "BatchTraceProcessor composes BackendSpanExporter (via _exporter field)",
+    "set_tracing_export_api_key depends_on default_exporter() singleton",
+    "default_exporter() lazily creates BackendSpanExporter (global _global_exporter, protected by _global_lock)",
+    "default_processor() lazily creates BatchTraceProcessor wrapping default_exporter() (global _global_processor)",
+    "BackendSpanExporter holds persistent httpx.Client (connection pooling)",
+    "BackendSpanExporter.api_key is cached_property reading _api_key or OPENAI_API_KEY env var; set_api_key() invalidates cache"
+  ],
+
+  "constants_and_thresholds": {
+    "ingest_endpoint": "https://api.openai.com/v1/traces/ingest",
+    "max_field_bytes": 100000,
+    "truncation_suffix": "... [truncated]",
+    "allowed_usage_keys": ["input_tokens", "output_tokens"],
+    "usage_span_types": ["generation"],
+    "max_queue_size": 8192,
+    "max_batch_size": 128,
+    "schedule_delay_seconds": 5.0,
+    "export_trigger_ratio": 0.7,
+    "max_retries": 3,
+    "base_delay_seconds": 1.0,
+    "max_delay_seconds": 30.0,
+    "http_timeout_seconds": 60,
+    "http_connect_timeout_seconds": 5.0
+  },
+
+  "important_notes": [
+    "Items grouped by item.tracing_api_key before export; per-item key overrides the global exporter key.",
+    "Sanitization only runs when posting to the default OpenAI ingest endpoint (custom endpoints bypass it).",
+    "_truncate_span_field_value handles str, dict, list recursively; unserializable values become a {truncated, original_type, preview} dict.",
+    "Retry uses exponential backoff with 10% jitter; 4xx errors are NOT retried (client fault).",
+    "BackgroundThread is a daemon thread, lazily started on first span/trace enqueue (double-checked locking).",
+    "set_api_key() must delete the cached_property from __dict__ before reassigning _api_key.",
+    "flush_traces() is the public API for immediate delivery (e.g., end of Celery task or FastAPI background job).",
+    "Organization and Project headers (OpenAI-Organization, OpenAI-Project) are added when configured."
+  ],
+
+  "source_files_analyzed": [
+    "src/agents/tracing/processors.py",
+    "src/agents/tracing/__init__.py",
+    "src/agents/tracing/processor_interface.py",
+    "docs/tracing.md"
+  ]
+}

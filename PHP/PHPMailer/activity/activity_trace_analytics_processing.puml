@@ -1,0 +1,138 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #212529
+    EndColor #212529
+    BarColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam noteBackgroundColor #E7F3FF
+skinparam noteBorderColor #4A90D9
+
+title Trace Analytics Value Processing\n<size:11>(DDTrace — Datadog PHP Tracing Library)</size>
+
+|Caller / Integration|
+start
+fork
+    :Call **Span::setTag**(Tag::ANALYTICS_KEY, $value);
+    note right
+      ANALYTICS_KEY = '_dd1.sr.eausr'
+      (Datadog-internal sampling-rate metric)
+    end note
+fork again
+    :Call **Integration::setAnalyticsIfEnabled**($span, $name);
+end fork
+
+|Span|
+if (Entry via Integration::setAnalyticsIfEnabled?) then (yes)
+
+    |Integration|
+    if (integration_analytics_enabled($name)\nOR (DD_TRACE_ANALYTICS_ENABLED env == true\nAND NOT requiresExplicitTraceAnalyticsEnabling)?) then (yes)
+        :Write **$span->metrics[ANALYTICS_KEY]**\n= integration_analytics_sample_rate($name);
+        note right
+          Bypasses normalizeAnalyticsValue —
+          rate sourced directly from env config
+          or per-integration configuration.
+        end note
+        |Span|
+        :Span metrics updated with\nintegration sample rate;
+        stop
+    else (no)
+        :No-op — analytics not enabled\nfor this integration;
+        stop
+    endif
+
+else (no — via setTag path)
+
+    |Span|
+    if (Span already finished\nAND setIfFinished == false?) then (yes)
+        :No-op — span is closed,\ncannot accept new tags;
+        stop
+    else (no)
+    endif
+
+    if (Key is non-string\nor numeric type?) then (yes)
+        :Guard rejected — invalid key type,\nsilently ignored;
+        stop
+    else (no)
+    endif
+
+    if (Key is in $specialTags\nOR $metricNames?) then (yes — routes to metric)
+        :Call **Span::setMetric**(Tag::ANALYTICS_KEY, $value);
+    else (no — plain tag)
+        :Store value in **$meta[]** array;
+        stop
+    endif
+
+    if (Key === Tag::ANALYTICS_KEY?) then (yes)
+        :Delegate to\n**TraceAnalyticsProcessor::\nnormalizeAnalyticsValue**(&$metrics, $value);
+        note right
+          Static utility — no instance state.
+          Mutates $internalSpan->metrics by reference.
+        end note
+    else (no — other metric key)
+        :Store directly:\n$metrics[$key] = $value;
+        stop
+    endif
+
+    |TraceAnalyticsProcessor|
+    if (value === **true**?) then (yes)
+        :Set **$metrics['_dd1.sr.eausr'] = 1.0**\n(100% sampling rate);
+        note right
+          Boolean true → full
+          trace analytics capture.
+        end note
+    elseif (value === **false**?) then (yes)
+        :Unset **$metrics['_dd1.sr.eausr']**\n(opt-out / disable analytics for span);
+        note right
+          false explicitly removes the key —
+          not zero-rate, but full opt-out.
+        end note
+    elseif (is_numeric($value)\nAND 0.0 <= $value <= 1.0?) then (yes)
+        :Set **$metrics['_dd1.sr.eausr'] = (float)$value**\n(explicit sample rate);
+        note right
+          Valid rate range: [0.0, 1.0].
+          Values outside range are silently dropped.
+        end note
+    else (invalid — out-of-range\nor non-numeric)
+        :No-op — value silently ignored,\nspan metrics unchanged;
+        note right
+          Business rule: invalid values
+          never raise exceptions.
+        end note
+        stop
+    endif
+
+    |Span|
+    :$internalSpan->metrics array\nupdated with analytics rate;
+    stop
+
+endif
+
+@enduml

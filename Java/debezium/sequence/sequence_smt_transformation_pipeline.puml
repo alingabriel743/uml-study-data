@@ -1,0 +1,225 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipantBackgroundColor #F8F9FA
+skinparam sequenceParticipantBorderColor #495057
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceGroupBorderColor #6C757D
+skinparam sequenceGroupBackgroundColor #E9ECEF
+skinparam noteBackgroundColor #FFF3CD
+skinparam noteBorderColor #856404
+skinparam activationBorderColor #495057
+skinparam activationBackgroundColor #DEE2E6
+
+title Single Message Transform (SMT) Pipeline
+
+actor "JMH Runner" as jmh
+
+participant "TransformState\n(JMH @State)" as state
+participant "SmtOverheadPerf" as smtPerf
+participant "FilterSmtPerf" as filterPerf
+participant "NewRecord\n(SMT)" as newRecord
+participant "NoOp\n(SMT)" as noop
+participant "NativeFilter\n(SMT)" as nativeFilter
+participant "Filter\n(ScriptingTransformation)" as filter
+participant "ScriptingEngine\n(Jsr223/GraalJs/Wasm)" as engine
+participant "SourceRecord" as record
+participant "Envelope" as envelope
+
+' ─────────────────────────────────────────────
+== SmtOverheadPerf — Setup ==
+' ─────────────────────────────────────────────
+
+jmh -> state : doSetup()\nbuild Schema (struct 'dummyenv', field 'op')
+activate state
+
+state -> record : new SourceRecord(topic='top1', partition=1,\nschema, value='d')  [delete record]
+activate record
+record --> state : deleteRecord
+deactivate record
+
+state -> record : new SourceRecord(topic='top1', partition=1,\nschema, value='c')  [create record]
+activate record
+record --> state : createRecord
+deactivate record
+
+state -> newRecord : new NewRecord();\nconfigure({})
+activate newRecord
+newRecord --> state : ready
+deactivate newRecord
+
+state -> noop : new NoOp();\nconfigure({})
+activate noop
+noop --> state : ready
+deactivate noop
+
+deactivate state
+
+' ─────────────────────────────────────────────
+== SmtOverheadPerf — NewRecord Benchmark ==
+' ─────────────────────────────────────────────
+
+jmh -> smtPerf : newRecord(state)\n[Throughput / μs]
+activate smtPerf
+
+smtPerf -> newRecord : apply(state.createRecord)
+activate newRecord
+newRecord -> record : newRecord(topic, partition,\nkeySchema, key, valueSchema,\nvalue, timestamp, headers)
+activate record
+record --> newRecord : new SourceRecord (copy)
+deactivate record
+newRecord --> smtPerf : new SourceRecord copy
+deactivate newRecord
+
+deactivate smtPerf
+
+' ─────────────────────────────────────────────
+== SmtOverheadPerf — NoOp Benchmark ==
+' ─────────────────────────────────────────────
+
+jmh -> smtPerf : noop(state)\n[Throughput / μs]
+activate smtPerf
+
+smtPerf -> noop : apply(state.createRecord)
+activate noop
+noop --> smtPerf : record (unchanged passthrough)
+deactivate noop
+
+deactivate smtPerf
+
+' ─────────────────────────────────────────────
+== SmtOverheadPerf — Base Benchmark (Baseline) ==
+' ─────────────────────────────────────────────
+
+jmh -> smtPerf : base(state)\n[empty body — cost baseline]
+activate smtPerf
+smtPerf --> jmh : (no-op)
+deactivate smtPerf
+
+' ─────────────────────────────────────────────
+== FilterSmtPerf — Setup ==
+' ─────────────────────────────────────────────
+
+jmh -> state : doSetup()\nbuild Schema + SourceRecords (op='d' delete, op='c' create)
+activate state
+
+state -> nativeFilter : new NativeFilter();\nconfigure({})
+activate nativeFilter
+nativeFilter --> state : ready
+deactivate nativeFilter
+
+state -> filter : new Filter<>() [groovyFilter]\nconfigure({language='jsr223.groovy',\ncondition="value.op == 'd'"})
+activate filter
+filter --> state : ready
+deactivate filter
+
+state -> filter : new Filter<>() [jsFilter]\nconfigure({language='jsr223.graal.js',\ncondition="value.get(op) == d"})
+activate filter
+filter --> state : ready
+deactivate filter
+
+state -> filter : new Filter<>() [chicoryFilter]\nconfigure({language='wasm.chicory',\ncondition=<wasm file path>})
+activate filter
+filter --> state : ready
+deactivate filter
+
+deactivate state
+
+' ─────────────────────────────────────────────
+== FilterSmtPerf — NativeFilter Benchmark ==
+' ─────────────────────────────────────────────
+
+jmh -> filterPerf : java(state)\n[Throughput / μs]
+activate filterPerf
+
+filterPerf -> nativeFilter : apply(state.createRecord)  [op='c']
+activate nativeFilter
+nativeFilter -> envelope : op == DELETE.code()?
+activate envelope
+envelope --> nativeFilter : false  (op='c' ≠ 'd')
+deactivate envelope
+nativeFilter --> filterPerf : record  [PASS]
+deactivate nativeFilter
+
+filterPerf -> nativeFilter : apply(state.createRecord)  [op='c', 2nd call]
+activate nativeFilter
+nativeFilter -> envelope : op == DELETE.code()?
+activate envelope
+envelope --> nativeFilter : false
+deactivate envelope
+nativeFilter --> filterPerf : record  [PASS]
+deactivate nativeFilter
+
+filterPerf -> nativeFilter : apply(state.deleteRecord)  [op='d']
+activate nativeFilter
+nativeFilter -> envelope : op == DELETE.code()?
+activate envelope
+envelope --> nativeFilter : true  (op='d' == DELETE)
+deactivate envelope
+nativeFilter --> filterPerf : null  [FILTERED OUT]
+deactivate nativeFilter
+
+deactivate filterPerf
+
+' ─────────────────────────────────────────────
+== FilterSmtPerf — Scripting Filter Benchmark (groovy / js / wasm) ==
+' ─────────────────────────────────────────────
+
+jmh -> filterPerf : groovy(state)  [also .javascript() / .chicory()]
+activate filterPerf
+
+filterPerf -> filter : apply(state.createRecord)
+activate filter
+note right of filter
+  Check topicPattern → null → skip
+  Delegate to doApply(record)
+end note
+filter -> engine : eval(record, Boolean.class)\ncondition: "value.op == 'd'"
+activate engine
+engine --> filter : false  (op='c' ≠ 'd')
+deactivate engine
+
+alt result == false → pass record
+    filter --> filterPerf : record  [PASS]
+end
+
+deactivate filter
+
+filterPerf -> filter : apply(state.deleteRecord)
+activate filter
+filter -> engine : eval(record, Boolean.class)\ncondition: "value.op == 'd'"
+activate engine
+engine --> filter : true  (op='d' matches)
+deactivate engine
+
+alt result == true → drop record
+    filter --> filterPerf : null  [FILTERED OUT]
+end
+
+deactivate filter
+
+deactivate filterPerf
+
+note over jmh, engine
+  Benchmark config: Throughput mode, MICROSECONDS, fork=1
+  Warmup: 10 × 1s  |  Measurement: 3 × 2s
+  NativeFilter uses direct Java op-code check (no scripting overhead)
+  ScriptingFilter delegates to pluggable engine selected by 'language' config
+end note
+
+@enduml

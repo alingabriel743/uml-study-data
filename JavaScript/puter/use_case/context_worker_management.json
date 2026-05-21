@@ -1,0 +1,185 @@
+{
+  "scope": "worker_management",
+  "title": "Worker Management",
+  "diagram_type": "use_case",
+  "description": "Creating, executing, listing, and deleting background workers on the Puter platform via Cloudflare Workers",
+
+  "actors": [
+    {
+      "name": "AuthenticatedUser",
+      "description": "Puter end-user interacting via puter.js SDK (web or app context)"
+    },
+    {
+      "name": "PuterApp",
+      "description": "App context; may own a sandbox app tied to the worker (appId flow)"
+    },
+    {
+      "name": "FileSystem",
+      "description": "Internal system actor – triggers auto-redeploy on fs.write.file events"
+    },
+    {
+      "name": "CloudflareWorkers",
+      "description": "External compute platform; hosts and executes deployed worker scripts"
+    },
+    {
+      "name": "ServiceManager",
+      "description": "putility service orchestrator; registers and initialises WorkerService with dependency resolution"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Create Worker",
+      "actor": "AuthenticatedUser",
+      "entry_point": "WorkersHandler.create(workerName, filePath, appName)",
+      "steps": [
+        "Authenticate via puter.ui.authenticateWithPuter() if not already authed",
+        "Resolve sandbox app (puter.apps.get / puter.apps.create) or look up named app uid",
+        "Call driver: utils.make_driver_method → WorkerService.create({filePath, workerName, authorization, appId})",
+        "WorkerService: validate name, check subdomain limit (<=100), reserved words, regex",
+        "WorkerService: upsert subdomain entity in es:subdomain (workers.puter.<calculatedName>)",
+        "WorkerService: read file via LLRead from Puter filesystem (max 10MB)",
+        "WorkerService: createWorker(userData, authToken, workerName, preamble+fileData) → Cloudflare API",
+        "WorkersHandler: store {filePath, url, deployTime, createTime} in puter.kv 'user-workers'",
+        "Return cfData (includes url)"
+      ],
+      "preconditions": "User authenticated; file exists in Puter FS",
+      "postconditions": "Worker deployed on Cloudflare; subdomain registered; KV updated"
+    },
+    {
+      "id": "UC2",
+      "name": "Execute Worker",
+      "actor": "AuthenticatedUser",
+      "entry_point": "WorkersHandler.exec(...fetchArgs)",
+      "steps": [
+        "Authenticate if needed",
+        "Construct Request from args",
+        "Inject 'puter-auth' header with authToken (unless x-puter-no-auth present)",
+        "fetch(req) → worker URL at <workerName>.puter.work"
+      ],
+      "preconditions": "Worker already created and deployed",
+      "postconditions": "HTTP response from worker returned to caller"
+    },
+    {
+      "id": "UC3",
+      "name": "List Workers",
+      "actor": "AuthenticatedUser",
+      "entry_point": "WorkersHandler.list()",
+      "steps": [
+        "Authenticate if needed",
+        "Call driver: WorkerService.getFilePaths({}) with no workerName filter",
+        "WorkerService: es:subdomain.select(StartsWith 'workers.puter.')",
+        "Map each subdomain entity to {name, url, file_path, file_uid, created_at}",
+        "Return array"
+      ]
+    },
+    {
+      "id": "UC4",
+      "name": "Get Worker Info",
+      "actor": "AuthenticatedUser",
+      "entry_point": "WorkersHandler.get(workerName)",
+      "steps": [
+        "Authenticate if needed",
+        "Normalize workerName to lowercase",
+        "Call driver: WorkerService.getFilePaths({workerName})",
+        "WorkerService: es:subdomain.select(Eq 'subdomain' = 'workers.puter.<workerName>')",
+        "Return first result object"
+      ]
+    },
+    {
+      "id": "UC5",
+      "name": "Delete Worker",
+      "actor": "AuthenticatedUser",
+      "entry_point": "WorkersHandler.delete(workerName)",
+      "steps": [
+        "Authenticate if needed",
+        "Normalize workerName to lowercase",
+        "Call driver: WorkerService.destroy({workerName, authorization})",
+        "WorkerService: getUserInfo(authorization) to verify ownership",
+        "WorkerService: deleteWorker(userData, authorization, workerName) → Cloudflare API",
+        "WorkerService: es:subdomain.delete(uid)",
+        "WorkersHandler: remove entry from puter.kv 'user-workers'",
+        "Return true on success"
+      ],
+      "preconditions": "Caller must own the worker (uuid check)",
+      "postconditions": "Worker removed from Cloudflare; subdomain entity deleted; KV updated"
+    },
+    {
+      "id": "UC6",
+      "name": "Stream Worker Logs",
+      "actor": "AuthenticatedUser",
+      "entry_point": "WorkersHandler.getLoggingHandle(workerName)",
+      "steps": [
+        "Call driver: WorkerService.getLoggingUrl() → returns config.loggingUrl",
+        "Open WebSocket: wss://<loggingEndpoint>/<authToken>/<workerName>",
+        "Return logStreamObject (EventTarget + ReadableStream-compatible) on socket open",
+        "Emits 'log' MessageEvents; exposes onLog callback and start/cancel for ReadableStream"
+      ]
+    },
+    {
+      "id": "UC7",
+      "name": "Auto-Redeploy Worker on File Change",
+      "actor": "FileSystem",
+      "entry_point": "WorkerService._init: svc_event.on('fs.write.file')",
+      "steps": [
+        "Event fires when a Puter file is written (same server only)",
+        "Check if written file's node is linked to a subdomain starting with 'workers.puter.'",
+        "Read updated file content via readPuterFile(actor, filePath)",
+        "Resolve auth token: app token (if app_owner) or session token",
+        "createWorker(owner, authToken, workerName, preamble+fileData) → Cloudflare",
+        "svc_notification.notify(user) with success or failure message"
+      ],
+      "notes": "Triggered automatically; no direct user action required"
+    },
+    {
+      "id": "UC8",
+      "name": "Register & Initialize WorkerService",
+      "actor": "ServiceManager",
+      "entry_point": "ServiceManager.register(name, factory, options)",
+      "steps": [
+        "factory.create({parameters, context}) → WorkerService instance",
+        "ServiceManager.maybe_init_: check TService.get_depends() for unresolved deps",
+        "If deps ready → ServiceManager.init_service_: call service_impl.init(), status → Running",
+        "If deps pending → store in waiting_ map; init triggered after dependency initializes",
+        "WorkerService._init() called: sets Cloudflare keys, wires fs.write.file event listener",
+        "WorkerService registers 'workers' interface in registry via '__on_driver.register.interfaces'"
+      ]
+    }
+  ],
+
+  "key_relationships": [
+    "WorkersHandler (client) depends_on utils.make_driver_method to call WorkerService (backend)",
+    "WorkerService extends BaseService",
+    "WorkerService uses es:subdomain (entity storage) for subdomain CRUD",
+    "WorkerService uses svc_auth for token generation",
+    "WorkerService uses svc_su for privilege escalation (sudo)",
+    "WorkerService uses svc_notification to notify users of deploy results",
+    "WorkerService uses svc_event to listen for fs.write.file auto-redeploy",
+    "WorkerService delegates Cloudflare operations to cloudflareDeploy (createWorker, deleteWorker)",
+    "ServiceManager orchestrates WorkerService lifecycle with dependency-aware initialization",
+    "ServiceManager uses TService interface (putility) to call init() and get_depends()"
+  ],
+
+  "driver_interface": {
+    "name": "workers",
+    "methods": ["create", "destroy", "getFilePaths", "startLogs", "endLogs", "getLoggingUrl"],
+    "registered_by": "WorkerService.__on_driver.register.interfaces"
+  },
+
+  "important_notes": [
+    "Worker names are normalized to lowercase; only [a-zA-Z0-9_-] allowed",
+    "Subdomain format: workers.puter.<calculatedName> mapped to <name>.puter.work URL",
+    "Worker limit: 100 subdomains per user",
+    "Worker code has 10MB max size",
+    "A preamble (puter.js bundle) is prepended to all worker scripts before Cloudflare deploy",
+    "KV store ('user-workers') is maintained client-side as a local cache of deployed workers",
+    "Sandbox app auto-created (sandbox-<workerName>) for user tokens without explicit appName"
+  ],
+
+  "source_files_analyzed": [
+    "src/puter-js/src/modules/Workers.js",
+    "src/putility/src/system/ServiceManager.js",
+    "src/backend/src/services/worker/WorkerService.js"
+  ]
+}

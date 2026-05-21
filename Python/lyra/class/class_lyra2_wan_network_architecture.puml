@@ -1,0 +1,241 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+title Lyra-2 WAN Network Architecture
+
+' ─────────────────────────────────────────────
+' External / Framework Bases
+' ─────────────────────────────────────────────
+package "PyTorch (External)" {
+    abstract class "nn.Module" as nnModule {
+        +forward(...): Tensor
+    }
+
+    class "nn.LayerNorm" as nnLayerNorm {
+        +forward(x): Tensor
+    }
+}
+
+' ─────────────────────────────────────────────
+' Base / Mixin Classes
+' ─────────────────────────────────────────────
+package "Base Classes" {
+    abstract class WeightTrainingStat {
+        {abstract} +weight_stat_hooks()
+    }
+
+    abstract class AbstractEmbModel {
+        {abstract} +forward(...): Dict
+    }
+}
+
+' ─────────────────────────────────────────────
+' Positional Embeddings  (wan2pt1.py)
+' ─────────────────────────────────────────────
+package "Positional Embeddings (wan2pt1.py)" {
+    abstract class VideoPositionEmb {
+        #_cp_group: ProcessGroup | None
+        +seq_dim: int
+        {abstract} +generate_embeddings(B_T_H_W_C): Tensor
+        +forward(x_B_T_H_W_C): Tensor
+        +enable_context_parallel(process_group)
+        +disable_context_parallel()
+        #_split_for_context_parallel(embeddings): Tensor
+    }
+
+    class VideoRopePosition3DEmb {
+        +max_h: int
+        +max_w: int
+        +max_t: int
+        +h_ntk_factor: float
+        +w_ntk_factor: float
+        +t_ntk_factor: float
+        -_dim_h: int
+        -_dim_t: int
+        -_is_initialized: bool
+        -seq: Tensor
+        -dim_spatial_range: Tensor
+        -dim_temporal_range: Tensor
+        +seq_dim: int
+        +__init__(head_dim, len_h, len_w, len_t, h_extrapolation_ratio, w_extrapolation_ratio, t_extrapolation_ratio)
+        +generate_embeddings(B_T_H_W_C, h_ntk_factor, w_ntk_factor, t_ntk_factor): Tensor
+        +cache_parameters(): None
+    }
+}
+
+' ─────────────────────────────────────────────
+' Attention Sub-modules  (wan2pt1.py)
+' ─────────────────────────────────────────────
+package "Attention Sub-modules (wan2pt1.py)" {
+    class WanLayerNorm {
+        +__init__(dim, eps, elementwise_affine)
+        +forward(x): Tensor
+    }
+
+    class WanSelfAttention {
+        +dim: int
+        +num_heads: int
+        +window_size: Tuple[int,int]
+        +qk_norm: bool
+        +__init__(dim, num_heads, window_size, qk_norm, eps, cp_comm_type)
+        +forward(x, seq_lens, video_size, freqs, kq_bias): Tensor
+        +init_weights()
+    }
+
+    class Head {
+        +norm: WanLayerNorm
+        +head: nn.Linear
+        +modulation: nn.Parameter
+        +__init__(dim, out_dim, patch_size, eps)
+        +forward(x, e): Tensor
+    }
+
+    class MLPProj {
+        +proj: nn.Sequential
+        +emb_pos: nn.Parameter
+        +__init__(in_dim, out_dim, flf_pos_emb)
+        +forward(image_embeds): Tensor
+    }
+}
+
+' ─────────────────────────────────────────────
+' Core Lyra-2 Network  (wan2pt1_lyra2.py)
+' ─────────────────────────────────────────────
+package "Lyra-2 Core (wan2pt1_lyra2.py)" {
+
+    class Lyra2AttentionBlock {
+        +dim: int
+        +ffn_dim: int
+        +num_heads: int
+        +window_size: Tuple[int,int]
+        +qk_norm: bool
+        +inject_kq_only: bool
+        +norm1: WanLayerNorm
+        +norm2: WanLayerNorm
+        +norm3: WanLayerNorm | nn.Identity
+        +self_attn: WanSelfAttention
+        +cross_attn: WanT2VCrossAttention | WanI2VCrossAttention
+        +ffn: nn.Sequential
+        +modulation: nn.Parameter
+        +cam_encoder: nn.Linear | None
+        +buffer_encoder: nn.Linear | nn.Sequential | None
+        +buffer_sincos_multires: int
+        +buffer_mlp_squeeze_dim: int
+        +__init__(cross_attn_type, dim, ffn_dim, num_heads, window_size, qk_norm, cross_attn_norm, eps, cp_comm_type, cam_dim, buffer_dim, buffer_sincos_multires, inject_kq_only, buffer_mlp_squeeze_dim)
+        +forward(x, e, seq_lens, video_size, freqs, context, context_lens, camera, buffer): Tensor
+        +init_weights()
+        -{static} _sincos_embed(x, multires): Tensor
+    }
+
+    class Lyra2WanModel {
+        +model_type: str
+        +patch_size: Tuple[int,int,int]
+        +dim: int
+        +ffn_dim: int
+        +freq_dim: int
+        +text_dim: int
+        +num_heads: int
+        +num_layers: int
+        +use_plucker_condition: bool
+        +buffer_in_dim: int
+        +inject_kq_only: bool
+        +patch_embedding: nn.Linear | nn.Conv3d
+        +text_embedding: nn.Sequential
+        +time_embedding: nn.Sequential
+        +time_projection: nn.Sequential
+        +blocks: nn.ModuleList
+        +head: Head
+        +rope_position_embedding: VideoRopePosition3DEmb
+        +img_emb: MLPProj
+        +clean_patch_embeddings: nn.ModuleList | None
+        +patch_embedding_buffer: nn.Linear | None
+        +sac_config: SACConfig
+        +__init__(model_type, patch_size, text_len, in_dim, dim, ffn_dim, freq_dim, text_dim, out_dim, num_heads, num_layers, ...)
+        +forward(x_B_C_T_H_W, timesteps_B_T, crossattn_emb, seq_len, frame_cond_crossattn_emb_B_L_D, y_B_C_T_H_W, y_buffer_B_C_T_H_W, padding_mask, is_uncond, slg_layers): Tensor
+        +init_clean_patch_embeddings(clean_latent_frame_kernel_sizes, clean_latent_frame_kernel_types): None
+        +init_patch_embedding_buffer(buffer_in_dim): None
+        +init_weights()
+        +enable_selective_checkpoint(sac_config, blocks)
+    }
+}
+
+' ─────────────────────────────────────────────
+' CLIP Embedder  (clip_lyra2.py)
+' ─────────────────────────────────────────────
+package "CLIP Embedder (clip_lyra2.py)" {
+
+    class CLIPModel {
+        +visual(image_tensor): Tensor
+    }
+
+    class Wan2pt1CLIPEmbLyra2 {
+        +num_token: int
+        +model_dim: int
+        +clip_model: CLIPModel
+        -_input_key: List[str]
+        -_dropout_rate: float
+        +dtype: torch.dtype
+        +__init__(input_key, dropout_rate, num_token, dtype)
+        +forward(image_tensor, video_tensor, media_latents, mask, buffer_latents): Dict[str, Tensor]
+        +random_dropout_input(in_tensor, dropout_rate, key): Tensor
+    }
+}
+
+' ─────────────────────────────────────────────
+' Inheritance Relationships
+' ─────────────────────────────────────────────
+WeightTrainingStat    --|> nnModule
+AbstractEmbModel      --|> nnModule
+
+VideoPositionEmb      --|> nnModule
+VideoRopePosition3DEmb --|> VideoPositionEmb
+
+WanLayerNorm          --|> nnLayerNorm
+nnLayerNorm           --|> nnModule
+
+WanSelfAttention      --|> nnModule
+Head                  --|> nnModule
+MLPProj               --|> nnModule
+
+Lyra2AttentionBlock   --|> nnModule
+Lyra2WanModel         --|> WeightTrainingStat
+
+Wan2pt1CLIPEmbLyra2   --|> AbstractEmbModel
+
+' ─────────────────────────────────────────────
+' Composition Relationships
+' ─────────────────────────────────────────────
+Lyra2WanModel *-- "num_layers" Lyra2AttentionBlock       : blocks
+Lyra2WanModel *-- Head                                    : head
+Lyra2WanModel *-- VideoRopePosition3DEmb                  : rope_position_embedding
+Lyra2WanModel *-- MLPProj                                 : img_emb\n(i2v / flf2v)
+
+Lyra2AttentionBlock *-- WanLayerNorm                      : norm1 / norm2 / norm3
+Lyra2AttentionBlock *-- WanSelfAttention                  : self_attn
+
+Head *-- WanLayerNorm                                     : norm
+
+Wan2pt1CLIPEmbLyra2 *-- CLIPModel                        : clip_model
+
+' ─────────────────────────────────────────────
+' Data-flow Dependencies
+' ─────────────────────────────────────────────
+Wan2pt1CLIPEmbLyra2 ..> Lyra2WanModel : frame_cond_crossattn_emb_B_L_D\n(CLIP visual features)
+VideoRopePosition3DEmb ..> WanSelfAttention : RoPE freqs
+
+@enduml

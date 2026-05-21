@@ -1,0 +1,356 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    GroupBackgroundColor #E9ECEF
+    GroupBorderColor #6C757D
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    NoteBackgroundColor #FFF9DB
+    NoteBorderColor #F59F00
+}
+
+title Sector and Campaign Progression Flow
+
+actor Player
+
+box "UI Layer" #EFF6FF
+    participant "PlanetDialog" as PD
+    participant "LaunchLoadoutDialog" as LLD
+end box
+
+box "Game World" #F0FFF4
+    participant "Planet" as PL
+    participant "Sector" as SEC
+    participant "SectorInfo" as SI
+end box
+
+box "Core Engine" #FFF0F0
+    participant "Control" as CTRL
+    participant "World" as WLD
+    participant "Logic" as LOG
+    participant "SaveSlot" as SS
+end box
+
+box "Game Config" #FFF9F0
+    participant "CampaignRules" as CR
+    participant "Rules" as R
+    participant "GameState" as GS
+end box
+
+' ─────────────────────────────────────────────
+' PHASE 1: Planet Map Browsing
+' ─────────────────────────────────────────────
+== Phase 1: Planet Map Browsing ==
+
+Player -> PD: show()
+activate PD
+note right of PD
+  launchSector = Vars.state.getSector()
+  mode = look / select / planetLaunch
+end note
+
+loop each frame on hover
+    PD -> PL: getSector(ray)
+    activate PL
+    PL --> PD: hovered Sector
+    deactivate PL
+end
+
+PD -> PL: selectable(planet)
+activate PL
+note right of PL
+  Checks mode == look / select / planetLaunch
+  to filter eligible planets
+end note
+PL --> PD: boolean
+deactivate PL
+
+' ─────────────────────────────────────────────
+' PHASE 2: Sector Selection & Panel Display
+' ─────────────────────────────────────────────
+== Phase 2: Sector Selection & Panel Display ==
+
+Player -> PD: click sector
+PD -> PD: selectSector(sector)
+PD -> PD: updateSelected()
+activate PD
+
+PD -> SI: read sector.info
+activate SI
+note right of SI
+  Reads: production, export, imports,
+  resources, attempts, wave,
+  icon, contentIcon
+end note
+SI --> PD: sector panel data
+deactivate SI
+
+PD --> Player: display sector info panel\n[launch / go / resume button\nbased on sector.hasBase() & mode]
+deactivate PD
+
+' ─────────────────────────────────────────────
+' PHASE 3: Launch Preparation
+' ─────────────────────────────────────────────
+== Phase 3: Launch Preparation ==
+
+Player -> PD: click launch button
+activate PD
+PD -> PD: playSelected()
+PD -> PD: findLauncher(sector)
+note right of PD
+  Checks planet.generator.findLaunchCandidate()
+  and launchSector validity
+end note
+
+alt launching to new sector with base available
+    PD -> LLD: loadouts.show(coreType, from, sector, callback)
+    activate LLD
+    Player -> LLD: select schematic loadout
+    LLD --> PD: callback(loadout)
+    deactivate LLD
+
+    PD -> SEC: from.removeItems(loadout.requirements())
+    activate SEC
+    PD -> SEC: from.removeItems(universe.getLaunchResources())
+    SEC --> PD: ok
+    deactivate SEC
+
+    PD -> PD: fire SectorLaunchLoadoutEvent(sector, from, loadout)
+end
+
+PD -> PD: renderer.showLaunch(core)\n[launch animation]
+
+PD -> CTRL: control.playSector(from, sector)
+deactivate PD
+
+' ─────────────────────────────────────────────
+' PHASE 4: Sector Load Routing
+' ─────────────────────────────────────────────
+== Phase 4: Sector Load Routing ==
+
+activate CTRL
+
+CTRL -> SS: saves.getCurrent().save()
+activate SS
+SS --> CTRL: ok
+deactivate SS
+CTRL -> SS: saves.resetSave()
+activate SS
+SS --> CTRL: ok
+deactivate SS
+
+CTRL -> PL: sector.planet.setLastSector(sector)
+activate PL
+note right of PL
+  Persists last-visited sector
+  to player settings
+end note
+PL --> CTRL: ok
+deactivate PL
+
+alt sector has existing save slot
+    CTRL -> SS: slot.load(world.makeSectorContext(sector))
+    activate SS
+    note right of SS
+      Triggers SaveVersion.load()
+      which re-applies planet rules
+    end note
+    SS -> R: state.rules.sector.planet.applyRules(state.rules)
+    activate R
+    R --> SS: rules configured
+    deactivate R
+    SS --> CTRL: world loaded
+    deactivate SS
+
+else no save / corrupted / no base → new sector
+    CTRL -> CTRL: playNewSector(origin, sector, reloader, params, beforePlay)
+
+    ' ─────────────────────────────────────────
+    ' PHASE 5: New Sector World Generation
+    ' ─────────────────────────────────────────
+    == Phase 5: New Sector World Generation ==
+
+    CTRL -> WLD: world.loadSector(sector, params)
+    activate WLD
+
+    WLD -> PL: sector.planet.applyRules(state.rules)
+    activate PL
+
+    PL -> PL: ruleSetter.get(rules)\n[custom planet rule lambda]
+    note right of PL
+      rules.attributes = defaultAttributes
+      rules.env = defaultEnv
+      rules.planet = this
+    end note
+
+    PL -> CR: campaignRules.apply(planet, rules)
+    activate CR
+    note right of CR
+      Sets: fog/staticFog, showSpawns,
+      randomWaveAI, pauseDisabled,
+      objectiveTimerMultiplier
+    end note
+    CR -> R: waveTeam.blockHealth *= difficulty.healthMultiplier
+    activate R
+    CR -> R: waveTeam.unitHealth *= difficulty.healthMultiplier
+    CR -> R: waveTeam.unitCostMultiplier *= difficulty.costMultiplier
+    R --> CR: ok
+    deactivate R
+    CR --> PL: rules applied
+    deactivate CR
+
+    PL --> WLD: planet rules applied
+    deactivate PL
+
+    WLD -> SI: sector.info.resources = content.toSeq()
+    activate SI
+    note right of SI
+      Collects available resource
+      content for this sector
+    end note
+    SI --> WLD: ok
+    deactivate SI
+
+    WLD --> CTRL: sector world loaded
+    deactivate WLD
+
+    ' State initialization
+    CTRL -> R: state.rules.sector = sector
+    activate R
+    R --> CTRL: ok
+    deactivate R
+
+    CTRL -> SI: sector.info.origin = origin\nsector.info.destination = origin\nsector.info.attempts++
+    activate SI
+    SI --> CTRL: ok
+    deactivate SI
+
+    CTRL -> LOG: logic.play()
+    activate LOG
+    LOG --> CTRL: ok
+    deactivate LOG
+
+    CTRL -> SS: control.saves.saveSector(sector)
+    activate SS
+    SS --> CTRL: ok
+    deactivate SS
+
+    CTRL -> GS: state.set(State.playing)
+    activate GS
+    GS --> CTRL: ok
+    deactivate GS
+
+    CTRL -> CTRL: fire SectorLaunchEvent(sector)\nfire Trigger.newGame
+end
+
+deactivate CTRL
+
+' ─────────────────────────────────────────────
+' PHASE 6: Save Load Event (Rules Re-sync)
+' ─────────────────────────────────────────────
+== Phase 6: Save Load Event — Rules Re-sync ==
+
+LOG -> LOG: on SaveLoadEvent (campaign)
+activate LOG
+
+LOG -> SI: info.write()
+activate SI
+note right of SI
+  Pushes persisted sector metadata
+  INTO the live state.rules
+end note
+SI -> R: state.rules.waves = waves
+activate R
+SI -> R: state.rules.waveSpacing = waveSpacing
+SI -> R: state.rules.winWave = winWave
+SI -> R: state.rules.attackMode = attackMode
+SI -> R: restore core items from info.items
+R --> SI: ok
+deactivate R
+SI --> LOG: rules synced
+deactivate SI
+
+LOG -> PL: state.getSector().planet.applyRules(state.rules)
+activate PL
+note right of PL
+  Re-applies planet + campaign rules
+  after every save load
+end note
+PL --> LOG: rules reapplied
+deactivate PL
+
+deactivate LOG
+
+' ─────────────────────────────────────────────
+' PHASE 7: Ongoing Game State Tracking
+' ─────────────────────────────────────────────
+== Phase 7: Ongoing Game State Tracking ==
+
+loop every 60 game ticks
+    SI -> SI: update()
+    note right of SI
+      Refreshes rolling means:
+      export / import / production rates
+    end note
+end
+
+SI -> SI: handleCoreItem(item, amount)\n→ accumulates coreDeltas
+SI -> SI: handleProduction()\n→ accumulates productionDeltas
+SI -> SI: handleItemExport/Import()\n→ increments counters
+
+note over SI
+  eachImport(planet, cons):
+  scans all planet.sectors where
+  info.destination == this sector
+  and info.anyExports() == true
+end note
+
+' ─────────────────────────────────────────────
+' PHASE 8: Pre-Save Snapshot
+' ─────────────────────────────────────────────
+== Phase 8: Pre-Save Snapshot ==
+
+SI -> SI: prepare(sector)
+activate SI
+note right of SI
+  Pulls live game state INTO SectorInfo:
+  core items, wave/attack state,
+  hasCore, bestCoreType,
+  storageCapacity, light coverage
+end note
+
+SI -> PL: sector.planet.generator.beforeSaveWrite(sector)
+activate PL
+PL --> SI: ok
+deactivate PL
+
+SI -> SEC: sector.saveInfo()
+activate SEC
+SEC --> SI: persisted
+deactivate SEC
+
+deactivate SI
+
+@enduml

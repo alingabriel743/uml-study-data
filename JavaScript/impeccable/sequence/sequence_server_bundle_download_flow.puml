@@ -1,0 +1,186 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #ADB5BD
+    GroupBorderColor #6C757D
+    GroupHeaderFontColor #212529
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Server Bundle Download Flow
+
+' ─── Participants ───────────────────────────────────────────
+participant "build.js" as Build
+participant "createAllZips\n(zip.js)" as AllZips
+participant "createProviderZip\n(zip.js)" as ProviderZip
+participant "archiver" as Archiver
+participant "FileSystem\n(dist/)" as FS
+
+box "Runtime — Cloudflare Pages" #EEF2FF
+    actor "Client" as Client
+    participant "[provider].js\n(CF Route)" as CFRoute
+    participant "BUNDLE_DOWNLOAD\nPROVIDERS" as Providers
+    participant "ASSETS\n(CF KV Store)" as Assets
+end box
+
+box "Runtime — Node / Bun Dev Server" #E8F5E9
+    participant "server/index.js\n(Node Route)" as NodeRoute
+    participant "handleBundleDownload\n(api-handlers.js)" as Handler
+    participant "isAllowedBundleProvider\n(validation.js)" as Validator
+    participant "FileSystem\n(dist/ local)" as LocalFS
+end box
+
+' ═══════════════════════════════════════════════════════════
+== BUILD TIME (pre-deployment) ==
+' ═══════════════════════════════════════════════════════════
+
+Build -> AllZips : createAllZips(distDir)
+activate AllZips
+
+AllZips -> ProviderZip : createProviderZip(distDir/universal, distDir, "universal")
+activate ProviderZip
+
+ProviderZip -> FS : existsSync(providerDir)
+FS --> ProviderZip : true
+
+ProviderZip -> Archiver : archiver("zip", {zlib:{level:9}})
+activate Archiver
+ProviderZip -> Archiver : archive.glob("**/*", {cwd:providerDir, dot:true,\nignore:["**/.DS_Store"]})
+ProviderZip -> FS : archive.pipe(createWriteStream("dist/universal.zip"))
+ProviderZip -> Archiver : archive.finalize()
+Archiver --> FS : write zip bytes
+deactivate Archiver
+
+ProviderZip -> FS : statSync("dist/universal.zip") — log size (MB)
+ProviderZip --> AllZips : done
+deactivate ProviderZip
+
+AllZips -> ProviderZip : createProviderZip(distDir/universal-prefixed, distDir, "universal-prefixed")
+activate ProviderZip
+ProviderZip -> FS : existsSync(providerDir)
+FS --> ProviderZip : true
+ProviderZip -> Archiver : archiver("zip", ...) + glob + pipe + finalize
+activate Archiver
+Archiver --> FS : write zip bytes
+deactivate Archiver
+ProviderZip -> FS : statSync("dist/universal-prefixed.zip")
+ProviderZip --> AllZips : done
+deactivate ProviderZip
+
+AllZips --> Build : all zips created
+deactivate AllZips
+
+' ═══════════════════════════════════════════════════════════
+== RUNTIME — Cloudflare Pages Path ==
+' ═══════════════════════════════════════════════════════════
+
+Client -> CFRoute : GET /api/download/bundle/{provider}
+activate CFRoute
+
+CFRoute -> CFRoute : context.params.provider → extract route param
+
+CFRoute -> Providers : BUNDLE_DOWNLOAD_PROVIDERS.includes(provider)
+activate Providers
+Providers --> CFRoute : valid / invalid
+deactivate Providers
+
+alt invalid provider
+    CFRoute --> Client : 400 — {error: "Invalid provider"}
+else valid provider
+    CFRoute -> CFRoute : new URL(request.url)\nurl.pathname = "/_data/dist/{provider}.zip"
+
+    CFRoute -> Assets : context.env.ASSETS.fetch(rewritten URL)
+    activate Assets
+
+    alt asset not found
+        Assets --> CFRoute : response.ok == false
+        CFRoute --> Client : 404 — {error: "Bundle not found"}
+    else asset found
+        Assets --> CFRoute : Response (zip bytes)
+        deactivate Assets
+
+        CFRoute -> CFRoute : response.arrayBuffer() — read into memory
+        CFRoute -> CFRoute : safeProvider = provider.replace(/[^a-zA-Z0-9._-]/g, "")
+
+        CFRoute --> Client : 200 application/zip\nContent-Disposition: attachment;\n  filename="impeccable-style-{safeProvider}.zip"\nCache-Control: public, s-maxage=86400,\n  stale-while-revalidate=3600
+    end
+end
+
+deactivate CFRoute
+
+' ═══════════════════════════════════════════════════════════
+== RUNTIME — Node / Bun Dev Server Path ==
+' ═══════════════════════════════════════════════════════════
+
+Client -> NodeRoute : GET /api/download/bundle/:provider
+activate NodeRoute
+
+NodeRoute -> Handler : handleBundleDownload(provider)
+activate Handler
+
+Handler -> Validator : isAllowedBundleProvider(provider)
+activate Validator
+note right of Validator : checks BUNDLE_DOWNLOAD_PROVIDERS\n["universal","universal-prefixed"]
+Validator --> Handler : allowed: true / false
+deactivate Validator
+
+alt invalid provider
+    Handler --> NodeRoute : 400 — "Invalid provider"
+    NodeRoute --> Client : 400 — "Invalid provider"
+else valid provider
+    Handler -> Handler : zipPath = join(PROJECT_ROOT, "dist", "{provider}.zip")
+
+    Handler -> LocalFS : existsSync(zipPath)
+    activate LocalFS
+    LocalFS --> Handler : exists: true / false
+    deactivate LocalFS
+
+    alt file not found
+        Handler --> NodeRoute : 404 — "Bundle not found"
+        NodeRoute --> Client : 404 — "Bundle not found"
+    else file found
+        Handler -> LocalFS : readFile(zipPath)
+        activate LocalFS
+        LocalFS --> Handler : zip Buffer
+        deactivate LocalFS
+
+        Handler -> Validator : sanitizeFilename(provider)
+        activate Validator
+        Validator --> Handler : safeProvider (strips non-alphanumeric)
+        deactivate Validator
+
+        Handler --> NodeRoute : Response(zipBuffer, headers)
+        NodeRoute --> Client : 200 application/zip\nContent-Disposition: attachment;\n  filename="impeccable-style-{safeProvider}.zip"
+    end
+end
+
+deactivate Handler
+deactivate NodeRoute
+
+@enduml

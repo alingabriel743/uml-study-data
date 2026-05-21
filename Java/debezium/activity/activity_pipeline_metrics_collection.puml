@@ -1,0 +1,179 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #495057
+    EndColor #212529
+    BarColor #6C757D
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+skinparam note {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+title Pipeline Metrics Collection
+
+|EventDispatcher|
+start
+
+fork
+  :Emit **onEvent**(partition, source, offset,\nkey, value, **operation**);
+fork again
+  :Emit **onFilteredEvent**(partition, event\n[± operation]);
+fork again
+  :Emit **onErroneousEvent**(partition, event\n[± operation]);
+fork again
+  :Emit **onConnectorEvent**(partition, event);
+fork again
+  :Emit **reset()**;
+end fork
+
+|PipelineMetrics|
+
+'──────────────────────────────────────────────────────
+' BRANCH 1 — onEvent
+'──────────────────────────────────────────────────────
+if (Incoming call?) then (onEvent)
+  :Delegate to\ncommonEventMeter.onEvent\n(source, offset, key, value, operation);
+
+  |CommonEventMeter|
+  :updateCommonEventMetrics(operation);
+  :**totalNumberOfEventsSeen**++;
+  :lastEventTimestamp = clock.currentTimeInMillis();
+
+  if (operation?) then (CREATE)
+    :**totalNumberOfCreateEventsSeen**++;
+  elseif (operation?) then (UPDATE)
+    :**totalNumberOfUpdateEventsSeen**++;
+  elseif (operation?) then (DELETE)
+    :**totalNumberOfDeleteEventsSeen**++;
+  else (other / null)
+    :No per-type counter incremented;
+  endif
+
+  :lastEvent = metadataProvider\n.toSummaryString(source, offset, key, value);
+
+  |PipelineMetrics|
+  note right: Event fully recorded\n(all AtomicLong counters\nare thread-safe)
+
+'──────────────────────────────────────────────────────
+' BRANCH 2 — onFilteredEvent
+'──────────────────────────────────────────────────────
+elseif (Incoming call?) then (onFilteredEvent)
+  :Delegate to\ncommonEventMeter.onFilteredEvent([operation]);
+
+  |CommonEventMeter|
+  :**numberOfEventsFiltered**++;
+
+  if (operation provided?) then (yes)
+    :updateCommonEventMetrics(operation);\n:**totalNumberOfEventsSeen**++;\nlastEventTimestamp updated;\nper-type counter incremented;
+  else (no)
+    :updateCommonEventMetrics(null);\n:**totalNumberOfEventsSeen**++;\nlastEventTimestamp updated;\nno per-type counter;
+  endif
+
+  |PipelineMetrics|
+
+'──────────────────────────────────────────────────────
+' BRANCH 3 — onErroneousEvent
+'──────────────────────────────────────────────────────
+elseif (Incoming call?) then (onErroneousEvent)
+  :Delegate to\ncommonEventMeter.onErroneousEvent([operation]);
+
+  |CommonEventMeter|
+  :**numberOfErroneousEvents**++;
+
+  if (operation provided?) then (yes)
+    :updateCommonEventMetrics(operation);\n:**totalNumberOfEventsSeen**++;\nlastEventTimestamp updated;\nper-type counter incremented;
+  else (no)
+    :updateCommonEventMetrics(null);\n:**totalNumberOfEventsSeen**++;\nlastEventTimestamp updated;\nno per-type counter;
+  endif
+
+  |PipelineMetrics|
+
+'──────────────────────────────────────────────────────
+' BRANCH 4 — onConnectorEvent (no-op in base)
+'──────────────────────────────────────────────────────
+elseif (Incoming call?) then (onConnectorEvent)
+  note right: No-op in base PipelineMetrics\nSubclasses may override
+  :[ subclass override logic ];
+
+'──────────────────────────────────────────────────────
+' BRANCH 5 — reset
+'──────────────────────────────────────────────────────
+else (reset)
+  :Delegate to commonEventMeter.reset();
+
+  |CommonEventMeter|
+  fork
+    :totalNumberOfEventsSeen = 0;
+  fork again
+    :totalNumberOfCreateEventsSeen = 0;
+  fork again
+    :totalNumberOfUpdateEventsSeen = 0;
+  fork again
+    :totalNumberOfDeleteEventsSeen = 0;
+  fork again
+    :numberOfEventsFiltered = 0;
+  fork again
+    :numberOfErroneousEvents = 0;
+  fork again
+    :lastEventTimestamp = -1;
+  fork again
+    :lastEvent = null;
+  end fork
+  note right: All counters atomically zeroed;\ntimestamp sentinel reset to -1
+
+  |PipelineMetrics|
+endif
+
+'──────────────────────────────────────────────────────
+' READ path (query operations)
+'──────────────────────────────────────────────────────
+|EventDispatcher|
+:Query metrics (read-only);
+
+|PipelineMetrics|
+if (Read request?) then (getMilliSecondsSinceLastEvent)
+  |CommonEventMeter|
+  if (lastEventTimestamp == -1?) then (yes — no event yet)
+    :Return -1;
+  else (no)
+    :Return clock.now() - lastEventTimestamp;
+  endif
+  |PipelineMetrics|
+elseif (Read request?) then (getQueue metrics)
+  :Delegate to\nChangeEventQueueMetrics\n(totalCapacity / remainingCapacity\n/ maxQueueSizeInBytes\n/ currentQueueSizeInBytes);
+else (counter getters)
+  |CommonEventMeter|
+  :Return AtomicLong.get()\nfor requested counter;
+  |PipelineMetrics|
+endif
+
+stop
+
+@enduml

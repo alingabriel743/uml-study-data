@@ -1,0 +1,111 @@
+{
+  "scope": "3d_convolution_upsampling",
+  "title": "3D Convolution & Upsampling",
+  "diagram_type": "use_case",
+  "description": "System applies factorized and multi-stage 3D transposed convolutions for spatial upsampling in the decoder of LatentRecon",
+
+  "actors": [
+    "LatentRecon (Decoder)",
+    "Configuration (opt.transposed_conv_type)",
+    "Gradient Checkpoint Utility (forward_checkpointing)"
+  ],
+
+  "use_cases": [
+    "Upsample 3D latent features (trilinear interpolation + Conv3d) [ConvTranspose3dFactorized]",
+    "Upsample with channel reduction then transposed conv [ConvTranspose3dReduced]",
+    "Upsample via sequential temporal + spatial deconv stages [MultiStageConvTranspose3d]",
+    "Apply single-shot transposed conv fallback [nn.ConvTranspose3d]",
+    "Decode patchified token sequence into spatiotemporal feature volume [LatentRecon.forward_gaussians]",
+    "Select upsampling module at runtime via config key [transposed_conv_type]",
+    "Enable gradient checkpointing per stage [forward_checkpointing]"
+  ],
+
+  "key_classes": [
+    {
+      "name": "ConvTranspose3dFactorized",
+      "base": "nn.Module",
+      "file": "Lyra-1/src/models/utils/model.py",
+      "init_params": "in_channels, out_channels, kernel_size, stride, padding, upsample_mode='trilinear', use_channel_reduction=True, gradient_checkpoint=True",
+      "components": [
+        "channel_reducer: nn.Conv3d(in_channels, out_channels, kernel_size=1)  [optional]",
+        "conv: nn.Conv3d(conv_in_channels, out_channels, kernel_size, padding)"
+      ],
+      "forward_steps": [
+        "1. _channel_reduce(x): 1x1x1 Conv3d to reduce channels [optional]",
+        "2. _interpolate(x): F.interpolate with scale_factor=stride, mode=trilinear",
+        "3. _conv(x): Conv3d refine"
+      ],
+      "notes": "Does NOT use ConvTranspose3d; uses interpolation + regular Conv3d. Duplicated definition in file (lines 191 & 235 — second overwrites first)."
+    },
+    {
+      "name": "ConvTranspose3dReduced",
+      "base": "nn.Module",
+      "file": "Lyra-1/src/models/utils/model.py",
+      "init_params": "in_channels, out_channels, kernel_size, stride, padding, hidden_channels=None, use_channel_reduction=True",
+      "components": [
+        "channel_reducer: nn.Conv3d(in_channels, hidden_channels, kernel_size=1)  [optional]",
+        "conv: nn.ConvTranspose3d(conv_in_channels, out_channels, kernel_size, stride, padding)"
+      ],
+      "forward_steps": [
+        "1. _channel_reduce(x): 1x1x1 Conv3d bottleneck [optional]",
+        "2. _conv(x): nn.ConvTranspose3d full upsampling"
+      ],
+      "notes": "Uses true transposed convolution after optional channel bottleneck. gradient_checkpoint passed at call time, not __init__."
+    },
+    {
+      "name": "MultiStageConvTranspose3d",
+      "base": "nn.Module",
+      "file": "Lyra-1/src/models/utils/model.py",
+      "init_params": "in_channels, out_channels, kernel_size, stride, padding, multi_stage=True, norm_layer=None, activation=nn.ReLU, gradient_checkpoint=False",
+      "components": [
+        "temporal_blocks: nn.ModuleList of Sequential[ConvTranspose3d(kD=3,kH=1,kW=1, sD=2,sH=1,sW=1) + norm? + act?]",
+        "spatial_blocks: nn.ModuleList of Sequential[ConvTranspose3d(kD=1,kH=3,kW=3, sD=1,sH=2,sW=2) + norm? + act?]",
+        "upsampler: nn.ConvTranspose3d  [single-shot fallback when multi_stage=False]",
+        "pre_pad: nn.ConstantPad3d  [lazy-computed on first forward]"
+      ],
+      "forward_steps": [
+        "If multi_stage=False: single ConvTranspose3d",
+        "1. _compute_input_padding(x.shape) → pre_pad [lazy, once]",
+        "2. pre_pad(x): ConstantPad3d to align spatial dimensions",
+        "3. For each block in temporal_blocks: ConvTranspose3d(stride=(2,1,1)) × log2(sD) times",
+        "4. For each block in spatial_blocks: ConvTranspose3d(stride=(1,2,2)) × log2(sH) times"
+      ],
+      "notes": "Decomposes stride=(sD,sH,sW) into log2(sD) temporal stages + log2(sH) spatial stages. Each stage doubles one dimension. Optional norm/activation per stage."
+    }
+  ],
+
+  "relationships": [
+    "LatentRecon uses ConvTranspose3dFactorized — when opt.transposed_conv_type == 'factorized'",
+    "LatentRecon uses ConvTranspose3dReduced — when opt.transposed_conv_type == 'reduce_transposed'",
+    "LatentRecon uses MultiStageConvTranspose3d — when opt.transposed_conv_type == 'multi_stage_transpose'",
+    "LatentRecon uses nn.ConvTranspose3d — fallback (default)",
+    "All three custom classes compose nn.Conv3d / nn.ConvTranspose3d internally",
+    "All three custom classes depend_on forward_checkpointing utility",
+    "ConvTranspose3dFactorized uses F.interpolate (not ConvTranspose3d) for upsampling",
+    "MultiStageConvTranspose3d composes temporal_blocks and spatial_blocks (nn.ModuleList)"
+  ],
+
+  "interaction_flow": [
+    "LatentRecon.__init__ → selects transposed_conv_module based on opt.transposed_conv_type",
+    "LatentRecon.__init__ → instantiates self.deconv = transposed_conv_module(blocks_out_channels, output_dims, patch_size_out, stride, padding)",
+    "LatentRecon.forward_gaussians → rearrange tokens: 'b (t h w) c -> b c t h w'",
+    "LatentRecon.forward_gaussians → forward_checkpointing(self.deconv, x) → upsampled feature volume",
+    "ConvTranspose3dFactorized.forward: channel_reduce → F.interpolate(trilinear, scale=stride) → Conv3d",
+    "ConvTranspose3dReduced.forward: channel_reduce → ConvTranspose3d",
+    "MultiStageConvTranspose3d.forward: ConstantPad3d → temporal_blocks loop → spatial_blocks loop"
+  ],
+
+  "important_notes": [
+    "ConvTranspose3dFactorized is defined TWICE in model.py (lines 191 and 235); second definition is active.",
+    "ConvTranspose3dFactorized uses interpolation (not transposed conv) despite its name.",
+    "MultiStageConvTranspose3d lazily computes pre_pad on first forward pass.",
+    "All modules are imported in model_latent_recon.py from src.models.utils.model.",
+    "gradient_checkpoint flag controls memory vs. compute tradeoff at each sub-step.",
+    "LatentRecon also supports a cosmos decoder path (load_cosmos_1_decoder) as alternative to these modules."
+  ],
+
+  "source_files_analyzed": [
+    "Lyra-1/src/models/utils/model.py",
+    "Lyra-1/src/models/recon/model_latent_recon.py"
+  ]
+}

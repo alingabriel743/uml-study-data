@@ -1,0 +1,159 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 11
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    BarColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleBackgroundColor #DEE2E6
+}
+skinparam note {
+    BackgroundColor #FFF3CD
+    BorderColor #FFC107
+}
+
+title File System Recursive Traversal
+
+|Caller|
+start
+:Invoke file system traversal operation;
+
+switch (Requested operation?)
+
+  case (fast_get_descendants)
+  |FSEntryController|
+  :Receive root uuid;
+  :Build WITH RECURSIVE descendant_cte\nseed: SELECT FROM fsentries\nWHERE parent_uid = uuid;
+  |Database|
+  :UNION ALL — join fsentries\nON f.parent_uid = d.uuid\n(expand one level per iteration);
+  :SELECT uuid FROM descendant_cte;
+  |FSEntryController|
+  :Map result rows → plain uuid[];
+  :Return all-depth descendant uuid[];
+
+  case (fast_get_direct_descendants)
+  |FSEntryController|
+  :Receive uuid;
+  if (uuid === NULL_UUID?) then (yes)
+    |Database|
+    :SELECT uuid FROM fsentries\nWHERE parent_uid IS NULL;
+  else (no)
+    |Database|
+    :SELECT uuid FROM fsentries\nWHERE parent_uid = ?;
+  endif
+  |FSEntryController|
+  :Map rows → uuid[];
+  :Return direct-child uuid[] (one level only);
+
+  case (readdirstat_uuid)
+  |PuterFSProvider|
+  :Receive uuid and options\n(thumbnail, etc.);
+  :Delegate to FSEntryController\n.get_descendants_full(uuid, options);
+  |FSEntryController|
+  :Build columns SQL:\ndefaultProperties (f.col)\n+ subdomainProperties (s.col AS subdomain_*)\n+ optional thumbnail column;
+  if (uuid === NULL_UUID?) then (yes)
+    |Database|
+    :SELECT cols FROM fsentries\nWHERE parent_uid IS NULL;
+  else (no)
+    |Database|
+    :SELECT cols FROM fsentries AS f\nLEFT JOIN subdomains AS s\n  ON f.id = s.root_dir_id\nWHERE parent_uid = ?\nORDER BY f.id;
+  endif
+  |FSEntryController|
+  :Deduplicate rows by entry id\nusing Map<id, entry>\n(collapse multiple subdomain rows\n→ entry.subdomains[]);
+  if (thumbnail option set?) then (yes)
+    :Attach thumbnail field to each entry;
+  endif
+  :Return Array.from(byId.values())\n— full fsentry objects[];
+  |PuterFSProvider|
+  :Map each raw_entry →\nsvc_fs.node(NodeRawEntrySelector);
+  :Set node.found = true on each node;
+  :Return FSNode[];
+
+  case (get_recursive_size)
+  |PuterFSProvider|
+  :Receive FSNode;
+  :await node.get('uid') → uuid;
+  |FSEntryController|
+  :Build WITH RECURSIVE descendant_cte\nseed: SELECT FROM fsentries\nWHERE parent_uid = uuid\n(includes size column);
+  |Database|
+  :UNION ALL — expand all descendants\nwith their individual size values;
+  :SELECT SUM(size) AS total_size\nFROM descendant_cte;
+  |FSEntryController|
+  :Return rows[0].total_size;
+
+  case (find by selector)
+  |FSEntryController|
+  :Receive selector object\n(any selector type);
+  if (RootNodeSelector?) then (yes)
+    :Return selector.entry directly\n(no DB call required);
+  elseif (NodePathSelector?) then (yes)
+    if (path === '/') then (yes)
+      :Return find(new RootNodeSelector());
+    else (no)
+      :Split path string into segments\n(filter empty parts);
+      |Database|
+      :Fast-path attempt:\nSELECT * FROM fsentries\nWHERE path = ? LIMIT 1;
+      |FSEntryController|
+      if (Denormalized path column hit?) then (yes)
+        :Return result[0] directly\n(skip segment walk);
+      else (no)
+        note right
+          Segment-by-segment walk:
+          for each path part i,
+          resolve against parent_uid
+        end note
+        :Initialize parent_uid = null;
+        :Walk each path segment against DB\n(NULL_UUID branch for root-level,\nparent_uid = ? for nested entries);
+        if (Any segment not found?) then (yes)
+          :Return false\n(path does not exist);
+          detach
+        endif
+        :Return final resolved fsentry;
+      endif
+    endif
+  elseif (NodeUIDSelector?) then (yes)
+    :Call findByUID(uuid, options);
+    |Database|
+    :db.tryHardRead:\nSELECT cols FROM fsentries\nWHERE uuid = ? LIMIT 1;
+    |FSEntryController|
+    :Return fsentry[0]\n(or undefined if not found);
+  elseif (NodeInternalIDSelector?) then (yes)
+    :Call findByID(id, options);
+    |Database|
+    :db.tryHardRead:\nSELECT cols FROM fsentries\nWHERE id = ? LIMIT 1;
+    |FSEntryController|
+    :Return fsentry[0];
+  else (NodeChildSelector)
+    if (parent is RootNodeSelector?) then (yes)
+      :findNameInRoot(selector.name) → id;
+    else (no)
+      :Recursive call:\nfind(selector.parent) → parentEntry;
+      :findNameInParent\n(parentEntry.uuid, selector.name) → id;
+    endif
+    if (id is undefined?) then (yes)
+      :Return null\n(child not found);
+      detach
+    else (no)
+      :Recurse: find(\n  new NodeInternalIDSelector('mysql', id)\n);
+    endif
+  endif
+
+endswitch
+
+|Caller|
+:Receive traversal result;
+stop
+
+@enduml

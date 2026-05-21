@@ -1,0 +1,66 @@
+{
+  "scope": "extension_tab_scan_flow",
+  "title": "Extension Tab Scan Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Trigger (DevToolsPort / PanelPort / PopupMessage / NavigationEvent)",
+    "ServiceWorker",
+    "chrome.storage.sync",
+    "chrome.scripting",
+    "ContentScript (content/content-script.js)",
+    "chrome.tabs",
+    "PanelPort (impeccable-panel-* / impeccable-sidebar-*)"
+  ],
+  "interaction_flow": [
+    "Trigger → ServiceWorker: scan request (via port.onMessage 'scan' OR runtime.onMessage {action:'scan'} OR webNavigation.onCompleted)",
+    "ServiceWorker → ServiceWorker: sendScanToTab(tabId)",
+    "ServiceWorker → ServiceWorker: ensureContentScriptInjected(tabId)",
+    "ServiceWorker → tabState: getState(tabId) — check csInjected flag",
+    "[if not injected] ServiceWorker → chrome.scripting: executeScript({ target:{tabId}, files:['content/content-script.js'], injectImmediately:true })",
+    "chrome.scripting → ContentScript: inject content-script.js into tab",
+    "ServiceWorker → tabState: state.csInjected = true",
+    "ServiceWorker → ServiceWorker: buildScanConfig()",
+    "ServiceWorker → chrome.storage.sync: get({ disabledRules, lineLengthMode, spotlightBlur, autoScan })",
+    "chrome.storage.sync → ServiceWorker: return settings",
+    "ServiceWorker → ServiceWorker: build config { disabledRules?, lineLengthMax (80|120), spotlightBlur }",
+    "ServiceWorker → chrome.tabs: sendMessage(tabId, { action:'scan', config })",
+    "chrome.tabs → ContentScript: deliver scan message with config",
+    "ContentScript → ServiceWorker: runtime.sendMessage({ action:'findings', findings:[] }) [async, after scan completes]",
+    "ServiceWorker → tabState: state.findings = msg.findings; state.injected = true",
+    "ServiceWorker → ServiceWorker: updateBadge(tabId) → chrome.action.setBadgeText / setBadgeBackgroundColor",
+    "ServiceWorker → PanelPort: notifyPanels(tabId, { action:'findings', findings }) — iterates panelPorts Map",
+    "ServiceWorker → chrome.runtime: sendMessage({ action:'findings-updated', tabId, findings }) [broadcast for popup]"
+  ],
+  "key_functions": {
+    "sendScanToTab(tabId)": "async; calls ensureContentScriptInjected then buildScanConfig, then chrome.tabs.sendMessage with {action:'scan', config}",
+    "ensureContentScriptInjected(tabId)": "async; checks state.csInjected, if false runs chrome.scripting.executeScript for content-script.js; returns bool",
+    "buildScanConfig()": "async; calls getSettings(), maps lineLengthMode→lineLengthMax (lax=120, strict=80), passes spotlightBlur and disabledRules",
+    "getSettings()": "async; chrome.storage.sync.get with defaults: disabledRules:[], lineLengthMode:'strict', spotlightBlur:true, autoScan:'panel'",
+    "notifyPanels(tabId, message)": "sync; looks up panelPorts Map by tabId, iterates Set<port>, calls port.postMessage(message); swallows disconnected-port errors",
+    "updateBadge(tabId)": "sync; reads findings count from tabState, calls chrome.action.setBadgeText and setBadgeBackgroundColor"
+  },
+  "trigger_paths": [
+    "DevTools lifecycle port (impeccable-devtools-{tabId}) onMessage 'scan' → sendScanToTab",
+    "Panel port (impeccable-panel-{tabId}) onMessage 'scan' → sendScanToTab",
+    "Panel port connected with no findings → sendScanToTab (auto-scan fallback)",
+    "Sidebar port (impeccable-sidebar-{tabId}) connected with no findings → sendScanToTab",
+    "runtime.onMessage {action:'scan'} from popup → sendScanToTab",
+    "runtime.onMessage {action:'disabled-rules-changed'} → sendScanToTab for all injected tabs",
+    "webNavigation.onCompleted (frameId=0, tab in devtoolsTabs, wasActive) → setTimeout(sendScanToTab, 300)"
+  ],
+  "state_management": {
+    "tabState": "Map<tabId, {findings[], overlaysVisible, injected, csInjected}>",
+    "panelPorts": "Map<tabId, Set<Port>> — panel + sidebar ports share this map",
+    "devtoolsTabs": "Set<tabId> — tracks tabs with DevTools open"
+  },
+  "key_relationships": [
+    "ServiceWorker owns tabState and panelPorts (module-level singletons)",
+    "sendScanToTab depends_on ensureContentScriptInjected and buildScanConfig",
+    "buildScanConfig depends_on getSettings (chrome.storage.sync)",
+    "notifyPanels reads panelPorts Map",
+    "ContentScript is injected lazily by ensureContentScriptInjected via chrome.scripting",
+    "Findings flow: ContentScript → ServiceWorker (runtime.onMessage) → tabState + badge + panelPorts + popup broadcast"
+  ],
+  "important_notes": "Content script injected on-demand (not static manifest entry) to minimize footprint. csInjected flag prevents double-injection within the same page lifecycle. Page navigation resets csInjected=false (reload destroys content script). notifyPanels covers both panel.js and sidebar pane ports. sendMessage calls use .catch(()=>{}) to silently handle missing tabs/content scripts.",
+  "source_files_analyzed": ["extension/background/service-worker.js"]
+}

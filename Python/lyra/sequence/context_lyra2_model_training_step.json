@@ -1,0 +1,154 @@
+{
+  "scope": "lyra2_model_training_step",
+  "title": "Lyra2 Model Training Step",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Trainer",
+    "Lyra2Model",
+    "RectifiedFlow",
+    "Conditioner",
+    "Tokenizer/VAE",
+    "Sparse3DCache",
+    "DiffusionNet (self.net)",
+    "SampleScheduler"
+  ],
+  "class_hierarchy": [
+    "Lyra2Model extends WANDiffusionModel",
+    "WANDiffusionModel extends T2VModelConfig base",
+    "Lyra2T2VConfig extends T2VModelConfig"
+  ],
+  "init_flow": [
+    "Lyra2Model.__init__(config: Lyra2T2VConfig)",
+    "  → super().__init__(config)  [WANDiffusionModel]",
+    "  → _init_lyra2_metadata()  [parses framepack_type string, sets framepack_clean_latent_frame_splits/kernel_sizes/kernel_types]",
+    "  → _compute_spatial_history_positions() → tuple[int,...]  [collect latent positions where kernel_type=='s']"
+  ],
+  "training_step_flow": [
+    "Trainer → Lyra2Model: training_step(data_batch, iteration)",
+    "  [iteration==0 and init_framepack_weights] → DiffusionNet: copy_weights_to_clean_patch_embeddings()",
+    "  → Lyra2Model: _update_train_stats(data_batch)",
+    "  [self_aug_enabled branch]:",
+    "    → Lyra2Model: get_data_and_condition(data_batch) → (raw_state, x0_latents, condition)",
+    "    → build init_latents_aug [history=clean, tail=noised via RectifiedFlow.get_interpolation]",
+    "    → Conditioner: get_condition_with_negative_prompt(data_batch) → (condition_A, uncondition_A)",
+    "    → [short denoise loop, steps_A iterations]:",
+    "        x0_fn_A: Lyra2Model.denoise(noise_x, t, condition_A) + denoise(noise_x, t, uncondition_A) → CFG blend",
+    "        SampleScheduler: step(vt_pred, t, latents) → next latents",
+    "    → Tokenizer/VAE: decode(latents_A) → full_frames (pixels)",
+    "    → splice decoded frames back into original video timeline (valid_indices mapping)",
+    "    → Lyra2Model: get_data_and_condition(data_batch_aug) → (raw_state, x0_latents, condition)  [Stage-B re-conditioning]",
+    "  [normal path]:",
+    "    → Lyra2Model: get_data_and_condition(data_batch) → (raw_state, x0_latents, condition)",
+    "  → RectifiedFlow: sample_train_time(batch_size) → t_B",
+    "  → build epsilon_full [zeros on history frames T<T_hist, randn on generated region T>=T_hist]",
+    "  → [CP group] broadcast(x0_latents, epsilon_full, t_B, condition) across CP ranks",
+    "  → DiffusionNet: enable_context_parallel(cp_group) or disable_context_parallel()",
+    "  → RectifiedFlow: get_discrete_timestamp(t_B) → timesteps",
+    "  → RectifiedFlow: get_sigmas(timesteps) → sigmas",
+    "  → RectifiedFlow: get_interpolation(epsilon_full, x0_latents, sigmas) → (xt, vt)",
+    "  → DiffusionNet: net(x_B_C_T_H_W=xt, timesteps_B_T=timesteps, **condition.to_dict(), **framepack_params) → vt_pred_gen",
+    "  → RectifiedFlow: train_time_weight(timesteps) → time_weights_B",
+    "  → compute MSE loss: mean((vt_pred_gen - vt[:,:,T_hist:])^2) weighted by time_weights_B",
+    "  → Trainer: return ({edm_loss: loss}, loss)"
+  ],
+  "get_data_and_condition_flow": [
+    "Lyra2Model.get_data_and_condition(data_batch, dropout=False)",
+    "  [not preprocessed] → _normalize_video_databatch_inplace(data_batch)",
+    "  → _tokenizing_video_to_latents(raw_state, dropout, data_batch) → (latent_state, last_hist_frame, cond_latent, cond_latent_mask)",
+    "  → data_batch['last_hist_frame'] = last_hist_frame",
+    "  → data_batch['cond_latent_mask'] = cond_latent_mask",
+    "  → data_batch[WAN2PT1_I2V_COND_LATENT_KEY] = cond_latent",
+    "  → Conditioner: conditioner(data_batch) → condition",
+    "  → condition.edit_data_type(DataType.VIDEO)",
+    "  → return (raw_state, latent_state, condition)"
+  ],
+  "tokenizing_video_to_latents_flow": [
+    "Lyra2Model._tokenizing_video_to_latents(video, dropout, data_batch)",
+    "  Step 1 – Window selection:",
+    "    → _prepare_video_window(video, start, cur_segment_id) → (video_win, video_indices, start, cur_segment_id, chunk_len)",
+    "  Step 2 – VAE encoding:",
+    "    [normal] → _vae_encode_with_shared_prefix(video_win) → (latents, cond_latent)",
+    "    [self_aug/stage-B] → vae_encode_with_cache(cache_T-2, prev_chunk), vae_encode_with_cache(cache, zeros), vae_encode_with_cache(cache_T-1, curr_chunk)",
+    "      → _encoder_feats_to_normalized_latents(feats) for each → stitch (latents, cond_latent)",
+    "  Step 3 – Spatial cache:",
+    "    [num_spatial_hist > 0] → Sparse3DCache.add(depth, camera_w2c, intrinsics) for selected stride frames",
+    "  Step 4 – Prepare model inputs:",
+    "    → _prepare_lyra2_inputs(history_full, gen_cond, spatial_cache, video, buffer_depth, camera_w2c, intrinsics, video_indices, is_training=True)",
+    "      → _get_cached_spatial_coords(H, W, num_spatial_hist) → coords",
+    "      → [warp pipeline] forward_warp_multiframes / unproject_points for spatial correspondences",
+    "      → returns (latents, cond_latent, mask, buffer_cond_latents)",
+    "  Step 5 – GT tail splice: latents[:,:,:T_hist] + gen_gt",
+    "  Step 6 (optional) – _apply_spatial_region_corruption(latents, cond_latent)",
+    "  → return (latents, last_hist_frame, cond_latent, mask)"
+  ],
+  "prepare_video_window_flow": [
+    "Lyra2Model._prepare_video_window(video, start=None, cur_segment_id=None)",
+    "  [start is None] → random start ∈ [0, video_length * starting_frame_ratio)",
+    "  [cur_segment_id is None] → random ∈ [0, max(1, min(max_segments, (video_length-start-1)//num_new_frames)))",
+    "  chunk_len = (cur_segment_id+1) * num_new_video_frames + 1",
+    "  [start+chunk_len > video_length] → pad-right by repeating last frame",
+    "  [else] → crop video_win = video[:,:,start:start+chunk_len]",
+    "  to_repeat_front = (framepack_num_history_latent - 1) * num_frames_per_latent",
+    "  [to_repeat_front > 0] → prepend first frame repeated to_repeat_front times",
+    "  → return (video_win, video_indices, start, cur_segment_id, chunk_len)"
+  ],
+  "compute_spatial_history_positions_flow": [
+    "Lyra2Model._compute_spatial_history_positions() → tuple[int,...]",
+    "  Iterates framepack_clean_latent_frame_splits + framepack_clean_latent_frame_kernel_types",
+    "  Collects integer latent positions where kernel_type == 's' (spatial kernel)",
+    "  Returns tuple of those positions (used for dropout/corruption indexing)"
+  ],
+  "get_x0_fn_from_batch_flow": [
+    "Lyra2Model.get_x0_fn_from_batch(data_batch, guidance, is_negative_prompt, seed)",
+    "  → get_data_and_condition(data_batch) → (_, x0_latents, _)",
+    "  → [negative_prompt] Conditioner.get_condition_with_negative_prompt(data_batch) → (condition, uncondition)",
+    "  → [else] Conditioner.get_condition_uncondition(data_batch) → (condition, uncondition)",
+    "  → condition/uncondition.edit_data_type(DataType.VIDEO)",
+    "  → broadcast_split_for_model_parallelsim(condition/uncondition)",
+    "  → build init_latents: history=x0_latents[:,:,:T_hist], gen_region=arch_invariant_rand noise",
+    "  → define x0_fn closure:",
+    "      x0_fn(noise_x, timestep):",
+    "        → denoise(noise_x, timestep, condition) → cond_v_gen",
+    "        → denoise(noise_x, timestep, uncondition) → uncond_v_gen",
+    "        → gen_v = uncond_v_gen + guidance*(cond_v_gen - uncond_v_gen)  [CFG]",
+    "        → vt_full = zeros_like(noise_x); vt_full[:,:,T_hist:] = gen_v  [zero history region]",
+    "        → return vt_full",
+    "  → return (x0_fn, init_latents)"
+  ],
+  "denoise_flow": [
+    "Lyra2Model.denoise(xt_B_C_T_H_W, timestep, condition)",
+    "  → DiffusionNet.net(x_B_C_T_H_W=xt.to(tensor_kwargs), timesteps_B_T=timestep, **condition.to_dict(), **framepack_params)",
+    "  → return vt_pred_gen.float()"
+  ],
+  "key_data_structures": {
+    "framepack_params": "dict with framepack_indices (arange), framepack_splits (list), framepack_kernel_ids (list), framepack_kernel_types (list) — injected to every net() call",
+    "latents shape": "[B, C, T_total, H_lat, W_lat] where T_total = T_hist + T_new",
+    "cond_latent shape": "[B, C+C_plucker, T_total, H_lat, W_lat] — concatenates VAE latent + Plucker ray encoding",
+    "T_hist": "framepack_total_max_num_latent_frames - framepack_num_new_latent_frames",
+    "epsilon_full": "history region = x0 (clean), gen region = randn noise",
+    "loss": "time-weighted MSE only on generated region vt[:,:,T_hist:]"
+  },
+  "key_config_fields": [
+    "framepack_type: str  e.g. 'f16k4f2k2f1k1_g3' — encodes history latent splits and kernel types (k=temporal, s=spatial)",
+    "num_frames_per_latent: int  [default 4] — video tokenizer temporal stride",
+    "max_segments: int  [default 10] — max AR window segments",
+    "starting_frame_ratio: float  [default 0.1] — fraction of video for start sampling",
+    "self_aug_enabled: bool  [default False] — enables Stage-A self-augmentation",
+    "spatial_memory_stride/skip_recent/dropout_rate — control sparse spatial cache sampling",
+    "multibuffer_max_spatial_frames: Optional[int] — max spatial history slots"
+  ],
+  "key_relationships": [
+    "Lyra2Model inherits WANDiffusionModel (training_step, get_x0_fn_from_batch, get_data_and_condition fully overridden)",
+    "Lyra2Model depends_on RectifiedFlow (sample_train_time, get_sigmas, get_interpolation, train_time_weight)",
+    "Lyra2Model depends_on Conditioner (conditioner(), get_condition_uncondition, get_condition_with_negative_prompt)",
+    "Lyra2Model depends_on Tokenizer/VAE (_vae_encode_with_shared_prefix, vae_encode_with_cache, decode)",
+    "Lyra2Model depends_on DiffusionNet/net (forward, copy_weights_to_clean_patch_embeddings, enable/disable_context_parallel)",
+    "Lyra2Model depends_on Sparse3DCache (spatial history frames, warp pipeline)",
+    "Lyra2Model uses SampleScheduler (inference only, set_timesteps, step)",
+    "_tokenizing_video_to_latents calls _prepare_video_window → _vae_encode_with_shared_prefix → Sparse3DCache.add → _prepare_lyra2_inputs"
+  ],
+  "important_notes": "Loss is computed ONLY over the generated region (T>=T_hist); history latents are clean x0. CP (context parallel) is handled internally by the net after Lyra2 patchify — no temporal split before net() call. framepack_params dict is passed verbatim to every net() forward. Spatial positions are those latent slots with kernel_type=='s' in the framepack_type string.",
+  "source_files_analyzed": [
+    "Lyra-2/lyra_2/_src/models/lyra2_model.py"
+  ]
+}

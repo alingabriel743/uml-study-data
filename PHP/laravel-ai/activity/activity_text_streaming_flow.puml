@@ -1,0 +1,205 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title Text Streaming Flow
+
+|Gateway\n(HandlesTextStreaming)|
+start
+:processTextStream(invocationId, provider,\nmodel, tools, schema, options, streamBody, depth);
+:Generate messageId (UUID v7);
+note right
+  streamStartEmitted = false
+  textStartEmitted = false
+  reasoningStartEmitted = false
+  currentText = ''
+  pendingToolCalls = []
+end note
+
+|SSE Parser\n(ParsesServerSentEvents)|
+:parseServerSentEvents(streamBody);
+repeat
+  :readLine(streamBody)\nbyte-by-byte until \\n;
+  if (Blank line or\nnon-data: prefix?) then (yes)
+    :Skip line;
+  else (no)
+    if (Line === '[DONE]'?) then (yes)
+      :Terminate generator;
+      stop
+    else (no)
+      :Strip "data:" prefix;
+      if (json_decode succeeds\n&& not null?) then (yes)
+        :Yield decoded SSE object;
+      else (no)
+        :Silently skip\nmalformed line;
+      endif
+    endif
+  endif
+repeat while (Stream body has more data?) is (yes)
+-> no;
+
+|Gateway\n(HandlesTextStreaming)|
+:Receive decoded SSE object;
+
+if (Event type = error?) then (yes)
+  |Stream Events|
+  :emit Error(code, message, retryable);
+  |Gateway\n(HandlesTextStreaming)|
+  :Terminate stream — RETURN;
+  stop
+else (no)
+endif
+
+if (stream-start trigger\n&& !streamStartEmitted?) then (yes)
+  |Stream Events|
+  :emit StreamStart(provider, model);
+  |Gateway\n(HandlesTextStreaming)|
+  :streamStartEmitted = true;
+else (no)
+endif
+
+if (Text delta event?) then (yes)
+  if (!textStartEmitted?) then (yes)
+    |Stream Events|
+    :emit TextStart(messageId);
+    |Gateway\n(HandlesTextStreaming)|
+    :textStartEmitted = true;
+  else (no)
+  endif
+  :Accumulate currentText\n+= deltaText;
+  |Stream Events|
+  :emit TextDelta(messageId, deltaText);
+  |Gateway\n(HandlesTextStreaming)|
+else (no)
+  if (Text done event?) then (yes)
+    if (textStartEmitted?) then (yes)
+      |Stream Events|
+      :emit TextEnd(messageId);
+      |Gateway\n(HandlesTextStreaming)|
+      :textStartEmitted = false\n(reset per Anthropic block);
+    else (no)
+    endif
+  else (no)
+    if (Reasoning delta event?) then (yes)
+      if (!reasoningStartEmitted?) then (yes)
+        |Stream Events|
+        :emit ReasoningStart(reasoningId);
+        |Gateway\n(HandlesTextStreaming)|
+        :reasoningStartEmitted = true;
+      else (no)
+      endif
+      |Stream Events|
+      :emit ReasoningDelta(reasoningId, delta);
+      |Gateway\n(HandlesTextStreaming)|
+    else (no)
+      if (Reasoning done event?) then (yes)
+        |Stream Events|
+        :emit ReasoningEnd(reasoningId);
+        |Gateway\n(HandlesTextStreaming)|
+        :reasoningStartEmitted = false\nreasoningId = null;
+      else (no)
+        if (Tool call fragment event?) then (yes)
+          :Accumulate pendingToolCalls[]\nwith id / name / arguments fragment;
+        else (no)
+          if (Usage / completion data?) then (yes)
+            :Capture Usage\n(inputTokens, outputTokens,\ncacheTokens, reasoningTokens);
+          else (no)
+            :Ignore unknown event type;
+          endif
+        endif
+      endif
+    endif
+  endif
+endif
+
+:Continue SSE loop;
+note right: Back to parseServerSentEvents\nyield loop
+
+:SSE loop complete;
+
+if (pendingToolCalls not empty?) then (yes)
+  :handleStreamingToolCalls();
+  fork
+    :mapStreamToolCalls()\n→ ToolCall DTOs;
+  fork again
+    :findTool(toolName)\nfor each ToolCall;
+  end fork
+  :executeTool(toolCall)\n→ ToolResult;
+  |Stream Events|
+  :emit ToolResult(toolResult, isStreaming, metadata);
+  |Gateway\n(HandlesTextStreaming)|
+  if (depth + 1 < maxSteps?) then (yes)
+    :Build next request body\n(stream = true);
+    :HTTP POST to provider\n→ new streamBody;
+    :Recursive call:\nprocessTextStream(depth + 1);
+    note right
+      maxSteps = round(count(tools) * 1.5)
+      Agentic loop continues
+    end note
+  else (no)
+    |Stream Events|
+    :emit StreamEnd('stop', Usage(0, 0))\n[depth exceeded];
+    |Gateway\n(HandlesTextStreaming)|
+  endif
+else (no)
+  |Stream Events|
+  :emit StreamEnd(finishReason, usage);
+  |Gateway\n(HandlesTextStreaming)|
+endif
+
+|Vercel Output\n(CanStreamUsingVercelProtocol)|
+:toVercelProtocolResponse();
+note right
+  Headers:
+  Content-Type: text/event-stream
+  x-vercel-ai-ui-message-stream: v1
+  Cache-Control: no-cache
+end note
+:response()->stream(): iterate all events;
+repeat
+  :event.toVercelProtocolArray();
+  if (Returns null?\n(StreamStart, ReasoningStart,\nReasoningDelta, ReasoningEnd,\nProviderToolEvent, Error)) then (yes)
+    :Skip — no output;
+  else (no)
+    if (Is StreamEnd?) then (yes)
+      :Buffer StreamEnd\n(emit last);
+    else (no)
+      :Output "data: {json}\\n\\n"\nper Vercel AI SDK protocol;
+    endif
+  endif
+repeat while (More events?) is (yes)
+-> no;
+:Output buffered StreamEnd\n"data: {json}\\n\\n";
+:Output "data: [DONE]\\n\\n";
+
+stop
+
+@enduml

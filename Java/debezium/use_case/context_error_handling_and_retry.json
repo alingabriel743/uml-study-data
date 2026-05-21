@@ -1,0 +1,98 @@
+{
+  "scope": "error_handling_and_retry",
+  "title": "Error Handling and Retry",
+  "diagram_type": "use_case",
+  "description": "Connector handles retriable and non-retriable errors, manages retry policy",
+  "actors": [
+    "BinlogSourceTask (MySqlConnectorTask / MariaDbConnectorTask)",
+    "ChangeEventSourceCoordinator",
+    "ErrorHandler",
+    "MySqlErrorHandler",
+    "MariaDbErrorHandler",
+    "BinlogHeartbeatErrorHandler",
+    "HeartbeatErrorHandler (interface)",
+    "RetryingCallable",
+    "ChangeEventQueue",
+    "CommonConnectorConfig"
+  ],
+  "use_cases": [
+    "Classify error as retriable (IOException, SQLException - except code 1236)",
+    "Classify error as non-retriable (SQL error 1236: ER_MASTER_FATAL_ERROR_READING_BINLOG)",
+    "Apply custom retriable exception regex (CUSTOM_RETRIABLE_EXCEPTION config)",
+    "Track retry count against maxRetries (errors.max.retries config)",
+    "Emit RetriableException to ChangeEventQueue (connector restarts)",
+    "Emit ConnectException to ChangeEventQueue (connector stops)",
+    "Reset retry counter on successful poll with change records",
+    "Propagate retry count from replaced ErrorHandler on restart",
+    "Handle heartbeat SQL errors (42000, 3D000 => fatal DebeziumException)",
+    "Retry callable action with DelayStrategy (RetryingCallable)",
+    "Validate binlog configuration (format=ROW, row_image=FULL)",
+    "Warn on missing/purged binlog files at startup"
+  ],
+  "key_relationships": [
+    "MySqlErrorHandler extends ErrorHandler",
+    "MariaDbErrorHandler extends ErrorHandler",
+    "BinlogHeartbeatErrorHandler implements HeartbeatErrorHandler (inner class of BinlogSourceTask)",
+    "BinlogSourceTask extends BaseSourceTask",
+    "ChangeEventSourceCoordinator holds ErrorHandler; calls setProducerThrowable(e) on Throwable",
+    "BaseSourceTask calls coordinator.getErrorHandler().resetRetries() after successful poll",
+    "ErrorHandler depends_on CommonConnectorConfig (getMaxRetriesOnError, customRetriableException)",
+    "ErrorHandler writes to ChangeEventQueue (producerException)",
+    "RetryingCallable is a standalone retry wrapper using DelayStrategy, catches RetriableException"
+  ],
+  "error_classification_logic": [
+    "ErrorHandler.isRetriable(): walks cause chain, matches communicationExceptions() set (default: IOException only)",
+    "MySqlErrorHandler/MariaDbErrorHandler override communicationExceptions() → {IOException, SQLException}",
+    "MySqlErrorHandler/MariaDbErrorHandler override isRetriable(): if SQLException.errorCode==1236 → false (non-retriable); else delegates to super",
+    "ErrorHandler.isCustomRetriable(): checks throwable message chain against regex in config 'custom.retriable.exception'",
+    "BinlogHeartbeatErrorHandler.onError(): SQL state 42000 or 3D000 → throw DebeziumException (fatal); others → ignored"
+  ],
+  "retry_policy": {
+    "config_key": "errors.max.retries",
+    "default": "RETRIES_UNLIMITED (-1)",
+    "constants": "RETRIES_UNLIMITED=-1, RETRIES_DISABLED=0",
+    "behavior": "retriable + hasMoreRetries() → RetriableException (connector restart); else ConnectException (connector stop)",
+    "counter_propagation": "replacedErrorHandler.getRetries() copied on construction to carry over count across restarts",
+    "counter_reset": "BaseSourceTask.resetErrorHandlerRetriesIfNeeded() resets retries to 0 after successful poll with change records"
+  },
+  "non_retriable_error_codes": {
+    "MySQL_MariaDB": [1236],
+    "description": "ER_MASTER_FATAL_ERROR_READING_BINLOG - always stops the connector"
+  },
+  "key_method_signatures": [
+    "ErrorHandler.setProducerThrowable(Throwable) - entry point for error reporting",
+    "ErrorHandler.isRetriable(Throwable): boolean - virtual, override in subclasses",
+    "ErrorHandler.isCustomRetriable(Throwable): boolean - regex match on message chain",
+    "ErrorHandler.hasMoreRetries(): boolean - increments retries, checks vs maxRetries",
+    "ErrorHandler.resetRetries(): void",
+    "ErrorHandler.getRetries(): int",
+    "MySqlErrorHandler(MySqlConnectorConfig, ChangeEventQueue, ErrorHandler) - constructor",
+    "MariaDbErrorHandler(MariaDbConnectorConfig, ChangeEventQueue, ErrorHandler) - constructor",
+    "BinlogHeartbeatErrorHandler.onError(SQLException) throws RuntimeException",
+    "RetryingCallable.call(): V - retry loop catching RetriableException with DelayStrategy",
+    "BinlogSourceTask.validateBinlogConfiguration(Snapshotter, BinlogConnectorConnection): void - throws DebeziumException if misconfigured",
+    "ChangeEventSourceCoordinator.getErrorHandler(): ErrorHandler",
+    "BaseSourceTask.resetErrorHandlerRetriesIfNeeded(List<SourceRecord>): void"
+  ],
+  "flow_summary": [
+    "1. Producer thread throws Throwable → ChangeEventSourceCoordinator catches → errorHandler.setProducerThrowable(e)",
+    "2. ErrorHandler: first=CAS null→e; check isRetriable(e) → check isCustomRetriable(e)",
+    "3. If retriable AND hasMoreRetries(): queue.producerException(RetriableException) → Kafka Connect restarts task",
+    "4. If not retriable OR no retries left: queue.producerException(ConnectException) → task stops",
+    "5. On restart: new ErrorHandler receives replacedErrorHandler to preserve retry count",
+    "6. After successful poll with records: BaseSourceTask.resetErrorHandlerRetriesIfNeeded() resets counter to 0",
+    "7. Heartbeat SQL errors: BinlogHeartbeatErrorHandler classifies 42000/3D000 as fatal, others as ignorable"
+  ],
+  "important_notes": "MySqlErrorHandler and MariaDbErrorHandler are structurally identical (same NON_RETRIABLE_ERROR_CODES set {1236}, same communicationExceptions). RetryingCallable is an embedded-engine-level retry (not connector pipeline retry). HeartbeatErrorHandler is a functional interface with DEFAULT_NOOP_ERRORHANDLER default.",
+  "source_files_analyzed": [
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/ErrorHandler.java",
+    "debezium-connector-mysql/src/main/java/io/debezium/connector/mysql/MySqlErrorHandler.java",
+    "debezium-connector-mariadb/src/main/java/io/debezium/connector/mariadb/MariaDbErrorHandler.java",
+    "debezium-connector-common/src/main/java/io/debezium/heartbeat/HeartbeatErrorHandler.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogSourceTask.java",
+    "debezium-embedded/src/main/java/io/debezium/embedded/async/RetryingCallable.java",
+    "debezium-connector-common/src/main/java/io/debezium/config/CommonConnectorConfig.java (grep)",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/ChangeEventSourceCoordinator.java (grep)",
+    "debezium-connector-common/src/main/java/io/debezium/connector/common/BaseSourceTask.java (grep)"
+  ]
+}

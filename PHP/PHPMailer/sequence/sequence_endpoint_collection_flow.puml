@@ -1,0 +1,213 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #F1F3F5
+    GroupBorderColor #495057
+    GroupBackgroundColor #DEE2E6
+    DividerBackgroundColor #E9ECEF
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Endpoint Collection and Flushing Flow\n(Datadog PHP Tracer — ddtrace auto-discovery)
+
+participant "Framework\n(HTTP Request)" as Request #D0E8FF
+participant "LaravelIntegration" as Laravel #C8F0C8
+participant "SymfonyIntegration" as Symfony #C8F0C8
+participant "EndpointCatalog" as Catalog #E8F4E8
+participant "SymfonyRouter" as SRouter #E8F4E8
+participant "DDTrace Extension\n(PHP C Extension)" as DDTrace #FFE8CC
+participant "SidecarActionsBuffer\n(Rust)" as Buffer #F5E6FF
+participant "ShmCacheMap\n(Shared Memory)" as ShmCache #FFE0E0
+participant "SidecarTransport\n(Rust)" as Transport #FFE0E0
+
+== Framework Hook: Endpoint Collection Trigger ==
+
+alt Laravel — Router::dispatch() posthook
+
+    Request -> Laravel : Router::dispatch() tracing hook fires\n(after route resolution)
+    activate Laravel
+
+    Laravel -> DDTrace : \\DDTrace\\are_endpoints_collected()
+    activate DDTrace
+    DDTrace -> ShmCache : ddog_sidecar_telemetry_are_endpoints_collected\n(cache, service, env)
+    activate ShmCache
+    note right of ShmCache
+        Checks if last_endpoints_push.elapsed() < 30 min.
+        Business rule: endpoint catalog sent ONCE per
+        service+env per 30-minute window.
+    end note
+    ShmCache --> DDTrace : bool (true = already collected)
+    deactivate ShmCache
+    DDTrace --> Laravel : bool
+    deactivate DDTrace
+
+    alt Endpoints NOT yet collected (false)
+
+        Laravel -> Laravel : $routeCollection = $this->getRoutes()
+        note right of Laravel
+            Retrieves all registered routes
+            from the Laravel Router instance.
+        end note
+
+        loop For each route in $routeCollection
+            Laravel -> DDTrace : \\DDTrace\\add_endpoint(\n  $path, 'http.request',\n  "$method $path", $method)
+            activate DDTrace
+            DDTrace -> Buffer : ddog_sidecar_telemetry_addEndpoint_buffer(\n  buffer, method, path,\n  operation_name, resource_name)
+            activate Buffer
+            note right of Buffer
+                Endpoint buffered as SidecarAction.
+                Endpoint record shape:
+                { path, operationName: "http.request",
+                  resourceName: "METHOD /path", method }
+            end note
+            Buffer --> DDTrace : void
+            deactivate Buffer
+            DDTrace --> Laravel : bool
+            deactivate DDTrace
+        end
+
+        Laravel -> DDTrace : \\DDTrace\\flush_endpoints()
+        activate DDTrace
+        DDTrace -> Transport : ddog_sidecar_telemetry_buffer_flush(\n  transport, instance_id, queue_id, buffer)
+        activate Transport
+        Transport -> ShmCache : blocking::enqueue_actions()\nupdates last_endpoints_push timestamp
+        activate ShmCache
+        ShmCache --> Transport : void
+        deactivate ShmCache
+        Transport --> DDTrace : MaybeError
+        deactivate Transport
+        DDTrace --> Laravel : void
+        deactivate DDTrace
+
+    else Endpoints already collected (true)
+        note over Laravel : Skips collection — 30-min TTL not yet expired.\nNo add_endpoint / flush_endpoints calls made.
+    end
+
+    deactivate Laravel
+
+else Symfony — EventDispatcher::dispatch() hook\n(kernel.request / kernel.controller events)
+
+    Request -> Symfony : EventDispatcher::dispatch() tracing hook fires
+    activate Symfony
+
+    Symfony -> DDTrace : \\DDTrace\\are_endpoints_collected()
+    activate DDTrace
+    DDTrace -> ShmCache : ddog_sidecar_telemetry_are_endpoints_collected\n(cache, service, env)
+    activate ShmCache
+    ShmCache --> DDTrace : bool
+    deactivate ShmCache
+    DDTrace --> Symfony : bool
+    deactivate DDTrace
+
+    alt Endpoints NOT yet collected (false)
+        note over Symfony : Only proceeds for Symfony >= 5.x\n(Symfony 4.x is skipped via version check)
+
+        Symfony -> Catalog : EndpointCatalog::generate($container)
+        activate Catalog
+
+        Catalog -> Catalog : getCacheDir($container)\nreads kernel.cache_dir parameter
+
+        alt Router cache files exist
+            Catalog -> Catalog : fromRouterCache($cacheDir)\nrequire url_generating_routes.php\n+ url_matching_routes.php
+            note right of Catalog
+                Memoized via static $memo.
+                Cache files are pre-compiled Symfony
+                route matchers — faster than live collection.
+            end note
+        else Cache files unavailable (fallback)
+            Catalog -> SRouter : fromRouteCollection()\n$router->getRouteCollection()
+            activate SRouter
+            note right of Catalog
+                HTTP method priority applied:
+                GET > POST > first available
+                (defaults to GET if none found)
+            end note
+            SRouter --> Catalog : RouteCollection
+            deactivate SRouter
+        end
+
+        Catalog --> Symfony : array[{path, operationName,\n  resourceName, method}]
+        deactivate Catalog
+
+        loop For each endpoint in catalog
+            Symfony -> DDTrace : \\DDTrace\\add_endpoint(\n  $endpoint['path'], 'http.request',\n  $endpoint['resourceName'],\n  $endpoint['method'])
+            activate DDTrace
+            DDTrace -> Buffer : ddog_sidecar_telemetry_addEndpoint_buffer(\n  buffer, method, path,\n  operation_name, resource_name)
+            activate Buffer
+            Buffer --> DDTrace : void
+            deactivate Buffer
+            DDTrace --> Symfony : bool
+            deactivate DDTrace
+        end
+
+        Symfony -> DDTrace : \\DDTrace\\flush_endpoints()
+        activate DDTrace
+        DDTrace -> Transport : ddog_sidecar_telemetry_buffer_flush(\n  transport, instance_id, queue_id, buffer)
+        activate Transport
+        Transport -> ShmCache : blocking::enqueue_actions()\nupdates last_endpoints_push timestamp
+        activate ShmCache
+        ShmCache --> Transport : void
+        deactivate ShmCache
+        Transport --> DDTrace : MaybeError
+        deactivate Transport
+        DDTrace --> Symfony : void
+        deactivate DDTrace
+
+    else Endpoints already collected (true)
+        note over Symfony : Skips collection — 30-min TTL not yet expired.
+    end
+
+    deactivate Symfony
+
+end
+
+== Per-Request: Root Span HTTP Metadata Tagging ==
+
+Request -> DDTrace : \\DDTrace\\root_span()
+activate DDTrace
+note right of DDTrace
+    Returns the RootSpanData for the active
+    trace stack. Called on every HTTP request
+    (independent of endpoint collection guard).
+end note
+DDTrace --> Request : RootSpanData (extends SpanData)
+deactivate DDTrace
+
+Request -> Request : rootSpan->meta['http.route'] = $route
+Request -> Request : rootSpan->meta['http.endpoint'] = $endpoint
+Request -> Request : rootSpan->meta['http.url'] = $url
+Request -> Request : rootSpan->meta['http.method'] = $method
+
+note over Request
+    Endpoint-based sampling precedence:
+    http.route > http.endpoint > computed from http.url
+    Note: 404 responses are NOT sampled even when
+    http.endpoint is set.
+end note
+
+@enduml

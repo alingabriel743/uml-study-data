@@ -1,0 +1,147 @@
+{
+  "scope": "trace_scope_lifecycle",
+  "title": "DDTrace Scope & Span Lifecycle",
+  "diagram_type": "activity",
+  "key_participants": [
+    "Caller (user code)",
+    "ScopeManager",
+    "Scope",
+    "Span",
+    "ObjectKVStore",
+    "DDTrace C-extension (root_span, active_span, trace_id)"
+  ],
+
+  "activities": [
+    {
+      "activity": "activate(span, finishSpanOnClose=true)",
+      "actor": "ScopeManager",
+      "steps": [
+        "Create new Scope(scopeManager=this, span, finishSpanOnClose)",
+        "[if span instanceof DDTrace\\Span AND ObjectKVStore has 'ddtrace_scope_activated' key] → ObjectKVStore::put(span.internalSpan, 'ddtrace_scope_activated', true)",
+        "Push scope onto $scopes[] stack",
+        "[if span.context.isHostRoot()] → push scope onto $hostRootScopes[]",
+        "Return Scope instance to caller"
+      ]
+    },
+    {
+      "activity": "getActive()",
+      "actor": "ScopeManager",
+      "steps": [
+        "Call reconcileInternalAndUserland() — sync C-extension spans into userland stack",
+        "Iterate $scopes[] from top (end) to bottom (start)",
+        "[if span is NOT DDTrace\\Span] → return this scope (pure userland span, always active)",
+        "[if span IS DDTrace\\Span] → check ObjectKVStore.get(span.internalSpan, 'ddtrace_scope_activated', default=true)",
+        "  [if value == true] → return this scope",
+        "  [else] → continue iterating down the stack",
+        "[if no scope found] → return null"
+      ]
+    },
+    {
+      "activity": "Scope::close()",
+      "actor": "Scope",
+      "steps": [
+        "[if finishSpanOnClose == true] → call span.finish()",
+        "Call scopeManager.deactivate(this)"
+      ]
+    },
+    {
+      "activity": "deactivate(scope)",
+      "actor": "ScopeManager",
+      "steps": [
+        "Search for scope in $scopes[] by identity",
+        "[if not found] → return (no-op)",
+        "Remove scope from $scopes[] via array_splice",
+        "[if span instanceof DDTrace\\Span AND ObjectKVStore has key] → ObjectKVStore::put(span.internalSpan, 'ddtrace_scope_activated', false)",
+        "[if span.context.isHostRoot()] → call deactivateHostRoot(scope)"
+      ]
+    },
+    {
+      "activity": "deactivateHostRoot(scope) [private]",
+      "actor": "ScopeManager",
+      "steps": [
+        "Search for scope in $hostRootScopes[] by identity",
+        "[if found] → remove via array_splice"
+      ]
+    },
+    {
+      "activity": "ScopeManager::close()",
+      "actor": "ScopeManager",
+      "steps": [
+        "Iterate all scopes in $hostRootScopes[]",
+        "Call scope.close() on each → triggers span.finish() + deactivate()"
+      ]
+    },
+    {
+      "activity": "reconcileInternalAndUserland() [private]",
+      "actor": "ScopeManager",
+      "steps": [
+        "Walk $scopes[] from top, remove any scope whose span.isFinished() == true",
+        "[if $scopes[] is now empty]",
+        "  → call C-ext root_span()",
+        "  [if root_span() exists]",
+        "    → call C-ext trace_id()",
+        "    → build SpanContext(traceId, internalRootSpan.id, parentId from rootContext)",
+        "    → set context.parentContext = this.rootContext",
+        "    → create Scope wrapping new Span(internalRootSpan, context), finishSpanOnClose=false",
+        "    → set as $scopes[0]",
+        "  [else] → return null",
+        "Walk active_span() chain (C-ext) downward from current active span",
+        "  Stop when span.id matches the known top scope's spanId",
+        "  For each gap span: create Scope(new Span(span, SpanContext), finishSpanOnClose=true)",
+        "  Collect new scopes in reverse order (oldest first)",
+        "Set parentContext links on new scopes to chain correctly",
+        "Push new scopes onto $scopes[]",
+        "Return newest scope added (or existing topScope if no gaps found)"
+      ]
+    },
+    {
+      "activity": "getPrimaryRoot()",
+      "actor": "ScopeManager",
+      "steps": [
+        "Call reconcileInternalAndUserland()",
+        "Return first element of $scopes[] (root scope) or null if empty"
+      ]
+    },
+    {
+      "activity": "getTopScope()",
+      "actor": "ScopeManager",
+      "steps": [
+        "Return result of reconcileInternalAndUserland() directly"
+      ]
+    }
+  ],
+
+  "key_relationships": [
+    "ScopeManager implements DDTrace\\Contracts\\ScopeManager",
+    "Scope implements DDTrace\\Contracts\\Scope",
+    "ScopeManager composes Scope (creates and owns $scopes[] stack)",
+    "Scope holds reference back to ScopeManager (for deactivation on close)",
+    "Scope holds reference to Span (SpanInterface)",
+    "ScopeManager uses ObjectKVStore to mark DDTrace\\Span internalSpan with 'ddtrace_scope_activated' flag",
+    "ScopeManager calls C-extension functions: root_span(), active_span(), trace_id()"
+  ],
+
+  "branching_conditions": [
+    "finishSpanOnClose: bool — controls whether Scope::close() finishes the span",
+    "span instanceof DDTrace\\Span — distinguishes internal (C-ext) spans from pure userland spans",
+    "ObjectKVStore 'ddtrace_scope_activated' key presence — only set for spans that were activated via userland ScopeManager",
+    "span.context.isHostRoot() — determines if scope is tracked in hostRootScopes for distributed tracing cleanup",
+    "scopes stack empty + root_span() available — triggers bootstrapping of root scope from C-extension"
+  ],
+
+  "important_notes": [
+    "Two-layer architecture: userland PHP scopes ($scopes[] stack) vs internal C-extension spans (active_span/root_span). reconcileInternalAndUserland() bridges the two.",
+    "reconcileInternalAndUserland() is called by getActive(), getPrimaryRoot(), getTopScope() — NOT by activate/deactivate.",
+    "Gaps between userland scope stack and C-ext active_span chain are auto-filled with synthetic Scope wrappers (finishSpanOnClose=true).",
+    "hostRootScopes tracks distributed tracing root spans; ScopeManager::close() terminates them all at request end.",
+    "DEFAULT_FINISH_SPAN_ON_CLOSE = true (interface constant); callers can opt out by passing false to activate().",
+    "Calling Scope::close() more than once is undefined behavior per interface contract.",
+    "ObjectKVStore uses false (not null) to mark a span as deactivated; null means the key was never set (i.e., not a userland-activated span)."
+  ],
+
+  "source_files_analyzed": [
+    "src/DDTrace/ScopeManager.php",
+    "src/DDTrace/Scope.php",
+    "src/ddtrace_php_api.stubs.php (DDTrace\\Contracts\\Scope, DDTrace\\Contracts\\ScopeManager, DDTrace\\Scope, DDTrace\\ScopeManager stubs)"
+  ]
+}

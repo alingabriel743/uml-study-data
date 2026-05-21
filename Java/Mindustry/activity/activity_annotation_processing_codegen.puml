@@ -1,0 +1,132 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 11
+skinparam backgroundColor #FEFEFE
+skinparam activityBackgroundColor #F8F9FA
+skinparam activityBorderColor #495057
+skinparam activityArrowColor #495057
+skinparam activityFontColor #212529
+skinparam activityDiamondBackgroundColor #DEE2E6
+skinparam activityDiamondBorderColor #495057
+skinparam swimlaneBorderColor #6C757D
+skinparam swimlaneBackgroundColor #E9ECEF
+skinparam partitionBackgroundColor #EFF3F5
+skinparam partitionBorderColor #6C757D
+skinparam noteBorderColor #ADB5BD
+skinparam noteBackgroundColor #FFF9C4
+
+title Annotation Processing & Code Generation
+
+|Build System|
+start
+:Java Compiler discovers annotation processors\n(META-INF/services/javax.annotation.processing.Processor);
+
+|BaseProcessor|
+:init(ProcessingEnvironment)\n· Initialize Trees, Types, Elements, Filer, Messager\n· Resolve rootDirectory from CLASS_OUTPUT option\n· packageName = "mindustry.gen";
+
+note right
+  Shared static fields:\n  typeu (Types), elementu (Elements),\n  filer (Filer), messager (Messager), trees (Trees)\n  ──────────────────────────────────────\n  write(TypeSpec.Builder) → JavaPoet → Filer\n  All four processors extend BaseProcessor.
+end note
+
+:process(annotations, RoundEnvironment)\n· Increment round counter\n· Guard: if round++ >= maxRounds → return false\n· Delegate to abstract process(RoundEnvironment);
+
+fork
+
+  |EntityProcess (3 Rounds)|
+  :Accumulate across all rounds:\nallDefs (@EntityDef), allGroups (@GroupDef),\nallInterfaces (@EntityInterface);
+
+  partition "Round 1 — Collect Base Data" {
+    :TypeIOResolver.resolve(this)\n→ build serializer map from @TypeIOHandler methods;
+    :Collect baseComponents = types(@BaseComponent);
+    :For each base component:\n· Extract varInitializers via AST (field init expressions)\n· Extract methodBlocks (method body source text)\n· Register in componentNames map;
+    :For each @EntityInterface:\n· Build interface TypeSpec\n· Inject field initializers from varInitializers\n· write(inter) → emit interface source;
+  }
+
+  partition "Round 2 — Build Groups & Entity Classes" {
+    :For each @GroupDef:\nBuild GroupDefinition\n(name, bestType, components, spatial, mapping, collides);
+    :Write group accessor interface TypeSpec;
+    :For each @EntityDef:\n· getComponents(type) — recursive resolution,\n  always appends baseComponents\n· Resolve matching groups\n  (group.components ⊆ entity.components)\n· Build entity TypeSpec.Builder with all component fields\n· Inject varInitializers into fields;
+    if (method is special case?) then (yes — add/remove/write/read/sync/interpolate/snap)
+      :Inject specialized body:\n· add/remove → group add/remove code\n· write/read → EntityIO delegation\n· writeSync/readSync → sync I/O\n· interpolate/snap → interpolation impl;
+    else (no — standard method)
+      :Inject methodBlock source\n(skip if abstract/native or no block);
+    endif
+    :Build reset() using varInitializers\nor getDefault() for each field;
+    :Store EntityDefinition\n(name, builder, type, extend, components, groups, legacy);
+    :Write Groups registry class (groupsBuilder);
+    :Write EntityMapping id-lookup class (idBuilder);
+  }
+
+  partition "Round 3 — Finalize & Emit" {
+    :For each EntityDefinition:\nCollect import statements from component method bodies;
+    :write(def.builder, imports)\n→ emit entity class to mindustry.gen;
+    :For legacy-flagged EntityDefinitions:\nWrite legacy wrapper class;
+  }
+
+  :OUTPUT:\nmindustry.gen.*Entity classes\nmindustry.gen.* entity interfaces\nmindustry.gen.Groups (registry)\nmindustry.gen.EntityMapping (id lookup);
+
+fork again
+
+  |RemoteProcess|
+  :TypeIOResolver.resolve(this)\n→ build I/O serializer map;
+  :Find all @Remote-annotated methods\n(elements(@Remote));
+  :Sort methods deterministically\n(sortComparing by toString);
+  :For each @Remote method:\n· Validate: public AND static → err() if not\n· Validate: targets != Loc.none → err() if none\n· Build packetName = Capitalize(name) + "CallPacket"\n  (+ disambiguator index on collision)\n· Create MethodEntry\n  (callLocation, packetName, targets, variants,\n   unreliable, forward, methodID++, priority);
+  :CallGenerator.generate(serializer, methods);
+
+  |CallGenerator|
+  :Create Call class builder\n+ registerPackets() method builder;
+  :For each MethodEntry:;
+  :· Create XxxCallPacket extends mindustry.net.Packet\n· Override getPriority() if priority != normal\n· makeWriter(packet): write() iterates params,\n  primitives inline, complex via serializer.getNetWriter()\n· makeReader(packet): read() stores DATA = READ.b(len),\n  handled() sets BAIS.setBytes(DATA), reads each param\n· Add handleClient() if client target\n· Add handleServer() if server target\n· Add allow(boolean server) if single direction only\n· Net.registerPacket(XxxCallPacket::new) in registerPackets\n· writeCallMethod() → adds static send method to Call:\n  - toAll=true if isClient or isAll target\n  - toOne if isServer + isOne target\n  - forwarded variant if forward=true\n· write(packet) → emit XxxCallPacket.java;
+  :write(callBuilder) → emit Call.java;
+
+  |RemoteProcess|
+  :OUTPUT:\nmindustry.gen.Call (static send methods)\nmindustry.gen.*CallPacket (one per @Remote method);
+
+fork again
+
+  |LogicStatementProcessor|
+  :Collect all @RegisterStatement types\n(types(@RegisterStatement));
+  :Create LogicIO class builder;
+  :Create write(Object obj, StringBuilder out) method\nCreate read(String[] tokens, int length) method\nAdd allStatements: Seq<Prov<LStatement>>\n(all registered types' ::new references);
+  :For each @RegisterStatement type:\n· Collect fields = c.fields() + superclass.fields()\n· WRITE branch:\n  if/else-if on obj.getClass() == T\n  → append name + each field value\n    (enums: use .name())\n· READ branch:\n  if/else-if on tokens[0].equals(name)\n  → new T(), assign each field from tokens[i+1]\n    (numeric: valueOf(); string: direct assign)\n  → call result.afterRead(), return result;
+  :Finalize: endControlFlow on both methods\nread() adds "return null" fallthrough\nAdd write() and read() to LogicIO TypeSpec;
+  :write(type) → emit LogicIO.java;
+  :OUTPUT:\nmindustry.gen.LogicIO\n(static write/read dispatch for all @RegisterStatement types);
+
+fork again
+
+  |LoadRegionProcessor|
+  :Collect all @Load-annotated fields\n(fields(@Load))\nValidate each field is public → err() if not;
+  :Group fields by enclosing type:\nfieldMap: ObjectMap<Stype, Seq<Svar>>;
+  :Create ContentRegions class builder\n(@SuppressWarnings("deprecation"))\nCreate static loadRegions(MappableContent content) method;
+  :Sort enclosing types by name\n(deterministic output ordering);
+  :For each content type:\nbeginControlFlow: if(content instanceof T);
+  :  For each @Load field (sorted by name):;
+  if (field is scalar? (array dims == 0)) then (yes)
+    :((T)content).field =\n  Core.atlas.find(parsedValue\n  [, fallbackRegion if doFallback]);
+  else (array — dims > 0)
+    :Validate: dims == lengths.length → err() if mismatch;
+    :((T)content).field =\n  new TextureRegion[dim0][dim1]...;
+    :Nested for-loops (beginControlFlow per dimension:\nfor INDEX0 = 0; INDEX0 < dim0; INDEX0++)\natlas.find(parsedValue) → assign\nfield[INDEX0][INDEX1]...\nendControlFlow per dimension;
+  endif
+
+  note right
+    parse() interpolates value tokens:\n"@"   → content.name\n"@size" → block.size\n"#"    → INDEX0\n"#1"   → INDEX1
+  end note
+
+  :endControlFlow (close instanceof check);
+  :regionClass.addMethod(method)\nwrite(regionClass) → emit ContentRegions.java;
+  :OUTPUT:\nmindustry.gen.ContentRegions\n(static loadRegions dispatches on content type,\npopulates TextureRegion fields via Core.atlas.find());
+
+end fork
+
+|Build System|
+:All annotation processors complete\n(EntityProcess: 3 rounds; others: 1 round);
+:Generated sources in mindustry.gen compiled\ninto project classpath;
+stop
+
+@enduml

@@ -1,0 +1,112 @@
+{
+  "scope": "endpoint_collection_flow",
+  "title": "Endpoint Collection and Flushing Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "FrameworkRequest",
+    "LaravelIntegration",
+    "SymfonyIntegration",
+    "EndpointCatalog",
+    "DDTraceExtension",
+    "SidecarActionsBuffer",
+    "ShmCacheMap",
+    "SidecarTransport"
+  ],
+  "interaction_flow": [
+    "FrameworkRequest → LaravelIntegration: HTTP request triggers Router::dispatch() hook",
+    "LaravelIntegration → DDTraceExtension: \\DDTrace\\are_endpoints_collected()",
+    "DDTraceExtension → ShmCacheMap: ddog_sidecar_telemetry_are_endpoints_collected(cache, service, env)",
+    "ShmCacheMap → DDTraceExtension: return bool (true if last_endpoints_push.elapsed() < 30min)",
+    "DDTraceExtension → LaravelIntegration: return bool",
+    "[if false] LaravelIntegration → LaravelIntegration: $routeCollection = $This->getRoutes()",
+    "[loop each route] LaravelIntegration → DDTraceExtension: \\DDTrace\\add_endpoint($path, 'http.request', \"$method $path\", $method)",
+    "DDTraceExtension → SidecarActionsBuffer: ddog_sidecar_telemetry_addEndpoint_buffer(buffer, method, path, operation_name, resource_name)",
+    "LaravelIntegration → DDTraceExtension: \\DDTrace\\flush_endpoints()",
+    "DDTraceExtension → SidecarTransport: ddog_sidecar_telemetry_buffer_flush(transport, instance_id, queue_id, buffer)",
+    "SidecarTransport → ShmCacheMap: blocking::enqueue_actions() → updates last_endpoints_push timestamp",
+    "[if false] SymfonyIntegration → EndpointCatalog: EndpointCatalog::generate($container)",
+    "EndpointCatalog → EndpointCatalog: getCacheDir($container) → reads kernel.cache_dir parameter",
+    "EndpointCatalog → EndpointCatalog: fromRouterCache($cacheDir) → require url_generating_routes.php + url_matching_routes.php",
+    "[fallback] EndpointCatalog → SymfonyRouter: fromRouteCollection() → $router->getRouteCollection()",
+    "EndpointCatalog → SymfonyIntegration: return array[{path, operationName, resourceName, method}]",
+    "[loop each endpoint] SymfonyIntegration → DDTraceExtension: \\DDTrace\\add_endpoint($endpoint['path'], 'http.request', $endpoint['resourceName'], $endpoint['method'])",
+    "SymfonyIntegration → DDTraceExtension: \\DDTrace\\flush_endpoints()",
+    "[per-request] FrameworkRequest → DDTraceExtension: \\DDTrace\\root_span() → RootSpanData",
+    "DDTraceExtension → FrameworkRequest: return RootSpanData (extends SpanData)",
+    "FrameworkRequest → RootSpanData: set meta[http.route] / meta[http.endpoint] / meta[http.url] / meta[http.method]"
+  ],
+  "method_signatures": {
+    "are_endpoints_collected": "\\DDTrace\\are_endpoints_collected(): bool",
+    "add_endpoint": "\\DDTrace\\add_endpoint(string $path, string $operation_name, string $resource_name, string $method): bool",
+    "flush_endpoints": "\\DDTrace\\flush_endpoints(): void",
+    "root_span": "\\DDTrace\\root_span(): null|RootSpanData",
+    "EndpointCatalog_generate": "EndpointCatalog::generate(ContainerInterface $container): array",
+    "rust_are_endpoints_collected": "ddog_sidecar_telemetry_are_endpoints_collected(cache: &mut ShmCacheMap, service: CharSlice, env: CharSlice): bool",
+    "rust_addEndpoint_buffer": "ddog_sidecar_telemetry_addEndpoint_buffer(buffer, method: data::Method, path, operation_name, resource_name)",
+    "rust_buffer_flush": "ddog_sidecar_telemetry_buffer_flush(transport, instance_id, queue_id, buffer: Box<SidecarActionsBuffer>): MaybeError"
+  },
+  "key_classes": {
+    "SpanData": {
+      "namespace": "DDTrace",
+      "key_fields": ["name", "resource", "service", "env", "version", "type", "meta[]", "metrics[]", "events[]", "parent: SpanData|null", "stack: SpanStack"]
+    },
+    "RootSpanData": {
+      "namespace": "DDTrace",
+      "extends": "SpanData",
+      "key_fields": ["origin", "propagatedTags[]", "samplingPriority", "traceId", "parentId", "tracestate", "gitMetadata", "inferredSpan: InferredSpanData|null"]
+    },
+    "InferredSpanData": {
+      "namespace": "DDTrace",
+      "extends": "SpanData"
+    },
+    "EndpointCatalog": {
+      "namespace": "DDTrace\\Integrations\\Symfony",
+      "methods": ["generate(ContainerInterface): array", "pathForRoute(routeName, ContainerInterface): ?string", "fromRouterCache(cacheDir): array", "fromRouteCollection(ContainerInterface): array", "tokensToPathTemplate(tokens): string", "extractMethodsByRoute(matchData): array", "pickMethod(methods): string", "pickMethodFromMethodList(methods): string"]
+    },
+    "SidecarActionsBuffer": {
+      "namespace": "Rust components-rs/telemetry.rs",
+      "fields": ["buffer: Vec<SidecarAction>"]
+    }
+  },
+  "key_relationships": [
+    "LaravelIntegration depends_on DDTraceExtension (are_endpoints_collected, add_endpoint, flush_endpoints, root_span)",
+    "SymfonyIntegration depends_on DDTraceExtension (same functions)",
+    "SymfonyIntegration depends_on EndpointCatalog (generates route list)",
+    "EndpointCatalog reads Symfony router cache files (url_generating_routes.php, url_matching_routes.php)",
+    "EndpointCatalog fallback uses RouterInterface.getRouteCollection()",
+    "DDTraceExtension (PHP) calls Rust FFI: ddog_sidecar_telemetry_addEndpoint_buffer, ddog_sidecar_telemetry_buffer_flush, ddog_sidecar_telemetry_are_endpoints_collected",
+    "RootSpanData extends SpanData",
+    "InferredSpanData extends SpanData"
+  ],
+  "business_rules": [
+    "Endpoints are only collected ONCE per service/env per 30-minute window (checked via ShmCacheMap TTL)",
+    "Collection guard: are_endpoints_collected() must return false before any add_endpoint/flush_endpoints calls",
+    "flush_endpoints() must be called once after batching all add_endpoint() calls",
+    "Laravel: iterates all registered routes, builds resourceName as '$method $path'",
+    "Symfony: uses EndpointCatalog which first tries router cache (memoized), falls back to live RouteCollection",
+    "HTTP method priority: GET > POST > first available (default GET if none)",
+    "Symfony: only collects for versions >= 5.x (skips Symfony 4.x via strpos check)",
+    "Endpoint fallback sampling: http.route > http.endpoint > computed from http.url",
+    "404 responses are NOT sampled even when http.endpoint is set",
+    "Root span meta tags used for endpoint-based sampling: http.route, http.endpoint, http.url, http.method",
+    "EndpointCatalog is memoized (static $memo) for the life of the request"
+  ],
+  "data_structures": {
+    "endpoint_record": {"path": "string", "operationName": "http.request", "resourceName": "METHOD /path", "method": "string"},
+    "rust_Endpoint": {"method": "data::Method", "path": "Option<String>", "operation_name": "String", "resource_name": "String"}
+  },
+  "integration_trigger_points": {
+    "Laravel": "Illuminate\\Routing\\Router::dispatch() tracing hook (posthook after route resolution)",
+    "Symfony": "EventDispatcher::dispatch() tracing hook (handles kernel.request / kernel.controller events)"
+  },
+  "important_notes": "This is Datadog PHP tracer (ddtrace) auto-discovery of HTTP endpoints for telemetry. The PHP extension exposes are_endpoints_collected/add_endpoint/flush_endpoints as C-extension functions. The Rust sidecar maintains a shared-memory cache (ShmCacheMap) so endpoint catalog is only sent once per 30 minutes per service+env combination. The root_span() function returns the RootSpanData for the active trace stack, used separately for per-request HTTP metadata tagging.",
+  "source_files_analyzed": [
+    "ext/ddtrace.stub.php",
+    "src/DDTrace/Integrations/Laravel/LaravelIntegration.php",
+    "src/DDTrace/Integrations/Symfony/SymfonyIntegration.php",
+    "src/DDTrace/Integrations/Symfony/EndpointCatalog.php",
+    "appsec/tests/integration/src/test/www/base/public/endpoint_collection.php",
+    "appsec/tests/integration/src/test/www/base/public/endpoint_fallback.php",
+    "components-rs/telemetry.rs"
+  ]
+}

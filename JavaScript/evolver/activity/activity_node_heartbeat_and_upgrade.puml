@@ -1,0 +1,171 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #E8F4FD
+    BorderColor #6C757D
+}
+
+title Node Heartbeat & Upgrade Check\n<size:11>(LifecycleManager — proxy/lifecycle/manager.js)</size>
+
+|LifecycleManager|
+start
+:startHeartbeatLoop(intervalMs);
+note right: Entry point for heartbeat loop
+
+if (_running == true?) then (yes — already active)
+    :return (no-op);
+    stop
+else (no)
+    :Set _running = true\nSet _startedAt = Date.now();
+    :interval = max(30 000 ms, intervalMs\n|| DEFAULT_HEARTBEAT_INTERVAL [6 min]);
+    :Invoke tick() immediately;
+endif
+
+|LifecycleManager|
+repeat
+    :tick();
+    if (_running == false?) then (yes — loop stopped)
+        :return (skip heartbeat);
+    else (no)
+        :await heartbeat();
+
+        if (hubUrl configured?) then (no)
+            :return {ok:false,\nerror:"no_hub_url"};
+        else (yes)
+            if (nodeId known?) then (no)
+                |hub (remote)|
+                :POST /a2a/hello\n[HELLO_TIMEOUT: 15 s];
+                |LifecycleManager|
+                if (hello ok?) then (no)
+                    :return hello result;
+                else (yes)
+                    :Store node_id\n& node_secret;
+                endif
+            endif
+
+            :Build request body\n(node_id, env_fingerprint,\npending counts, taskMeta);
+
+            |hub (remote)|
+            :POST /a2a/heartbeat\n[HEARTBEAT_TIMEOUT: 10 s];
+
+            |LifecycleManager|
+            if (Network / timeout error?) then (yes)
+                :Increment _consecutiveFailures;
+                :Log error;
+                :return {ok:false};
+            else (no)
+                if (HTTP 401 or 403?) then (yes)
+                    :Increment _consecutiveFailures;
+                    if (_skipReauth == false?) then (yes — attempt reauth)
+                        :reAuthenticate();
+                        note right
+                          Loop up to MAX_REAUTH_ATTEMPTS (2):
+                          1. hello({rotateSecret:true})
+                          2. If hello fails → continue
+                          3. If no new secret → continue
+                          4. heartbeat({_skipReauth:true})
+                          5. If heartbeat ok → return true
+                          End loop → return false
+                        end note
+                        if (reAuthenticate recovered?) then (yes)
+                            :Reset _consecutiveFailures = 0;
+                            :return {ok:true, recovered:true};
+                        else (no)
+                            :return {ok:false,\nerror:"auth_failed_<status>"};
+                        endif
+                    else (no — skip reauth)
+                        :return {ok:false,\nerror:"auth_failed_<status>"};
+                    endif
+                else (no — other HTTP error?)
+                    if (HTTP error (non-401/403)?) then (yes)
+                        :Increment _consecutiveFailures;
+                        :return {ok:false,\nerror:"http_<status>"};
+                    else (no — success)
+                        :Reset _consecutiveFailures = 0;
+
+                        |store|
+                        :setState("last_heartbeat_at", now);
+
+                        |LifecycleManager|
+                        if (data.status == "unknown_node"?) then (yes)
+                            |hub (remote)|
+                            :POST /a2a/hello\n[re-register node];
+                            |LifecycleManager|
+                        endif
+
+                        if (data.events array non-empty?) then (yes)
+                            |store|
+                            :writeInboundBatch(events)\nchannel = "evomap-hub";
+                            |LifecycleManager|
+                        endif
+
+                        if (data.min_proxy_version present\nAND _shouldUpgrade(min_proxy_version)?) then (yes)
+                            note right
+                              _shouldUpgrade: semver compare
+                              PROXY_PROTOCOL_VERSION vs minVersion
+                              Returns true only if current < min
+                              (major.minor.patch component-by-component)
+                            end note
+                            |store|
+                            :writeInbound({type:"system",\npayload:{action:"proxy_upgrade_required"},\npriority:"high"});
+                            |logger|
+                            :logger.warn(upgrade message);
+                            |LifecycleManager|
+                        else (no upgrade needed)
+                        endif
+
+                        :return {ok:true, response:data};
+                    endif
+                endif
+            endif
+        endif
+
+        '--- Back in tick(): schedule next tick ---
+        if (_running still true?) then (yes)
+            if (_consecutiveFailures > 0?) then (yes)
+                :backoff = min(\n  interval × 2^_consecutiveFailures,\n  30 min [max backoff]\n);
+                note right: Exponential backoff\nmin_backoff: 30 s
+            else (no)
+                :backoff = interval\n(normal cadence);
+            endif
+            :_heartbeatTimer =\nsetTimeout(tick, backoff);
+            :timer.unref()\n(non-blocking process exit);
+        else (no — _running = false)
+            :No next tick scheduled\n(loop stopped);
+        endif
+    endif
+repeat while (loop active?) is (yes)
+->no;
+
+|LifecycleManager|
+:stopHeartbeatLoop();
+note right: Called externally to halt loop
+:Set _running = false;
+:clearTimeout(_heartbeatTimer);
+:_heartbeatTimer = null;
+
+stop
+
+@enduml

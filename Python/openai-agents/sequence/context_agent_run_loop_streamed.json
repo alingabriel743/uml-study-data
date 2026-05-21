@@ -1,0 +1,164 @@
+{
+  "scope": "agent_run_loop_streamed",
+  "title": "Agent Run Loop (Streamed)",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Caller",
+    "Runner",
+    "RunResultStreaming",
+    "start_streaming",
+    "run_single_turn_streamed",
+    "Model",
+    "get_single_step_result_from_response",
+    "InputGuardrailRunner",
+    "OutputGuardrailRunner",
+    "Session",
+    "RunState"
+  ],
+  "interaction_flow": [
+    "Caller → Runner: run_streamed(agent, input, run_config, ...)",
+    "Runner → RunResultStreaming: create(current_agent, max_turns, _event_queue, run_loop_task=None)",
+    "Runner → asyncio: create_task(start_streaming(starting_input, streamed_result, ...))",
+    "Runner → Caller: return RunResultStreaming (stream not yet consumed)",
+    "Caller → RunResultStreaming: async for event in stream_events()",
+    "RunResultStreaming → RunResultStreaming: dequeue from _event_queue (awaits)",
+
+    "--- start_streaming background task begins ---",
+    "start_streaming → Trace: start(mark_as_current=True)",
+    "start_streaming → RunState: create(context, original_input, starting_agent, max_turns) [if no run_state]",
+    "start_streaming → streamed_result._event_queue: put AgentUpdatedStreamEvent(new_agent)",
+    "start_streaming → prepare_input_with_session: (starting_input, session, session_input_callback) → prepared_input",
+
+    "--- main while-True loop ---",
+    "start_streaming: [turn 1] run sequential input guardrails (blocking)",
+    "start_streaming → InputGuardrailRunner: run_input_guardrails_with_queue(sequential_guardrails, ...)",
+    "InputGuardrailRunner → streamed_result._input_guardrail_queue: put result",
+    "start_streaming: [turn 1] schedule parallel input guardrails as asyncio.Task",
+    "start_streaming → asyncio: create_task(run_input_guardrails_with_queue(parallel_guardrails, ...))",
+    "start_streaming → start_streaming: increment current_turn; start turn_span",
+    "start_streaming → run_single_turn_streamed(streamed_result, bindings, hooks, all_tools, server_conversation_tracker, ...) → SingleStepResult",
+
+    "--- inside run_single_turn_streamed ---",
+    "run_single_turn_streamed → hooks: on_agent_start(context, agent) [if should_run_agent_start_hooks]",
+    "run_single_turn_streamed → agent: get_system_prompt(context_wrapper), get_prompt(context_wrapper) [parallel]",
+    "run_single_turn_streamed → agent: get_handoffs(context_wrapper)",
+    "run_single_turn_streamed → model: resolve + maybe_reset_tool_choice",
+    "run_single_turn_streamed → hooks: on_llm_start(context_wrapper, agent, instructions, input) [parallel]",
+    "run_single_turn_streamed → Session: save_result_to_session(input_items, [], state) [if not yet persisted]",
+    "run_single_turn_streamed → Model: stream_response(instructions, input, model_settings, tools, output_schema, handoffs, ...) via stream_response_with_retry",
+    "Model → run_single_turn_streamed: async stream of response events",
+    "run_single_turn_streamed → streamed_result._event_queue: put RawResponsesStreamEvent(data=event) [each event]",
+    "run_single_turn_streamed: on ResponseOutputItemDoneEvent(tool_search_call) → put RunItemStreamEvent(name='tool_search_called')",
+    "run_single_turn_streamed: on ResponseOutputItemDoneEvent(tool_search_output) → put RunItemStreamEvent(name='tool_search_output_created')",
+    "run_single_turn_streamed: on ResponseOutputItemDoneEvent(tool_call/MCP) → put RunItemStreamEvent(name='tool_called', item=ToolCallItem)",
+    "run_single_turn_streamed: on ResponseOutputItemDoneEvent(reasoning) → put RunItemStreamEvent(name='reasoning_item_created')",
+    "run_single_turn_streamed: on ResponseCompletedEvent → build final_response = ModelResponse",
+    "run_single_turn_streamed → hooks: on_llm_end(context_wrapper, agent, final_response) [parallel]",
+    "run_single_turn_streamed → get_single_step_result_from_response(bindings, input, pre_step_items, final_response, tools, handoffs, ...) → SingleStepResult",
+    "get_single_step_result_from_response → run_single_turn_streamed: SingleStepResult (next_step, new_step_items, model_response)",
+    "run_single_turn_streamed → stream_step_result_to_queue(filtered_result, _event_queue): emits RunItemStreamEvents for message_output, tool_output, handoff_requested, handoff_occured",
+    "run_single_turn_streamed → start_streaming: return SingleStepResult",
+
+    "--- back in start_streaming: branch on next_step ---",
+    "start_streaming → start_streaming: update streamed_result.raw_responses, .input, ._model_input_items, .new_items",
+
+    "BRANCH NextStepRunAgain:",
+    "start_streaming → _save_stream_items_with_count(turn_session_items, response_id, store_setting)",
+    "_save_stream_items_with_count → _save_stream_items(session, server_conversation_tracker, ...)",
+    "_save_stream_items → Session: save_result_to_session([], items, run_state, response_id)",
+    "_save_stream_items → streamed_result: update _current_turn_persisted_item_count",
+    "start_streaming: [if cancel_mode=after_turn] → put QueueCompleteSentinel, break; else continue loop",
+
+    "BRANCH NextStepHandoff:",
+    "start_streaming → _save_stream_items_without_count(turn_session_items, ...)",
+    "start_streaming: current_agent = new_agent; should_run_agent_start_hooks = True",
+    "start_streaming → streamed_result._event_queue: put AgentUpdatedStreamEvent(new_agent)",
+    "start_streaming: continue loop",
+
+    "BRANCH NextStepFinalOutput:",
+    "start_streaming → _finalize_streamed_final_output(streamed_result, agent, run_config, output, save_items=_save_stream_items_with_count, ...)",
+    "_finalize_streamed_final_output → OutputGuardrailRunner: run_output_guardrails(guardrails, agent, output, context)",
+    "_finalize_streamed_final_output → streamed_result: set .final_output, .is_complete=True, .output_guardrail_results",
+    "_finalize_streamed_final_output → _save_stream_items_with_count(items, response_id, store_setting)",
+    "_finalize_streamed_final_output → streamed_result._event_queue: put QueueCompleteSentinel()",
+    "start_streaming: break",
+
+    "BRANCH NextStepInterruption:",
+    "start_streaming: update RunState._last_processed_response, ._generated_items, ._current_step, ._current_turn",
+    "start_streaming → _finalize_streamed_interruption(streamed_result, save_items, items, response_id, interruptions, processed_response)",
+    "_finalize_streamed_interruption → _save_stream_items_with_count(items, response_id, store_setting)",
+    "_finalize_streamed_interruption → _complete_stream_interruption(streamed_result, interruptions, processed_response)",
+    "_complete_stream_interruption → streamed_result: set .interruptions list, put QueueCompleteSentinel()",
+    "start_streaming: break",
+
+    "--- stream_events() consumer side ---",
+    "RunResultStreaming: on QueueCompleteSentinel → await input_guardrails_task; _check_errors(); break iterator",
+    "RunResultStreaming: if _stored_exception → raise (MaxTurnsExceeded, GuardrailTripwireTriggered, etc.)",
+    "RunResultStreaming: in finally → await run_loop_task; _cleanup_tasks(); _drain_event_queue()",
+
+    "--- post-stream caller patterns ---",
+    "Caller: if result.interruptions → state = result.to_state(); state.approve(interruption); Runner.run_streamed(agent, state)",
+    "Caller: result.cancel(mode='immediate'|'after_turn') to stop early"
+  ],
+  "key_relationships": [
+    "Runner creates RunResultStreaming and spawns start_streaming as asyncio.Task (run_loop_task)",
+    "start_streaming writes StreamEvents to RunResultStreaming._event_queue",
+    "RunResultStreaming.stream_events() dequeues from _event_queue and yields to caller",
+    "start_streaming calls run_single_turn_streamed each turn",
+    "run_single_turn_streamed calls Model.stream_response() for LLM streaming",
+    "run_single_turn_streamed calls get_single_step_result_from_response after stream completes (tool execution, response parsing)",
+    "_finalize_streamed_final_output runs output guardrails then signals completion via QueueCompleteSentinel",
+    "_finalize_streamed_interruption saves items and signals interruption via QueueCompleteSentinel",
+    "_save_stream_items delegates to save_result_to_session for Session persistence",
+    "RunResultStreaming.to_state() creates RunState for resumption after interruption"
+  ],
+  "event_types_emitted": [
+    "AgentUpdatedStreamEvent - when agent changes (start, handoff)",
+    "RawResponsesStreamEvent - every raw LLM response event token-by-token",
+    "RunItemStreamEvent(name='tool_search_called') - hosted tool search request done",
+    "RunItemStreamEvent(name='tool_search_output_created') - hosted tool search result",
+    "RunItemStreamEvent(name='tool_called') - function/MCP tool call item done",
+    "RunItemStreamEvent(name='reasoning_item_created') - reasoning block done",
+    "RunItemStreamEvent(name='message_output_created') - full message output",
+    "RunItemStreamEvent(name='handoff_requested') - handoff request",
+    "RunItemStreamEvent(name='handoff_occured') - handoff completed (misspelled for compat)",
+    "RunItemStreamEvent(name='tool_output') - tool execution result",
+    "RunItemStreamEvent(name='mcp_approval_requested') - MCP approval needed",
+    "RunItemStreamEvent(name='mcp_approval_response') - MCP approval response",
+    "RunItemStreamEvent(name='mcp_list_tools') - MCP tool listing",
+    "QueueCompleteSentinel - signals end of stream (internal, not yielded to caller)"
+  ],
+  "next_step_outcomes": {
+    "NextStepRunAgain": "save items, continue loop (tool turn, more LLM calls needed)",
+    "NextStepHandoff": "save items, switch agent, emit AgentUpdatedStreamEvent, continue loop",
+    "NextStepFinalOutput": "run output guardrails, set final_output, is_complete=True, emit QueueCompleteSentinel, break",
+    "NextStepInterruption": "save items, set interruptions list, emit QueueCompleteSentinel, break (awaiting approval)"
+  },
+  "cancellation_modes": {
+    "immediate": "cancel all tasks, clear queues, is_complete=True, emit QueueCompleteSentinel",
+    "after_turn": "set _cancel_mode flag; loop exits after current turn completes before starting next"
+  },
+  "guardrail_execution": {
+    "input_sequential": "run blocking before turn 1 LLM call; tripwire raises InputGuardrailTripwireTriggered",
+    "input_parallel": "asyncio.Task launched concurrently with LLM stream; results checked via _input_guardrail_queue",
+    "output": "asyncio.Task in _finalize_streamed_final_output; tripwire stored in _stored_exception"
+  },
+  "session_persistence": {
+    "_save_stream_items": "called after each completed turn step (RunAgain, Handoff, FinalOutput, Interruption)",
+    "save_result_to_session": "underlying helper writing to Session store",
+    "_current_turn_persisted_item_count": "tracks how many items already persisted in current turn",
+    "input_persistence": "input items saved once before first LLM call via save_result_to_session"
+  },
+  "important_notes": "start_streaming runs as a background asyncio.Task; stream_events() is the consumer that dequeues events. The run is NOT complete until stream_events() iterator exits. Interruptions expose pending ToolApprovalItem objects on RunResultStreaming.interruptions after stream ends. is_complete flag is set to True in: _finalize_streamed_final_output, _finalize_streamed_interruption, cancel(immediate), and the start_streaming else/except clauses. RunResultStreaming.to_state() serializes current run state into RunState for resumption.",
+  "key_classes": {
+    "RunResultStreaming": "dataclass holding _event_queue (asyncio.Queue), run_loop_task, is_complete, final_output, current_agent, interruptions; provides stream_events(), cancel(), to_state()",
+    "SingleStepResult": "returned by run_single_turn_streamed; has next_step, new_step_items, pre_step_items, model_response, original_input, processed_response",
+    "RunState": "mutable state across turns: _current_agent, _generated_items, _session_items, _model_responses, _current_step, _current_turn, _last_processed_response",
+    "QueueCompleteSentinel": "sentinel object put in _event_queue to signal stream completion"
+  },
+  "source_files_analyzed": [
+    "src/agents/run_internal/run_loop.py",
+    "src/agents/result.py",
+    "docs/streaming.md"
+  ]
+}

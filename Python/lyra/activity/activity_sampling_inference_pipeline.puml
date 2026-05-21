@@ -1,0 +1,189 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #212529
+    EndColor #212529
+    BarColor #495057
+}
+
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title Sampling / Inference Pipeline
+
+|CLI / Config|
+start
+:Parse CLI args\n(--config, --config_default);
+:load_and_merge_configs(\n  [config_default, config]);
+:OmegaConf.from_dotlist(unknown)\n→ merge CLI overrides;
+
+|Orchestrator (main)|
+:Read config.target_index_manual;
+if (target_index_manual is None\nAND start_idx set?) then (yes)
+    :Build index range list\nfrom start_idx;
+endif
+
+if (target_index_manual is a list?\n(batch bullet-time)) then (yes)
+    :LOOP over each\ntarget_index_manual_i;
+    :Set config.target_index_manual = i;
+    |Model Loading|
+    if (transformer / vae cached\nin kwargs?) then (no)
+        :Resolve checkpoint path\n(auto-detect most recent\nOR use config.ckpt_path);
+        :PartialState() → distributed device;
+        :load_vae(vae_backbone, vae_path)\n→ vae;
+        :LatentRecon(config)\n→ transformer;
+        :torch.load(ckpt_path) → weights;
+        :transformer.load_state_dict(\n  data['module']);
+        :Cast transformer + vae\nto (device, bfloat16);
+        :transformer.eval()\nvae.eval();
+    else (yes, reuse)
+        :Reuse cached\ntransformer + vae + distributed_state;
+    endif
+    |Orchestrator (main)|
+    :Call main_single(config,\n  transformer, vae,\n  distributed_state, ckpt_path);
+    :Cache returned models\nin kwargs (model reuse);
+    if (More indices?) then (yes)
+        :Next target_index_manual_i;
+        note right: Loop back
+    else (no)
+    endif
+else (no — single mode)
+    |Model Loading|
+    if (transformer / vae cached?) then (no)
+        :Resolve checkpoint path;
+        :PartialState() → distributed device;
+        :load_vae(vae_backbone, vae_path)\n→ vae;
+        :LatentRecon(config) → transformer;
+        :torch.load(ckpt_path) → weights;
+        :transformer.load_state_dict(\n  data['module']);
+        :Cast to (device, bfloat16)\ntransformer.eval() / vae.eval();
+    else (yes)
+        :Reuse cached models;
+    endif
+    |Orchestrator (main)|
+    :Call main_single(config,\n  transformer, vae,\n  distributed_state, ckpt_path);
+endif
+
+|main_single — Setup|
+:Set weight_dtype = bfloat16;
+:Init Generator\nseed_everything(seed);
+:Load / merge main_config\nvia OmegaConf;
+:Extract ckpt_name via regex\n(checkpoint-N pattern);
+:Append ckpt_name / dataset_name /\nbullet_time index to outdir;
+if (Checkpoint file found?) then (no)
+    :Raise ValueError;
+    stop
+else (yes)
+endif
+:Apply config overrides\n(set_manual_time_idx,\nstatic_view_indices_fixed,\nnum_test_images, data_mode, ...);
+:get_multi_dataloader(main_config)\n→ (train_dataloader, test_dataloader);
+:Create output dirs:\noutdir, raw, meta, grid,\nfull_output, main_gaussians_renderings;
+
+|Data Pipeline|
+:LOOP over test_dataloader (batch_test);
+if (meta JSON already exists\nAND skip_existing?) then (yes)
+    :Skip sample → next batch;
+else (no)
+endif
+if (do_eval AND all view mp4s\nexist AND skip_existing?) then (yes)
+    :Skip sample → next batch;
+else (no)
+endif
+:Move tensors to device\ncast to weight_dtype (bfloat16);
+if (compute_plucker_cuda?) then (yes)
+    :get_plucker_embedding_and_rays\n(intrinsics_input, c2ws_input, ...);
+endif
+if (rgb_latents already in batch?) then (yes)
+    :Use pre-encoded latents directly;
+else (no)
+    :encode_multi_view_video\n(vae, video, ...) → rgb_latents;
+endif
+if (time_embedding_vae?) then (yes)
+    :encode_latent_time_vae(...);
+endif
+if (plucker_embedding_vae?) then (yes)
+    :encode_plucker_vae(...);
+endif
+
+|Inference|
+:torch.no_grad():\nmodel_output = transformer(batch_test);
+:pred_images = model_output\n['images_pred'].cpu();
+:pred_depths = create_depth_visu\n(model_output['depths_pred']).cpu();
+if (save_gaussians?) then (yes)
+    :save_ply(model_output['gaussians'],\n  path, scale_factor);
+endif
+if (save_gaussians_orig?) then (yes)
+    :save_ply_orig(model_output['gaussians'],\n  path, scale_factor);
+endif
+:del model_output['gaussians'];
+:Rearrange pred_images_views:\n'b (v t) c h w → v b t c h w';
+
+|Output|
+if (save_rgb_decoding?) then (yes)
+    :decode_multi_view_latents\n(vae, model_input, ...)\n→ reconstructed_latents;
+endif
+if (do_eval?) then (no — visualization mode)
+    :generate_wave_video\n(pred_images, pred_depths,\n  wave_length, ...);
+    :save_video(wave + rgb concat\n  → outdir/main_gaussians_renderings/);
+    :save_video(wave only\n  → outdir/raw/ [rgb_wave_N]);
+    :save_video per view\n  → outdir/raw/;
+else (yes — eval mode)
+    :save_video per view\n  → outdir/<view_idx>/<file>.mp4;
+endif
+:Build images_grid_list:\npred_images + [gt_images] +\n[video_norm] + pred_depths + [gt_depths];
+:pred_images_out = torch.cat\n(images_grid_list, dim=-1);
+if (save_grid?) then (yes)
+    :Accumulate test_video_out\nand test_video_out_rgb;
+endif
+if (NOT do_eval?) then (yes)
+    :save_video(pred_images_out\n  → outdir/full_output/);
+    :write_dict_to_json(meta\n  → outdir/meta/sample_N.json);
+endif
+if (step_test_sum >= num_grid_samples?) then (yes)
+    fork
+        :save_video(test_video_out\n  → outdir/grid/ [sample_grid_N]);
+    fork again
+        :save_video(test_video_out_rgb\n  → outdir/grid/ [rgb_grid_N]);
+    fork again
+        :save_video(test_video_in\n  → outdir/grid/ [input_grid_N])\n  if non-empty;
+    end fork
+    :Reset grid counters and lists;
+endif
+if (More batches in test_dataloader?) then (yes)
+    :Next batch_test;
+    note right: Loop back
+else (no)
+endif
+
+|Orchestrator (main)|
+:Return (transformer, vae,\n  distributed_state, ckpt_path);
+
+stop
+
+@enduml

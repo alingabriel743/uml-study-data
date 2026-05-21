@@ -1,0 +1,611 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 11
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #F9A825
+}
+skinparam ArrowColor #495057
+skinparam ArrowFontSize 10
+
+title Sandbox – Cloud Provider Extensions
+
+' ═══════════════════════════════════════════════════════════
+'  CORE BASE CLASSES
+' ═══════════════════════════════════════════════════════════
+package "Core — agents.sandbox.session" {
+
+    abstract class BaseSandboxSession {
+        +state: SandboxSessionState
+        #_dependencies: Dependencies
+        #_pre_stop_hooks: list[Callable]
+        --
+        +start(): None
+        +stop(): None
+        +shutdown(): None
+        +exec(cmd, ...): ExecResult
+        +read(path, *, user): IOBase
+        +write(path, data, *, user): None
+        +running(): bool
+        +persist_workspace(): IOBase
+        +hydrate_workspace(data): None
+        +ls(path): list
+        +rm(path): None
+        +mkdir(path): None
+        +resolve_exposed_port(port): ExposedPortEndpoint
+        +supports_pty(): bool
+        +pty_exec_start(...): int
+        +pty_write_stdin(process_id, payload): None
+        +pty_terminate_all(): None
+        #{abstract} _exec_internal(...)
+        #{abstract} _resolve_exposed_port(port)
+        #{abstract} _ensure_backend_started()
+        #{abstract} _prepare_backend_workspace()
+        #{abstract} _after_start()
+        #{abstract} _shutdown_backend()
+    }
+
+    abstract class BaseSandboxClient {
+        +backend_id: str
+        +supports_default_options: bool = False
+        #_dependencies: Dependencies | None
+        --
+        +{abstract} create(*, snapshot, manifest, options): SandboxSession
+        +delete(session): SandboxSession
+        +resume(state, ...): SandboxSession
+        +serialize_session_state(state): dict
+        +deserialize_session_state(payload): SandboxSessionState
+    }
+
+    class BaseSandboxClientOptions <<pydantic>> {
+        +type: str
+        +{static} _subclass_registry: dict
+        --
+        +{static} parse(payload): BaseSandboxClientOptions
+    }
+
+    class SandboxSessionState <<pydantic>> {
+        +type: str
+        +session_id: UUID
+        +snapshot: SnapshotBase
+        +manifest: Manifest
+        +exposed_ports: tuple[int, ...]
+        +snapshot_fingerprint: str | None
+        +workspace_root_ready: bool
+        +{static} _subclass_registry: dict
+    }
+
+    abstract class MountStrategyBase <<pydantic>> {
+        +type: str
+    }
+}
+
+' ═══════════════════════════════════════════════════════════
+'  MODAL PROVIDER
+' ═══════════════════════════════════════════════════════════
+package "Modal — modal.com" {
+
+    class ModalSandboxSession {
+        +state: ModalSandboxSessionState
+        -_sandbox: modal.Sandbox | None
+        -_image: modal.Image | None
+        -_running: bool
+        -_pty_lock: asyncio.Lock
+        -_pty_processes: dict[int, _ModalPtyProcessEntry]
+        --
+        +snapshot_filesystem(): str
+        -_persist_workspace_via_snapshot_filesystem(): IOBase
+        -_persist_workspace_via_snapshot_directory(): IOBase
+        -_persist_workspace_via_tar(): IOBase
+    }
+
+    class ModalSandboxClient {
+        +backend_id = "modal"
+        -_default_image: ModalImageSelector | None
+        -_default_sandbox: ModalSandboxSelector | None
+        -_instrumentation: Instrumentation
+        --
+        +create(*, snapshot, manifest, options): SandboxSession
+        +delete(session): SandboxSession
+        +resume(state, ...): SandboxSession
+        +deserialize_session_state(payload): SandboxSessionState
+    }
+
+    class ModalSandboxClientOptions <<pydantic>> {
+        +type: Literal["modal"]
+        +app_name: str
+        +gpu: str | None
+        +timeout: int = 300
+        +workspace_persistence: WorkspacePersistenceMode = "tar"
+        +exposed_ports: tuple[int, ...]
+        +use_sleep_cmd: bool = True
+        +sandbox_create_timeout_s: float | None
+    }
+
+    class ModalSandboxSessionState <<pydantic>> {
+        +type: Literal["modal"]
+        +app_name: str
+        +image_id: str | None
+        +image_tag: str | None
+        +sandbox_id: str | None
+        +gpu: str | None
+        +timeout: int
+        +workspace_persistence: WorkspacePersistenceMode
+        +sandbox_create_timeout_s: float
+    }
+
+    class ModalImageSelector {
+        +from_image()
+        +from_id()
+        +from_tag()
+    }
+
+    class ModalSandboxSelector {
+    }
+
+    class ModalCloudBucketMountStrategy <<pydantic>> {
+        +type: str
+    }
+}
+
+note bottom of ModalSandboxClientOptions
+  GPU support: A100, H100:8.
+  workspace_persistence: tar |
+  snapshot_filesystem | snapshot_directory
+end note
+
+' ═══════════════════════════════════════════════════════════
+'  E2B PROVIDER
+' ═══════════════════════════════════════════════════════════
+package "E2B — e2b.dev" {
+
+    class E2BSandboxSession {
+        +state: E2BSandboxSessionState
+        -_sandbox: _E2BSandboxAPI
+        -_workspace_root_ready: bool
+        -_pty_lock: asyncio.Lock
+        -_pty_processes: dict[int, _E2BPtyProcessEntry]
+    }
+
+    class E2BSandboxClient {
+        +backend_id = "e2b"
+        -_instrumentation: Instrumentation
+        --
+        +create(*, snapshot, manifest, options): SandboxSession
+    }
+
+    class E2BSandboxClientOptions <<pydantic>> {
+        +type: Literal["e2b"]
+        +sandbox_type: E2BSandboxType | str
+        +template: str | None
+        +timeout: int | None
+        +secure: bool = True
+        +allow_internet_access: bool = True
+        +workspace_persistence: WorkspacePersistenceMode = "tar"
+        +on_timeout: E2BTimeoutAction = "pause"
+        +auto_resume: bool = True
+        +pause_on_exit: bool = False
+        +mcp: dict | None
+    }
+
+    class E2BSandboxSessionState <<pydantic>> {
+        +type: Literal["e2b"]
+        +sandbox_id: str
+        +sandbox_type: E2BSandboxType
+        +template: str | None
+        +pause_on_exit: bool
+        +workspace_persistence: WorkspacePersistenceMode
+        +on_timeout: E2BTimeoutAction
+        +auto_resume: bool
+        +mcp: dict | None
+    }
+
+    enum E2BSandboxType {
+        CODE_INTERPRETER
+        E2B
+    }
+
+    class E2BCloudBucketMountStrategy <<pydantic>> {
+        +type: str
+    }
+}
+
+note bottom of E2BSandboxClientOptions
+  Two sandbox modes: plain E2B and
+  e2b_code_interpreter. Supports MCP config.
+  Lazy SDK import.
+end note
+
+' ═══════════════════════════════════════════════════════════
+'  CLOUDFLARE PROVIDER
+' ═══════════════════════════════════════════════════════════
+package "Cloudflare — Worker HTTP/WS" {
+
+    class CloudflareSandboxSession {
+        +state: CloudflareSandboxSessionState
+        -_api_key: str | None
+        -_http: aiohttp.ClientSession | None
+        -_exec_timeout_s: float | None
+        -_request_timeout_s: float | None
+        -_pty_lock: asyncio.Lock
+        -_pty_processes: dict[int, _CloudflarePtyProcessEntry]
+    }
+
+    class CloudflareSandboxClient {
+        +backend_id = "cloudflare"
+        -_instrumentation: Instrumentation
+        -_exec_timeout_s: float
+        -_request_timeout_s: float
+        --
+        +create(*, snapshot, manifest, options): SandboxSession
+    }
+
+    class CloudflareSandboxClientOptions <<pydantic>> {
+        +type: Literal["cloudflare"]
+        +worker_url: str
+        +api_key: str | None
+        +exposed_ports: tuple[int, ...]
+    }
+
+    class CloudflareSandboxSessionState <<pydantic>> {
+        +type: Literal["cloudflare"]
+        +worker_url: str
+        +sandbox_id: str
+    }
+
+    class CloudflareBucketMountStrategy <<pydantic>> {
+        +type: str
+    }
+}
+
+note bottom of CloudflareSandboxClientOptions
+  Transport: HTTP REST + SSE + WebSocket (aiohttp).
+  PTY over WebSocket. No lazy import (requires aiohttp extra).
+end note
+
+' ═══════════════════════════════════════════════════════════
+'  DAYTONA PROVIDER
+' ═══════════════════════════════════════════════════════════
+package "Daytona — daytona.io" {
+
+    class DaytonaSandboxSession {
+        +state: DaytonaSandboxSessionState
+        -_sandbox: Any
+        -_pty_lock: asyncio.Lock
+        -_pty_sessions: dict[int, _DaytonaPtySessionEntry]
+    }
+
+    class DaytonaSandboxClient {
+        +backend_id = "daytona"
+        -_daytona: AsyncDaytona
+        -_instrumentation: Instrumentation
+        --
+        +create(*, snapshot, manifest, options): SandboxSession
+    }
+
+    class DaytonaSandboxClientOptions <<pydantic>> {
+        +type: Literal["daytona"]
+        +sandbox_snapshot_name: str | None
+        +image: str | None
+        +resources: DaytonaSandboxResources | None
+        +pause_on_exit: bool = False
+        +create_timeout: int = 60
+        +start_timeout: int = 60
+        +exposed_ports: tuple[int, ...]
+        +exposed_port_url_ttl_s: int = 3600
+        +timeouts: DaytonaSandboxTimeouts | None
+    }
+
+    class DaytonaSandboxSessionState <<pydantic>> {
+        +type: Literal["daytona"]
+        +sandbox_id: str
+        +sandbox_snapshot_name: str | None
+        +pause_on_exit: bool
+        +timeouts: DaytonaSandboxTimeouts
+        +resources: DaytonaSandboxResources | None
+        +exposed_port_url_ttl_s: int
+    }
+
+    class DaytonaSandboxResources <<pydantic>> {
+        +cpu: int | None
+        +memory: int | None
+        +disk: int | None
+    }
+
+    class DaytonaSandboxTimeouts <<pydantic>> {
+        +exec_timeout_unbounded_s: float | None
+        +keepalive_s: float | None
+        +cleanup_s: float | None
+        +fast_op_s: float | None
+        +file_upload_s: float | None
+        +file_download_s: float | None
+        +workspace_tar_s: float | None
+    }
+
+    class DaytonaCloudBucketMountStrategy <<pydantic>> {
+        +type: str
+    }
+}
+
+note bottom of DaytonaSandboxClientOptions
+  Signed preview URLs for exposed ports (TTL-based).
+  Resource config: CPU/memory/disk.
+  Lazy AsyncDaytona SDK import.
+end note
+
+' ═══════════════════════════════════════════════════════════
+'  RUNLOOP PROVIDER
+' ═══════════════════════════════════════════════════════════
+package "Runloop — runloop.ai" {
+
+    class RunloopSandboxSession {
+        +state: RunloopSandboxSessionState
+        -_sdk: Any
+        -_devbox: Any
+        -_skip_start: bool
+    }
+
+    class RunloopSandboxClient {
+        +backend_id = "runloop"
+        +supports_default_options = True
+        -_sdk: AsyncRunloopSDK
+        -_platform: RunloopPlatformClient
+        -_instrumentation: Instrumentation
+        --
+        +create(*, snapshot, manifest, options): SandboxSession
+    }
+
+    class RunloopSandboxClientOptions <<pydantic>> {
+        +type: Literal["runloop"]
+        +blueprint_id: str | None
+        +blueprint_name: str | None
+        +pause_on_exit: bool = False
+        +exposed_ports: tuple[int, ...]
+        +tunnel: RunloopTunnelConfig | None
+        +gateways: dict[str, RunloopGatewaySpec] | None
+        +mcp: dict[str, RunloopMcpSpec] | None
+        +managed_secrets: dict[str, str] | None
+    }
+
+    class RunloopSandboxSessionState <<pydantic>> {
+        +type: Literal["runloop"]
+        +devbox_id: str
+        +blueprint_id: str | None
+        +pause_on_exit: bool
+        +timeouts: RunloopTimeouts
+        +tunnel: RunloopTunnelConfig | None
+        +gateways: dict[str, RunloopGatewaySpec]
+        +mcp: dict[str, RunloopMcpSpec]
+        +secret_refs: dict[str, str]
+    }
+
+    class RunloopPlatformClient {
+        +blueprints: RunloopPlatformBlueprintsClient
+        +benchmarks: RunloopPlatformBenchmarksClient
+        +secrets: RunloopPlatformSecretsClient
+        +network_policies: RunloopPlatformNetworkPoliciesClient
+        +axons: RunloopPlatformAxonsClient
+    }
+
+    class RunloopCloudBucketMountStrategy <<pydantic>> {
+        +type: str
+    }
+}
+
+note bottom of RunloopSandboxClientOptions
+  Devbox-based execution. Rich platform API:
+  blueprints, benchmarks, secrets, network_policies, axons.
+  Public tunnel + MCP gateway specs. Lazy SDK import.
+  Only provider with supports_default_options = True.
+end note
+
+' ═══════════════════════════════════════════════════════════
+'  BLAXEL PROVIDER
+' ═══════════════════════════════════════════════════════════
+package "Blaxel — blaxel.ai" {
+
+    class BlaxelSandboxSession {
+        +state: BlaxelSandboxSessionState
+        -_sandbox: Any
+        -_token: str | None
+        -_pty_lock: asyncio.Lock
+        -_pty_sessions: dict[int, _BlaxelPtySessionEntry]
+        --
+        +start(): None
+        +stop(): None
+    }
+
+    class BlaxelSandboxClient {
+        +backend_id = "blaxel"
+        -_instrumentation: Instrumentation
+        -_token: str | None
+        --
+        +create(*, snapshot, manifest, options): SandboxSession
+    }
+
+    class BlaxelSandboxClientOptions <<dataclass, frozen>> {
+        +image: str | None
+        +memory: int | None
+        +region: str | None
+        +pause_on_exit: bool = False
+        +exposed_port_public: bool = True
+        +exposed_port_url_ttl_s: int = 3600
+        +timeouts: BlaxelTimeouts | None
+        +labels: dict[str, str] | None
+        +ttl: str | None
+    }
+
+    class BlaxelSandboxSessionState <<pydantic>> {
+        +type: Literal["blaxel"]
+        +sandbox_name: str
+        +image: str | None
+        +memory: int | None
+        +region: str | None
+        +pause_on_exit: bool
+        +timeouts: BlaxelTimeouts
+        +sandbox_url: str | None
+        +exposed_port_public: bool
+        +labels: dict[str, str]
+        +ttl: str | None
+    }
+
+    class BlaxelCloudBucketMountStrategy <<pydantic>> {
+        +type: str
+    }
+
+    class BlaxelDriveMountStrategy <<pydantic>> {
+        +type: str
+    }
+}
+
+note bottom of BlaxelSandboxClientOptions
+  Plain @dataclass(frozen=True) — does NOT
+  extend BaseSandboxClientOptions.
+  Token auth via BL_API_KEY env var.
+  Exposed ports can be public or private (URL TTL).
+end note
+
+' ═══════════════════════════════════════════════════════════
+'  VERCEL PROVIDER
+' ═══════════════════════════════════════════════════════════
+package "Vercel — vercel.com" {
+
+    class VercelSandboxSession {
+        +state: VercelSandboxSessionState
+        -_sandbox: Any | None
+        -_token: str | None
+        --
+        +supports_pty(): bool
+    }
+
+    class VercelSandboxClient {
+        +backend_id = "vercel"
+        -_instrumentation: Instrumentation
+        -_token: str | None
+        -_project_id: str | None
+        -_team_id: str | None
+        --
+        +create(*, snapshot, manifest, options): SandboxSession
+    }
+
+    class VercelSandboxClientOptions <<pydantic>> {
+        +type: Literal["vercel"]
+        +project_id: str | None
+        +team_id: str | None
+        +timeout_ms: int | None = 270000
+        +runtime: str | None
+        +workspace_persistence: WorkspacePersistenceMode = "tar"
+        +interactive: bool = False
+        +network_policy: NetworkPolicy | None
+        +snapshot_expiration_ms: int | None
+    }
+
+    class VercelSandboxSessionState <<pydantic>> {
+        +type: Literal["vercel"]
+        +sandbox_id: str
+        +project_id: str | None
+        +team_id: str | None
+        +timeout_ms: int | None
+        +runtime: str | None
+        +interactive: bool
+        +workspace_persistence: WorkspacePersistenceMode
+        +network_policy: NetworkPolicy | None
+    }
+}
+
+note bottom of VercelSandboxClientOptions
+  NO PTY support. Workspace persistence:
+  tar or Vercel native snapshot (UC_VERCEL_SNAPSHOT_V1).
+  Default 270s timeout. NetworkPolicy support.
+end note
+
+' ═══════════════════════════════════════════════════════════
+'  INHERITANCE: Sessions → BaseSandboxSession
+' ═══════════════════════════════════════════════════════════
+ModalSandboxSession       --|> BaseSandboxSession
+E2BSandboxSession         --|> BaseSandboxSession
+CloudflareSandboxSession  --|> BaseSandboxSession
+DaytonaSandboxSession     --|> BaseSandboxSession
+RunloopSandboxSession     --|> BaseSandboxSession
+BlaxelSandboxSession      --|> BaseSandboxSession
+VercelSandboxSession      --|> BaseSandboxSession
+
+' ═══════════════════════════════════════════════════════════
+'  INHERITANCE: Clients → BaseSandboxClient
+' ═══════════════════════════════════════════════════════════
+ModalSandboxClient       --|> BaseSandboxClient
+E2BSandboxClient         --|> BaseSandboxClient
+CloudflareSandboxClient  --|> BaseSandboxClient
+DaytonaSandboxClient     --|> BaseSandboxClient
+RunloopSandboxClient     --|> BaseSandboxClient
+BlaxelSandboxClient      --|> BaseSandboxClient
+VercelSandboxClient      --|> BaseSandboxClient
+
+' ═══════════════════════════════════════════════════════════
+'  INHERITANCE: Options → BaseSandboxClientOptions  (all except Blaxel)
+' ═══════════════════════════════════════════════════════════
+ModalSandboxClientOptions      --|> BaseSandboxClientOptions
+E2BSandboxClientOptions        --|> BaseSandboxClientOptions
+CloudflareSandboxClientOptions --|> BaseSandboxClientOptions
+DaytonaSandboxClientOptions    --|> BaseSandboxClientOptions
+RunloopSandboxClientOptions    --|> BaseSandboxClientOptions
+VercelSandboxClientOptions     --|> BaseSandboxClientOptions
+
+' ═══════════════════════════════════════════════════════════
+'  INHERITANCE: States → SandboxSessionState
+' ═══════════════════════════════════════════════════════════
+ModalSandboxSessionState      --|> SandboxSessionState
+E2BSandboxSessionState        --|> SandboxSessionState
+CloudflareSandboxSessionState --|> SandboxSessionState
+DaytonaSandboxSessionState    --|> SandboxSessionState
+RunloopSandboxSessionState    --|> SandboxSessionState
+BlaxelSandboxSessionState     --|> SandboxSessionState
+VercelSandboxSessionState     --|> SandboxSessionState
+
+' ═══════════════════════════════════════════════════════════
+'  INHERITANCE: Mount Strategies → MountStrategyBase
+' ═══════════════════════════════════════════════════════════
+ModalCloudBucketMountStrategy     --|> MountStrategyBase
+E2BCloudBucketMountStrategy       --|> MountStrategyBase
+CloudflareBucketMountStrategy     --|> MountStrategyBase
+DaytonaCloudBucketMountStrategy   --|> MountStrategyBase
+RunloopCloudBucketMountStrategy   --|> MountStrategyBase
+BlaxelCloudBucketMountStrategy    --|> MountStrategyBase
+BlaxelDriveMountStrategy          --|> MountStrategyBase
+
+' ═══════════════════════════════════════════════════════════
+'  COMPOSITION: Sessions own their State
+' ═══════════════════════════════════════════════════════════
+ModalSandboxSession      *-- ModalSandboxSessionState      : state
+E2BSandboxSession        *-- E2BSandboxSessionState        : state
+CloudflareSandboxSession *-- CloudflareSandboxSessionState : state
+DaytonaSandboxSession    *-- DaytonaSandboxSessionState    : state
+RunloopSandboxSession    *-- RunloopSandboxSessionState    : state
+BlaxelSandboxSession     *-- BlaxelSandboxSessionState     : state
+VercelSandboxSession     *-- VercelSandboxSessionState     : state
+
+' ═══════════════════════════════════════════════════════════
+'  COMPOSITION: Auxiliary objects
+' ═══════════════════════════════════════════════════════════
+DaytonaSandboxSessionState *-- DaytonaSandboxTimeouts    : timeouts
+DaytonaSandboxSessionState o-- DaytonaSandboxResources   : resources (optional)
+RunloopSandboxClient       *-- RunloopPlatformClient     : _platform
+ModalSandboxClient         ..> ModalImageSelector        : uses
+ModalSandboxClient         ..> ModalSandboxSelector      : uses
+E2BSandboxClientOptions    ..> E2BSandboxType            : sandbox_type
+
+@enduml

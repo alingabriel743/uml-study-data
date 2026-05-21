@@ -1,0 +1,109 @@
+{
+  "scope": "3d_gaussian_rendering",
+  "title": "3D Gaussian Rendering",
+  "diagram_type": "use_case",
+  "description": "System renders 3D Gaussian splat scenes including deferred shading and patch-based rendering",
+
+  "actors": [
+    "LatentRecon (model — primary consumer)",
+    "Training Pipeline",
+    "gsplat.rendering.rasterization (external GPU rasterizer)"
+  ],
+
+  "system_boundary": "3D Gaussian Splatting Rendering Subsystem",
+
+  "components": [
+    {
+      "name": "GaussianRenderer",
+      "kind": "class",
+      "file": "src/rendering/gs.py",
+      "base": null,
+      "methods": [
+        "render(gaussians[B,N,14], cam_view[B,V,4,4], bg_color, intrinsics) -> {images_pred, alphas_pred, depths_pred}",
+        "save_ply(gaussians, path, compatible=True)",
+        "load_ply(path, compatible=True) -> gaussians"
+      ],
+      "description": "Standard (non-deferred) Gaussian renderer. Loops over batch & view chunks, calls gsplat rasterization with RGB+ED mode."
+    },
+    {
+      "name": "GaussianRendererDeferred",
+      "kind": "class",
+      "file": "src/rendering/gs_deferred.py",
+      "base": null,
+      "methods": [
+        "render(gaussians[B,N,14], cam_view, bg_color, intrinsics, patch_size=None) -> {images_pred, alphas_pred, depths_pred}",
+        "render_deferred(means3D, opacity, scales, rotations, rgbs, viewmat, Ks, backgrounds, H, W, near_plane, far_plane, patch_size) -> dict",
+        "render_standard(means3D, opacity, scales, rotations, rgbs, viewmat, Ks, backgrounds, H, W, near_plane, far_plane) -> dict",
+        "render_downscale(..., downscale_factor) -> dict",
+        "save_ply(gaussians, path, compatible=True)",
+        "load_ply(path, compatible=True) -> gaussians"
+      ],
+      "description": "Extended renderer with deferred backpropagation support and OOM-safe downscaling. Selects render_func at init based on opt.deferred_bp flag. Supports 3DGuT via raster_kwargs."
+    },
+    {
+      "name": "DeferredBP",
+      "kind": "class",
+      "file": "src/rendering/gs_deferred.py",
+      "base": "torch.autograd.Function",
+      "methods": [
+        "render(xyz, feature, scale, rotation, opacity, test_w2c, test_intr, W, H, near_plane, far_plane, backgrounds, raster_kwargs) -> (image, alpha, depth)  [static]",
+        "forward(ctx, xyz, feature, scale, rotation, opacity, test_w2cs, test_intr, W, H, near_plane, far_plane, backgrounds, raster_kwargs) -> (images, alphas, depths)",
+        "backward(ctx, images_grad, alphas_grad, depths_grad) -> gradients"
+      ],
+      "description": "Custom autograd Function. Forward runs rasterization per-view in no_grad context storing results in requires_grad tensors; backward re-runs rasterization with grad enabled to propagate gradients to GS parameters."
+    },
+    {
+      "name": "DeferredBPPatch",
+      "kind": "class",
+      "file": "src/rendering/gs_deferred_patch.py",
+      "base": "torch.autograd.Function",
+      "methods": [
+        "forward(ctx, xyz, features, scaling, rotation, opacity, C2W, Ks, width, height, near_plane, far_plane, backgrounds, patch_size, raster_kwargs) -> (colors[B,V,3,H,W], alphas[B,V,1,H,W], depths[B,V,1,H,W])",
+        "backward(ctx, grad_colors, grad_alphas, grad_depths) -> gradients"
+      ],
+      "description": "Patch-based deferred rendering. Divides the image into (patch_size[0] x patch_size[1]) tiles, renders each patch independently by shifting cx/cy, then assembles full image. Saves GPU memory by rendering small tiles sequentially."
+    }
+  ],
+
+  "use_cases": [
+    "Render 3D Gaussian scene (standard mode) — GaussianRenderer.render() → rasterization()",
+    "Render 3D Gaussian scene (deferred mode, full image) — GaussianRendererDeferred.render() → render_deferred() → DeferredBP.apply()",
+    "Render 3D Gaussian scene (patch-based deferred) — GaussianRendererDeferred.render(patch_size=...) → render_deferred() → DeferredBPPatch.apply()",
+    "Render with OOM fallback downscaling — GaussianRendererDeferred.render_downscale() → resize outputs with F.interpolate",
+    "Render with 3DGuT backend — GaussianRendererDeferred (use_3dgut=True, raster_kwargs with_ut=True)",
+    "Export Gaussian scene to PLY — save_ply() with opacity pruning + inverse activation",
+    "Load Gaussian scene from PLY — load_ply() with sigmoid/exp activation"
+  ],
+
+  "key_relationships": [
+    "LatentRecon instantiates GaussianRendererDeferred when opt.deferred_bp=True, else GaussianRenderer",
+    "GaussianRendererDeferred delegates to DeferredBP.apply() (full-image deferred) or DeferredBPPatch.apply() (patch-based) in render_deferred()",
+    "DeferredBP and DeferredBPPatch both depend on gsplat.rendering.rasterization",
+    "GaussianRendererDeferred imports DeferredBPPatch from gs_deferred_patch",
+    "render_downscale depends on src.models.utils.render.downscale_intrinsics and einops/F.interpolate"
+  ],
+
+  "key_data_flow": [
+    "Input gaussians tensor [B, N, 14]: channels = pos(3) + opacity(1) + scale(3) + rotation(4) + rgb(3)",
+    "cam_view [B, V, 4, 4] transposed to viewmat [B, V, 4, 4] for gsplat convention",
+    "intrinsics [B, V, 4] (fx, fy, cx, cy) → built into Ks [B, V, 3, 3]",
+    "Output dict: images_pred[B,V,3,H,W], alphas_pred[B,V,1,H,W], depths_pred[B,V,1,H,W]",
+    "DeferredBPPatch shifts cx/cy per tile: new_cx = cx - m*patch_w, new_cy = cy - n*patch_h"
+  ],
+
+  "important_notes": [
+    "render_mode='RGB+ED' (RGB + Euclidean depth) used throughout",
+    "GaussianRendererDeferred.oom_downscale_factors=[1,2,4,8] but OOM retry logic is currently commented out",
+    "DeferredBP.backward() re-runs full forward to compute gradients (memory-efficient but slower)",
+    "DeferredBPPatch requires height % patch_h == 0 and width % patch_w == 0",
+    "Compatible PLY format: inverse_sigmoid(opacity), log(scales), normalised SHs"
+  ],
+
+  "source_files_analyzed": [
+    "Lyra-1/src/rendering/gs.py",
+    "Lyra-1/src/rendering/gs_deferred.py",
+    "Lyra-1/src/rendering/gs_deferred_patch.py",
+    "Lyra-1/src/models/recon/model_latent_recon.py (partial — usage context)",
+    "diagrams/use_case/ir_view_use_case.json"
+  ]
+}

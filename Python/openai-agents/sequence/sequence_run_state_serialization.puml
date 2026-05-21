@@ -1,0 +1,261 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipantBorderColor #495057
+skinparam sequenceParticipantBackgroundColor #F8F9FA
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceGroupBorderColor #6C757D
+skinparam sequenceGroupBackgroundColor #E9ECEF
+skinparam noteBorderColor #6C757D
+skinparam noteBackgroundColor #FFF3CD
+
+title Run State Serialization & Deserialization
+
+actor Caller as caller
+
+participant "RunState" as rs
+participant "RunContextWrapper\n(context)" as ctx
+participant "_build_run_state\n_from_json" as builder
+participant "ProcessedResponse" as pr
+participant "Agent" as agent
+participant "TraceState" as ts
+
+== Serialization: RunState → JSON ==
+
+caller -> rs : to_string(context_serializer?, strict_context?,\ninclude_tracing_api_key?)
+activate rs
+note right of rs
+  Thin wrapper: calls to_json()
+  then json.dumps() the result
+end note
+
+rs -> rs : to_json()
+activate rs
+
+rs -> rs : _serialize_approvals()
+activate rs
+rs -> ctx : read _approvals
+ctx --> rs : dict[tool_name → {approved, rejected,\nrejection_messages, sticky_rejection_message}]
+deactivate rs
+
+rs -> rs : _serialize_original_input()
+activate rs
+note right of rs
+  Normalises assistant messages:
+  adds status='completed',
+  wraps plain string content
+end note
+deactivate rs
+
+rs -> rs : _serialize_model_responses()
+activate rs
+note right of rs
+  For each ModelResponse:
+  {usage, output[], response_id, request_id}
+end note
+deactivate rs
+
+rs -> rs : _serialize_context_payload(context_serializer,\nstrict_context)
+activate rs
+note right of rs
+  Strategy cascade:
+  1. Mapping → direct dict copy
+  2. context_serializer(ctx) callable
+  3. Pydantic → model_dump() + warning
+  4. Dataclass → asdict() + warning
+  5. Unknown → {} + warning (omitted=True)
+  strict_context=True → raises UserError
+end note
+rs -> ctx : read tool_input
+ctx --> rs : tool_input value
+rs -> rs : _serialize_tool_input(tool_input)
+deactivate rs
+
+rs -> rs : _merge_generated_items_with_processed()
+activate rs
+note right of rs
+  Deduplicates _generated_items +
+  last_processed_response.new_items
+  by (id,type) / (call_id,type)
+end note
+deactivate rs
+
+rs -> rs : _serialize_item(item)\n[for each generated/session item]
+activate rs
+note right of rs
+  Produces: {type, raw_item, agent,
+  output?, tool_name?, tool_lookup_key?,
+  tool_origin?, source_agent?, target_agent?}
+end note
+deactivate rs
+
+rs -> rs : _serialize_processed_response\n(last_processed_response)
+activate rs
+
+rs -> rs : _serialize_tool_action_groups()
+activate rs
+note right of rs
+  Keys: functions, computer_actions,
+  custom_tool_actions, local_shell_actions,
+  shell_actions, apply_patch_actions,
+  handoffs, mcp_approval_requests
+end note
+deactivate rs
+
+rs -> rs : _serialize_pending_nested_agent_tool_runs()
+activate rs
+loop for each function_run with nested Agent.as_tool()
+    rs -> rs : peek_agent_tool_run_result()
+    note right of rs
+      If pending nested RunResult
+      with interruptions → recursively
+      call nested_state.to_json() and
+      embed as entry['agent_run_state']
+    end note
+end
+deactivate rs
+
+deactivate rs
+
+rs -> rs : _serialize_current_step()
+activate rs
+note right of rs
+  NextStepInterruption →
+  {type:'next_step_interruption',
+   data:{interruptions:[...]}}
+  via _serialize_tool_approval_interruption()
+end note
+deactivate rs
+
+rs -> ts : _serialize_trace_data(include_tracing_api_key)
+activate ts
+ts --> rs : trace dict (optional API key included)
+deactivate ts
+
+rs --> rs : assemble full JSON dict\n($schemaVersion=1.9, current_turn,\ncurrent_agent, original_input,\nmodel_responses, context,\ngenerated_items, session_items,\ncurrent_step, last_processed_response,\ntrace, guardrail_results, ...)
+deactivate rs
+
+rs --> caller : JSON string (UTF-8)
+deactivate rs
+
+== Deserialization: JSON → RunState ==
+
+caller -> rs : from_string(initial_agent, state_string,\ncontext_override?, context_deserializer?,\nstrict_context?)
+activate rs
+rs -> rs : json.loads(state_string)
+rs -> rs : from_json(initial_agent, state_json, ...)
+activate rs
+rs -> builder : _build_run_state_from_json(state_json, ...)
+activate builder
+
+builder -> builder : 1. validate $schemaVersion\nagainst SUPPORTED_SCHEMA_VERSIONS\n(1.0 – 1.9)
+note right of builder
+  Fail-fast forward compat:
+  older SDKs reject unknown
+  newer schema versions
+end note
+
+builder -> agent : 2. _build_agent_map(initial_agent)\n_build_agent_identity_map(initial_agent)
+activate agent
+note right of agent
+  BFS over handoffs +
+  agent-as-tool instances to
+  build name→agent maps
+end note
+agent --> builder : agent_map, identity_map
+deactivate agent
+
+builder -> builder : 3. _resolve_agent_from_data()\nidentity key → name lookup → current_agent
+
+builder -> ctx : 4. restore context\n(context_override | context_deserializer | Mapping)
+activate ctx
+builder -> ctx : set usage
+builder -> ctx : _rebuild_approvals(approvals_dict)
+builder -> ctx : restore tool_input
+ctx --> builder : RunContextWrapper restored
+deactivate ctx
+
+builder -> rs : 5. construct RunState(context,\noriginal_input, starting_agent,\nmax_turns, conversation_id,\nprevious_response_id)
+activate rs
+
+builder -> builder : 6. _deserialize_model_responses()\n→ state._model_responses
+note right of builder
+  Deserializes each entry:
+  usage + output items
+  (ResponseOutputMessage,
+  ResponseFunctionToolCall,
+  ResponseComputerToolCall,
+  ResponseReasoningItem, etc.)
+end note
+
+builder -> builder : 7. _deserialize_items\n(generated_items, agent_map)\n→ state._generated_items
+
+builder -> pr : 8. await _deserialize_processed_response\n(last_processed_response_data,\ncurrent_agent, context, agent_map)
+activate pr
+
+pr -> agent : get_all_tools(context)
+activate agent
+agent --> pr : FunctionTool / ComputerTool /\nCustomTool / LocalShellTool /\nShellTool / ApplyPatchTool /\nHostedMCPTool / Handoff maps
+deactivate agent
+
+pr -> pr : _deserialize_action_groups()\n[functions, computer_actions,\ncustom_tool_actions, ...]
+
+loop for each function_entry with 'agent_run_state'
+    pr -> builder : await _restore_pending_nested_\nagent_tool_runs()
+    activate builder
+    builder -> builder : recursively await\n_build_run_state_from_json()
+    builder --> pr : _SerializedAgentToolRunResult
+    deactivate builder
+    pr -> pr : record_agent_tool_run_result()
+end
+
+pr -> pr : _deserialize_tool_approval_item()\nfor mcp_approval_requests\nand interruptions
+
+pr --> builder : ProcessedResponse(new_items, handoffs,\nfunctions, computer_actions,\ncustom_tool_calls, shell_calls,\napply_patch_calls, mcp_approval_requests,\ninterruptions)
+deactivate pr
+
+builder -> builder : 9. restore session_items\n(or merge from generated+processed)
+
+builder -> builder : 10. restore current_step\n→ NextStepInterruption via\n_deserialize_tool_approval_item()
+
+builder -> builder : 11. restore guardrail results\n(input / output / tool_input /\ntool_output stubs)
+
+builder -> ts : 12. TraceState.from_json(trace_payload)
+activate ts
+ts --> builder : TraceState restored
+deactivate ts
+
+builder -> rs : set sandbox, tool_use_tracker,\nreasoning_item_id_policy,\ngenerated_prompt_cache_key
+deactivate rs
+
+builder --> rs : rebuilt RunState
+deactivate builder
+
+rs --> rs : return rebuilt RunState
+deactivate rs
+rs --> caller : RunState (fully restored)
+deactivate rs
+
+note over caller, ts
+  Schema versions 1.0–1.9 all supported on read.
+  to_json() always emits $schemaVersion = 1.9 (CURRENT_SCHEMA_VERSION).
+  Approval decisions (always_approve/always_reject) persist across serialization rounds (schema 1.6+).
+  Nested Agent.as_tool() interruptions are serialized recursively inside last_processed_response.functions[n].agent_run_state.
+end note
+
+@enduml

@@ -1,0 +1,230 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    ActorBackgroundColor #F8F9FA
+    ActorFontColor #212529
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Agent-to-Agent (A2A) Protocol and Mailbox Transport
+
+actor "Caller\n(Agent Node)" as Caller
+
+box "GEP A2A Layer" #EEF2FF
+    participant "a2a.js\n(parseA2AInput)" as A2AParser
+    participant "a2aProtocol.js\n(buildPublish / registry)" as A2AProtocol
+end box
+
+box "Mailbox Transport Layer" #E8F5E9
+    participant "mailboxTransport.js\n(send / receive / list)" as MailboxTransport
+    participant "settings.js\n(getProxyUrl)" as Settings
+end box
+
+box "Local Proxy Server" #FFF3E0
+    participant "ProxyServer\n(routes.js)" as ProxyServer
+    participant "MailboxStore\n(store.js)" as MailboxStore
+end box
+
+participant "A2AHub\n(A2A_HUB_URL)" as A2AHub
+
+' ─────────────────────────────────────────────
+' 1. TRANSPORT REGISTRATION (init / lazy require)
+' ─────────────────────────────────────────────
+note over Caller, A2AProtocol
+  **Boot: register mailbox transport**
+  (lazy require avoids circular dependency)
+end note
+
+Caller -> A2AProtocol: registerMailboxTransport()
+activate A2AProtocol
+A2AProtocol -> A2AProtocol: registerTransport('mailbox', mailboxTransport)
+A2AProtocol --> Caller: transport registered
+deactivate A2AProtocol
+
+' ─────────────────────────────────────────────
+' 2. PARSE INCOMING A2A INPUT
+' ─────────────────────────────────────────────
+|||
+== Parse Incoming A2A Input ==
+
+Caller -> A2AParser: parseA2AInput(text)
+activate A2AParser
+note right of A2AParser
+  Input: raw JSON object,
+  JSON array, or NDJSON lines
+end note
+
+loop for each parsed item
+    A2AParser -> A2AParser: unwrapAssetFromMessage(item)
+    note right of A2AParser
+      If protocol='gep-a2a' + message_type='publish'
+        → extract payload.asset
+      Else if {type + id} present
+        → return asset as-is
+      Else → null
+    end note
+end
+
+A2AParser --> Caller: Asset[]\n(Gene | Capsule | EvolutionEvent)
+deactivate A2AParser
+
+' ─────────────────────────────────────────────
+' 3. BUILD & SEND A2A PUBLISH MESSAGE
+' ─────────────────────────────────────────────
+|||
+== Build & Send A2A Publish Message ==
+
+Caller -> A2AProtocol: buildPublish({ asset })
+activate A2AProtocol
+A2AProtocol -> A2AProtocol: buildMessage({ messageType: 'publish', payload })
+note right of A2AProtocol
+  Validates asset.type + asset.id
+  Generates message_id: 'msg_<uuid>'
+  Signs with A2A_NODE_SECRET
+end note
+A2AProtocol --> Caller: { protocol: 'gep-a2a',\n  message_type: 'publish',\n  message_id: 'msg_*',\n  timestamp, payload:\n  { asset_type, local_id, signature } }
+deactivate A2AProtocol
+
+Caller -> MailboxTransport: mailboxTransportSend(message)
+activate MailboxTransport
+note right of MailboxTransport
+  Extracts:
+  type = message.message_type || message.type
+  payload = message.payload || message
+end note
+
+MailboxTransport -> MailboxTransport: _request('POST', '/mailbox/send', {type, payload})
+activate MailboxTransport
+
+MailboxTransport -> Settings: getProxyUrl()
+activate Settings
+Settings --> MailboxTransport: proxyBaseUrl (from settings.json)
+deactivate Settings
+
+MailboxTransport -> ProxyServer: HTTP POST /mailbox/send\n{ type, payload }\n[timeout: 10s]
+activate ProxyServer
+
+ProxyServer -> MailboxStore: store.send({ type, payload })
+activate MailboxStore
+MailboxStore -> MailboxStore: generateUUIDv7()
+MailboxStore -> MailboxStore: _appendMessage()
+MailboxStore --> ProxyServer: { id: <uuid_v7>, ... }
+deactivate MailboxStore
+
+ProxyServer --> MailboxTransport: HTTP 200 JSON\n{ id, ... }
+deactivate ProxyServer
+
+MailboxTransport --> MailboxTransport: resolve parsed JSON
+deactivate MailboxTransport
+
+MailboxTransport --> Caller: result { id, ... }
+deactivate MailboxTransport
+
+' ─────────────────────────────────────────────
+' 4. POLL FOR INBOUND MESSAGES
+' ─────────────────────────────────────────────
+|||
+== Poll for Inbound Messages ==
+
+Caller -> MailboxTransport: mailboxTransportReceive({ type, channel, limit })
+activate MailboxTransport
+
+MailboxTransport -> ProxyServer: HTTP POST /mailbox/poll\n{ type, channel, limit: 20 }\n[via _request]
+activate ProxyServer
+
+ProxyServer -> MailboxStore: store.poll({ channel, type, limit })
+activate MailboxStore
+MailboxStore --> ProxyServer: messages[]
+deactivate MailboxStore
+
+ProxyServer --> MailboxTransport: HTTP 200\n{ messages, count }
+deactivate ProxyServer
+
+MailboxTransport --> Caller: messages[]
+deactivate MailboxTransport
+
+' ─────────────────────────────────────────────
+' 5. LIST MESSAGES (non-destructive)
+' ─────────────────────────────────────────────
+|||
+== List Messages (Non-Destructive) ==
+
+Caller -> MailboxTransport: mailboxTransportList({ type, limit })
+activate MailboxTransport
+
+MailboxTransport -> ProxyServer: HTTP GET /mailbox/list\n?type=hub_event&limit=20\n[via _request]
+activate ProxyServer
+
+ProxyServer -> MailboxStore: store.list({ type, limit })
+activate MailboxStore
+MailboxStore --> ProxyServer: messages[]
+deactivate MailboxStore
+
+ProxyServer --> MailboxTransport: HTTP 200\n{ messages, count }
+deactivate ProxyServer
+
+MailboxTransport --> Caller: messages[]
+deactivate MailboxTransport
+
+' ─────────────────────────────────────────────
+' 6. HEARTBEAT (direct to Hub)
+' ─────────────────────────────────────────────
+|||
+== Periodic Heartbeat to A2A Hub ==
+
+note over Caller, A2AHub
+  sendHeartbeat() uses global fetch (NOT _request),
+  bypassing the local proxy — talks directly to A2A_HUB_URL
+end note
+
+Caller -> A2AProtocol: sendHeartbeat()
+activate A2AProtocol
+
+A2AProtocol -> A2AHub: fetch POST A2A_HUB_URL\n{ status: 'ok' }
+activate A2AHub
+A2AHub --> A2AProtocol: HTTP 200 OK
+deactivate A2AHub
+
+A2AProtocol -> A2AProtocol: touch EVOLVER_LOGS_DIR/evolver_loop.log
+A2AProtocol --> Caller: heartbeat sent
+deactivate A2AProtocol
+
+' ─────────────────────────────────────────────
+' 7. HUB SSE EVENT STREAM
+' ─────────────────────────────────────────────
+|||
+== Open Hub SSE Event Stream ==
+
+Caller -> A2AProtocol: hubOpenEventStream({})
+activate A2AProtocol
+
+A2AProtocol -> A2AHub: new EventSource(\n  '/a2a/events/stream\n  ?node_id=<A2A_NODE_ID>',\n  { headers: { Authorization:\n    'Bearer <A2A_NODE_SECRET>' } }\n)
+activate A2AHub
+note right of A2AHub
+  Persistent SSE connection;
+  server pushes hub events
+  to subscribed node
+end note
+
+A2AHub --> A2AProtocol: EventSource connection established
+deactivate A2AHub
+
+A2AProtocol --> Caller: { ok: true, close() }
+deactivate A2AProtocol
+
+@enduml

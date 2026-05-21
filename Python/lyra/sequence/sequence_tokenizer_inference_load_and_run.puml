@@ -1,0 +1,238 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+}
+
+title Tokenizer Inference Load and Run
+
+actor Caller as caller
+
+participant "load_model /\nload_encoder_model /\nload_decoder_model" as load_fn
+participant "_load_pytorch_model" as load_pytorch
+participant "load_jit_model" as load_jit
+participant "TokenizerModels\n(Enum)" as tok_enum
+participant "torch.jit" as torchj
+participant "TokenizerNetwork\n(CI/DI/CV/DV)" as net
+participant "ImageTokenizer" as img_tok
+
+' ─────────────────────────────────────────────
+' 1. MODEL LOADING — JIT path
+' ─────────────────────────────────────────────
+box "Model Loading — JIT Path" #EEF4FF
+  caller -> load_fn : load_model(jit_filepath,\ntokenizer_config=None, device)
+  activate load_fn
+
+  load_fn -> load_jit : load_jit_model(jit_filepath, device)
+  activate load_jit
+
+  load_jit -> torchj : torch.jit.load(jit_filepath,\nmap_location=device)
+  activate torchj
+  torchj --> load_jit : ScriptModule
+  deactivate torchj
+
+  load_jit -> load_jit : model.eval().to(device)
+  load_jit --> load_fn : ScriptModule (eval)
+  deactivate load_jit
+
+  load_fn --> caller : jit_model
+  deactivate load_fn
+end box
+
+' ─────────────────────────────────────────────
+' 2. MODEL LOADING — PyTorch path
+' ─────────────────────────────────────────────
+box "Model Loading — PyTorch Path" #F0FFF0
+  caller -> load_fn : load_model(jit_filepath,\ntokenizer_config, device)
+  activate load_fn
+
+  load_fn -> load_pytorch : _load_pytorch_model(jit_filepath,\ntokenizer_config, device)
+  activate load_pytorch
+
+  load_pytorch -> tok_enum : TokenizerModels[tokenizer_name].value\n(**tokenizer_config)
+  activate tok_enum
+  note right of tok_enum
+    CI → ContinuousImageTokenizer
+    DI → DiscreteImageTokenizer
+    CV → CausalContinuousVideoTokenizer
+    DV → CausalDiscreteVideoTokenizer
+  end note
+  tok_enum --> load_pytorch : network instance
+  deactivate tok_enum
+
+  load_pytorch -> torchj : torch.jit.load(jit_filepath,\nmap_location=device)
+  activate torchj
+  torchj --> load_pytorch : ckpts (ScriptModule)
+  deactivate torchj
+
+  load_pytorch --> load_fn : (model, ckpts)
+  deactivate load_pytorch
+
+  load_fn -> net : full_model.load_state_dict(\nckpts.state_dict(), strict=True)
+  activate net
+  net --> load_fn : weights transferred
+  deactivate net
+
+  load_fn -> net : full_model.eval().to(device)
+  activate net
+  net --> load_fn : full_model (eval)
+  deactivate net
+
+  load_fn --> caller : full_model
+  deactivate load_fn
+end box
+
+' ─────────────────────────────────────────────
+' 3. ENCODER / DECODER EXTRACTION
+' ─────────────────────────────────────────────
+box "Encoder / Decoder Extraction" #FFF8EE
+  caller -> load_fn : load_encoder_model(jit_filepath,\ntokenizer_config, device)
+  activate load_fn
+
+  load_fn -> load_pytorch : _load_pytorch_model(...)
+  activate load_pytorch
+  load_pytorch --> load_fn : (full_model, ckpts)
+  deactivate load_pytorch
+
+  load_fn -> net : full_model.encoder_jit()
+  activate net
+  net --> load_fn : encoder sub-module
+  deactivate net
+
+  load_fn -> net : encoder_model.load_state_dict(\nckpts.state_dict(), strict=True)
+  activate net
+  net --> load_fn : ok
+  deactivate net
+
+  load_fn -> net : encoder_model.eval().to(device)
+  activate net
+  net --> load_fn : encoder_model (eval)
+  deactivate net
+
+  load_fn --> caller : encoder_model
+  deactivate load_fn
+
+  caller -> load_fn : load_decoder_model(jit_filepath,\ntokenizer_config, device)
+  activate load_fn
+
+  load_fn -> load_pytorch : _load_pytorch_model(...)
+  activate load_pytorch
+  load_pytorch --> load_fn : (full_model, ckpts)
+  deactivate load_pytorch
+
+  load_fn -> net : full_model.decoder_jit()
+  activate net
+  net --> load_fn : decoder sub-module
+  deactivate net
+
+  load_fn -> net : decoder_model.load_state_dict(...)
+  activate net
+  net --> load_fn : ok
+  deactivate net
+
+  load_fn -> net : decoder_model.eval().to(device)
+  activate net
+  net --> load_fn : decoder_model (eval)
+  deactivate net
+
+  load_fn --> caller : decoder_model
+  deactivate load_fn
+end box
+
+' ─────────────────────────────────────────────
+' 4. ImageTokenizer Initialisation
+' ─────────────────────────────────────────────
+box "ImageTokenizer Initialization" #FFF0F8
+  caller -> img_tok : __init__(checkpoint, checkpoint_enc,\ncheckpoint_dec, tokenizer_config,\ndevice, dtype=bfloat16)
+  activate img_tok
+
+  img_tok -> load_fn : load_model(checkpoint,\ntokenizer_config, device)
+  activate load_fn
+  load_fn --> img_tok : _full_model
+  deactivate load_fn
+
+  img_tok -> load_fn : load_encoder_model(checkpoint_enc,\ntokenizer_config, device)
+  activate load_fn
+  load_fn --> img_tok : _enc_model
+  deactivate load_fn
+
+  img_tok -> load_fn : load_decoder_model(checkpoint_dec,\ntokenizer_config, device)
+  activate load_fn
+  load_fn --> img_tok : _dec_model
+  deactivate load_fn
+
+  img_tok --> caller : ImageTokenizer ready
+  deactivate img_tok
+end box
+
+' ─────────────────────────────────────────────
+' 5. Inference — encode / decode / autoencode
+' ─────────────────────────────────────────────
+box "Inference" #F5FAFF
+  caller -> img_tok : encode(input_tensor: Bx3xHxW)
+  activate img_tok
+  img_tok -> net : _enc_model(input_tensor)
+  activate net
+  net --> img_tok : latent\n(CI: Bx16xhxw | DI: indices+code)
+  deactivate net
+  img_tok --> caller : latent
+  deactivate img_tok
+
+  caller -> img_tok : decode(input_latent)
+  activate img_tok
+  img_tok -> net : _dec_model(input_latent)
+  activate net
+  net --> img_tok : output_tensor Bx3xHxW
+  deactivate net
+  img_tok --> caller : output_tensor
+  deactivate img_tok
+
+  caller -> img_tok : autoencode(input_tensor)
+  activate img_tok
+  alt _full_model is not None
+    img_tok -> net : _full_model(input_tensor)
+    activate net
+    net --> img_tok : reconstructed tensor
+    deactivate net
+  else _full_model is None
+    img_tok -> img_tok : encode(input_tensor)
+    img_tok -> img_tok : decode(output_latent)
+  end
+  img_tok --> caller : reconstructed Bx3xHxW
+  deactivate img_tok
+
+  caller -> img_tok : forward(image: BxHxWxC, range[0..255])
+  activate img_tok
+  img_tok -> img_tok : pad_image_batch(image)\n→ padded_input_image, crop_region
+  img_tok -> img_tok : numpy2tensor(padded_input_image, dtype, device)\n→ input_tensor Bx3xHxW
+  img_tok -> img_tok : autoencode(input_tensor)\n→ output_tensor
+  img_tok -> img_tok : tensor2numpy(output_tensor)\n→ padded_output_image BxHxWxC uint8
+  img_tok -> img_tok : unpad_image_batch(padded_output_image, crop_region)
+  img_tok --> caller : reconstructed numpy image BxHxWxC
+  deactivate img_tok
+end box
+
+@enduml

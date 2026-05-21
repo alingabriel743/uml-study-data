@@ -1,0 +1,145 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam actor {
+    BackgroundColor #D0E8FF
+    BorderColor #3A7BD5
+    FontColor #212529
+}
+skinparam usecase {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam ArrowColor #495057
+
+title Diffusion Noise Scheduling & Denoising
+
+left to right direction
+
+actor "Training Loop" as TrainingLoop
+actor "Inference Pipeline" as InferencePipeline
+actor "Context Parallel\nWorker" as CPWorker
+
+rectangle "Diffusion Noise Scheduling & Denoising System" {
+
+    ' --- Encoding / Decoding ---
+    usecase "Encode Multiview\nVideo to Latent" as UC_Encode
+    note right of UC_Encode
+      Rearrange B C (V T) H W → (B V) C T H W
+      VAE/tokenizer encode × sigma_data
+    end note
+
+    usecase "Decode Latent to\nMultiview Video" as UC_Decode
+    note right of UC_Decode
+      Inverse encode: decode ÷ sigma_data
+      VAE/tokenizer decode
+    end note
+
+    ' --- Noise Region Setup ---
+    usecase "Set Condition Video\nIndicator (Noise Region Mask)" as UC_Indicator
+    note right of UC_Indicator
+      Training: first_random_n frames → 1
+      Inference: first_n frames → 1
+      Sets gt_latent, condition_video_indicator
+    end note
+
+    usecase "Augment Conditional\nLatent Frames with Noise" as UC_AugNoise
+    note right of UC_AugNoise
+      augment_latent = latent + noise × augment_sigma
+      precondition_inputs(augment_latent, augment_sigma)
+      new_xt = indicator × augmented + (1−indicator) × xt
+    end note
+
+    ' --- Core Denoising ---
+    usecase "Denoise Noisy Input\n(Epsilon Prediction)" as UC_Denoise
+    note right of UC_Denoise
+      Composite condition region with augmented latent
+      Net forward pass → epsilon prediction
+      Returns VideoDenoisePrediction (x0, eps, logvar)
+    end note
+
+    usecase "Compute Training Loss\nwith Epsilon & Sigma" as UC_Loss
+    note right of UC_Loss
+      EDM loss via base DiffusionModel
+      Returns (output_batch, kendall_loss, pred_mse, edm_loss)
+      CP: kendall_loss × cp_world_size if loss_reduce='sum'
+    end note
+
+    ' --- Sampling / Inference ---
+    usecase "Classifier-Free Guidance\nDenoising Step (CFG)" as UC_CFG
+    note right of UC_CFG
+      raw_x0 = cond_x0 + guidance × (cond_x0 − uncond_x0)
+      Optionally: x0_pred_replaced for extend model
+    end note
+
+    usecase "SDE Sampler-Based\nGeneration (EDM-style)" as UC_SDE
+    note right of UC_SDE
+      x_sigma_max = randn() × sde.sigma_max
+      sampler(x0_fn, x_sigma_max, num_steps=35,
+              solver_option='2ab')
+    end note
+
+    usecase "Iterative Denoising\nSampling Loop (Scheduler)" as UC_Scheduler
+    note right of UC_Scheduler
+      scheduler.set_timesteps(num_steps)
+      xt = randn() × scheduler.init_noise_sigma
+      for t in scheduler.timesteps:
+        sigma = scheduler.sigmas[step_index]
+        xt = scheduler.step(output, t, new_xt).prev_sample
+    end note
+
+    ' --- Context Parallel ---
+    usecase "Context Parallel\nDistribution of Noisy Tensors" as UC_CP
+    note right of UC_CP
+      split_inputs_cp(x, seq_dim=2, cp_group)
+      cat_outputs_cp(samples, seq_dim=2, cp_group)
+      Rearrange (B V) C T H W ↔ B C (V T) H W
+    end note
+}
+
+' --- Actor → Use Case Relationships ---
+TrainingLoop       --> UC_Encode
+TrainingLoop       --> UC_Indicator
+TrainingLoop       --> UC_AugNoise
+TrainingLoop       --> UC_Loss
+
+InferencePipeline  --> UC_Encode
+InferencePipeline  --> UC_Decode
+InferencePipeline  --> UC_Indicator
+InferencePipeline  --> UC_AugNoise
+InferencePipeline  --> UC_Denoise
+InferencePipeline  --> UC_CFG
+InferencePipeline  --> UC_SDE
+InferencePipeline  --> UC_Scheduler
+
+CPWorker           --> UC_CP
+
+' --- Include / Extend Relationships ---
+UC_Loss            ..> UC_CP         : <<include>>\n(CP enabled)
+
+UC_SDE             ..> UC_Denoise    : <<include>>
+UC_SDE             ..> UC_CFG        : <<include>>
+
+UC_Scheduler       ..> UC_AugNoise  : <<include>>
+UC_Scheduler       ..> UC_CFG        : <<include>>
+
+UC_Denoise         ..> UC_AugNoise  : <<include>>\n(video path)
+
+UC_Loss            ..> UC_Denoise   : <<extend>>\n(training forward)
+
+@enduml

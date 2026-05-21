@@ -1,0 +1,164 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+}
+
+title MySQL DDL Parsing Flow
+
+participant "BinlogDatabaseSchema" as schema
+participant "AntlrDdlParser\n(MySqlAntlrDdlParser)" as parser
+participant "MySqlLexer" as lexer
+participant "CommonTokenStream" as tokenStream
+participant "MySqlParser" as mysqlParser
+participant "ParsingErrorListener" as errorListener
+participant "ParseTreeWalker" as walker
+participant "MySqlAntlrDdlParserListener" as mainListener
+participant "Sub-Listeners\n(Create/Alter/Drop...)" as subListeners
+participant "Tables" as tables
+participant "DdlChanges" as ddlChanges
+
+' ─── Entry point ───────────────────────────────────────────────────────────────
+[-> schema : parseStreamingDdl(partition, ddl, db, offset, time)\n  OR parseSnapshotDdl(...)
+activate schema
+
+schema -> parser : setCurrentSchema(databaseName)
+activate parser
+
+schema -> parser : parse(ddlStatements, tables())
+note right of parser: ddl = "CREATE TABLE t1 (id int, ...)"
+
+' ─── Step 1: Lexing ────────────────────────────────────────────────────────────
+box "Step 1 — Tokenization / Lexing" #EEF2FF
+    parser -> parser : CharStreams.fromString(ddl)\n→ CodePointCharStream\n→ CaseChangingCharStream (uppercased)
+    parser -> lexer : createNewLexerInstance(CaseChangingCharStream)
+    activate lexer
+    lexer --> parser : MySqlLexer instance
+    deactivate lexer
+
+    parser -> tokenStream : new CommonTokenStream(lexer)\n[buffers all tokens]
+    activate tokenStream
+end box
+
+' ─── Step 2: Parsing ───────────────────────────────────────────────────────────
+box "Step 2 — ANTLR Parsing" #EEF8EE
+    parser -> mysqlParser : createNewParserInstance(tokenStream)\n→ new MySqlParser(tokenStream)
+    activate mysqlParser
+
+    parser -> errorListener : removeErrorListener(ConsoleErrorListener)\naddErrorListener(ParsingErrorListener)
+    activate errorListener
+
+    parser -> mysqlParser : parseTree(parser)\n→ parser.root()
+    mysqlParser --> parser : ParseTree (ANTLR AST)
+
+    alt Parse errors detected
+        errorListener --> parser : throws ParsingException\n/ MultipleParsingExceptions
+        parser --> schema : rethrow (or log if skipUnparseable)
+    end
+    deactivate errorListener
+    deactivate mysqlParser
+end box
+
+' ─── Step 3: AST Traversal ─────────────────────────────────────────────────────
+box "Step 3 — AST Listener Walk" #FFF8EE
+    parser -> mainListener : createParseTreeWalkerListener()\n→ new MySqlAntlrDdlParserListener(parser)
+    activate mainListener
+    note right of mainListener
+        Registers 13 sub-listeners on construction:
+        CreateTable, AlterTable, DropTable,
+        RenameTable, TruncateTable,
+        CreateDatabase, DropDatabase,
+        CreateView, AlterView, DropView,
+        CreateUniqueIndex, SetStatement,
+        UseStatement
+    end note
+
+    parser -> walker : ParseTreeWalker.DEFAULT.walk(listener, parseTree)
+    activate walker
+
+    loop for each AST node
+        walker -> mainListener : enterXxx(ctx) / exitXxx(ctx)
+        mainListener -> subListeners : delegate via\nProxyParseTreeListenerUtil
+
+        activate subListeners
+
+        alt CREATE TABLE statement
+            subListeners -> subListeners : exitColumnCreateTable(ctx)\n→ build Table via tableEditor
+            subListeners -> tables : overwriteTable(tableEditor.create())
+            activate tables
+            tables --> subListeners : updated
+            deactivate tables
+            subListeners -> ddlChanges : signalCreateTable(tableId, ctx)\n→ add TableCreatedEvent
+            activate ddlChanges
+        else ALTER TABLE statement
+            subListeners -> tables : overwriteTable(tableEditor.create())
+            subListeners -> ddlChanges : signalAlterTable(tableId, ctx)\n→ add TableAlteredEvent
+        else DROP TABLE statement
+            subListeners -> tables : removeTable(tableId)
+            subListeners -> ddlChanges : signalDropTable(tableId, statement)\n→ add TableDroppedEvent
+        end
+
+        deactivate subListeners
+    end
+
+    walker --> parser : walk complete
+    deactivate walker
+    deactivate mainListener
+end box
+
+' ─── Step 4: Return DdlChanges ─────────────────────────────────────────────────
+parser --> schema : getAndResetDdlChanges() → DdlChanges
+deactivate parser
+
+' ─── Step 5: Schema event generation ──────────────────────────────────────────
+box "Step 4 — Schema Change Events" #FFF0F0
+    schema -> ddlChanges : getEventsByDatabase(callback)\n[iterate events grouped by database]
+
+    loop for each (database, events) group
+        schema -> schema : handleTableEvent(offset, dbName, tableIds, sourceTime)\n→ offset.tableEvent()
+        schema -> schema : emitChangeEvent(partition, offset, dbName, event, tableId, type, snapshot)\n→ build SchemaChangeEvent, add to list
+    end
+
+    deactivate ddlChanges
+end box
+
+' ─── Step 6: Apply schema changes ─────────────────────────────────────────────
+schema -> schema : applySchemaChange(SchemaChangeEvent)
+note right of schema
+    CREATE / ALTER:
+      schemaChange.getTableChanges()
+        .forEach(x → buildAndRegisterSchema(x.getTable()))
+    DROP:
+      removeSchema(x.getId())
+    ALL:
+      record(schemaChange, tableChanges)
+      [persists DDL to schema history store]
+end note
+
+[<-- schema : List<SchemaChangeEvent>
+deactivate schema
+
+@enduml

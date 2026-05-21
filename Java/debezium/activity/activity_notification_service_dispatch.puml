@@ -1,0 +1,130 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title Notification Service Dispatch
+
+|NotificationService|
+start
+
+partition "**Constructor — Initialization**" {
+    :Receive channels, config, schemaFactory, consumer;
+    :Read enabledChannels from\nCommonConnectorConfig;
+
+    :Iterate notificationChannels (init pass);
+    repeat
+        if (channel.name() IN enabledChannels?) then (yes)
+            :channel.init(config);
+        else (no)
+            :Skip channel (disabled);
+        endif
+    repeat while (more channels?)
+
+    :Iterate notificationChannels (ConnectChannel init pass);
+    repeat
+        if (channel instanceof ConnectChannel?) then (yes)
+            :((ConnectChannel) channel)\n.initConnectChannel(schemaFactory, consumer);
+        else (no)
+            :Skip non-ConnectChannel;
+        endif
+    repeat while (more channels?)
+
+    :Create IncrementalSnapshotNotificationService(this, config, Clock.systemUTC());
+    :Create InitialSnapshotNotificationService(this, config, Clock.systemUTC());
+}
+
+partition "**notify(Notification) — Simple Dispatch**" {
+    :Receive Notification;
+    repeat
+        if (channel.name() IN enabledChannels\n[isEnabled()]?) then (yes)
+            |LogNotificationChannel|
+            if (channel is LogNotificationChannel?) then (yes)
+                :Log message:\n"[Notification Service]\n{id, aggregateType, type,\nadditionalData, timestamp}";
+            else (no)
+            endif
+            |SinkNotificationChannel|
+            if (channel is SinkNotificationChannel?) then (yes)
+                :Build SourceRecord\n(topic = notificationTopic);
+                :BlockingConsumer.accept(record);
+            else (no)
+            endif
+        else (no)
+            |NotificationService|
+            :Skip disabled channel;
+        endif
+        |NotificationService|
+    repeat while (more channels?)
+}
+
+partition "**notify(Notification, Offsets) — Offset-Aware Dispatch**" {
+    :Receive Notification + Offsets<P, ?>;
+
+    fork
+        note right: Branch A — Non-ConnectChannels
+        repeat
+            if (isEnabled() AND NOT isConnectChannel()?) then (yes)
+                |LogNotificationChannel|
+                :channel.send(notification)\n[plain log, no offsets];
+                |NotificationService|
+            else (no)
+                :Skip channel;
+            endif
+        repeat while (more channels?)
+
+    fork again
+        note right: Branch B — ConnectChannels
+        repeat
+            if (isEnabled() AND isConnectChannel()?) then (yes)
+                |SinkNotificationChannel|
+                :((ConnectChannel) channel)\n.send(notification, offsets)\n[embed Kafka offsets in SourceRecord];
+                |NotificationService|
+            else (no)
+                :Skip channel;
+            endif
+        repeat while (more channels?)
+
+    end fork
+}
+
+partition "**stop() — Lifecycle Shutdown**" {
+    :stop() called;
+    repeat
+        if (channel.name() IN enabledChannels\n[isEnabled()]?) then (yes)
+            :NotificationChannel.close();
+        else (no)
+            :Skip disabled channel;
+        endif
+    repeat while (more channels?)
+}
+
+stop
+
+@enduml

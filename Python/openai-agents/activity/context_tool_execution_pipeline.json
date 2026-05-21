@@ -1,0 +1,123 @@
+{
+  "scope": "tool_execution_pipeline",
+  "title": "Tool Execution Pipeline",
+  "diagram_type": "activity",
+  "description": "Batch tool invocation: fan-out execution, approval gating, result collection, error handling per tool",
+
+  "entry_point": "execute_function_tool_calls(bindings, tool_runs, hooks, context_wrapper, config)",
+  "exit_point": "returns (list[FunctionToolResult], list[ToolInputGuardrailResult], list[ToolOutputGuardrailResult])",
+
+  "key_classes": [
+    "_FunctionToolBatchExecutor: owns mutable state for a batch of function-tool executions; manages task lifecycle, failure arbitration, and result collection",
+    "FunctionTool: dataclass – name, description, params_json_schema, on_invoke_tool, needs_approval, failure_error_function, timeout, timeout_behavior",
+    "FunctionToolResult: dataclass – tool, output, run_item (ToolCallOutputItem | ToolApprovalItem | None), interruptions, agent_run_result",
+    "ToolApprovalItem: run item surfaced in RunResult.interruptions when a tool call is pending human review",
+    "RunContextWrapper: holds approval state; get_approval_status(), approve_tool(), reject_tool(), get_rejection_message()",
+    "RunConfig: run-wide config; trace_include_sensitive_data, tool_error_formatter",
+    "ToolContext: per-call context derived from RunContextWrapper; carries tool_call, tool_namespace, agent, run_config",
+    "_FunctionToolTaskState: per-task mutable state; in_post_invoke_phase flag, invoke_task reference",
+    "_FunctionToolFailure: error + failure source ('cancelled_teardown' | 'post_invoke')"
+  ],
+
+  "activity_flow": [
+    "START: execute_function_tool_calls() called with bindings, tool_runs[], hooks, context_wrapper, config",
+    "CREATE: _FunctionToolBatchExecutor instantiated; isolate_parallel_failures defaults to True when >1 tool",
+    "RESOLVE ENABLED TOOLS: resolve_enabled_function_tools(execution_agent, context_wrapper) → available_function_tools[]",
+    "FAN-OUT: for each ToolRunFunction in tool_runs → asyncio.create_task(_run_single_tool())",
+    "DRAIN LOOP: asyncio.wait(pending_tasks, FIRST_COMPLETED) until all done",
+    "  PER COMPLETED TASK: _record_completed_function_tool_tasks() → detect failure?",
+    "  IF FAILURE DETECTED → _raise_failure_after_draining_siblings():",
+    "    Partition siblings: cancellable_tasks (not in post_invoke) vs post_invoke_tasks",
+    "    Cancel cancellable siblings; _drain_cancelled_tasks() with timeout",
+    "    Await post_invoke_tasks with _FUNCTION_TOOL_POST_INVOKE_WAIT_SECONDS timeout",
+    "    _merge_late_function_tool_failure(); re-raise merged error",
+    "COLLECT: _build_function_tool_results() → assemble FunctionToolResult list with nested interruptions",
+    "RETURN: (function_tool_results, tool_input_guardrail_results, tool_output_guardrail_results)",
+
+    "--- _run_single_tool() per tool ---",
+    "NORMALIZE: normalize_tool_call_for_function_tool(tool_call, func_tool)",
+    "OPEN SPAN: function_span(trace_tool_name) for tracing",
+    "BUILD CONTEXT: ToolContext.from_agent_context(context_wrapper, call_id, ...)",
+    "APPROVAL CHECK: _maybe_execute_tool_approval(func_tool, tool_call)",
+    "  → function_needs_approval(): evaluate needs_approval (bool | callable)",
+    "  IF needs approval=False → continue to tool body",
+    "  IF approval_status is None (no stored decision) → return FunctionToolResult(run_item=ToolApprovalItem) [INTERRUPT]",
+    "  IF approval_status is False (rejected) → resolve_approval_rejection_message() → return rejection FunctionToolResult",
+    "  IF approval_status is True (approved) → continue to tool body",
+    "EXECUTE BODY: _execute_single_tool_body()",
+    "  INPUT GUARDRAILS: _execute_tool_input_guardrails() → if rejected return rejection message",
+    "  HOOK: hooks.on_tool_start() + agent_hooks.on_tool_start() [gathered]",
+    "  INVOKE: asyncio.create_task(_invoke_tool_and_run_post_invoke())",
+    "  AWAIT: asyncio.shield(invoke_task) [shields from sibling cancellation]",
+    "    → invoke_function_tool(function_tool, tool_context, arguments)",
+    "    ON CancelledError: maybe_invoke_function_tool_failure_error_function() → recover or re-raise",
+    "  POST-INVOKE PHASE: task_state.in_post_invoke_phase = True",
+    "  OUTPUT GUARDRAILS: _execute_tool_output_guardrails(real_result)",
+    "  HOOK: hooks.on_tool_end() + agent_hooks.on_tool_end() [gathered]",
+    "  RETURN final_result"
+  ],
+
+  "approval_gating_detail": [
+    "needs_approval on FunctionTool: bool | async callable(context, parsed_args, call_id) → bool",
+    "Evaluation: function_needs_approval() parses JSON args, calls evaluate_needs_approval_setting()",
+    "Stored approval state lives in RunContextWrapper; keyed by (tool_name, call_id, tool_namespace, tool_lookup_key)",
+    "States: None=pending (interrupt), True=approved (proceed), False=rejected (return rejection message)",
+    "ToolApprovalItem carries: agent, raw_item, tool_name, tool_namespace, tool_origin, tool_lookup_key",
+    "After interruption: caller calls state.approve(item) or state.reject(item, rejection_message=...)",
+    "always_approve=True / always_reject=True sticky decisions persist across resumed run turns",
+    "Rejection message resolution order: per-call rejection_message > RunConfig.tool_error_formatter > REJECTION_MESSAGE constant"
+  ],
+
+  "parallel_failure_isolation": [
+    "isolate_parallel_failures=True (default for batch >1): sibling tasks are cancelled on first failure",
+    "Partition tasks: cancellable (not in post_invoke phase) vs post_invoke (already past tool invocation)",
+    "Cancellable tasks get asyncio.cancel(); waited via _drain_cancelled_tasks()",
+    "Post-invoke tasks get a fixed timeout (_FUNCTION_TOOL_POST_INVOKE_WAIT_SECONDS)",
+    "Late failures from teardown are merged via _merge_late_function_tool_failure() using priority ordering",
+    "_get_function_tool_failure_priority: ranks ToolInputGuardrailTripwireTriggered > ToolOutputGuardrailTripwireTriggered > other AgentsExceptions > generic"
+  ],
+
+  "guardrails_detail": [
+    "_execute_tool_input_guardrails(func_tool, tool_context, agent, tool_input_guardrail_results) → rejection_message | None",
+    "_execute_tool_output_guardrails(func_tool, tool_context, agent, real_result, tool_output_guardrail_results) → final_result",
+    "ToolInputGuardrailTripwireTriggered / ToolOutputGuardrailTripwireTriggered exceptions propagate as high-priority failures"
+  ],
+
+  "nested_agent_tool_results": [
+    "Agent.as_tool() results stored as nested run state keyed by tool_call in RunContextWrapper scope",
+    "_resolve_nested_tool_run_result(): peek nested run result; consume if no unresolved interruptions",
+    "_consume_nested_tool_run_result(): consume agent tool state via consume_agent_tool_run_result()",
+    "Nested interruptions (ToolApprovalItem list) bubble up to FunctionToolResult.interruptions",
+    "If nested interruptions unresolved: run_item=None (suppress tool output until resolved)"
+  ],
+
+  "key_relationships": [
+    "execute_function_tool_calls creates _FunctionToolBatchExecutor",
+    "_FunctionToolBatchExecutor depends_on FunctionTool (per tool_run)",
+    "_FunctionToolBatchExecutor reads RunContextWrapper for approval state",
+    "_FunctionToolBatchExecutor uses RunHooks (on_tool_start, on_tool_end)",
+    "_FunctionToolBatchExecutor produces FunctionToolResult[]",
+    "FunctionToolResult contains run_item: ToolCallOutputItem | ToolApprovalItem | None",
+    "ToolApprovalItem surfaces in RunResult.interruptions for human-in-the-loop",
+    "RunConfig.tool_error_formatter controls rejection message text",
+    "_FunctionToolTaskState tracks in_post_invoke_phase (used for cancellation partitioning)"
+  ],
+
+  "error_handling_paths": [
+    "Tool invocation exception → UserError wrapping unless already AgentsException",
+    "ToolTimeoutError raised if timeout_behavior='raise_exception'",
+    "Timeout message returned to model if timeout_behavior='error_as_result' (default)",
+    "failure_error_function on FunctionTool handles invocation crashes; None=re-raise; default=default_tool_error_function",
+    "CancelledError during invoke: maybe_invoke_function_tool_failure_error_function() tries recovery",
+    "Parent cancellation: all pending tasks cancelled, done callbacks log remaining exceptions"
+  ],
+
+  "source_files_analyzed": [
+    "src/agents/run_internal/tool_execution.py (lines 1059-1900 key sections)",
+    "src/agents/tool.py (class/method structure via grep)",
+    "docs/human_in_the_loop.md",
+    "docs/tools.md"
+  ],
+
+  "important_notes": "Fan-out is true asyncio parallelism via create_task per tool. Approval gating is per-call, stored in RunContextWrapper keyed by call_id. Nested Agent.as_tool() interruptions surface on outer run. Post-invoke phase (after tool returns but before hooks/guardrails finish) is protected from cancellation during sibling failure teardown."
+}

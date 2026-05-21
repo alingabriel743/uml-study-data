@@ -1,0 +1,119 @@
+{
+  "scope": "tool_execution_approved",
+  "title": "Tool Execution (Approved Tools)",
+  "diagram_type": "sequence",
+  "description": "Dispatching and executing approved tool calls after HITL resume: resolving approval status, dispatching function/custom tools, and gathering results.",
+
+  "key_participants": [
+    "Caller (run_loop)",
+    "execute_approved_tools",
+    "RunContextWrapper",
+    "_resolve_tool_run (inner helper)",
+    "execute_function_tool_calls",
+    "_FunctionToolBatchExecutor",
+    "_run_single_tool (per-tool task)",
+    "_maybe_execute_tool_approval",
+    "_execute_single_tool_body",
+    "_invoke_tool_and_run_post_invoke",
+    "invoke_function_tool",
+    "execute_custom_tool_calls",
+    "CustomToolAction",
+    "resolve_approval_status",
+    "resolve_approval_rejection_message",
+    "RunHooks / AgentHooks"
+  ],
+
+  "interaction_flow": [
+    "Caller → execute_approved_tools(agent, interruptions, context_wrapper, generated_items, run_config, hooks, all_tools)",
+    "execute_approved_tools: build tool_map from all_tools (FunctionTool + named non-FunctionTool)",
+    "execute_approved_tools → _resolve_tool_run(interruption) [for each interruption]",
+    "_resolve_tool_run → RunContextWrapper.get_approval_status(tool_name, call_id, tool_namespace, tool_lookup_key)",
+    "_resolve_tool_run: if approval_status is False → resolve_approval_rejection_message() → _append_error() → return None",
+    "_resolve_tool_run: if approval_status is not True → _append_error('unclear') → return None",
+    "_resolve_tool_run: if tool not found or not FunctionTool → _append_error() → return None",
+    "_resolve_tool_run → return (tool_call, FunctionTool, tool_name, call_id)",
+    "execute_approved_tools: collect resolved ToolRunFunction list",
+    "execute_approved_tools → execute_function_tool_calls(bindings, tool_runs, hooks, context_wrapper, config)",
+    "execute_function_tool_calls → _FunctionToolBatchExecutor.execute()",
+    "_FunctionToolBatchExecutor.execute() → resolve_enabled_function_tools(execution_agent, context_wrapper)",
+    "_FunctionToolBatchExecutor: for each tool_run → _create_tool_task(tool_run, order) → asyncio.create_task(_run_single_tool(...))",
+    "_FunctionToolBatchExecutor → _drain_pending_tasks() [asyncio.wait FIRST_COMPLETED loop]",
+    "_run_single_tool → normalize_tool_call_for_function_tool(tool_call, func_tool)",
+    "_run_single_tool → ToolContext.from_agent_context(context_wrapper, call_id, ...)",
+    "_run_single_tool → _maybe_execute_tool_approval(func_tool, tool_call, raw_tool_call, span)",
+    "_maybe_execute_tool_approval → function_needs_approval(func_tool, context_wrapper, tool_call)",
+    "_maybe_execute_tool_approval: if needs approval → context_wrapper.get_approval_status(...)",
+    "_maybe_execute_tool_approval: if approval_status is None → return FunctionToolResult(run_item=ToolApprovalItem) [interrupt]",
+    "_maybe_execute_tool_approval: if approval_status is False → resolve_approval_rejection_message() → return FunctionToolResult(rejection)",
+    "_maybe_execute_tool_approval: if approved → return None (proceed)",
+    "_run_single_tool: if approval_result is None → _execute_single_tool_body(...)",
+    "_execute_single_tool_body → _execute_tool_input_guardrails(func_tool, tool_context, agent, ...)",
+    "_execute_single_tool_body: if guardrail rejects → return rejection_message",
+    "_execute_single_tool_body → hooks.on_tool_start + agent_hooks.on_tool_start [asyncio.gather]",
+    "_execute_single_tool_body → asyncio.create_task(_invoke_tool_and_run_post_invoke(...))",
+    "_execute_single_tool_body → _await_invoke_task(invoke_task) [asyncio.shield]",
+    "_invoke_tool_and_run_post_invoke → invoke_function_tool(function_tool, context, arguments)",
+    "_invoke_tool_and_run_post_invoke: set task_state.in_post_invoke_phase = True",
+    "_invoke_tool_and_run_post_invoke → _execute_tool_output_guardrails(func_tool, tool_context, agent, real_result, ...)",
+    "_invoke_tool_and_run_post_invoke → hooks.on_tool_end + agent_hooks.on_tool_end [asyncio.gather]",
+    "_invoke_tool_and_run_post_invoke → return final_result",
+    "_FunctionToolBatchExecutor → _build_function_tool_results(): for each tool_run consume nested agent run results / interruptions",
+    "execute_function_tool_calls → return (list[FunctionToolResult], list[ToolInputGuardrailResult], list[ToolOutputGuardrailResult])",
+    "execute_approved_tools: append FunctionToolResult.run_item to generated_items",
+
+    "--- Custom Tool path (execute_custom_tool_calls) ---",
+    "execute_custom_tool_calls(public_agent, calls, context_wrapper, hooks, config)",
+    "execute_custom_tool_calls: for each ToolRunCustom → CustomToolAction.execute(agent, call, hooks, context_wrapper, config)",
+    "CustomToolAction.execute → evaluate_needs_approval_setting(custom_tool.runtime_needs_approval(), ...)",
+    "CustomToolAction.execute: if needs_approval → resolve_approval_status(..., on_approval=custom_tool.runtime_on_approval())",
+    "resolve_approval_status → context_wrapper.get_approval_status(tool_name, call_id, ...)",
+    "resolve_approval_status: if status None and on_approval callback → call on_approval(context_wrapper, approval_item) → context_wrapper.approve_tool/reject_tool",
+    "resolve_approval_status → return (bool|None, ToolApprovalItem)",
+    "CustomToolAction.execute: if rejected → resolve_approval_rejection_message() → return rejection ToolCallOutputItem",
+    "CustomToolAction.execute: if status not True → return ToolApprovalItem (interrupt)",
+    "CustomToolAction.execute → hooks.on_tool_start + agent_hooks.on_tool_start [asyncio.gather]",
+    "CustomToolAction.execute → custom_tool.on_invoke_tool(tool_context, tool_input)",
+    "CustomToolAction.execute → hooks.on_tool_end + agent_hooks.on_tool_end [asyncio.gather]",
+    "CustomToolAction.execute → return ToolCallOutputItem(type='custom_tool_call_output')"
+  ],
+
+  "key_relationships": [
+    "execute_approved_tools calls execute_function_tool_calls for all approved FunctionTool interruptions",
+    "execute_function_tool_calls delegates to _FunctionToolBatchExecutor.execute()",
+    "_FunctionToolBatchExecutor spawns asyncio.Task per tool via _create_tool_task; waits with _drain_pending_tasks",
+    "_run_single_tool calls _maybe_execute_tool_approval first; if not blocked calls _execute_single_tool_body",
+    "_execute_single_tool_body runs input guardrails, fires on_tool_start hooks, then spawns _invoke_tool_and_run_post_invoke task",
+    "_invoke_tool_and_run_post_invoke runs the actual tool, output guardrails, and on_tool_end hooks",
+    "resolve_approval_status is shared util: builds ToolApprovalItem, checks context_wrapper approval status, optionally calls on_approval callback",
+    "resolve_approval_rejection_message checks per-call rejection_message override first, then run_config.tool_error_formatter, then default REJECTION_MESSAGE",
+    "execute_custom_tool_calls iterates serially; CustomToolAction.execute handles approval check internally via resolve_approval_status",
+    "_settle_pending_function_tool_tasks is the bounded timeout loop: calls _collect_settled_function_tool_tasks repeatedly until deadline or done",
+    "_FunctionToolBatchExecutor.execute returns tuple (FunctionToolResults, ToolInputGuardrailResults, ToolOutputGuardrailResults)"
+  ],
+
+  "approval_states": {
+    "None": "No decision stored → create ToolApprovalItem and surface as interruption",
+    "True": "Approved → proceed with execution",
+    "False": "Rejected → resolve rejection message and return error item to model"
+  },
+
+  "parallel_execution_notes": "FunctionTool calls execute in parallel via asyncio.Task per call. isolate_parallel_failures=True (default when >1 call) cancels siblings on first failure. _settle_pending_function_tool_tasks drains with a timeout bound. CustomTool and Shell calls execute serially.",
+
+  "key_types": [
+    "ToolRunFunction: (function_tool: FunctionTool, tool_call: ResponseFunctionToolCall)",
+    "FunctionToolResult: (tool, output, run_item, agent_run_result, interruptions)",
+    "ToolApprovalItem: (agent, raw_item, tool_name, tool_namespace, tool_origin, tool_lookup_key)",
+    "ToolCallOutputItem: wraps model-visible output + raw API item",
+    "_FunctionToolTaskState: (tool_run, order, in_post_invoke_phase, invoke_task)",
+    "AgentBindings: (execution_agent, public_agent)"
+  ],
+
+  "important_notes": "execute_approved_tools is the HITL resume path — called after RunState.approve() to re-execute previously interrupted tool calls. It only handles FunctionTool calls (non-function tools like ShellTool have separate approval handling in their own action classes). The _settle_pending_function_tool_tasks function is an internal helper for the FunctionToolBatchExecutor, not called from execute_approved_tools directly.",
+
+  "source_files_analyzed": [
+    "src/agents/run_internal/tool_execution.py",
+    "src/agents/run_internal/tool_actions.py",
+    "docs/human_in_the_loop.md",
+    "docs/tools.md"
+  ]
+}

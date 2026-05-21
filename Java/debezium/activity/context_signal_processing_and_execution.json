@@ -1,0 +1,166 @@
+{
+  "scope": "signal_processing_and_execution",
+  "title": "Signal Processing and Execution",
+  "diagram_type": "activity",
+  "description": "Signal channel polling, signal parsing, action dispatch, semaphore-guarded execution, and source signal handling",
+
+  "key_participants": [
+    "SignalProcessor",
+    "ScheduledExecutorService (signalProcessorExecutor)",
+    "SignalChannelReader (enabled channels)",
+    "SourceSignalChannel",
+    "SignalRecord",
+    "SignalAction",
+    "SignalPayload",
+    "DocumentReader",
+    "Semaphore"
+  ],
+
+  "activity_flow": [
+    "START: SignalProcessor constructor called",
+    "  → filter signalChannelReaders by connectorConfig.getEnabledChannels() → enabledChannelReaders",
+    "  → forEach enabledChannelReader: reader.init(connectorConfig)",
+    "  → signalActions.putAll(provided actions)",
+    "  → create ScheduledExecutorService via Threads.newSingleThreadScheduledExecutor()",
+    "",
+    "LIFECYCLE: start()",
+    "  → scheduleAtFixedRate(this::process, 0, signalPollInterval ms, MILLISECONDS)",
+    "",
+    "PERIODIC: process()  [called by scheduler]",
+    "  → executeWithSemaphore(lambda)",
+    "    → semaphore.tryAcquire(10, SECONDS)",
+    "    → [ACQUIRE FAILED] throw DebeziumException",
+    "    → [ACQUIRE OK] iterate enabledChannelReaders",
+    "      → for each reader: reader.read() → List<SignalRecord>",
+    "      → flatMap all records",
+    "      → for each signalRecord: processSignal(signalRecord, null)",
+    "    → finally: semaphore.release()",
+    "",
+    "ON-DEMAND: processSourceSignal(P partition)  [called by streaming thread]",
+    "  → executeWithSemaphore(lambda)",
+    "    → semaphore.tryAcquire(10, SECONDS)",
+    "    → filter enabledChannelReaders to SourceSignalChannel only",
+    "    → for each matching reader: reader.read() → List<SignalRecord>",
+    "    → for each signalRecord: processSignal(signalRecord, partition)",
+    "    → finally: semaphore.release()",
+    "",
+    "SIGNAL PROCESSING: processSignal(SignalRecord, P knownPartition)",
+    "  → lookup action = signalActions.get(signalRecord.getType())",
+    "  → [action == null] WARN and return",
+    "  → [action found] parse JSON: documentReader.read(signalRecord.getData()) → Document jsonData",
+    "    → [IOException] WARN unparseable data, return",
+    "  → getOffsets(knownPartition, jsonData) → Offsets<P,O>",
+    "    → [knownPartition != null] return Offsets.of(knownPartition, partitionOffsets.get(knownPartition))",
+    "    → [partitionOffsets.size() == 1] return Offsets.of(partitionOffsets)",
+    "    → [else] extractPartitionFromData(jsonData)",
+    "      → read 'data-collections' array from jsonData",
+    "      → [empty/null] return Optional.empty()",
+    "      → [has entries] for each entry: split on '.', extract databaseName (parts[0])",
+    "        → for each partition in partitionOffsets: matchesDatabase(partition, databaseName)",
+    "          → cast to AbstractPartition, compare loggingContext[DATABASE_NAME] case-insensitively",
+    "        → [match found] return Optional.of(partition)",
+    "      → [no match] return Optional.empty()",
+    "    → [targetPartition present + offset found] return Offsets.of(partition, offset)",
+    "    → [targetPartition present + offset missing] WARN, return Offsets.of(Map.of())",
+    "    → [targetPartition absent] broadcast: return Offsets.of(partitionOffsets)",
+    "  → for each (partition, offset) in finalOffsets: executeSignal(action, signalRecord, jsonData, partition, offset)",
+    "    → build SignalPayload(partition, id, type, jsonData, offset, additionalData)",
+    "    → action.arrived(payload)  [SignalAction.arrived()]",
+    "    → [InterruptedException] WARN, Thread.currentThread().interrupt()",
+    "    → [Exception] WARN action failed",
+    "",
+    "LIFECYCLE: stop()",
+    "  → submit task to executor: forEach enabledChannelReaders → reader.close()",
+    "  → executor.shutdown()",
+    "  → awaitTermination(executorShutdownTimeout ms)",
+    "  → [not shutdown in time] WARN, Thread.interrupted(), shutdownNow(), awaitTermination again",
+    "  → END"
+  ],
+
+  "source_signal_channel_flow": [
+    "Streaming thread receives CDC event from signaling table → SourceSignalChannel.process(Struct value)",
+    "  → SignalRecord.buildSignalRecordFromChangeEventSource(value, connectorConfig)",
+    "    → [DELETE op] config.parseSignallingMessage(value, BEFORE) → CloseIncrementalSnapshotWindow signal",
+    "    → [other op] config.parseSignallingMessage(value, AFTER) → SignalRecord(id, type, data)",
+    "  → signals.add(signalRecord)  [ConcurrentLinkedQueue]",
+    "Later: processSourceSignal(partition) → SourceSignalChannel.read() → signals.poll() → SignalRecord"
+  ],
+
+  "key_decisions": [
+    "Channel enabled check: connectorConfig.getEnabledChannels().contains(reader.name())",
+    "Semaphore guard: tryAcquire(10s) prevents concurrent process() and processSourceSignal() execution",
+    "Action lookup: signalActions.get(type) — unknown type logs WARN and skips",
+    "Data parse failure: IOException → WARN log, signal skipped",
+    "Offset resolution strategy: knownPartition first → single partition shortcut → extract from data-collections → broadcast to all",
+    "Database matching: AbstractPartition loggingContext DATABASE_NAME vs data-collection prefix (case-insensitive)",
+    "DELETE CDC op on signal table treated as CloseIncrementalSnapshotWindow signal (INSERT_DELETE strategy)"
+  ],
+
+  "key_classes": {
+    "SignalProcessor<P,O>": {
+      "fields": ["Map<String,SignalAction<P>> signalActions", "List<SignalChannelReader> enabledChannelReaders", "ScheduledExecutorService signalProcessorExecutor", "Semaphore semaphore(1)", "Map<P,O> partitionOffsets (ConcurrentHashMap)", "DocumentReader documentReader"],
+      "methods": ["SignalProcessor(connector, config, signalActions, channelReaders, docReader, offsets)", "start()", "stop() throws InterruptedException", "process()", "processSourceSignal(P partition)", "processSignal(SignalRecord, P knownPartition) [private]", "executeWithSemaphore(Runnable) [private]", "executeSignal(action, record, jsonData, partition, offset) [private]", "getOffsets(P, Document) [private]", "extractPartitionFromData(Document) [private]", "matchesDatabase(P, String) [private]", "registerSignalAction(String id, SignalAction<P>)", "setContext(Offsets<P,O>)", "getSignalChannel(Class<T>)"]
+    },
+    "SignalChannelReader": {
+      "type": "interface",
+      "methods": ["name():String", "init(CommonConnectorConfig)", "reset(T reference) [default no-op]", "read():List<SignalRecord>", "close()"]
+    },
+    "SourceSignalChannel implements SignalChannelReader": {
+      "fields": ["Queue<SignalRecord> signals (ConcurrentLinkedQueue)", "CommonConnectorConfig connectorConfig"],
+      "methods": ["name()→'source'", "init(config)", "read() → poll one from queue", "close() → signals.clear()", "process(Struct value) → enqueue SignalRecord"],
+      "note": "@NotThreadSafe; used by streaming thread to enqueue, read() called from SignalProcessor thread"
+    },
+    "SignalRecord": {
+      "fields": ["String id", "String type", "String data (JSON)", "Map<String,Object> additionalData"],
+      "factory": "buildSignalRecordFromChangeEventSource(Struct, CommonConnectorConfig)"
+    },
+    "SignalAction<P> (interface)": {
+      "methods": ["boolean arrived(SignalPayload<P>) throws InterruptedException"]
+    },
+    "SignalPayload<P>": {
+      "fields": ["P partition", "String id", "String type", "Document data", "OffsetContext offsetContext", "Map additionalData"]
+    }
+  },
+
+  "concurrent_access_notes": [
+    "Semaphore(1) guards both process() (scheduler thread) and processSourceSignal() (connector thread) from concurrent execution",
+    "SEMAPHORE_WAIT_TIME = 10 seconds; failure throws DebeziumException",
+    "partitionOffsets uses ConcurrentHashMap; setContext() may be called from connector thread",
+    "SourceSignalChannel.signals is ConcurrentLinkedQueue — safe for concurrent add (streaming) and poll (executor)"
+  ],
+
+  "test_scenarios": [
+    "shouldExecuteLog: mock channel returns Log signal → Log action logs message → verified via LogInterceptor",
+    "onlyEnabledConnectorShouldExecute: two channels, only generic1 enabled → generic2 signals ignored",
+    "shouldIgnoreInvalidSignalType: unknown type → WARN logged, no action executed",
+    "shouldIgnoreUnparseableData: malformed JSON data → WARN logged",
+    "shouldRegisterAdditionalAction: registerSignalAction('custom', lambda) → custom action executed with payload data"
+  ],
+
+  "constants": {
+    "SEMAPHORE_WAIT_TIME": "10 seconds",
+    "DATA_COLLECTIONS_FIELD_NAME": "data-collections",
+    "POINT_REGEX": "\\.",
+    "SourceSignalChannel.CHANNEL_NAME": "source"
+  },
+
+  "key_relationships": [
+    "SignalProcessor composes List<SignalChannelReader> (enabled channels)",
+    "SignalProcessor composes Map<String, SignalAction<P>>",
+    "SignalProcessor composes Semaphore (mutual exclusion)",
+    "SignalProcessor composes ScheduledExecutorService (polling)",
+    "SignalProcessor depends_on DocumentReader (JSON parsing)",
+    "SourceSignalChannel implements SignalChannelReader",
+    "SignalAction receives SignalPayload (carries partition + offset context)",
+    "SignalRecord built from CDC Struct via buildSignalRecordFromChangeEventSource"
+  ],
+
+  "source_files_analyzed": [
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/signal/SignalProcessor.java",
+    "debezium-connector-common/src/test/java/io/debezium/pipeline/signal/SignalProcessorTest.java",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/signal/channels/SourceSignalChannel.java",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/signal/channels/SignalChannelReader.java",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/signal/actions/SignalAction.java",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/signal/SignalRecord.java"
+  ]
+}

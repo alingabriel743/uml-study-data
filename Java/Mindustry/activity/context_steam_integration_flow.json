@@ -1,0 +1,206 @@
+{
+  "scope": "steam_integration_flow",
+  "title": "Steam Integration Flow",
+  "diagram_type": "activity",
+  "key_participants": ["SVars", "SNet", "SStats", "SWorkshop", "SUser", "SteamMatchmaking", "SteamNetworking", "SteamUGC", "SteamUserStats", "SteamFriends"],
+
+  "activity_flows": [
+
+    {
+      "flow": "Initialization",
+      "steps": [
+        "SVars holds static refs: net (SNet), stats (SStats), workshop (SWorkshop), user (SUser)",
+        "SStats(): stats.requestCurrentStats() → onUserStatsReceived() → service.init()",
+        "SStats schedules periodic timer every 4 min: if updated → stats.storeStats()",
+        "SWorkshop(): ugc.getSubscribedItems() → resolve install folders → classify into Map/Schematic/LoadedMod lists",
+        "SWorkshop: if any Map items found → Achievement.downloadMapWorkshop.complete()",
+        "SNet(): registers Events on ClientLoadEvent, WaveEvent, Trigger.newGame, PlayerIpBanEvent, PlayerIpUnbanEvent"
+      ]
+    },
+
+    {
+      "flow": "Host Server (SNet.hostServer)",
+      "steps": [
+        "provider.hostServer(port)",
+        "smat.createLobby(type=Public|FriendsOnly, playerLimit)",
+        "[Callback] onLobbyCreated(result, steamID)",
+        "  [OK] currentLobby = steamID",
+        "  smat.setLobbyData: name, mapname, version, versionType, wave, gamemode",
+        "  updateBans(null) → smat.setLobbyData('banned', bannedSteamIDs)",
+        "  [FAIL] log error, ignore"
+      ]
+    },
+
+    {
+      "flow": "Client Connect (SNet.connectClient)",
+      "steps": [
+        "[Steam IP] parse SteamID from 'steam:<handle>'",
+        "  joinCallback = success",
+        "  smat.joinLobby(lobby)",
+        "  [Callback] onLobbyEnter(steamIDLobby, response)",
+        "    [response != Success] show error, return",
+        "    [version mismatch] show version error, smat.leaveLobby(), return",
+        "    logic.reset(), net.reset()",
+        "    currentLobby = steamIDLobby, currentServer = smat.getLobbyOwner()",
+        "    joinCallback.run()",
+        "    net.setClientConnected(), net.handleClientReceived(Connect)",
+        "[TCP IP] provider.connectClient(ip, port, success)"
+      ]
+    },
+
+    {
+      "flow": "Send/Receive P2P Packets (SNet)",
+      "steps": [
+        "[Server update loop] snet.isP2PPacketAvailable(0)",
+        "  snet.readP2PPacket(from, readBuffer) → copy to readCopyBuffer",
+        "  serializer.read(readCopyBuffer) → Packet",
+        "  [net.server()] find/create SteamConnection → net.handleServerReceived(con, packet)",
+        "  [net.client(), from==currentServer] net.handleClientReceived(packet)",
+        "[Client send] serializer.write(writeBuffer, object)",
+        "  snet.sendP2PPacket(currentServer, writeBuffer, reliable/unreliable)",
+        "[P2P session request] onP2PSessionRequest → [server] snet.acceptP2PSessionWithUser()",
+        "[P2P connect fail] onP2PSessionConnectFail → disconnectSteamUser() or net.handleClientReceived(Disconnect)"
+      ]
+    },
+
+    {
+      "flow": "Lobby Discovery (SNet.discoverServers)",
+      "steps": [
+        "smat.addRequestLobbyListResultCountFilter(32)",
+        "smat.addRequestLobbyListDistanceFilter(Worldwide)",
+        "smat.requestLobbyList()",
+        "[Callback] onLobbyMatchList(matches)",
+        "  For each lobby: getLobbyData(hidden/version/gamemode/banned/name/mapname/wave)",
+        "  Filter: skip hidden, version-mismatched lobbies",
+        "  Check ban list against SVars.user.user.getSteamID()",
+        "  Build Host objects, sort by player count desc",
+        "  invoke lobbyCallback per host",
+        "  lobbyDoneCallback → provider.discoverServers() (local network fallback)"
+      ]
+    },
+
+    {
+      "flow": "Disconnect (SNet)",
+      "steps": [
+        "[Client] disconnectClient()",
+        "  smat.leaveLobby(currentLobby)",
+        "  snet.closeP2PSessionWithUser(currentServer)",
+        "  currentServer=null, currentLobby=null",
+        "  net.handleClientReceived(Disconnect)",
+        "[Server] closeServer()",
+        "  provider.closeServer()",
+        "  smat.leaveLobby(currentLobby)",
+        "  close() each SteamConnection → disconnectSteamUser(sid)",
+        "[LobbyChatUpdate: member left] onLobbyChatUpdate",
+        "  [client, host left] net.disconnect()",
+        "  [server] disconnectSteamUser(who)"
+      ]
+    },
+
+    {
+      "flow": "Lobby State Updates (SNet)",
+      "steps": [
+        "[WaveEvent / Trigger.newGame] updateWave()",
+        "  if currentLobby != null && net.server()",
+        "  smat.setLobbyData: mapname, wave, gamemode",
+        "[PlayerIpBanEvent/UnbanEvent] updateBans(ip)",
+        "  filter steam IPs, rebuild ban list",
+        "  smat.setLobbyData('banned', ...)",
+        "[updateLobby()] setLobbyType, setLobbyMemberLimit",
+        "[showFriendInvites()] friends.activateGameOverlayInviteDialog(currentLobby)"
+      ]
+    },
+
+    {
+      "flow": "Workshop Publish (SWorkshop.publish)",
+      "steps": [
+        "publish(p): check p.hasSteamID()",
+        "  [already published] viewListing(p) → query UGC details → show owner dialog or open overlay",
+        "  [new] p.prePublish() check",
+        "    [fail] reject",
+        "    [ok] showPublish() → user confirms EULA",
+        "      ugc.createItem(steamAppID, Community)",
+        "      ui.loadfrag.show('@publishing')",
+        "      [Callback] onCreateItem(publishedFileID, result)",
+        "        [OK] itemHandlers.first().get(publishedFileID) → calls update(p, id, null, true)",
+        "        [FAIL] show publish error"
+      ]
+    },
+
+    {
+      "flow": "Workshop Update (SWorkshop.update / updateItem)",
+      "steps": [
+        "updateItem(publishedFileID, tagger, updated)",
+        "  ugc.startItemUpdate(steamAppID, publishedFileID) → SteamUGCUpdateHandle",
+        "  tagger: setItemTitle, setItemDescription, setItemTags, setItemPreview, setItemContent",
+        "  if changelog==null: setItemVisibility(Private)",
+        "  ugc.submitItemUpdate(handle, changelog)",
+        "  ui.loadfrag.setProgress() showing ItemUpdateStatus",
+        "  [Callback] onSubmitItemUpdate(publishedFileID, needsWLA, result)",
+        "    [OK] activateGameOverlayToWebPage (item page)",
+        "    [needsWLA] activateGameOverlayToWebPage (EULA page)",
+        "    updatedHandlers.get(id).run() → p.addSteamID(sid)",
+        "    if Map → Achievement.publishMap.complete()",
+        "    [FAIL] show publish error"
+      ]
+    },
+
+    {
+      "flow": "Workshop Download (SWorkshop)",
+      "steps": [
+        "[onSubscribeItem] ugc.getItemInstallInfo() → log folder → Achievement.downloadMapWorkshop.complete()",
+        "[onDownloadItemResult] Achievement.downloadMapWorkshop.complete() → ugc.getItemInstallInfo() → log folder",
+        "[onUnsubscribeItem] ugc.getItemInstallInfo() → log folder",
+        "[onDeleteItem] ugc.getItemInstallInfo() → log folder"
+      ]
+    },
+
+    {
+      "flow": "Stats Synchronisation (SStats)",
+      "steps": [
+        "onUpdate() → marks updated=true",
+        "Periodic timer (every 4 min): if updated → stats.storeStats()",
+        "[Callback] onUserStatsStored(gameID, result)",
+        "  [OK] updated=true (flag kept for next cycle)",
+        "  [FAIL] log error"
+      ]
+    }
+  ],
+
+  "key_relationships": [
+    "SVars is static registry holding SNet, SStats, SWorkshop, SUser instances",
+    "SNet implements NetProvider + SteamNetworkingCallback + SteamMatchmakingCallback + SteamFriendsCallback",
+    "SNet wraps provider (ArcNetProvider) and delegates non-Steam calls to it",
+    "SNet.SteamConnection extends NetConnection; serializes via PacketSerializer over P2P",
+    "SWorkshop implements SteamUGCCallback; uses SVars.user.user.getSteamID() to check item ownership",
+    "SWorkshop uses SVars.net.friends to open Steam overlay pages",
+    "SStats implements SteamUserStatsCallback; calls service.init() after stats received",
+    "SUser implements SteamUserCallback; exposes SteamUser handle for ID lookups",
+    "Achievement enum used for milestone tracking in SWorkshop (publishMap, downloadMapWorkshop)"
+  ],
+
+  "conditions_and_branches": [
+    "connectClient: steam: prefix → P2P lobby join; else → TCP provider",
+    "sendClient: isSteamClient() → P2P send; else → provider",
+    "disconnectClient: isSteamClient() → leave lobby; else → provider",
+    "onLobbyEnter: response != Success → show error; version mismatch → version error; ok → connect flow",
+    "onLobbyMatchList: skip hidden=true, version-mismatch, empty-mode lobbies; check ban list",
+    "onLobbyCreated: result==OK → set lobby data; not server → ignore",
+    "publish: hasSteamID → viewListing; else prePublish check → showPublish",
+    "onCreateItem: OK → call update handler; FAIL → show error",
+    "onSubmitItemUpdate: OK → open overlay + run updated callback; FAIL → show error",
+    "onP2PSessionRequest: net.server() → accept session",
+    "onLobbyChatUpdate: Disconnected/Left → client disconnects if host left; server removes user",
+    "update(): changelog==null → Private visibility + '<Created>' note; else → use provided changelog"
+  ],
+
+  "important_notes": "Steam App ID is 1127400 (SVars.steamID). Lobby metadata keys: name, mapname, version, versionType, wave, gamemode, hidden, banned. P2P reliability: packets >= 1000 bytes or flagged reliable use P2PSend.Reliable; StreamChunk uses ReliableWithBuffering. Stats saved every 4 minutes only if dirty. Workshop items classified by file extension (mapExtension, schematicExtension) or presence of mod.json/mod.hjson.",
+
+  "source_files_analyzed": [
+    "desktop/src/mindustry/desktop/steam/SNet.java",
+    "desktop/src/mindustry/desktop/steam/SWorkshop.java",
+    "desktop/src/mindustry/desktop/steam/SStats.java",
+    "desktop/src/mindustry/desktop/steam/SVars.java",
+    "desktop/src/mindustry/desktop/steam/SUser.java"
+  ]
+}

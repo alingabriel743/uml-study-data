@@ -1,0 +1,156 @@
+{
+  "scope": "geometry_type_handling",
+  "title": "Geometry and Special Type Handling Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "BinlogEventReader",
+    "BinlogValueConverters",
+    "BinlogGeometry",
+    "Geometry (debezium schema)",
+    "Point (debezium schema)",
+    "BinlogUnsignedIntegerConverter",
+    "TinyIntOneToBooleanConverter",
+    "BinlogChangeRecordEmitter",
+    "RelationalChangeRecordEmitter",
+    "Receiver"
+  ],
+  "interaction_flow": [
+    "--- GEOMETRY HANDLING ---",
+    "BinlogEventReader → BinlogValueConverters: schemaBuilder(column) [GEOMETRY/LINESTRING/POLYGON/MULTIPOINT/MULTILINESTRING/MULTIPOLYGON/GEOMETRYCOLLECTION]",
+    "BinlogValueConverters → Geometry: builder() → SchemaBuilder",
+    "BinlogEventReader → BinlogValueConverters: schemaBuilder(column) [POINT]",
+    "BinlogValueConverters → Point: builder() → SchemaBuilder",
+    "BinlogEventReader → BinlogValueConverters: converter(column, fieldDefn, data) [GEOMETRY types]",
+    "BinlogValueConverters → BinlogValueConverters: convertGeometry(column, fieldDefn, byte[])",
+    "BinlogValueConverters → BinlogGeometry: fromBytes(byte[]) → parse SRID (4 bytes LE) + WKB (remaining)",
+    "BinlogGeometry → BinlogValueConverters: return BinlogGeometry{wkb, srid}",
+    "BinlogValueConverters → Geometry: createValue(schema, wkb, srid) → Struct{wkb, srid}",
+    "BinlogValueConverters → Receiver: deliver(Struct)",
+    "BinlogEventReader → BinlogValueConverters: converter(column, fieldDefn, data) [POINT type]",
+    "BinlogValueConverters → BinlogValueConverters: convertPoint(column, fieldDefn, byte[])",
+    "BinlogValueConverters → BinlogGeometry: fromBytes(byte[]) → BinlogGeometry{wkb, srid}",
+    "BinlogValueConverters → BinlogGeometry: isPoint() [check wkb.length == 21]",
+    "alt isPoint() == true",
+    "  BinlogValueConverters → Point: createValue(schema, wkb, srid) → Struct",
+    "  BinlogValueConverters → Receiver: deliver(Struct)",
+    "alt isPoint() == false",
+    "  BinlogValueConverters → BinlogValueConverters: throw ConnectException(\"Failed to parse POINT\")",
+    "--- NULL/EMPTY GEOMETRY FALLBACK ---",
+    "BinlogValueConverters → BinlogGeometry: createEmpty() → BinlogGeometry{WKB_EMPTY_GEOMETRYCOLLECTION, null}",
+    "BinlogValueConverters → Geometry: createValue(schema, emptyWkb, null) [default value]",
+    "--- UNSIGNED INTEGER PROMOTION ---",
+    "BinlogEventReader → BinlogValueConverters: converter(column) [TINYINT UNSIGNED]",
+    "BinlogValueConverters → BinlogValueConverters: convertUnsignedTinyint(column, fieldDefn, data)",
+    "BinlogValueConverters → BinlogUnsignedIntegerConverter: convertUnsignedTinyint(short) → if <0: value+256",
+    "BinlogEventReader → BinlogValueConverters: converter(column) [SMALLINT UNSIGNED]",
+    "BinlogValueConverters → BinlogUnsignedIntegerConverter: convertUnsignedSmallint(int) → if <0: value+65536",
+    "BinlogEventReader → BinlogValueConverters: converter(column) [MEDIUMINT UNSIGNED]",
+    "BinlogValueConverters → BinlogUnsignedIntegerConverter: convertUnsignedMediumint(int) → if <0: value+16777216",
+    "BinlogEventReader → BinlogValueConverters: converter(column) [INT UNSIGNED]",
+    "BinlogValueConverters → BinlogUnsignedIntegerConverter: convertUnsignedInteger(long) → if <0: value+4294967296",
+    "BinlogEventReader → BinlogValueConverters: converter(column) [BIGINT UNSIGNED, PRECISE mode]",
+    "BinlogValueConverters → BinlogUnsignedIntegerConverter: convertUnsignedBigint(BigDecimal) → if <0: value+18446744073709551616",
+    "note: BIGINT UNSIGNED in LONG mode routes to convertBigInt() (no correction)",
+    "--- TINYINT(1) TO BOOLEAN CONVERSION ---",
+    "ConnectorStartup → TinyIntOneToBooleanConverter: configure(Properties{selector, length.checker})",
+    "TinyIntOneToBooleanConverter → Predicates: includes(selectorConfig) → Predicate<RelationalColumn>",
+    "SchemaRegistration → TinyIntOneToBooleanConverter: converterFor(RelationalColumn, ConverterRegistration)",
+    "TinyIntOneToBooleanConverter: check typeName in [TINYINT, TINYINT UNSIGNED] AND (lengthChecker==false OR length==1) AND selector.test(field)",
+    "TinyIntOneToBooleanConverter → ConverterRegistration: register(SchemaBuilder.bool(), converter lambda)",
+    "BinlogEventReader → TinyIntOneToBooleanConverter lambda: convert(value)",
+    "alt value==null → return null (optional) / defaultValue / false",
+    "alt value instanceof Boolean → pass-through",
+    "alt value instanceof Number → intValue() > 0",
+    "alt value instanceof String → Integer.parseInt() or Boolean.parseBoolean()",
+    "--- CHANGE RECORD EMISSION ---",
+    "BinlogEventReader → BinlogChangeRecordEmitter: new(partition, offset, clock, operation, before[], after[], connectorConfig)",
+    "BinlogChangeRecordEmitter → RelationalChangeRecordEmitter: super(partition, offset, clock, connectorConfig)",
+    "RelationalChangeRecordEmitter → BinlogChangeRecordEmitter: getOldColumnValues() → before[]",
+    "RelationalChangeRecordEmitter → BinlogChangeRecordEmitter: getNewColumnValues() → after[]",
+    "RelationalChangeRecordEmitter → Receiver: changeRecord(partition, schema, operation, key, envelope, offset, headers)",
+    "alt operation==TRUNCATE: BinlogChangeRecordEmitter → schema.envelopeSchema: truncate(sourceInfo, timestamp) → Struct"
+  ],
+  "key_relationships": [
+    "BinlogChangeRecordEmitter extends RelationalChangeRecordEmitter<BinlogPartition>",
+    "TinyIntOneToBooleanConverter implements CustomConverter<SchemaBuilder, RelationalColumn>",
+    "TinyIntOneToBooleanConverter implements ConfigDescriptor",
+    "BinlogValueConverters uses BinlogGeometry (static factory calls)",
+    "BinlogValueConverters uses BinlogUnsignedIntegerConverter (static utility calls)",
+    "BinlogGeometry creates Geometry/Point schema Structs via debezium data.geometry classes",
+    "BinlogValueConverters extends parent value converter (JdbcValueConverters via RelationalChangeRecordEmitter chain)",
+    "TinyIntOneToBooleanConverterConfig provides Field definitions for SELECTOR and LENGTH_CHECKER"
+  ],
+  "class_structures": {
+    "BinlogGeometry": {
+      "type": "class",
+      "fields": ["byte[] wkb", "Integer srid"],
+      "constants": ["WKB_POINT_SIZE=21", "WKB_EMPTY_GEOMETRYCOLLECTION=byte[9]"],
+      "methods": [
+        "static fromBytes(byte[] mysqlBytes): BinlogGeometry",
+        "static createEmpty(): BinlogGeometry",
+        "getWkb(): byte[]",
+        "getSrid(): Integer",
+        "isPoint(): boolean"
+      ]
+    },
+    "BinlogUnsignedIntegerConverter": {
+      "type": "utility class (private constructor)",
+      "methods": [
+        "static convertUnsignedTinyint(short): short",
+        "static convertUnsignedSmallint(int): int",
+        "static convertUnsignedMediumint(int): int",
+        "static convertUnsignedInteger(long): long",
+        "static convertUnsignedBigint(BigDecimal): BigDecimal"
+      ],
+      "correction_constants": ["TINYINT+256", "SMALLINT+65536", "MEDIUMINT+16777216", "INT+4294967296", "BIGINT+18446744073709551616"]
+    },
+    "TinyIntOneToBooleanConverter": {
+      "type": "class",
+      "implements": ["CustomConverter<SchemaBuilder,RelationalColumn>", "ConfigDescriptor"],
+      "fields": ["Predicate<RelationalColumn> selector", "boolean lengthChecker=true"],
+      "methods": [
+        "configure(Properties): void",
+        "converterFor(RelationalColumn, ConverterRegistration<SchemaBuilder>): void",
+        "getConfigFields(): Field.Set"
+      ],
+      "config_props": ["selector (regex, table.column format)", "length.checker (boolean, default true)"]
+    },
+    "BinlogChangeRecordEmitter": {
+      "type": "class",
+      "extends": "RelationalChangeRecordEmitter<BinlogPartition>",
+      "fields": ["Operation operation", "OffsetContext offset", "Object[] before", "Object[] after"],
+      "constructor": "BinlogChangeRecordEmitter(P partition, OffsetContext offset, Clock clock, Operation operation, Serializable[] before, Serializable[] after, BinlogConnectorConfig connectorConfig)",
+      "methods": [
+        "getOffset(): OffsetContext",
+        "getOperation(): Operation",
+        "getOldColumnValues(): Object[]",
+        "getNewColumnValues(): Object[]",
+        "emitTruncateRecord(Receiver<P>, TableSchema): void"
+      ]
+    },
+    "Geometry (schema)": {
+      "type": "schema helper",
+      "logical_name": "io.debezium.data.geometry.Geometry",
+      "fields_in_struct": ["wkb (bytes)", "srid (optional int32)"],
+      "methods": ["static builder(): SchemaBuilder", "static createValue(Schema, byte[], Integer): Struct"]
+    }
+  },
+  "important_notes": [
+    "MySQL stores geometry as 4-byte SRID (little-endian) + WKB; BinlogGeometry.fromBytes() strips the SRID prefix before delivering standard WKB",
+    "SRID==0 is normalized to null (unset/unknown) per Debezium convention",
+    "POINT type check: wkb.length == 21 (1 byte order + 4 type + 8 X + 8 Y)",
+    "Unsigned integer correction: binlog stores value = insertion_value - max_boundary - 1; converter adds max+1 to restore",
+    "BIGINT UNSIGNED has two modes: LONG (no promotion, may lose precision) and PRECISE (BigDecimal)",
+    "TinyIntOneToBooleanConverter is a pluggable CustomConverter; must be registered via connector config",
+    "length.checker=true (default) restricts conversion to TINYINT(1); disable for MySQL 8+ where SHOW CREATE TABLE omits length for TINYINT UNSIGNED",
+    "BinlogChangeRecordEmitter delegates row array access back to parent RelationalChangeRecordEmitter which handles the record building/routing to Receiver"
+  ],
+  "source_files_analyzed": [
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogGeometry.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogUnsignedIntegerConverter.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/converters/TinyIntOneToBooleanConverter.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/converters/TinyIntOneToBooleanConverterConfig.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogChangeRecordEmitter.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/jdbc/BinlogValueConverters.java (key sections)"
+  ]
+}

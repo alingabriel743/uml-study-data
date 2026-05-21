@@ -1,0 +1,279 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipantBorderColor #495057
+skinparam sequenceParticipantBackgroundColor #F8F9FA
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceGroupBorderColor #6C757D
+skinparam sequenceGroupBackgroundColor #E9ECEF
+skinparam noteBackgroundColor #FFF9C4
+skinparam noteBorderColor #F9A825
+
+title Filesystem Node Read and Stat Flow
+
+actor "Caller\n(API/Service)" as Caller
+participant "FSService\n(svc_fs)" as FSService
+participant "FSNodeContext" as FSNode
+participant "ECMAP\n(EntityContextMap)" as ECMAP
+participant "PuterFSProvider" as Provider
+participant "ResourceService\n(svc_resource)" as ResSvc
+participant "FSEntryController" as Controller
+database "Database\n(db)" as DB
+
+' ─────────────────────────────────────────────
+' 1. NODE CONSTRUCTION
+' ─────────────────────────────────────────────
+== Node Construction ==
+
+Caller -> FSService: node(selector)\n[NodeUIDSelector | NodePathSelector |\nNodeChildSelector | NodeRawEntrySelector]
+activate FSService
+
+FSService -> FSNode: new FSNodeContext({ services, selector, provider, fs })
+activate FSNode
+
+FSNode -> ECMAP: get_fsNodeContext_from_selector(selector)
+activate ECMAP
+note right of ECMAP: Deduplication check —\nreturns existing context\nif selector already seen
+ECMAP --> FSNode: existing context (or null)
+deactivate ECMAP
+
+FSNode -> FSNode: selector.setPropertiesKnownBySelector(this)\n// pre-populate uid/path from selector
+
+FSService <-- FSNode: FSNodeContext instance
+deactivate FSNode
+Caller <-- FSService: FSNodeContext
+deactivate FSService
+
+' ─────────────────────────────────────────────
+' 2. OPTIMAL SELECTOR RESOLUTION
+' ─────────────────────────────────────────────
+== get_optimal_selector ==
+
+Caller -> FSNode: .selector (property access)
+activate FSNode
+FSNode -> FSNode: get_optimal_selector()
+note right of FSNode
+  Priority order:
+  1. NodeRawEntrySelector
+  2. RootNodeSelector
+  3. NodeInternalIDSelector
+  4. NodeUIDSelector
+  5. NodeChildSelector
+  6. NodePathSelector
+  Returns first matching type from selectors_[]
+end note
+FSNode --> Caller: optimal selector
+deactivate FSNode
+
+' ─────────────────────────────────────────────
+' 3. FETCH ENTRY (STAT)
+' ─────────────────────────────────────────────
+== fetchEntry (stat) ==
+
+Caller -> FSNode: fetchEntry(fetch_entry_options)
+activate FSNode
+
+alt already fetching (concurrency dedup)
+    FSNode -> FSNode: await this.fetching\n(TeePromise guard — blocks duplicate callers)
+end
+
+alt found===true && !force && thumbnail satisfied
+    FSNode --> Caller: (return early — cached)
+end
+
+FSNode -> Provider: stat({ selector: get_optimal_selector(),\noptions, node: this, controls })
+activate Provider
+
+' ─────────────────────────────────────────────
+' 4. PUTERFS PROVIDER STAT — resource/entry race
+' ─────────────────────────────────────────────
+== PuterFSProvider.stat — Resource/Entry Race ==
+
+Provider -> ResSvc: waitForResource(selector)
+activate ResSvc
+note right of ResSvc: Resolves when uid is\nno longer pending-create
+deactivate ResSvc
+
+Provider -> Controller: waitForEntry(node, callback)
+activate Controller
+note right of Controller: Resolves when an op\nis queued for this uid
+deactivate Controller
+
+note over Provider: First of the two promises to resolve wins;\nthe other is detached (raceCase)
+
+' ─────────────────────────────────────────────
+' 5. FETCH FROM CONTROLLER
+' ─────────────────────────────────────────────
+== PuterFSProvider.stat — Fetch from Controller ==
+
+alt resource is pending (svc_resource.getResourceInfo(uid) truthy)
+    Provider -> Controller: get(maybe_uid, options)\n// scans currentState + deferredState queues, then DB
+    activate Controller
+    Controller -> DB: findByUID(uuid) if not in queue
+    activate DB
+    DB --> Controller: fsentry row
+    deactivate DB
+    Controller --> Provider: entry
+    deactivate Controller
+else resource is ready
+    Provider -> Controller: find(selector, options)
+    activate Controller
+
+    ' ─────────────────────────────────────────────
+    ' 6. FSENTRY CONTROLLER SELECTOR DISPATCH
+    ' ─────────────────────────────────────────────
+    == FSEntryController.find — Selector Dispatch ==
+
+    alt RootNodeSelector
+        Controller -> Controller: return selector.entry directly\n(virtual root, no DB hit)
+    else NodePathSelector
+        Controller -> DB: findByPath(path)\n// direct path column lookup first;\nfalls back to iterative segment walk
+        activate DB
+        DB --> Controller: fsentry row (or null)
+        deactivate DB
+    else NodeUIDSelector
+        Controller -> DB: findByUID(uuid)\nSELECT defaultProperties FROM fsentries WHERE uuid=?
+        activate DB
+        DB --> Controller: fsentry row
+        deactivate DB
+    else NodeInternalIDSelector
+        Controller -> DB: findByID(id)\nSELECT defaultProperties FROM fsentries WHERE id=?
+        activate DB
+        DB --> Controller: fsentry row
+        deactivate DB
+    else NodeChildSelector
+        Controller -> Controller: find(selector.parent) [recursive]
+        Controller -> DB: findNameInParent(parentUuid, name)
+        activate DB
+        DB --> Controller: child id
+        deactivate DB
+        Controller -> Controller: find(new NodeInternalIDSelector(id))
+    end
+
+    Controller --> Provider: entry (or null)
+    deactivate Controller
+end
+
+' ─────────────────────────────────────────────
+' 7. BACK IN STAT — post-fetch
+' ─────────────────────────────────────────────
+== PuterFSProvider.stat — Post-Fetch ==
+
+Provider -> FSNode: controls.provide_selector(\nnew NodeInternalIDSelector('mysql', entry.id))
+note right of FSNode: Caches internal MySQL ID\ninto selectors_[] for future calls\n(fastest subsequent lookups)
+
+Provider --> FSNode: entry object (or null if not found)
+deactivate Provider
+
+' ─────────────────────────────────────────────
+' 8. FSNODE CONTEXT FINALIZE
+' ─────────────────────────────────────────────
+== FSNodeContext.fetchEntry — Finalize ==
+
+alt entry is null
+    FSNode -> FSNode: found = false\nentry = false
+else entry found
+    FSNode -> FSNode: found = true\nupdate uid, mysql_id, path, name from entry\nObject.assign(this.entry, entry)
+end
+
+FSNode -> FSNode: this.fetching.resolve()\n// unblocks all concurrent awaiting callers
+FSNode --> Caller: (resolved)
+deactivate FSNode
+
+' ─────────────────────────────────────────────
+' 9. STAT CHECKS
+' ─────────────────────────────────────────────
+== Stat Checks (root / public / appdata) ==
+
+Caller -> FSNode: isRoot [property]
+activate FSNode
+FSNode --> Caller: this.path === '/'
+deactivate FSNode
+
+Caller -> FSNode: isUserDirectory()
+activate FSNode
+FSNode -> FSNode: fetchEntry() [if not yet fetched]
+FSNode --> Caller: !this.entry.parent_uid
+deactivate FSNode
+
+Caller -> FSNode: isPublic()
+activate FSNode
+FSNode -> FSNode: getPathComponents()\n// split this.path or NodePathSelector.value by '/'
+FSNode -> FSNode: isUserDirectory()
+note right of FSNode: public = components[1]==='Public'\nAND NOT isUserDirectory()
+FSNode --> Caller: boolean
+deactivate FSNode
+
+Caller -> FSNode: isAppDataDirectory()
+activate FSNode
+FSNode -> FSNode: getPathComponents()
+note right of FSNode: appdata = components[1]==='AppData'
+FSNode --> Caller: boolean
+deactivate FSNode
+
+' ─────────────────────────────────────────────
+' 10. READDIR OPERATIONS
+' ─────────────────────────────────────────────
+== readdirstat_uuid (Optimized Readdir) ==
+
+Caller -> Provider: readdirstat_uuid({ uuid, options })\n// requires READDIR_UUID_MODE capability
+activate Provider
+
+Provider -> Controller: get_descendants_full(uuid, options)
+activate Controller
+Controller -> DB: SELECT defaultProperties [+thumbnail]\nFROM fsentries AS f\nLEFT JOIN subdomains AS s ON f.id=s.root_dir_id\nWHERE parent_uid=? ORDER BY f.id
+activate DB
+DB --> Controller: raw rows (with subdomain join dupes)
+deactivate DB
+Controller -> Controller: collapse rows by id,\ncollect subdomains[]
+Controller --> Provider: raw_entry[]
+deactivate Controller
+
+loop for each raw_entry
+    Provider -> FSService: svc_fs.node(new NodeRawEntrySelector(raw_entry, { found_thumbnail }))
+    activate FSService
+    FSService --> Provider: FSNodeContext
+    deactivate FSService
+    Provider -> FSNode: node.found = true\n// mark as already resolved — skip fetchEntry
+end
+
+Provider --> Caller: Promise<FSNodeContext[]>
+deactivate Provider
+
+== readdir (Standard — UUIDs Only) ==
+
+Caller -> Provider: readdir({ node })
+activate Provider
+Provider -> FSNode: node.get('uid')\n// may trigger fetchEntry if not cached
+activate FSNode
+FSNode --> Provider: uuid
+deactivate FSNode
+
+Provider -> Controller: fast_get_direct_descendants(uuid)
+activate Controller
+Controller -> DB: SELECT uuid FROM fsentries\nWHERE parent_uid=? [or IS NULL for root]
+activate DB
+DB --> Controller: uuid[]
+deactivate DB
+Controller --> Provider: uuid[]
+deactivate Controller
+
+Provider --> Caller: uuid[]\n// caller calls svc_fs.node() per uuid to get FSNodeContext
+deactivate Provider
+
+@enduml

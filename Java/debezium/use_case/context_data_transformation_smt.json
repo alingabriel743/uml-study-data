@@ -1,0 +1,188 @@
+{
+  "scope": "data_transformation_smt",
+  "title": "Data Transformation (SMT)",
+  "diagram_type": "use_case",
+  "description": "Application developer configures SMT transforms for routing and filtering change events via scripting languages or WASM modules",
+
+  "actors": [
+    {
+      "name": "ApplicationDeveloper",
+      "type": "primary",
+      "description": "Configures SMT transforms (ContentBasedRouter, Filter) on a Kafka Connect connector"
+    },
+    {
+      "name": "KafkaConnectPlatform",
+      "type": "system",
+      "description": "Applies registered SMT chain to each ConnectRecord in the pipeline"
+    },
+    {
+      "name": "ScriptingEngine",
+      "type": "secondary",
+      "description": "Evaluates expressions: GraalJsEngine (graal.js), Jsr223Engine (groovy/others), WasmEngine (chicory/chicory-interpreter)"
+    },
+    {
+      "name": "BenchmarkHarness",
+      "type": "secondary",
+      "description": "JMH runner that drives FilterSmtPerf and SmtOverheadPerf benchmarks"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Configure ContentBasedRouter",
+      "actor": "ApplicationDeveloper",
+      "description": "Set language + topic.expression; records are rerouted to new topic when expression returns non-null string",
+      "config_params": ["language (jsr223.* | wasm.*)", "topic.expression (STRING, required)", "null.handling.mode (keep|drop|evaluate)", "topic.regex (optional)"],
+      "class": "io.debezium.transforms.ContentBasedRouter"
+    },
+    {
+      "id": "UC2",
+      "name": "Configure Filter SMT",
+      "actor": "ApplicationDeveloper",
+      "description": "Set language + condition; records are dropped when boolean expression returns false",
+      "config_params": ["language", "condition (STRING, required)", "null.handling.mode", "topic.regex"],
+      "class": "io.debezium.transforms.Filter"
+    },
+    {
+      "id": "UC3",
+      "name": "Select Scripting Language / Engine",
+      "actor": "ApplicationDeveloper",
+      "description": "Choose JSR223 language (jsr223.groovy, jsr223.graal.js) or WASM runtime (wasm.chicory, wasm.chicory-interpreter)",
+      "engines": {
+        "graal.js": "GraalJsEngine",
+        "chicory / chicory-interpreter": "WasmEngine",
+        "default (e.g. groovy)": "Jsr223Engine"
+      }
+    },
+    {
+      "id": "UC4",
+      "name": "Apply Null Handling Policy",
+      "actor": "ApplicationDeveloper",
+      "description": "Configure null.handling.mode: keep (pass through), drop (remove), evaluate (pass to engine)",
+      "enum": "ScriptingTransformation.NullHandling {DROP, KEEP, EVALUATE}"
+    },
+    {
+      "id": "UC5",
+      "name": "Route Record to New Topic",
+      "actor": "KafkaConnectPlatform",
+      "description": "ContentBasedRouter.doApply() calls engine.eval(record, String.class); if non-null builds record.newRecord(topicName,...)",
+      "call_chain": [
+        "ScriptingTransformation.apply(record)",
+        "→ check topicPattern match",
+        "→ check null handling",
+        "→ ContentBasedRouter.doApply(record)",
+        "→ engine.eval(record, String.class) → topicName",
+        "→ record.newRecord(topicName, partition, keySchema, key, valueSchema, value, timestamp, headers)"
+      ]
+    },
+    {
+      "id": "UC6",
+      "name": "Filter Out Change Event",
+      "actor": "KafkaConnectPlatform",
+      "description": "Filter.doApply() calls engine.eval(record, Boolean.class); returns null (drop) if false",
+      "call_chain": [
+        "ScriptingTransformation.apply(record)",
+        "→ Filter.doApply(record)",
+        "→ engine.eval(record, Boolean.class)",
+        "→ true → return record | false → return null (dropped)"
+      ]
+    },
+    {
+      "id": "UC7",
+      "name": "Benchmark Filter SMT Performance",
+      "actor": "BenchmarkHarness",
+      "description": "FilterSmtPerf compares NativeFilter vs Groovy/JS/Chicory/ChicoryInterpreter Filter implementations using JMH @Benchmark",
+      "class": "io.debezium.performance.core.FilterSmtPerf",
+      "benchmarks": ["java()", "groovy()", "javascript()", "chicory()", "chicoryInterpreter()"],
+      "state_class": "FilterSmtPerf.TransformState",
+      "state_fields": ["nativeFilter", "groovyFilter", "jsFilter", "chicoryFilter", "chicoryInterpreterFilter", "delete:SourceRecord", "create:SourceRecord"]
+    },
+    {
+      "id": "UC8",
+      "name": "Measure SMT Overhead (NoOp vs NewRecord)",
+      "actor": "BenchmarkHarness",
+      "description": "SmtOverheadPerf measures baseline cost of SMT invocation with NoOp (pass-through) vs NewRecord (copy) vs empty base()",
+      "class": "io.debezium.performance.core.SmtOverheadPerf",
+      "benchmarks": ["base()", "noop()", "newRecord()"],
+      "state_class": "SmtOverheadPerf.TransformState",
+      "state_fields": ["newRecord:Transformation", "noop:Transformation", "delete:SourceRecord", "create:SourceRecord"]
+    }
+  ],
+
+  "key_classes": [
+    {
+      "name": "ScriptingTransformation<R>",
+      "package": "io.debezium.transforms",
+      "type": "abstract class",
+      "implements": ["Transformation<R>", "Versioned", "ConfigDescriptor"],
+      "annotation": "@Incubating",
+      "key_fields": ["Engine engine", "NullHandling nullHandling", "Pattern topicPattern"],
+      "key_methods": ["configure(Map)", "apply(R record)", "doApply(R record) [abstract]", "expressionField() [abstract]"],
+      "config_fields": ["LANGUAGE (required)", "NULL_HANDLING (drop|keep|evaluate)", "TOPIC_REGEX (optional)"]
+    },
+    {
+      "name": "ContentBasedRouter<R>",
+      "package": "io.debezium.transforms",
+      "extends": "ScriptingTransformation<R>",
+      "annotation": "@Incubating",
+      "config_field": "EXPRESSION = topic.expression (required STRING)",
+      "doApply_logic": "engine.eval(record, String.class) → null ? pass-through : record.newRecord(topicName,...)"
+    },
+    {
+      "name": "Filter<R>",
+      "package": "io.debezium.transforms",
+      "extends": "ScriptingTransformation<R>",
+      "annotation": "@Incubating",
+      "config_field": "EXPRESSION = condition (required STRING)",
+      "doApply_logic": "engine.eval(record, Boolean.class) ? record : null"
+    },
+    {
+      "name": "NoOp",
+      "package": "io.debezium.performance.core (inner class of SmtOverheadPerf)",
+      "implements": ["Transformation<SourceRecord>", "Versioned"],
+      "doApply_logic": "return record unchanged — baseline pass-through"
+    },
+    {
+      "name": "NativeFilter",
+      "package": "io.debezium.performance.core (inner class of FilterSmtPerf)",
+      "implements": ["Transformation<SourceRecord>", "Versioned"],
+      "doApply_logic": "Java-native: drop record if op==DELETE, else pass through"
+    },
+    {
+      "name": "TransformState (FilterSmtPerf)",
+      "annotation": "@State(Scope.Thread)",
+      "fields": ["nativeFilter", "groovyFilter", "jsFilter", "chicoryFilter", "chicoryInterpreterFilter", "delete", "create"],
+      "setup": "@Setup(Level.Trial) doSetup() — initializes schema, records, and all filter variants"
+    },
+    {
+      "name": "TransformState (SmtOverheadPerf)",
+      "annotation": "@State(Scope.Thread)",
+      "fields": ["newRecord:Transformation", "noop:Transformation", "delete", "create"],
+      "setup": "@Setup(Level.Trial) doSetup() — initializes schema, records, NoOp, NewRecord"
+    }
+  ],
+
+  "relationships": [
+    "ContentBasedRouter extends ScriptingTransformation",
+    "Filter extends ScriptingTransformation",
+    "ScriptingTransformation implements Transformation<R> (Kafka Connect API)",
+    "ScriptingTransformation implements Versioned",
+    "ScriptingTransformation implements ConfigDescriptor",
+    "ScriptingTransformation delegates_to Engine (GraalJsEngine | Jsr223Engine | WasmEngine)",
+    "NoOp implements Transformation<SourceRecord> (inner SmtOverheadPerf)",
+    "NativeFilter implements Transformation<SourceRecord> (inner FilterSmtPerf)",
+    "FilterSmtPerf.TransformState holds nativeFilter + scripting Filter instances",
+    "SmtOverheadPerf.TransformState holds NoOp + NewRecord instances"
+  ],
+
+  "important_notes": "All SMTs are @Incubating. Language must start with 'jsr223.' or 'wasm.' else DebeziumException. ContentBasedRouter routes by returning new topic name (null = keep original). Filter drops by returning null. Benchmarks use JMH Mode.Throughput with microsecond units. WASM engines (chicory) load .wasm files from debezium-microbenchmark/src/main/resources/wasm/.",
+
+  "source_files_analyzed": [
+    "debezium-scripting/debezium-scripting/src/main/java/io/debezium/transforms/ContentBasedRouter.java",
+    "debezium-scripting/debezium-scripting/src/main/java/io/debezium/transforms/Filter.java",
+    "debezium-scripting/debezium-scripting/src/main/java/io/debezium/transforms/ScriptingTransformation.java",
+    "debezium-microbenchmark/src/main/java/io/debezium/performance/core/FilterSmtPerf.java",
+    "debezium-microbenchmark/src/main/java/io/debezium/performance/core/SmtOverheadPerf.java"
+  ]
+}

@@ -1,0 +1,190 @@
+{
+  "scope": "steam_multiplayer_session",
+  "title": "Steam Multiplayer Session Setup",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "DesktopLauncher",
+    "SVars",
+    "SNet",
+    "SteamConnection",
+    "SUser",
+    "SWorkshop",
+    "SStats",
+    "SteamAPI",
+    "SteamMatchmaking (smat)",
+    "SteamNetworking (snet)",
+    "SteamFriends (friends)",
+    "SteamUGC (ugc)",
+    "SteamUserStats (stats)",
+    "Net (mindustry net layer)",
+    "GameService"
+  ],
+
+  "initialization_flow": [
+    "DesktopLauncher → SteamAPI: loadLibraries() + init()",
+    "DesktopLauncher → SVars: net = new SNet(new ArcNetProvider())",
+    "DesktopLauncher → SVars: stats = new SStats()",
+    "DesktopLauncher → SVars: workshop = new SWorkshop()",
+    "DesktopLauncher → SVars: user = new SUser()",
+    "SNet constructor → Events.on(ClientLoadEvent) → registers P2P read loop via Core.app.addListener",
+    "SStats constructor → stats.requestCurrentStats() [async → onUserStatsReceived → service.init()]",
+    "SStats constructor → Events.on(ClientLoadEvent) → Timer.schedule every 4 min: if updated → stats.storeStats()",
+    "SWorkshop constructor → ugc.getSubscribedItems(ids) → ugc.getItemInstallInfo(each id)",
+    "SWorkshop → categorizes files into workshopFiles[Map, Schematic, LoadedMod]",
+    "SWorkshop → if maps found: Achievement.downloadMapWorkshop.complete()",
+    "DesktopLauncher → Events.on(ClientLoadEvent) → friends.getPersonaName() → set player.name",
+    "DesktopLauncher → Core.app.addListener → update loop: SteamAPI.runCallbacks()"
+  ],
+
+  "host_server_flow": [
+    "DesktopLauncher → SNet.hostServer(port)",
+    "SNet → provider.hostServer(port) [ArcNetProvider, TCP/UDP]",
+    "SNet → smat.createLobby(LobbyType.Public|FriendsOnly, playerLimit)",
+    "Steam → SNet.onLobbyCreated(SteamResult.OK, steamID)",
+    "SNet → currentLobby = steamID",
+    "SNet → smat.setLobbyData(steamID, 'name', player.name)",
+    "SNet → smat.setLobbyData(steamID, 'mapname', state.map.name())",
+    "SNet → smat.setLobbyData(steamID, 'version', Version.build)",
+    "SNet → smat.setLobbyData(steamID, 'versionType', Version.type)",
+    "SNet → smat.setLobbyData(steamID, 'wave', state.wave)",
+    "SNet → smat.setLobbyData(steamID, 'gamemode', state.rules.mode())",
+    "SNet → updateBans(null) → smat.setLobbyData(steamID, 'banned', bannedSteamHandles)"
+  ],
+
+  "client_connect_flow": [
+    "Net → SNet.connectClient('steam:<lobbyHandle>', port, successCallback)",
+    "SNet → smat.joinLobby(SteamID from handle) [async]",
+    "Steam → SNet.onLobbyEnter(steamIDLobby, chatPermissions, blocked, response)",
+    "SNet: if response != Success → ui.showErrorMessage(); return",
+    "SNet → smat.getLobbyData(lobby, 'version') → version check; mismatch → smat.leaveLobby(); return",
+    "SNet → logic.reset() + net.reset()",
+    "SNet → currentLobby = steamIDLobby; currentServer = smat.getLobbyOwner(steamIDLobby)",
+    "SNet → friends.getFriendPersonaName(currentServer) [log only]",
+    "SNet → joinCallback.run() [signals connect success]",
+    "SNet → net.setClientConnected()",
+    "SNet → net.handleClientReceived(new Connect('steam:<serverAccountID>'))"
+  ],
+
+  "p2p_session_accept_flow": [
+    "Steam → SNet.onP2PSessionRequest(steamIDRemote) [client initiating first packet]",
+    "SNet: if net.server() → snet.acceptP2PSessionWithUser(steamIDRemote)",
+    "SNet update loop → snet.isP2PPacketAvailable(0) returns length > 0",
+    "SNet → snet.readP2PPacket(from, readBuffer, 0)",
+    "SNet → serializer.read(readCopyBuffer) → Packet",
+    "SNet [server mode]: steamConnections.get(fromID) == null → new SteamConnection(from)",
+    "SNet → net.handleServerReceived(con, new Connect('steam:<fromAccountID>'))",
+    "SNet → net.handleServerReceived(con, packet)"
+  ],
+
+  "p2p_send_receive_flow": [
+    "SteamConnection.send(object, reliable) → serializer.write(writeBuffer, object)",
+    "SteamConnection → snet.sendP2PPacket(sid, writeBuffer, P2PSend.Reliable|UnreliableNoDelay, channel=0)",
+    "SNet.sendClient(object, reliable) [client side] → serializer.write → snet.sendP2PPacket(currentServer, ...)",
+    "Remote SNet update loop → isP2PPacketAvailable → readP2PPacket → serializer.read → net.handleClientReceived(packet)"
+  ],
+
+  "disconnect_flow": [
+    "SNet.disconnectClient() → smat.leaveLobby(currentLobby) + snet.closeP2PSessionWithUser(currentServer)",
+    "SNet → net.handleClientReceived(new Disconnect()); currentServer=null; currentLobby=null",
+    "Steam → SNet.onLobbyChatUpdate(lobby, who, changer, Disconnected|Left)",
+    "SNet [client]: if who == currentServer → net.disconnect()",
+    "SNet [server]: disconnectSteamUser(who) → snet.closeP2PSessionWithUser(steamid) + net.handleServerReceived(con, Disconnect)",
+    "Steam → SNet.onP2PSessionConnectFail(steamIDRemote, error)",
+    "SNet [server]: disconnectSteamUser(steamIDRemote)",
+    "SNet [client]: net.handleClientReceived(new Disconnect())"
+  ],
+
+  "workshop_discovery_flow": [
+    "SWorkshop constructor → ugc.getSubscribedItems(ids[])",
+    "SWorkshop → ugc.getItemInstallInfo(fileID, info) → info.getFolder()",
+    "SWorkshop → classify folders: .msav=Map, .msch=Schematic, mod.json/hjson=LoadedMod",
+    "DesktopLauncher.getWorkshopContent(type) → SVars.workshop.getWorkshopFiles(type)"
+  ],
+
+  "workshop_publish_flow": [
+    "DesktopLauncher.publish(p) → SVars.workshop.publish(p)",
+    "SWorkshop.publish(p): if hasSteamID → viewListing(p); return",
+    "SWorkshop → p.prePublish() check",
+    "SWorkshop → showPublish(id -> update(p, id, null, true))",
+    "User confirms → ugc.createItem(SVars.steamID, WorkshopFileType.Community)",
+    "Steam → SWorkshop.onCreateItem(publishedFileID, needsWLA, SteamResult.OK)",
+    "SWorkshop → itemHandlers.first().get(publishedFileID) → update(p, id, null, true)",
+    "SWorkshop.update() → updateItem(id, tagger, onUpdated)",
+    "SWorkshop → ugc.startItemUpdate(steamID, publishedFileID) → handle h",
+    "SWorkshop → ugc.setItemTitle/Description/Tags/Preview/Content(h, ...)",
+    "SWorkshop → ugc.submitItemUpdate(h, changelog)",
+    "Steam → SWorkshop.onSubmitItemUpdate(publishedFileID, needsWLA, OK)",
+    "SWorkshop → friends.activateGameOverlayToWebPage('steam://url/CommunityFilePage/...')",
+    "SWorkshop → updatedHandlers.get(id).run() → p.addSteamID(sid)"
+  ],
+
+  "stats_achievements_flow": [
+    "SStats constructor → stats.requestCurrentStats()",
+    "Steam → SStats.onUserStatsReceived(gameID, steamID, OK) → service.init()",
+    "GameService.completeAchievement(name) → SVars.stats.stats.setAchievement(name) + storeStats()",
+    "GameService.storeStats() → SVars.stats.onUpdate() → updated=true",
+    "Timer every 4 min → if updated: stats.storeStats()",
+    "Steam → SStats.onUserStatsStored(gameID, OK) → updated=true",
+    "GameService.setStat(name, amount) → SVars.stats.stats.setStatI(name, amount)",
+    "GameService.getStat(name, def) → SVars.stats.stats.getStatI(name, def)",
+    "GameService.isAchieved(name) → SVars.stats.stats.isAchieved(name, false)"
+  ],
+
+  "lobby_server_update_flow": [
+    "Events.on(WaveEvent) → SNet.updateWave() → smat.setLobbyData(currentLobby, 'mapname'/'wave'/'gamemode', ...)",
+    "Events.run(Trigger.newGame) → SNet.updateWave()",
+    "DesktopLauncher.updateLobby() → SVars.net.updateLobby()",
+    "SNet.updateLobby() → smat.setLobbyType + setLobbyMemberLimit",
+    "Events.on(PlayerIpBanEvent) → SNet.updateBans(ip) → smat.setLobbyData('banned', steamHandleList)",
+    "SNet.showFriendInvites() → friends.activateGameOverlayInviteDialog(currentLobby)"
+  ],
+
+  "server_discovery_flow": [
+    "SNet.discoverServers(callback, done) → smat.addRequestLobbyListResultCountFilter(32)",
+    "SNet → smat.addRequestLobbyListDistanceFilter(Worldwide)",
+    "SNet → smat.requestLobbyList()",
+    "Steam → SNet.onLobbyMatchList(matches)",
+    "SNet: for each lobby → getLobbyData(version/gamemode/hidden/banned/mapname/wave/name/...)",
+    "SNet → filter hidden=true lobbies, version mismatches, self-banned",
+    "SNet → hosts.sort(by -players) → hosts.each(lobbyCallback)",
+    "SNet → lobbyDoneCallback.run() → provider.discoverServers(callback, done) [local network]"
+  ],
+
+  "key_relationships": [
+    "SVars is static holder: SVars.net=SNet, SVars.stats=SStats, SVars.workshop=SWorkshop, SVars.user=SUser",
+    "SNet implements NetProvider — wraps ArcNetProvider (fallback for non-Steam connections)",
+    "SNet composes SteamNetworking(snet), SteamMatchmaking(smat), SteamFriends(friends)",
+    "SNet.SteamConnection extends NetConnection — per-peer P2P connection object",
+    "SUser composes SteamUser(user) — provides getSteamID() for auth/UUID",
+    "SWorkshop composes SteamUGC(ugc) — mod/map discovery and publishing",
+    "SWorkshop depends_on SVars.user (owner check in viewListing)",
+    "SWorkshop depends_on SVars.net.friends (overlay navigation)",
+    "SStats composes SteamUserStats(stats) — achievement/stat sync",
+    "SStats depends_on GameService (service.init() on stats received)",
+    "DesktopLauncher implements GameService bridge using SVars.stats",
+    "SNet depends_on SVars.user for ban list check (getLobbyMatchList)",
+    "SNet reads Version.build for lobby version gating"
+  ],
+
+  "important_notes": [
+    "Steam P2P uses channel 0 for all packets; reliable flag auto-set for packets >= 1000 bytes",
+    "Lobby data keys: name, mapname, version, versionType, wave, gamemode, hidden, banned",
+    "SNet checks 'hidden' lobby flag — hides dev/test servers from public list",
+    "Version mismatch on lobby join shows clientOutdated/serverOutdated kick reason",
+    "SWorkshop categorizes by file extension: msav=Map, msch=Schematic, mod.json|hjson=LoadedMod",
+    "SStats save interval: 4 minutes (statSavePeriod), only stores if updated=true",
+    "SUser is minimal — just wraps SteamUser; UUID derived as Base64(Rand(accountID).nextBytes(8))",
+    "GameService.init() called only after SteamUserStats arrives (async post-init pattern)",
+    "Workshop Achievement.downloadMapWorkshop fires on subscribe OR on constructor if maps already present",
+    "Steam P2P handshake: client sends first packet → server receives onP2PSessionRequest → acceptP2PSessionWithUser"
+  ],
+
+  "source_files_analyzed": [
+    "desktop/src/mindustry/desktop/steam/SNet.java",
+    "desktop/src/mindustry/desktop/steam/SUser.java",
+    "desktop/src/mindustry/desktop/steam/SWorkshop.java",
+    "desktop/src/mindustry/desktop/steam/SStats.java",
+    "desktop/src/mindustry/desktop/steam/SVars.java",
+    "desktop/src/mindustry/desktop/DesktopLauncher.java"
+  ]
+}

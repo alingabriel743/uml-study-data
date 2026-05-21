@@ -1,0 +1,326 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #F9A825
+}
+
+title Single Message Transforms (SMTs)
+
+' ─── External interfaces (abbreviated) ───────────────────────────────────────
+interface "Transformation<R>" as Transformation <<Kafka Connect>> {
+    + apply(record: R): R
+    + config(): ConfigDef
+    + close(): void
+}
+
+interface "Versioned" as Versioned <<Debezium>> {
+    + version(): String
+}
+
+interface "ConfigDescriptor" as ConfigDescriptor <<Debezium>> {
+    + config(): ConfigDef
+    + getConfigFields(): Field.Set
+}
+
+' ─── Package: io.debezium.transforms ─────────────────────────────────────────
+package "io.debezium.transforms" {
+
+    abstract class "AbstractExtractNewRecordState<R>" as AbstractExtractNewRecordState {
+        # config: Configuration
+        # smtManager: SmtManager<R>
+        # extractRecordStrategy: ExtractRecordStrategy<R>
+        # additionalHeaders: List<FieldReference>
+        # additionalFields: List<FieldReference>
+        # routeByField: String
+        --
+        + configure(configs: Map<String,?>): void
+        + apply(record: R): R
+        {abstract} # doApply(record: R): R
+        {abstract} # validateConfigFields(): Iterable<Field>
+        # setTopic(updatedTopicValue: String, record: R): R
+        # makeHeaders(additionalHeaders: List<FieldReference>, originalRecordValue: Struct): Headers
+        + version(): String
+        + close(): void
+    }
+
+    class "ExtractNewRecordState<R>" as ExtractNewRecordState {
+        - dropFieldsHeaderName: String
+        - dropFieldsFromKey: boolean
+        - dropFieldsKeepSchemaCompatible: boolean
+        - schemaUpdateCache: BoundedConcurrentHashMap<NewRecordValueMetadata, Schema>
+        - {static} SCHEMA_CACHE_SIZE: int = 64
+        --
+        + configure(configs: Map<String,?>): void
+        + doApply(record: R): R
+        - addFields(additionalFields: List<FieldReference>, originalRecord: R, unwrappedRecord: R): R
+        - dropFields(record: R): R
+        - makeUpdatedSchema(additionalFields: List<FieldReference>, schema: Schema, originalRecordValue: Struct): Schema
+        + validateConfigFields(): Iterable<Field>
+        + config(): ConfigDef
+        + getConfigFields(): Field.Set
+    }
+
+    class "ExtractChangedRecordState<R>" as ExtractChangedRecordState {
+        - headerChangedName: String
+        - headerUnchangedName: String
+        - changedSchema: Schema
+        - unchangedSchema: Schema
+        - smtManager: SmtManager<R>
+        - {static} HEADER_CHANGED_NAME: Field
+        - {static} HEADER_UNCHANGED_NAME: Field
+        --
+        + configure(configs: Map<String,?>): void
+        + apply(record: R): R
+        + config(): ConfigDef
+        + version(): String
+        + close(): void
+        + getConfigFields(): Field.Set
+    }
+    note bottom of ExtractChangedRecordState
+      Compares before/after fields; emits
+      changed/unchanged field-name lists
+      as record headers. Chain BEFORE
+      ExtractNewRecordState.
+    end note
+
+    class "SchemaChangeEventFilter<R>" as SchemaChangeEventFilter {
+        - excludeSchemaChangeEvents: Set<SchemaChangeEventType>
+        - smtManager: SmtManager<R>
+        - {static} SCHEMA_CHANGE_EVENT_EXCLUDE_LIST: Field
+        --
+        + configure(configs: Map<String,?>): void
+        + apply(record: R): R
+        + config(): ConfigDef
+        + version(): String
+        + close(): void
+        + getConfigFields(): Field.Set
+    }
+    note right of SchemaChangeEventFilter
+      Filters DDL events by type
+      (CREATE/ALTER/DROP/DATABASE).
+      Returns null to drop events.
+    end note
+
+    class "ByLogicalTableRouter<R>" as ByLogicalTableRouter {
+        - topicRegex: Pattern
+        - topicReplacement: String
+        - keyFieldRegex: Pattern
+        - keyEnforceUniqueness: boolean
+        - keyFieldName: String
+        - keySchemaUpdateCache: Cache<Schema,Schema>
+        - topicRegexReplaceCache: Cache<String,String>
+        - smtManager: SmtManager<R>
+        - schemaNameAdjuster: SchemaNameAdjuster
+        --
+        + configure(props: Map<String,?>): void
+        + apply(record: R): R
+        - determineNewTopic(oldTopic: String): String
+        - updateKeySchema(oldKeySchema: Schema, newTopicName: String): Schema
+        - updateKey(newKeySchema: Schema, oldKey: Struct, oldTopic: String): Struct
+        - updateEnvelopeSchema(oldEnvelopeSchema: Schema, newTopicName: String): Schema
+        + config(): ConfigDef
+        + version(): String
+        + close(): void
+        + getConfigFields(): Field.Set
+    }
+    note right of ByLogicalTableRouter
+      Routes sharded tables to a single
+      logical topic; augments key with
+      __dbz__physicalTableIdentifier.
+      Uses LRU caches for performance.
+    end note
+
+    class "SmtManager<R>" as SmtManager {
+        - {static} RECORD_ENVELOPE_KEY_SCHEMA_NAME_SUFFIX: String = ".Key"
+        --
+        + SmtManager(config: Configuration)
+        + isValidEnvelope(record: R): boolean
+        + isValidSchemaChange(record: R): boolean
+        + isValidHeartBeat(record: R): boolean
+        + isValidNotification(record: R): boolean
+        + isValidKey(record: R): boolean
+        + isValidRecordForLineage(record: R): boolean
+        + validate(configuration: Configuration, fields: Field.Set): void
+        + {static} isGenericOrTruncateMessage(originalRecord: SourceRecord): boolean
+    }
+
+    class "ExtractNewRecordStateConfigDefinition" as ExtractNewRecordStateConfigDefinition {
+        + {static} DEBEZIUM_OPERATION_HEADER_KEY: String = "__op"
+        + {static} DELETED_FIELD: String = "__deleted"
+        + {static} METADATA_FIELD_PREFIX: String = "__"
+        + {static} HANDLE_TOMBSTONE_DELETES: Field
+        + {static} ROUTE_BY_FIELD: Field
+        + {static} ADD_FIELDS: Field
+        + {static} ADD_FIELDS_PREFIX: Field
+        + {static} ADD_HEADERS: Field
+        + {static} ADD_HEADERS_PREFIX: Field
+        + {static} REPLACE_NULL_WITH_DEFAULT: Field
+        + {static} CONFIG_FIELDS: Field.Set
+    }
+
+    enum "DeleteTombstoneHandling" as DeleteTombstoneHandling {
+        DROP
+        TOMBSTONE
+        REWRITE
+        REWRITE_WITH_TOMBSTONE
+        DELETE_TO_TOMBSTONE
+    }
+}
+
+' ─── Package: io.debezium.transforms (scripting) ─────────────────────────────
+package "io.debezium.transforms (scripting)" {
+
+    abstract class "ScriptingTransformation<R>" as ScriptingTransformation {
+        # engine: Engine
+        - nullHandling: NullHandling
+        - topicPattern: Pattern
+        - {static} LANGUAGE: Field
+        - {static} NULL_HANDLING: Field
+        - {static} TOPIC_REGEX: Field
+        --
+        + configure(configs: Map<String,?>): void
+        + apply(record: R): R
+        {abstract} # doApply(record: R): R
+        {abstract} # expressionField(): Field
+        + config(): ConfigDef
+        + version(): String
+        + close(): void
+        + getConfigFields(): Field.Set
+    }
+    note bottom of ScriptingTransformation
+      Supports jsr223.* (Groovy, GraalJS)
+      and wasm.* (Chicory/WebAssembly)
+      engines
+    end note
+
+    enum "NullHandling" as NullHandling {
+        DROP
+        KEEP
+        EVALUATE
+    }
+
+    class "ContentBasedRouter<R>" as ContentBasedRouter <<@Incubating>> {
+        - {static} EXPRESSION: Field
+        --
+        # doApply(record: R): R
+        # expressionField(): Field
+    }
+    note right of ContentBasedRouter
+      engine.eval() → String (new topic)
+      null = keep original topic
+    end note
+
+    class "Filter<R>" as Filter <<@Incubating>> {
+        - {static} EXPRESSION: Field
+        --
+        # doApply(record: R): R
+        # expressionField(): Field
+    }
+    note right of Filter
+      engine.eval() → Boolean
+      true = keep, false = drop
+    end note
+}
+
+' ─── Package: io.debezium.transforms.extractnewstate ─────────────────────────
+package "io.debezium.transforms.extractnewstate" {
+
+    interface "ExtractRecordStrategy<R>" as ExtractRecordStrategy {
+        + handleTruncateRecord(record: R): R
+        + handleTombstoneRecord(record: R): R
+        + handleDeleteRecord(record: R): R
+        + handleRecord(record: R): R
+        + afterDelegate(): ExtractField<R>
+        + beforeDelegate(): ExtractField<R>
+        + updateDescriptionDelegate(): ExtractField<R>
+        + isRewriteMode(): boolean
+        + close(): void
+    }
+
+    abstract class "AbstractExtractRecordStrategy<R>" as AbstractExtractRecordStrategy {
+        # afterDelegate: ExtractField<R>
+        # beforeDelegate: ExtractField<R>
+        # removedDelegate: InsertField<R>
+        # updatedDelegate: InsertField<R>
+        # updateDescriptionDelegate: ExtractField<R>
+        --
+        + AbstractExtractRecordStrategy(replaceNullWithDefault: boolean)
+        + handleTruncateRecord(record: R): R
+        + afterDelegate(): ExtractField<R>
+        + beforeDelegate(): ExtractField<R>
+        + updateDescriptionDelegate(): ExtractField<R>
+        + close(): void
+    }
+    note bottom of AbstractExtractRecordStrategy
+      removedDelegate inserts __deleted=true
+      updatedDelegate inserts __deleted=false
+    end note
+
+    class "DefaultDeleteHandlingStrategy<R>" as DefaultDeleteHandlingStrategy {
+        - deleteTombstoneHandling: DeleteTombstoneHandling
+        --
+        + DefaultDeleteHandlingStrategy(deleteTombstoneHandling: DeleteTombstoneHandling, replaceNullWithDefault: boolean)
+        + handleTombstoneRecord(record: R): R
+        + handleDeleteRecord(record: R): R
+        + handleRecord(record: R): R
+        + isRewriteMode(): boolean
+    }
+    note right of DefaultDeleteHandlingStrategy
+      5 delete modes: DROP, TOMBSTONE,
+      DELETE_TO_TOMBSTONE, REWRITE,
+      REWRITE_WITH_TOMBSTONE
+    end note
+}
+
+' ─── Inheritance ──────────────────────────────────────────────────────────────
+ExtractNewRecordState --|> AbstractExtractNewRecordState
+ScriptingTransformation ..|> Transformation
+ScriptingTransformation ..|> Versioned
+ScriptingTransformation ..|> ConfigDescriptor
+ContentBasedRouter --|> ScriptingTransformation
+Filter --|> ScriptingTransformation
+AbstractExtractRecordStrategy ..|> ExtractRecordStrategy
+DefaultDeleteHandlingStrategy --|> AbstractExtractRecordStrategy
+
+' ─── Interface implementations ────────────────────────────────────────────────
+AbstractExtractNewRecordState ..|> Transformation
+AbstractExtractNewRecordState ..|> Versioned
+ExtractNewRecordState ..|> ConfigDescriptor
+ExtractChangedRecordState ..|> Transformation
+ExtractChangedRecordState ..|> Versioned
+ExtractChangedRecordState ..|> ConfigDescriptor
+SchemaChangeEventFilter ..|> Transformation
+SchemaChangeEventFilter ..|> Versioned
+SchemaChangeEventFilter ..|> ConfigDescriptor
+ByLogicalTableRouter ..|> Transformation
+ByLogicalTableRouter ..|> Versioned
+ByLogicalTableRouter ..|> ConfigDescriptor
+
+' ─── Compositions / Dependencies ─────────────────────────────────────────────
+AbstractExtractNewRecordState *-- SmtManager : smtManager
+AbstractExtractNewRecordState *-- ExtractRecordStrategy : extractRecordStrategy
+ExtractNewRecordState ..> ExtractNewRecordStateConfigDefinition : uses config from
+ExtractChangedRecordState *-- SmtManager : smtManager
+SchemaChangeEventFilter *-- SmtManager : smtManager
+ByLogicalTableRouter *-- SmtManager : smtManager
+DefaultDeleteHandlingStrategy ..> DeleteTombstoneHandling : mode
+ScriptingTransformation +-- NullHandling
+ExtractNewRecordStateConfigDefinition +-- DeleteTombstoneHandling
+
+@enduml

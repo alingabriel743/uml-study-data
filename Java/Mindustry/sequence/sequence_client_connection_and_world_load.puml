@@ -1,0 +1,206 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    GroupBorderColor #6C757D
+    DividerBorderColor #6C757D
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Client Connection and World Load
+
+actor Player as player
+participant "Net\n(Transport Layer)" as Net
+participant "NetClient" as NetClient
+participant "UI" as UI
+participant "Groups" as Groups
+participant "GameState" as GameState
+participant "NetworkIO" as NetworkIO
+participant "SaveVersion" as SaveVersion
+participant "ContentLoader" as ContentLoader
+participant "EntityMapping" as EntityMapping
+participant "BuildingComp" as BuildingComp
+
+== Phase 1: TCP Connection Established ==
+
+Net -> NetClient : handle(Connect.class, packet)
+activate NetClient
+
+NetClient -> NetClient : reset()\n[clears Groups, sets connecting=true]
+NetClient -> Groups : clear()
+activate Groups
+return
+NetClient -> GameState : net.setClientLoaded(false)
+activate GameState
+return
+NetClient -> UI : loadfrag.show('@connecting.data')
+activate UI
+return
+
+NetClient -> Net : send(ConnectPacket{\n  name, uuid, usid, locale,\n  mods, versionType, color\n})
+activate Net
+return
+
+== Phase 2: Server Signals World Data Incoming ==
+
+Net -> NetClient : @Remote worldDataBegin()
+NetClient -> Groups : clear()
+activate Groups
+return
+NetClient -> GameState : logic.reset()
+activate GameState
+return
+note right of NetClient : connecting=true\nclientLoaded=false
+
+== Phase 3: World Stream Received (DEFLATE Compressed Binary) ==
+
+Net -> NetClient : handle(WorldStream.class, data)
+NetClient -> NetworkIO : loadWorld(new InflaterInputStream(data.stream))
+activate NetworkIO
+
+NetworkIO -> GameState : state.rules = JsonIO.read(Rules, stream)
+activate GameState
+return
+NetworkIO -> GameState : state.mapLocales = JsonIO.read(MapLocales, stream)
+activate GameState
+return
+NetworkIO -> GameState : state.map = new Map(readStringMap(stream))
+activate GameState
+return
+NetworkIO -> GameState : state.wave / wavetime / tick =\nstream.readInt/Float/Double()
+activate GameState
+return
+
+NetworkIO -> player : player.reset()\nplayer.read(new Reads(stream))\nplayer.add()
+
+NetworkIO -> SaveVersion : readContentHeader(stream)
+activate SaveVersion
+SaveVersion -> ContentLoader : reads type + total + name[]\nper ContentType → builds\nMappableContent[][] map
+activate ContentLoader
+return
+SaveVersion -> ContentLoader : content.setTemporaryMapper(map)\n[enables server ID → name remapping]
+activate ContentLoader
+return
+deactivate SaveVersion
+
+NetworkIO -> SaveVersion : readContentPatches(stream)
+activate SaveVersion
+return
+
+NetworkIO -> SaveVersion : readMap(stream, world.context)\n[reads width/height, tile floor/block IDs]
+activate SaveVersion
+return
+
+NetworkIO -> SaveVersion : readTeamBlocks(stream)\n[reads building states per team]
+activate SaveVersion
+return
+
+NetworkIO -> SaveVersion : readMarkers(stream)\nreadCustomChunks(stream)
+activate SaveVersion
+return
+
+NetworkIO -> ContentLoader : content.setTemporaryMapper(null)\n[cleanup — disables ID remapping]
+activate ContentLoader
+return
+
+deactivate NetworkIO
+
+== Phase 4: finishConnecting() ==
+
+NetClient -> NetClient : finishConnecting()
+NetClient -> GameState : state.set(State.playing)
+activate GameState
+return
+note right of NetClient : connecting=false
+NetClient -> UI : join.hide()
+activate UI
+return
+NetClient -> Net : net.setClientLoaded(true)
+activate Net
+return
+NetClient -> Net : Call.connectConfirm()\n[async via Core.app.post]
+activate Net
+return
+NetClient -> UI : loadfrag.hide()\n[async via Core.app.post]
+activate UI
+return
+
+deactivate NetClient
+
+== Phase 5: Ongoing UDP Sync Loop (In-Game) ==
+
+loop Every frame (entity snapshot, UDP/unreliable)
+    Net -> NetClient : @Remote entitySnapshot(\n  short amount, byte[] data\n)
+    activate NetClient
+    loop × amount entities
+        NetClient -> EntityMapping : EntityMapping.map(typeID).get()\n[factory lookup by type byte]
+        activate EntityMapping
+        EntityMapping --> NetClient : new entity instance (Syncc)
+        deactivate EntityMapping
+        NetClient -> NetClient : entity.readSync(read)
+        NetClient -> NetClient : entity.snapSync()\n[if newly created]
+        NetClient -> NetClient : entity.add()\n[if not already tracked]
+    end
+    deactivate NetClient
+end
+
+loop Every frame (block snapshot, UDP/unreliable)
+    Net -> NetClient : @Remote blockSnapshot(\n  short amount, byte[] data\n)
+    activate NetClient
+    loop × amount buildings
+        NetClient -> BuildingComp : tile.build.readSync(reads, version)
+        activate BuildingComp
+        BuildingComp -> BuildingComp : readAll(read, revision)
+        BuildingComp -> BuildingComp : readBase(read)\n[items/power/liquids via moduleBitmask]
+        BuildingComp -> BuildingComp : read(read, revision)\n[block-specific override]
+        deactivate BuildingComp
+    end
+    deactivate NetClient
+end
+
+loop Every frame (state snapshot, UDP/unreliable)
+    Net -> NetClient : @Remote stateSnapshot(\n  waveTime, wave, enemies, paused,\n  gameOver, tps, rand0, rand1, coreData[]\n)
+    activate NetClient
+    NetClient -> GameState : state.wave / wavetime /\ngameOver / serverTps updated
+    activate GameState
+    return
+    deactivate NetClient
+end
+
+loop Every 66ms
+    NetClient -> Net : Call.clientSnapshot(...)\n[player unit state → server]
+    activate Net
+    return
+end
+
+loop Every 1s
+    NetClient -> Net : Call.ping(Time.millis())
+    activate Net
+    return
+end
+
+@enduml

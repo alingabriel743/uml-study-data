@@ -1,0 +1,242 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #F9A825
+}
+
+title Incremental Snapshot Framework
+
+package "io.debezium.pipeline.source.snapshot.incremental" {
+
+    ' ─── Interfaces ───────────────────────────────────────────────
+
+    interface "IncrementalSnapshotChangeEventSource<P, T>" as IncrementalSnapshotChangeEventSource {
+        +init(partition: P, offsetContext: OffsetContext): void
+        +closeWindow(partition: P, id: String, offsetContext: OffsetContext): void
+        +processMessage(partition: P, dataCollectionId: DataCollectionId, key: Object, offsetContext: OffsetContext): void
+        +addDataCollectionNamesToSnapshot(signalPayload: SignalPayload<P>, config: SnapshotConfiguration): void
+        +requestStopSnapshot(partition: P, offsetContext: OffsetContext, additionalData: Map, ids: List<String>): void
+        +pauseSnapshot(partition: P, offsetContext: OffsetContext): void
+        +resumeSnapshot(partition: P, offsetContext: OffsetContext): void
+        +{abstract} processHeartbeat(partition: P, offsetContext: OffsetContext): void
+        +{abstract} processSchemaChange(partition: P, offsetContext: OffsetContext, dataCollectionId: DataCollectionId): void
+    }
+
+    interface "IncrementalSnapshotContext<T>" as IncrementalSnapshotContext {
+        +currentDataCollectionId(): DataCollection<T>
+        +nextDataCollection(): DataCollection<T>
+        +addDataCollectionNamesToSnapshot(correlationId: String, ids: List<String>, conditions: List<AdditionalCondition>, surrogateKey: String): List<DataCollection<T>>
+        +openWindow(id: String): boolean
+        +closeWindow(id: String): boolean
+        +snapshotRunning(): boolean
+        +isSnapshotPaused(): boolean
+        +pauseSnapshot(): void
+        +resumeSnapshot(): void
+        +startNewChunk(): void
+        +revertChunk(): void
+        +deduplicationNeeded(): boolean
+        +maximumKey(): Optional<Object[]>
+        +maximumKey(key: Object[]): void
+        +store(offset: Map<String,Object>): Map<String,Object>
+        +getDataCollections(): List<DataCollection<T>>
+        +requestSnapshotStop(dataCollectionIds: List<String>): void
+        +setSchema(schema: Table): void
+        +getSchema(): Table
+    }
+
+    interface WatermarkWindowCloser {
+        +closeWindow(partition: Partition, offsetContext: OffsetContext, chunkId: String): void
+    }
+
+    interface "ChunkQueryBuilder<T>" as ChunkQueryBuilder {
+        +buildChunkQuery(context: IncrementalSnapshotContext<T>, table: Table, additionalCondition: Optional<String>): String
+        +buildChunkQuery(context: IncrementalSnapshotContext<T>, table: Table, limit: int, additionalCondition: Optional<String>): String
+        +buildMaxPrimaryKeyQuery(context: IncrementalSnapshotContext<T>, table: Table, additionalCondition: Optional<String>): String
+        +getQueryColumns(context: IncrementalSnapshotContext<T>, table: Table): List<Column>
+        +readTableChunkStatement(context: IncrementalSnapshotContext<T>, table: Table, sql: String): PreparedStatement
+        +prepareTable(context: IncrementalSnapshotContext<T>, table: Table): Table
+    }
+
+    ' ─── Abstract Classes ──────────────────────────────────────────
+
+    abstract class "AbstractIncrementalSnapshotChangeEventSource<P, T>" as AbstractIncrementalSnapshotChangeEventSource {
+        #connectorConfig: RelationalDatabaseConnectorConfig
+        #dispatcher: EventDispatcher<P, T>
+        #context: IncrementalSnapshotContext<T>
+        #jdbcConnection: JdbcConnection
+        #chunkQueryBuilder: ChunkQueryBuilder<T>
+        #window: Map<Struct, Object[]>
+        #notificationService: NotificationService<P, ?>
+        -clock: Clock
+        -databaseSchema: RelationalDatabaseSchema
+        -progressListener: SnapshotProgressListener<P>
+        -dataListener: DataChangeEventListener<P>
+        -totalRowsScanned: long
+        -currentTable: Table
+        +closeWindow(partition: P, id: String, offsetContext: OffsetContext): void
+        +pauseSnapshot(partition: P, offsetContext: OffsetContext): void
+        +resumeSnapshot(partition: P, offsetContext: OffsetContext): void
+        +init(partition: P, offsetContext: OffsetContext): void
+        +addDataCollectionNamesToSnapshot(signalPayload: SignalPayload<P>, config: SnapshotConfiguration): void
+        +requestStopSnapshot(partition: P, offsetContext: OffsetContext, additionalData: Map, ids: List<String>): void
+        +processSchemaChange(partition: P, offsetContext: OffsetContext, dataCollectionId: DataCollectionId): void
+        #readChunk(partition: P, offsetContext: OffsetContext): void
+        #sendWindowEvents(partition: P, offsetContext: OffsetContext): void
+        #deduplicateWindow(dataCollectionId: DataCollectionId, key: Object): void
+        #emitWindowOpen(partition: P, offsetContext: OffsetContext): void
+        #emitWindowClose(partition: P, offsetContext: OffsetContext): void
+        -createDataEventsForTable(partition: P): boolean
+    }
+
+    abstract class "AbstractIncrementalSnapshotContext<T>" as AbstractIncrementalSnapshotContext {
+        #windowOpened: boolean
+        -chunkEndPosition: Object[]
+        -lastEventKeySent: Object[]
+        -currentChunkId: String
+        -maximumKey: Object[]
+        -schema: Table
+        -schemaVerificationPassed: boolean
+        -correlationId: String
+        -paused: AtomicBoolean
+        -dataCollectionsToStop: LinkedBlockingQueue<String>
+        -snapshotDataCollection: SnapshotDataCollection<T>
+        +openWindow(id: String): boolean
+        +closeWindow(id: String): boolean
+        +snapshotRunning(): boolean
+        +deduplicationNeeded(): boolean
+        +startNewChunk(): void
+        +revertChunk(): void
+        +nextChunkPosition(end: Object[]): void
+        +nextDataCollection(): DataCollection<T>
+        +store(offset: Map<String,Object>): Map<String,Object>
+        +{static} init(context: AbstractIncrementalSnapshotContext<U>, offsets: Map): IncrementalSnapshotContext<U>
+    }
+
+    ' ─── Concrete Classes ──────────────────────────────────────────
+
+    class "SignalBasedIncrementalSnapshotChangeEventSource<P, T>" as SignalBasedIncrementalSnapshotChangeEventSource {
+        -signalMetadata: SignalMetadata
+        +processMessage(partition: P, dataCollectionId: DataCollectionId, key: Object, offsetContext: OffsetContext): void
+        #emitWindowOpen(partition: P, offsetContext: OffsetContext): void
+        #emitWindowClose(partition: P, offsetContext: OffsetContext): void
+        #getSignalTableNameForPartition(partition: Partition): String
+        -getWatermarkWindowCloser(config: CommonConnectorConfig, jdbc: JdbcConnection, signalTable: String): WatermarkWindowCloser
+    }
+
+    class "SignalBasedIncrementalSnapshotContext<T>" as SignalBasedIncrementalSnapshotContext {
+        +{static} load(offsets: Map<String,?>): IncrementalSnapshotContext<U>
+        +{static} load(offsets: Map<String,?>, useCatalogBeforeSchema: boolean): SignalBasedIncrementalSnapshotContext<U>
+    }
+
+    class "DataCollection<T>" as DataCollection {
+        -id: T
+        -additionalCondition: String
+        -surrogateKey: String
+        +getId(): T
+        +getAdditionalCondition(): Optional<String>
+        +getSurrogateKey(): Optional<String>
+    }
+
+    class "SnapshotDataCollection<T>" as SnapshotDataCollection {
+        -dataCollectionsToSnapshot: LinkedList<DataCollection<T>>
+        +add(collection: DataCollection<T>): boolean
+        +getNext(): DataCollection<T>
+        +peek(): DataCollection<T>
+        +isEmpty(): boolean
+        +remove(id: String): boolean
+        +dataCollectionsAsJsonString(): String
+    }
+
+    class DeleteWindowCloser<P, T> {
+        -jdbcConnection: JdbcConnection
+        -signalWindowStatement: String
+        -incrementalSnapshotChangeEventSource: SignalBasedIncrementalSnapshotChangeEventSource<P,T>
+        +closeWindow(partition: Partition, offsetContext: OffsetContext, chunkId: String): void
+    }
+
+    class InsertWindowCloser {
+        -jdbcConnection: JdbcConnection
+        -signalWindowStatement: String
+        -signalMetadata: SignalMetadata
+        +closeWindow(partition: Partition, offsetContext: OffsetContext, chunkId: String): void
+    }
+
+    class SignalMetadata {
+        -openWindowTimestamp: Instant
+        -closeWindowTimestamp: Instant
+        +metadataString(): String
+    }
+
+    ' ─── Relationships ─────────────────────────────────────────────
+
+    ' Inheritance / Implementation
+    AbstractIncrementalSnapshotChangeEventSource  ..|>  IncrementalSnapshotChangeEventSource
+    SignalBasedIncrementalSnapshotChangeEventSource  --|>  AbstractIncrementalSnapshotChangeEventSource
+
+    AbstractIncrementalSnapshotContext  ..|>  IncrementalSnapshotContext
+    SignalBasedIncrementalSnapshotContext  --|>  AbstractIncrementalSnapshotContext
+
+    DeleteWindowCloser  ..|>  WatermarkWindowCloser
+    InsertWindowCloser  ..|>  WatermarkWindowCloser
+
+    ' Composition
+    AbstractIncrementalSnapshotChangeEventSource  *--  IncrementalSnapshotContext : "context"
+    AbstractIncrementalSnapshotChangeEventSource  *--  ChunkQueryBuilder : "chunkQueryBuilder"
+    AbstractIncrementalSnapshotContext  *--  SnapshotDataCollection : "snapshotDataCollection"
+
+    ' Associations / Uses
+    IncrementalSnapshotContext  ..>  DataCollection : "returns"
+    SnapshotDataCollection  o--  DataCollection : "holds queue of"
+
+    ' Signal-based source creates watermark closers
+    SignalBasedIncrementalSnapshotChangeEventSource  ..>  WatermarkWindowCloser : "creates (DELETE or INSERT strategy)"
+    SignalBasedIncrementalSnapshotChangeEventSource  *--  SignalMetadata : "signalMetadata"
+
+    ' DeleteWindowCloser depends on the source
+    DeleteWindowCloser  ..>  SignalBasedIncrementalSnapshotChangeEventSource : "delegates to"
+
+    ' InsertWindowCloser uses SignalMetadata
+    InsertWindowCloser  *--  SignalMetadata : "signalMetadata"
+
+}
+
+note top of AbstractIncrementalSnapshotChangeEventSource
+  @NotThreadSafe
+  window = LinkedHashMap<Struct, Object[]>
+  Holds current snapshot chunk rows keyed by PK struct.
+  emitWindowOpen/Close are abstract — implemented by
+  SignalBasedIncrementalSnapshotChangeEventSource.
+end note
+
+note right of SignalBasedIncrementalSnapshotChangeEventSource
+  INSERT_DELETE strategy → DeleteWindowCloser
+    emitWindowOpen:  INSERT '{chunkId}-open' row
+    emitWindowClose: DELETE '{chunkId}-open' row
+  INSERT_INSERT strategy → InsertWindowCloser
+    emitWindowOpen:  INSERT '{chunkId}-open' row
+    emitWindowClose: INSERT '{chunkId}-close' row
+end note
+
+note bottom of AbstractIncrementalSnapshotContext
+  deduplicationNeeded() returns windowOpened flag.
+  Offset keys: EVENT_PRIMARY_KEY, TABLE_MAXIMUM_KEY,
+  DATA_COLLECTIONS_TO_SNAPSHOT_KEY, CORRELATION_ID.
+end note
+
+@enduml

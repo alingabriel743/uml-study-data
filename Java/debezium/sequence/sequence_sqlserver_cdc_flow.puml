@@ -1,0 +1,254 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F0C040
+}
+
+title SQL Server CDC Capture Flow
+
+participant "SqlServerStreaming\nChangeEventSource" as src
+participant "dataConnection\n(SqlServerConnection)" as dataCon
+participant "metadataConnection\n(SqlServerConnection)" as metaCon
+participant "SQL Server DB" as db
+participant "SqlServerChange\nTablePointer" as ptr
+participant "SqlServerOffsetContext" as offset
+participant "EventDispatcher" as dispatcher
+
+== CDC Poll Iteration: executeIteration() ==
+
+src -> src: checkCommitTimer()\npauseBetweenCommits elapsed?
+activate src
+alt commit timers elapsed
+    src -> dataCon: commit()
+    src -> metaCon: commit()
+end
+
+src -> metaCon: didTransactionEnd()\n[endTransactionTimer elapsed]
+activate metaCon
+metaCon -> db: SELECT TOP 1 start_lsn\nFROM sys.dm_cdc_log_scan_sessions\nORDER BY session_id DESC
+db --> metaCon: lsn result
+metaCon --> src: transactionEnded
+deactivate metaCon
+opt transaction ended
+    src -> dispatcher: dispatchTransactionCommittedEvent\n(partition, offsetContext, sourceTime)
+end
+
+== LSN Range Resolution ==
+
+src -> src: getToLsn(dataConnection, databaseName,\nlastProcessedPosition, maxTransactionsPerIteration)
+activate src
+
+alt maxTransactionsPerIteration == 0 (unbounded batch)
+    src -> dataCon: getMaxTransactionLsn(databaseName)
+    activate dataCon
+    dataCon -> db: SELECT MAX(start_lsn) FROM\ncdc.lsn_time_mapping WHERE tran_id <> 0x00
+    db --> dataCon: toLsn
+    dataCon --> src: toLsn
+    deactivate dataCon
+else fromLsn unavailable (first run)
+    src -> dataCon: getNthTransactionLsnFromBeginning\n(databaseName, maxOffset)
+    activate dataCon
+    dataCon -> db: SELECT TOP N start_lsn\nFROM cdc.lsn_time_mapping
+    db --> dataCon: toLsn
+    dataCon --> src: toLsn
+    deactivate dataCon
+else fromLsn available
+    src -> dataCon: getNthTransactionLsnFromLast\n(databaseName, fromLsn, maxOffset)
+    activate dataCon
+    dataCon -> db: SELECT TOP N+1 start_lsn FROM\ncdc.lsn_time_mapping WHERE start_lsn >= fromLsn
+    db --> dataCon: toLsn
+    dataCon --> src: toLsn
+    deactivate dataCon
+end
+deactivate src
+
+opt toLsn unavailable
+    src -> dataCon: isAgentRunning(databaseName)
+    activate dataCon
+    dataCon -> db: SELECT * FROM sys.dm_server_services\nWHERE filename LIKE '%SQLAGENT%'
+    db --> dataCon: agentStatus
+    dataCon --> src: agentRunning
+    deactivate dataCon
+    note right of src: Warn/skip iteration\nif agent not running
+end
+
+src -> dataCon: incrementLsn(databaseName, lastCommitLsn)
+activate dataCon
+dataCon -> db: SELECT sys.fn_cdc_increment_lsn(?)
+db --> dataCon: fromLsn (advanced past last position)
+dataCon --> src: fromLsn
+deactivate dataCon
+
+== Change Table Discovery ==
+
+src -> dataCon: getNewChangeTables(databaseName, fromLsn, toLsn)
+activate dataCon
+dataCon -> db: SELECT * FROM cdc.change_tables\nWHERE start_lsn BETWEEN fromLsn AND toLsn
+db --> dataCon: newChangeTables[]
+dataCon --> src: newChangeTables[]
+deactivate dataCon
+
+opt new capture instances found
+    src -> src: tablesSlot.set(tables)\nschemaChangeCheckpoints.add(table)
+end
+
+src -> src: getChangeTablesToQuery(partition, offsetContext, toLsn)
+activate src
+
+src -> dataCon: getChangeTables(databaseName, toLsn)
+activate dataCon
+dataCon -> db: SELECT captured_columns\nFROM cdc.captured_columns\nORDER BY object_id, column_id
+db --> dataCon: capturedColumns
+dataCon -> db: WITH ordered_change_tables AS\n(ROW_NUMBER OVER PARTITION BY source_object_id)\nSELECT ... WHERE ct.start_lsn <= toLsn
+db --> dataCon: changeTables[]
+dataCon --> src: List<SqlServerChangeTable>
+deactivate dataCon
+
+src -> src: filter by dataCollectionFilter()
+note right of src: Excludes tables not\nin connector config
+
+loop for each new / future capture instance
+    src -> dataCon: getTableSchemaFromTable\n(databaseName, changeTable)
+    activate dataCon
+    dataCon -> db: DatabaseMetaData.getColumns()\n+ readPrimaryKeyOrUniqueIndexNames()
+    db --> dataCon: tableSchema
+    dataCon --> src: TableSchema
+    deactivate dataCon
+    src -> dispatcher: dispatchSchemaChangeEvent\n(partition, offsetContext, tableId,\nSchemaChangeEmitter[CREATE])
+    activate dispatcher
+    dispatcher --> src: ok
+    deactivate dispatcher
+end
+deactivate src
+
+== Inner Loop: Change Row Processing (LSN Order) ==
+
+loop for each SqlServerChangeTable in changeTables[]
+
+    src -> ptr: new SqlServerChangeTablePointer\n(changeTable, dataConnection, fromLsn, toLsn, fetchSize)
+    activate ptr
+
+    ptr -> dataCon: getChangesForTable\n(changeTable, fromLsn, toLsn, maxRows)
+    activate dataCon
+
+    dataCon -> dataCon: getFromLsn()\nadjust to max(changeTable.startLsn, intervalFromLsn)
+    opt fromLsn null
+        dataCon -> db: SELECT sys.fn_cdc_get_min_lsn\n(captureInstance)
+        db --> dataCon: minLsn
+    end
+
+    alt DataQueryMode = FUNCTION
+        dataCon -> db: SELECT cols,\nTODATETIMEOFFSET(fn_cdc_map_lsn_to_time(start_lsn),...)\nFROM cdc.fn_cdc_get_all_changes_<capture>\n(fromLsn, toLsn, 'all update old')\nORDER BY start_lsn, seqval, operation
+    else DataQueryMode = DIRECT
+        dataCon -> db: SELECT cols FROM cdc.<changeTable>\nWHERE LSN range\nORDER BY start_lsn, command_id, seqval, operation
+    end
+
+    db --> dataCon: ResultSet (open cursor)
+    dataCon --> ptr: ResultSet
+    deactivate dataCon
+
+end
+
+note over src, ptr: Priority-queue scan:\nfind tableWithSmallestLsn\nacross all pointers\n(compare commit_lsn, seqval, operation)
+
+loop while rows remain across all change table pointers
+
+    src -> ptr: next() [advance smallest-LSN pointer]
+    activate ptr
+    ptr --> src: changeRow (commit_lsn, seqval, op, data)
+    deactivate ptr
+
+    alt changePosition < lastProcessedPositionOnStart
+        src -> src: skip row\n(replay dedup after restart)
+    else changeTable.stopLsn <= commitLsn
+        src -> src: skip row\n(older capture instance superseded)
+    else commitLsn >= schemaChangeCheckpoints.peek().startLsn
+        src -> src: migrateTable()
+        activate src
+        src -> metaCon: getTableSchemaFromTable\n(databaseName, newCaptureTable)
+        activate metaCon
+        metaCon -> db: DatabaseMetaData.getColumns()\n+ readPrimaryKeyOrUniqueIndexNames()
+        db --> metaCon: updatedSchema
+        metaCon --> src: TableSchema
+        deactivate metaCon
+        src -> dispatcher: dispatchSchemaChangeEvent\n(partition, offsetContext, tableId,\nSchemaChangeEmitter[ALTER])
+        activate dispatcher
+        dispatcher --> src: ok
+        deactivate dispatcher
+        deactivate src
+    else normal change row
+        opt operation == OP_UPDATE_BEFORE (op=1)
+            src -> ptr: next() [fetch paired UPDATE_AFTER row (op=2)]
+            activate ptr
+            ptr --> src: afterRow
+            deactivate ptr
+        end
+
+        src -> offset: setChangePosition\n(changePosition, eventCount)
+        activate offset
+        offset --> src: ok
+        deactivate offset
+
+        src -> dispatcher: dispatchDataChangeEvent\n(partition, tableId,\nSqlServerChangeRecordEmitter\n(partition, offsetContext, operation,\nbefore, after, clock, config))
+        activate dispatcher
+        dispatcher --> src: ok
+        deactivate dispatcher
+    end
+
+    opt fetchSize page boundary reached
+        ptr -> dataCon: getNextResultSet(lastPositionSeen)\n[paginated continuation]
+        activate dataCon
+        dataCon -> db: re-query with offset\nfrom lastPositionSeen
+        db --> dataCon: nextResultSet
+        dataCon --> ptr: ResultSet
+        deactivate dataCon
+    end
+
+end
+
+deactivate ptr
+
+== End of Iteration ==
+
+src -> dataCon: rollback()\n[terminate tx → allow CDC log cleanup]
+activate dataCon
+dataCon --> src: ok
+deactivate dataCon
+
+src -> src: streamingExecutionContext\n.setLastProcessedPosition\n(TxLogPosition.valueOf(toLsn))
+
+opt no change rows found
+    src -> dispatcher: dispatchHeartbeatEvent\n(partition, offsetContext)
+    activate dispatcher
+    dispatcher --> src: ok
+    deactivate dispatcher
+end
+
+deactivate src
+
+@enduml

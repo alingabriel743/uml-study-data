@@ -1,0 +1,188 @@
+{
+  "scope": "web_browser_automation",
+  "title": "Web Browser Automation Flow (TMWebDriver)",
+  "diagram_type": "activity",
+  "key_participants": [
+    "GenericAgentHandler",
+    "web_scan (ga.py)",
+    "web_execute_js (ga.py)",
+    "first_init_driver (ga.py)",
+    "TMWebDriver",
+    "Session",
+    "JSExecutor (inner WebSocket class)",
+    "simphtml.get_html",
+    "simphtml.execute_js_rich",
+    "Browser (WebSocket/HTTP)"
+  ],
+
+  "activity_flows": [
+    {
+      "flow": "Driver Initialization",
+      "steps": [
+        "START: instantiate TMWebDriver(host, port)",
+        "CHECK: socket.connect_ex(host, port+1) == 0 → is_remote?",
+        "[If remote] set self.remote = 'http://{host}:{port+1}/link'",
+        "[If local] start_ws_server() — spawns WebSocketServer(JSExecutor) as daemon thread",
+        "[If local] start_http_server() — spawns Bottle HTTP server as daemon thread",
+        "END: driver ready"
+      ]
+    },
+    {
+      "flow": "Session Registration (Browser Connects)",
+      "steps": [
+        "Browser tab sends WebSocket message with type='ready' or 'ext_ready'/'tabs_update'",
+        "JSExecutor.handle() parses JSON",
+        "[type=ready] extract sessionId, url, title → call driver._register_client(session_id, ws_client, session_info)",
+        "[type=ext_ready/tabs_update] iterate tabs list, mark missing sessions disconnected, register/update each tab",
+        "[type=ack] store acks[id]=True",
+        "[type=result/error] store results[id]",
+        "_register_client: IF new session → create Session(session_id, info, client) → add to self.sessions",
+        "_register_client: IF existing → session.reconnect(client, info)",
+        "Set self.latest_session_id; if no default → set self.default_session_id"
+      ]
+    },
+    {
+      "flow": "web_scan — Get Page Content",
+      "steps": [
+        "START: do_web_scan(args) → call web_scan(tabs_only, switch_tab_id, text_only)",
+        "CHECK: driver is None → call first_init_driver() (creates TMWebDriver, polls sessions up to 20s)",
+        "CHECK: get_all_sessions() empty → return error",
+        "Build tabs list (id, url truncated to 50 chars) from active sessions",
+        "[If switch_tab_id] set driver.default_session_id = switch_tab_id",
+        "[If tabs_only=True] return metadata with tabs list only",
+        "[Else] reload simphtml module; call simphtml.get_html(driver, cutlist=True, maxchars=35000)",
+        "  get_html: execute JS findMainList → detect repeating list selectors for cutlist",
+        "  get_html → get_main_block(driver) → execute JS optHTML() in browser → returns optimized DOM HTML",
+        "  optimize_html_for_tokens(html): BeautifulSoup cleanup (strip styles, shorten src/href, remove non-essential attrs)",
+        "  [cutlist enabled] truncate long repeated lists (keep first 3 items + '[FAKE ELEMENT] N more' hint)",
+        "  [if over maxchars] smart_truncate(soup, maxchars) — recursive proportional truncation",
+        "Return {status, metadata:{tabs_count, tabs, active_tab}, content: html_string}",
+        "END"
+      ]
+    },
+    {
+      "flow": "web_execute_js — Execute JavaScript & Monitor DOM",
+      "steps": [
+        "START: do_web_execute_js(args) → call web_execute_js(script, switch_tab_id, no_monitor)",
+        "CHECK: driver None → first_init_driver()",
+        "CHECK: no sessions → return error",
+        "[If switch_tab_id] set driver.default_session_id = switch_tab_id",
+        "Call simphtml.execute_js_rich(script, driver, no_monitor)",
+        "  [If not no_monitor] capture baseline: get_html(driver, extra_js=temp_monitor_js) — also starts DOM text monitor (window._tm)",
+        "  Record before_sids = driver.get_session_dict().keys()",
+        "  Call driver.execute_js(script) → returns response dict",
+        "  Extract result from response['data'] or response['result']",
+        "  Detect page reload: response.get('closed')==1 → reloaded=True",
+        "  sleep(1) to allow DOM to settle",
+        "  [If error] catch exception, extract error message",
+        "  Detect new tabs: compare after session dict vs before_sids",
+        "  [If not no_monitor and not reloaded] collect transient texts: get_temp_texts(driver) → JS stopStrMonitor()",
+        "  [If not reloaded and no newTabs] compute DOM diff: find_changed_elements(before_html, after_html)",
+        "    find_changed_elements: parse before/after with BeautifulSoup, build element signature maps, find new/changed elements",
+        "    Identify boundary elements (parent not in changed set), find largest top_change",
+        "  Assemble result: {status, js_return, tab_id, diff, transients, newTabs, reloaded?, error?}",
+        "[If save_to_file] write js_return to file, truncate in-memory copy",
+        "Return StepOutcome with JSON-formatted result",
+        "END"
+      ]
+    },
+    {
+      "flow": "TMWebDriver.execute_js — Send JS & Await Result",
+      "steps": [
+        "START: execute_js(code, timeout, session_id)",
+        "[If is_remote] POST to remote /link with cmd=execute_js → return response",
+        "Resolve session: if None or inactive, sleep(3) and retry",
+        "  [Still inactive] scan alive sessions, auto-switch to first alive session",
+        "  [None alive] raise ValueError",
+        "Determine session type: ws / ext_ws / http",
+        "Generate exec_id = uuid4()",
+        "Build payload: {id: exec_id, code: code} + tabId if ext_ws",
+        "[ws/ext_ws] session.ws_client.send_message(payload)",
+        "[http] session.http_queue.put(payload)",
+        "clean_sessions() — remove stale sessions (disconnected > 600s)",
+        "POLL LOOP (while exec_id not in self.results):",
+        "  sleep(0.2)",
+        "  [If ack received] reset start_time (ACK = script delivered)",
+        "  [ws/ext_ws] check session.is_active(); if went inactive → hasjump=True",
+        "  [hasjump + session active again] return reload message",
+        "  [timeout exceeded]:",
+        "    [hasjump] return 'reloaded and loading' message",
+        "    [acked, no result] return 'script running, no response' message",
+        "    [no ack] return 'script not delivered' message",
+        "    [http + acked] return 'delivered but no result' message",
+        "Pop result from self.results; clean self.acks",
+        "[result.success=False] raise Exception(result.data)",
+        "Build return: {data: result.data, newTabs?: [...]}",
+        "END"
+      ]
+    },
+    {
+      "flow": "HTTP Long-Poll Bridge (browser side)",
+      "steps": [
+        "Browser POSTs to /api/longpoll with {sessionId, url, title}",
+        "Server registers/updates Session with type='http', http_queue=Queue()",
+        "Server waits up to 5s polling http_queue.get(timeout=0.2)",
+        "[Message available] send ACK, return message to browser",
+        "[No message in 5s] return {id:'', ret:'next long-poll'}",
+        "Browser executes received script, POSTs result to /api/result",
+        "/api/result handler stores result/error in self.results[id]"
+      ]
+    }
+  ],
+
+  "key_classes": {
+    "TMWebDriver": {
+      "init_params": "host='127.0.0.1', port=18765",
+      "key_attrs": "sessions:dict, results:dict, acks:dict, default_session_id, latest_session_id, is_remote:bool",
+      "key_methods": ["start_ws_server()", "start_http_server()", "_register_client(sid,client,info)", "_unregister_client(client)", "execute_js(code,timeout,session_id)", "get_all_sessions()", "find_session(url_pattern)", "set_session(url_pattern)", "jump(url)", "newtab(url)", "_remote_cmd(cmd)", "clean_sessions()"]
+    },
+    "Session": {
+      "init_params": "session_id, info:dict, client",
+      "key_attrs": "id, info, connect_at, disconnect_at, type(ws/ext_ws/http), ws_client, http_queue",
+      "key_methods": ["url (property)", "is_active()", "reconnect(client,info)", "mark_disconnected()"]
+    },
+    "JSExecutor (WebSocket inner class)": {
+      "parent": "WebSocket",
+      "key_methods": ["handle() — parses incoming messages (ready/ext_ready/tabs_update/ack/result/error)", "connected()", "handle_close() — calls driver._unregister_client(self)"]
+    }
+  },
+
+  "key_relationships": [
+    "GenericAgentHandler uses web_scan and web_execute_js (ga.py module functions)",
+    "web_scan and web_execute_js depend on TMWebDriver (global driver singleton)",
+    "web_scan calls simphtml.get_html(driver)",
+    "web_execute_js calls simphtml.execute_js_rich(script, driver)",
+    "execute_js_rich calls driver.execute_js(script) and get_html(driver) for before/after diff",
+    "TMWebDriver contains sessions:Dict[str, Session]",
+    "TMWebDriver.start_ws_server creates inner JSExecutor class (WebSocket subclass)",
+    "JSExecutor calls driver._register_client / _unregister_client",
+    "Session stores either ws_client (WebSocket) or http_queue (Queue) based on type",
+    "HTTP bridge: browser → /api/longpoll (receive script) → /api/result (send result)"
+  ],
+
+  "branching_conditions": [
+    "is_remote: routes execute_js to remote HTTP relay vs local execution",
+    "session.type in [ws, ext_ws, http]: determines delivery mechanism (WebSocket vs Queue)",
+    "tabs_only: skip HTML retrieval in web_scan",
+    "no_monitor: skip DOM baseline capture and diff computation in execute_js_rich",
+    "response.get('closed')==1: session reloaded (page navigation)",
+    "exec_id in self.acks: ACK received, reset timeout clock",
+    "hasjump: session went inactive then returned (page reload mid-execution)",
+    "new_sids detected: new browser tabs opened during JS execution",
+    "cutlist: truncate long repeated list elements in HTML output"
+  ],
+
+  "session_types": {
+    "ws": "Direct WebSocket from page content script",
+    "ext_ws": "Browser extension WebSocket managing multiple tabs (sends tabId in payload)",
+    "http": "Long-poll HTTP fallback, script delivered via Queue, result via POST /api/result"
+  },
+
+  "important_notes": "TMWebDriver runs WS server on port 18765, HTTP server on port 18766. Remote mode proxies all calls via HTTP to port 18766. DOM monitoring uses window._tm (interval-based text snapshot). find_changed_elements uses element signature diffing (tag+attrs+text). simphtml.optimize_html_for_tokens strips non-semantic HTML attributes to reduce token count. smart_truncate recursively cuts largest DOM subtrees to fit within maxchars budget.",
+
+  "source_files_analyzed": [
+    "TMWebDriver.py",
+    "ga.py",
+    "simphtml.py"
+  ]
+}

@@ -1,0 +1,278 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+title Sandbox – Session & Runtime Management
+
+' ─────────────────────────────────────────────
+'  External / referenced types (lightweight)
+' ─────────────────────────────────────────────
+package "sandbox.external" <<Frame>> {
+    abstract class BaseSandboxSession {
+        +start() : None
+    }
+    abstract class BaseSandboxClient {
+    }
+    class SandboxRunConfig {
+    }
+    class RunState <<Generic[TContext]>> {
+    }
+    class SandboxAgent <<Generic[TContext]>> {
+    }
+    class Manifest {
+    }
+    interface EventSink {
+    }
+    class Capability {
+    }
+}
+
+' ─────────────────────────────────────────────
+'  sandbox.runtime_session_manager
+' ─────────────────────────────────────────────
+package "sandbox.runtime_session_manager" {
+
+    class SandboxRuntimeSessionManager <<Generic[TContext]>> {
+        -_sandbox_config : SandboxRunConfig | None
+        -_run_state : RunState[TContext] | None
+        -_resources_by_agent : dict[int, _SandboxSessionResources]
+        -_current_agent_id : int | None
+        -_acquired_agents : dict[int, SandboxAgent[TContext]]
+        -_resume_keys_by_agent_id : dict[int, str]
+        -_resume_source_key_by_agent_id : dict[int, str]
+        -_available_resumed_keys_by_name : dict[str, list[str]] | None
+        -_claimed_resumed_keys : set[str]
+        -_stable_resume_keys_by_agent_id : dict[int, str]
+        +enabled : bool
+        +current_session : BaseSandboxSession | None
+        --
+        +acquire_agent(agent) : None
+        +ensure_session(agent, capabilities, is_resumed_state) : BaseSandboxSession
+        +serialize_resume_state() : dict | None
+        +cleanup() : dict | None
+        -_create_resources(agent, capabilities, is_resumed_state) : _SandboxSessionResources
+        -_resolve_client() : BaseSandboxClient
+        -_resolve_concurrency_limits() : SandboxConcurrencyLimits
+        -_configure_session_materialization(session, concurrency_limits) : None
+        -_resolve_manifest(agent, resume_from_run_state) : Manifest | None
+        -_ensure_resume_key(agent) : str
+        -_serialize_sessions_by_agent(client) : dict[str, object]
+        -_release_agents() : None
+    }
+
+    note right of SandboxRuntimeSessionManager
+      Central lifecycle coordinator:
+      acquire → ensure_session → cleanup.
+      Sessions can be CREATED (fresh),
+      RESUMED (from RunState), or
+      INJECTED (pre-existing, not owned).
+    end note
+
+    class _SandboxSessionResources {
+        -_session : BaseSandboxSession
+        -_client : BaseSandboxClient | None
+        -_owns_session : bool
+        -_cleanup_lock : asyncio.Lock
+        -_cleaned : bool
+        -_started : bool
+        +session : BaseSandboxSession
+        +state : SandboxSessionState
+        --
+        +ensure_started() : None
+        +cleanup() : None
+    }
+
+    note bottom of _SandboxSessionResources
+      owns_session=False for injected sessions
+      — cleanup will NOT stop/delete them.
+    end note
+
+    class _SandboxConcurrencyGuard <<dataclass>> {
+        +lock : threading.Lock
+        +active_runs : int
+    }
+
+    note right of _SandboxConcurrencyGuard
+      Prevents the same SandboxAgent
+      from being used in two concurrent runs.
+    end note
+
+    class _LiveSessionManifestUpdate <<frozen dataclass>> {
+        +processed_manifest : Manifest | None
+        +entries_to_apply : list[tuple[Path, BaseEntry]]
+    }
+}
+
+' ─────────────────────────────────────────────
+'  sandbox.session.manager
+' ─────────────────────────────────────────────
+package "sandbox.session.manager" {
+
+    class Instrumentation {
+        -_sinks : list[EventSink]
+        +payload_policy : EventPayloadPolicy
+        +payload_policy_by_op : dict[OpName, EventPayloadPolicy]
+        -_tasks : set[asyncio.Task]
+        +sinks : list[EventSink]
+        --
+        +add_sink(sink : EventSink) : None
+        +emit(event : SandboxSessionEvent) : None
+        +flush() : None
+        -_policy_for(op, sink) : EventPayloadPolicy
+        -_apply_policy(event, policy) : SandboxSessionEvent
+        -_deliver(sink, event) : None
+        -_deliver_chained(sink, event) : None
+        -_handle_sink_error(sink, event, force_no_raise) : None
+    }
+
+    note right of Instrumentation
+      Three sink delivery modes:
+      sync (errors propagate),
+      async (fire-and-forget),
+      best_effort (errors swallowed).
+      ChainedSink enforces in-order delivery.
+    end note
+}
+
+' ─────────────────────────────────────────────
+'  sandbox.session.events
+' ─────────────────────────────────────────────
+package "sandbox.session.events" {
+
+    class EventPayloadPolicy {
+        +include_exec_output : bool = False
+        +max_stdout_chars : int = 8000
+        +max_stderr_chars : int = 8000
+        +include_write_len : bool = True
+    }
+
+    note bottom of EventPayloadPolicy
+      Policy merges: default → per-op override
+      → per-sink override (most specific wins).
+    end note
+
+    abstract class SandboxSessionEventBase {
+        +version : int = 1
+        +event_id : uuid.UUID
+        +ts : datetime
+        +session_id : uuid.UUID
+        +seq : int
+        +op : OpName
+        +phase : Literal['start','finish']
+        +span_id : str
+        +parent_span_id : str | None
+        +trace_id : str | None
+        +data : dict[str, object]
+    }
+
+    class SandboxSessionStartEvent {
+        +phase : Literal['start'] = 'start'
+    }
+
+    class SandboxSessionFinishEvent {
+        +phase : Literal['finish'] = 'finish'
+        +ok : bool
+        +duration_ms : float
+        +error_code : ErrorCode | None
+        +error_type : str | None
+        +error_message : str | None
+        +stdout : str | None
+        +stderr : str | None
+    }
+
+    note bottom of SandboxSessionFinishEvent
+      stdout_bytes / stderr_bytes excluded from
+      Pydantic serialization; decoded by
+      Instrumentation._apply_policy per policy.
+    end note
+}
+
+' ─────────────────────────────────────────────
+'  sandbox.workspace_paths
+' ─────────────────────────────────────────────
+package "sandbox.workspace_paths" {
+
+    class WorkspacePathPolicy {
+        -_root : Path
+        --
+        +absolute_workspace_path(path) : Path
+        +relative_path(path) : Path
+        +normalize_path_for_host_io(path) : Path
+        -_absolute_workspace_posix_path(path) : PurePosixPath
+        -_normalized_root() : PurePosixPath
+        -_invalid_path_error(path, cause) : InvalidManifestPathError
+    }
+
+    note right of WorkspacePathPolicy
+      Raises InvalidManifestPathError for
+      absolute paths outside root or
+      path-traversal escape attempts.
+    end note
+}
+
+' ─────────────────────────────────────────────
+'  sandbox.runtime_agent_preparation (utility)
+' ─────────────────────────────────────────────
+package "sandbox.runtime_agent_preparation" {
+
+    class AgentPreparationUtils <<utility>> {
+        {static} +prepare_sandbox_agent(agent, session, capabilities, run_config_model) : Agent[TContext]
+        {static} +build_sandbox_instructions(base_instructions, additional_instructions, capabilities, manifest) : Callable[..., Awaitable[str | None]]
+        {static} +prepare_sandbox_input(capabilities, current_input) : str | list
+        {static} +resolve_sandbox_model_name(agent, run_config_model) : str | None
+        {static} +clone_capabilities(capabilities) : list[Capability]
+    }
+
+    note right of AgentPreparationUtils
+      prepare_sandbox_agent clones the agent
+      (never mutates the original) and calls
+      set_public_agent() to maintain the
+      public/internal identity mapping.
+    end note
+}
+
+' ─────────────────────────────────────────────
+'  Relationships
+' ─────────────────────────────────────────────
+
+' Inheritance / extension
+SandboxSessionStartEvent  --|> SandboxSessionEventBase
+SandboxSessionFinishEvent --|> SandboxSessionEventBase
+
+' Composition / aggregation
+SandboxRuntimeSessionManager "1" *-- "0..*" _SandboxSessionResources : _resources_by_agent
+SandboxRuntimeSessionManager "1" *-- "0..*" _SandboxConcurrencyGuard : concurrency guard per agent
+_SandboxSessionResources "1" *-- "1" BaseSandboxSession : _session (owns lifecycle)
+Instrumentation "1" *-- "1" EventPayloadPolicy : payload_policy
+
+' Usage / dependency
+SandboxRuntimeSessionManager ..> SandboxRunConfig : reads config
+SandboxRuntimeSessionManager ..> RunState : resume state source
+SandboxRuntimeSessionManager ..> BaseSandboxClient : create / resume sessions
+SandboxRuntimeSessionManager ..> SandboxAgent : per-agent identity
+SandboxRuntimeSessionManager ..> Manifest : manifest processing
+SandboxRuntimeSessionManager ..> _LiveSessionManifestUpdate : produces
+_SandboxSessionResources ..> BaseSandboxClient : optional (delete on cleanup)
+Instrumentation "1" o-- "0..*" EventSink : _sinks
+Instrumentation ..> SandboxSessionStartEvent : emits
+Instrumentation ..> SandboxSessionFinishEvent : emits
+AgentPreparationUtils ..> SandboxAgent : clones
+AgentPreparationUtils ..> BaseSandboxSession : provides session context
+AgentPreparationUtils ..> Capability : merges tools
+AgentPreparationUtils ..> Manifest : builds instructions
+
+@enduml

@@ -1,0 +1,112 @@
+{
+  "scope": "qq_dingtalk_wecom_bot_message_flow",
+  "title": "QQ / DingTalk / WeCom Bot Message Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "QQPlatform (botpy)",
+    "QQBot (botpy.Client)",
+    "QQApp (AgentChatMixin)",
+    "DingTalkPlatform (dingtalk_stream)",
+    "_DingTalkHandler (CallbackHandler)",
+    "DingTalkApp (AgentChatMixin)",
+    "WeComPlatform (WSClient)",
+    "WeComApp (AgentChatMixin)",
+    "AgentChatMixin (chatapp_common)",
+    "GeneraticAgent"
+  ],
+
+  "interaction_flow": [
+    "=== QQ FLOW ===",
+    "QQPlatform → QQBot: on_group_at_message_create(GroupMessage) [group mention]",
+    "QQPlatform → QQBot: on_c2c_message_create(C2CMessage) [direct message]",
+    "QQBot → QQApp: on_message(data, is_group=True/False)",
+    "QQApp: dedup check via PROCESSED_IDS deque(maxlen=1000)",
+    "QQApp: extract content, user_id, chat_id (group_openid or user_openid)",
+    "QQApp: public_access(ALLOWED) guard check",
+    "QQApp [if cmd]: → AgentChatMixin.handle_command(chat_id, content, msg_id, is_group)",
+    "QQApp [if msg]: asyncio.create_task → AgentChatMixin.run_agent(chat_id, content, msg_id, is_group)",
+    "AgentChatMixin.run_agent → QQApp.send_text(chat_id, '思考中...')",
+    "QQApp.send_text → botpy.api.post_group_message / post_c2c_message (split_text chunks)",
+    "AgentChatMixin.run_agent → GeneraticAgent.put_task(text, source='qq') → returns deque dq",
+    "AgentChatMixin.run_agent: poll dq via asyncio.to_thread(dq.get, True, 3)",
+    "AgentChatMixin.run_agent [on done]: → send_done(chat_id, result) → QQApp.send_text(response)",
+
+    "=== DINGTALK FLOW ===",
+    "DingTalkPlatform → _DingTalkHandler.process(message) [stream callback on ChatbotMessage.TOPIC]",
+    "_DingTalkHandler.process: ChatbotMessage.from_dict(message.data)",
+    "_DingTalkHandler.process: extract text (text.content or extensions.content.recognition)",
+    "_DingTalkHandler.process: extract sender_id (sender_staff_id or sender_id), sender_name (sender_nick)",
+    "_DingTalkHandler.process: extract conversationType, conversationId/openConversationId",
+    "_DingTalkHandler → DingTalkApp.on_message(text, sender_id, sender_name, conversation_type, conversation_id)",
+    "_DingTalkHandler: return AckMessage.STATUS_OK, 'OK'",
+    "DingTalkApp.on_message: public_access(ALLOWED) guard",
+    "DingTalkApp.on_message: chat_id = 'group:{conversationId}' if group else sender_id",
+    "DingTalkApp [if cmd]: → handle_command(chat_id, content)",
+    "DingTalkApp [if msg]: asyncio.create_task → run_agent(chat_id, content) [tracked in background_tasks set]",
+    "AgentChatMixin.run_agent → DingTalkApp.send_text(chat_id, '思考中...')",
+    "DingTalkApp.send_text → _send_batch_message(chat_id, 'sampleMarkdown', {text, title})",
+    "DingTalkApp._send_batch_message → _get_access_token() [POST oauth2/accessToken, cached with expiry]",
+    "DingTalkApp._send_batch_message → POST groupMessages/send (group) or oToMessages/batchSend (1:1)",
+    "AgentChatMixin.run_agent → GeneraticAgent.put_task(text, source='dingtalk') → dq",
+    "AgentChatMixin.run_agent [on done]: → send_done → DingTalkApp.send_text(response)",
+
+    "=== WECOM FLOW ===",
+    "WeComPlatform → WeComApp.on_text(frame) [WSClient 'message.text' event]",
+    "WeComApp.on_text: extract body from frame.body or frame dict",
+    "WeComApp.on_text: dedup via PROCESSED_IDS (msgid or chatid+sendertime key)",
+    "WeComApp.on_text: extract sender_id (from.userid), chat_id (chatid), content (text.content)",
+    "WeComApp.on_text: public_access(ALLOWED) guard",
+    "WeComApp.on_text: store frame in self.chat_frames[chat_id]",
+    "WeComApp [if cmd]: → handle_command(chat_id, content)",
+    "WeComApp [if msg]: asyncio.create_task → run_agent(chat_id, content)",
+    "AgentChatMixin.run_agent → WeComApp.send_text(chat_id, '思考中...')",
+    "WeComApp.send_text → WSClient.reply_stream(frame, req_id, part, finish=True) [split chunks]",
+    "AgentChatMixin.run_agent → GeneraticAgent.put_task(text, source='wecom') → dq",
+    "AgentChatMixin.run_agent [on done]: → send_done → WeComApp.send_text(response)",
+
+    "=== SHARED run_agent LOOP ===",
+    "run_agent: poll dq every 3s via asyncio.to_thread",
+    "run_agent [Q.Empty + is_running + ping_interval exceeded]: send '⏳ 还在处理中...' ping",
+    "run_agent [item has 'done']: send_done(chat_id, item['done']) → break",
+    "run_agent [state running=False]: send '⏹️ 已停止'",
+    "run_agent [exception]: send '❌ 错误: {e}'"
+  ],
+
+  "key_relationships": [
+    "QQApp extends AgentChatMixin (label='QQ', source='qq', split_limit=1500)",
+    "DingTalkApp extends AgentChatMixin (label='DingTalk', source='dingtalk', split_limit=1800)",
+    "WeComApp extends AgentChatMixin (label='WeCom', source='wecom', split_limit=1200)",
+    "QQBot (inner class) wraps QQApp via closure — delegates all events to app.on_message()",
+    "_DingTalkHandler extends CallbackHandler — holds DingTalkApp ref, calls app.on_message()",
+    "AgentChatMixin holds GeneraticAgent ref (shared singleton per process) and USER_TASKS dict",
+    "QQBot uses _build_intents() to configure botpy.Intents (public_messages, direct_message, group_at_message etc.)",
+    "DingTalkApp.start() registers _DingTalkHandler on ChatbotMessage.TOPIC via DingTalkStreamClient",
+    "WeComApp.start() registers event handlers on WSClient via .on(event, handler)",
+    "GeneraticAgent.put_task() returns a deque (dq) used as async result queue",
+    "GeneraticAgent.run() is launched in daemon thread; agent is shared across all chat_ids"
+  ],
+
+  "auth_and_dedup": [
+    "All three apps use ALLOWED set (from mykeys) + public_access() for authorization",
+    "QQ & WeCom: PROCESSED_IDS = deque(maxlen=1000) for msg dedup by msg_id",
+    "DingTalk: no explicit dedup (stream guarantees delivery once)",
+    "QQ: APP_ID/APP_SECRET from mykeys.qq_app_id/qq_app_secret",
+    "DingTalk: CLIENT_ID/CLIENT_SECRET; OAuth2 access token cached until expiry-60s",
+    "WeCom: BOT_ID/SECRET; WSClient handles reconnect (max_reconnect_attempts=-1, heartbeat=30s)"
+  ],
+
+  "send_text_mechanics": [
+    "QQ: split_text(content, 1500) → post_group_message(group_openid) or post_c2c_message(openid) with msg_seq (thread-safe counter)",
+    "DingTalk: split_text(content, 1800) → _send_batch_message → sampleMarkdown REST API (group or 1:1)",
+    "WeCom: split_text(content, 1200) → WSClient.reply_stream(frame, req_id, part, finish=True)"
+  ],
+
+  "important_notes": "All three frontends follow identical pattern: platform SDK event → on_message/on_text → auth check → dedup → command or agent task → run_agent polls GeneraticAgent deque → send_text response. QQBot is dynamically created inner class (_make_bot_class) so it captures QQApp instance. DingTalk adds OAuth2 token management. WeCom stores frame per chat_id for reply context. All agents run in same process with shared GeneraticAgent singleton on daemon thread.",
+
+  "source_files_analyzed": [
+    "frontends/qqapp.py",
+    "frontends/dingtalkapp.py",
+    "frontends/wecomapp.py",
+    "frontends/chatapp_common.py (run_agent, handle_command methods)"
+  ]
+}

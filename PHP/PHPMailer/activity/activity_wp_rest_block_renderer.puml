@@ -1,0 +1,223 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #212529
+    EndColor #212529
+    BarColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+skinparam note {
+    BackgroundColor #D1ECF1
+    BorderColor #0C5460
+    FontColor #0C5460
+}
+
+title WordPress REST Block Renderer Flow\n<size:11><i>WP_REST_Block_Renderer_Controller — /wp/v2/block-renderer/{name}</i></size>
+
+|#E8F4FD| REST Client |
+|#EAF4EA| WP_REST_Block_Renderer_Controller |
+|#FFF8E1| WP_Block_Type_Registry |
+|#F3E8FF| WordPress Core Functions |
+
+|WP_REST_Block_Renderer_Controller|
+
+' ─── ROUTE REGISTRATION PHASE ───────────────────────────────────────────────
+
+start
+
+:register_routes();
+note right
+  Called during REST API
+  initialization (rest_api_init)
+end note
+
+|WP_Block_Type_Registry|
+
+:get_all_registered() → block types list;
+
+|WP_REST_Block_Renderer_Controller|
+
+:Iterate over each registered block type;
+
+repeat
+    if (block_type->is_dynamic()?\n<i>has render_callback?</i>) then (yes — dynamic)
+        :register_rest_route(\n  'wp/v2',\n  '/block-renderer/{name}'\n);
+        note right
+          HTTP: GET (READABLE)
+          Args: name, context (default='view'),
+          attributes (object), post_id (integer)
+          callback → get_item()
+          permission_callback → get_item_permissions_check()
+          schema → get_public_item_schema()
+        end note
+    else (no — static block)
+        :Skip — no REST route registered;
+    endif
+repeat while (more block types?) is (yes)
+-> (no more);
+
+' ─── INCOMING REQUEST PHASE ─────────────────────────────────────────────────
+
+|REST Client|
+
+:HTTP GET /wp/v2/block-renderer/{name}\n[?post_id=N&attributes={...}];
+
+|WP_REST_Block_Renderer_Controller|
+
+' ─── PERMISSION CHECK PHASE ─────────────────────────────────────────────────
+
+:get_item_permissions_check($request);
+note right
+  Runs BEFORE get_item()
+end note
+
+:Extract post_id = intval(request['post_id'])\n(default: 0);
+
+if (post_id > 0?) then (yes — post context)
+
+    |WordPress Core Functions|
+    :get_post(post_id);
+
+    |WP_REST_Block_Renderer_Controller|
+    if (post found?) then (no)
+        :Return WP_Error(\n  'block_cannot_read',\n  HTTP 404\n);
+        |REST Client|
+        :Receive 404 Not Found;
+        stop
+    else (yes)
+        |WordPress Core Functions|
+        :current_user_can('edit_post', post_id);
+
+        |WP_REST_Block_Renderer_Controller|
+        if (user can edit_post?) then (no)
+            :Return WP_Error(\n  'block_cannot_read',\n  HTTP 401/403\n);
+            |REST Client|
+            :Receive 401/403 Unauthorized;
+            stop
+        else (yes)
+            :Permission granted — continue;
+        endif
+    endif
+
+else (no — post_id == 0, general context)
+
+    |WordPress Core Functions|
+    :current_user_can('edit_posts');
+
+    |WP_REST_Block_Renderer_Controller|
+    if (user can edit_posts?) then (no)
+        :Return WP_Error(\n  'block_cannot_read',\n  HTTP 401/403\n);
+        |REST Client|
+        :Receive 401/403 Unauthorized;
+        stop
+    else (yes)
+        :Permission granted — continue;
+    endif
+
+endif
+
+:Return true (access granted);
+
+' ─── ITEM RETRIEVAL & RENDER PHASE ──────────────────────────────────────────
+
+:get_item($request)\n<i>(permission already verified)</i>;
+
+:Extract post_id = intval(request['post_id'])\n(default: 0);
+
+if (post_id > 0?) then (yes)
+
+    |WordPress Core Functions|
+    :get_post(post_id)\nsetup_postdata($post)\n<i>— sets global $post context</i>;
+    note right
+      Enables blocks that call
+      get_the_ID(), get_the_title(), etc.
+    end note
+
+    |WP_REST_Block_Renderer_Controller|
+
+endif
+
+|WP_Block_Type_Registry|
+
+:get_registered(request['name']);
+
+|WP_REST_Block_Renderer_Controller|
+
+if (block type found?) then (no — null)
+    :Return WP_Error(\n  'block_invalid',\n  'Invalid block.',\n  HTTP 404\n);
+    |REST Client|
+    :Receive 404 Block Not Found;
+    stop
+else (yes — registered)
+    :Extract attributes\nfrom $request->get_param('attributes');
+
+    :Construct block array:\n{ blockName, attrs,\n  innerHTML: '',\n  innerContent: [] };
+
+    |WordPress Core Functions|
+    :render_block($block)\n<i>— fires all 'render_block' filters\n  then invokes render_callback</i>;
+
+    |WP_REST_Block_Renderer_Controller|
+    :Wrap result:\n$data = ['rendered' => rendered_html];
+
+    :rest_ensure_response($data)\n→ WP_REST_Response;
+
+    |REST Client|
+    :Receive 200 OK\n{ "rendered": "<html>...</html>" };
+    note right
+      Context restricted to 'edit' only.
+      Schema: rendered-block / type:object /
+      rendered:string (required)
+    end note
+
+endif
+
+' ─── SCHEMA PHASE ───────────────────────────────────────────────────────────
+
+|REST Client|
+
+:OPTIONS /wp/v2/block-renderer/{name}\n<i>(schema request)</i>;
+
+|WP_REST_Block_Renderer_Controller|
+
+:get_item_schema();
+
+if ($this->schema already cached?) then (yes)
+    :Return cached $this->schema immediately;
+else (no — first call)
+    :Build schema array:\n{\n  '$schema': 'http://json-schema.org/schema#',\n  title: 'rendered-block',\n  type: 'object',\n  properties: {\n    rendered: { type:'string',\n    required:true, context:['edit'] }\n  }\n};
+    :Cache → $this->schema;
+    :Return $this->schema;
+endif
+
+|REST Client|
+
+:Receive JSON Schema response;
+
+stop
+
+@enduml

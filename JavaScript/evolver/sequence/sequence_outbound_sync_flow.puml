@@ -1,0 +1,158 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #DEE2E6
+    GroupHeaderFontColor #212529
+    DividerBackgroundColor #CED4DA
+    DividerBorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF3CD
+    BorderColor #856404
+    FontColor #212529
+}
+
+title Outbound Message Sync Flow
+
+participant "Caller\n(EvoMapProxy)" as Caller
+participant "SyncEngine" as Engine
+participant "OutboundSync" as Outbound
+participant "MailboxStore" as Store
+participant "Hub (HTTP)" as Hub
+
+== Trigger ==
+
+alt start()
+    Caller -> Engine: start()
+    activate Engine
+    Engine -> Engine: _running = true
+    Engine -> Engine: _scheduleOutbound(500ms)
+else notifyNewOutbound()
+    Caller -> Engine: notifyNewOutbound()
+    activate Engine
+    note right of Engine
+        Only fires if !_outPending
+        Clears existing timer first
+    end note
+    Engine -> Engine: _lastActivity = Date.now()
+    Engine -> Engine: _scheduleOutbound(100ms)
+end
+
+== Outbound Flush Loop ==
+
+Engine -> Engine: setTimeout fires → _outPending = true
+Engine -> Outbound: flush(channel='evomap-hub')
+activate Outbound
+
+Outbound -> Store: pollOutbound({ channel, limit: 50 })
+activate Store
+Store --> Outbound: pending[] (sorted by priority, created_at)
+deactivate Store
+
+alt pending.length === 0
+    Outbound --> Engine: { sent: 0 }
+    note right of Outbound: Early return — nothing to do
+else pending.length > 0
+    Outbound -> Store: getState('node_id')
+    activate Store
+    Store --> Outbound: senderId
+    deactivate Store
+
+    Outbound -> Hub: POST /a2a/mailbox/outbound\n{ sender_id, proxy_protocol_version: '0.1.0', messages[] }\n[30s timeout]
+    activate Hub
+    Hub --> Outbound: 200 { results: [{ id, status, response?, error? }] }
+    deactivate Hub
+
+    loop for each result in results
+        alt status === 'accepted' | 'ok'
+            Outbound -> Outbound: updates.push({ id, status: 'synced' })
+        else status === 'failed' | 'rejected'
+            alt retry_count < MAX_RETRIES (10)
+                Outbound -> Store: incrementRetry(id, error)
+                activate Store
+                Store --> Outbound: ok
+                deactivate Store
+            else retry_count >= MAX_RETRIES
+                Outbound -> Outbound: updates.push({ id, status: 'failed' })
+            end
+        end
+
+        alt result.response present
+            Outbound -> Outbound: inboundMessages.push\n({ type, payload, refId, channel })
+        end
+    end
+
+    Outbound -> Store: updateStatusBatch(updates)
+    activate Store
+    note right of Store: Marks messages synced/failed\nEvicts from in-memory index
+    Store --> Outbound: ok
+    deactivate Store
+
+    opt inboundMessages.length > 0
+        Outbound -> Store: writeInboundBatch(inboundMessages)
+        activate Store
+        Store --> Outbound: string[] (new message ids)
+        deactivate Store
+    end
+
+    Outbound -> Store: setState('last_sync_at', ISO-timestamp)
+    activate Store
+    Store --> Outbound: ok (persisted to state.json)
+    deactivate Store
+
+    Outbound --> Engine: { sent, synced, responses }
+end
+
+deactivate Outbound
+
+== Post-Flush Rescheduling ==
+
+alt AuthError thrown (HTTP 401/403)
+    Engine -> Engine: _handleAuthError('outbound')
+    Engine -> Caller: onAuthError() callback
+    note right of Engine: Loop halts on auth failure
+else flush completed normally
+    Engine -> Engine: if result.sent > 0 → _lastActivity = Date.now()
+
+    Engine -> Store: countPending({ direction: 'outbound' })
+    activate Store
+    Store --> Engine: pendingCount
+    deactivate Store
+
+    alt pendingCount > 0
+        Engine -> Engine: _scheduleOutbound(1_000ms)
+        note right of Engine: More work to do — flush again soon
+    else pendingCount === 0
+        Engine -> Engine: _scheduleOutbound(5_000ms)
+        note right of Engine: Idle — use DEFAULT_OUTBOUND_INTERVAL
+    end
+end
+
+Engine -> Engine: _outPending = false
+deactivate Engine
+
+@enduml

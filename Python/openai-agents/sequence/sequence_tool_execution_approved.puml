@@ -1,0 +1,288 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F0AD4E
+}
+
+title Tool Execution (Approved Tools)\nHITL Resume Path — Dispatching & Executing Approved Tool Calls
+
+participant "run_loop" as RunLoop
+participant "execute_approved_tools" as ExecApproved
+participant "RunContextWrapper" as CtxWrapper
+participant "_resolve_tool_run" as ResolveRun
+participant "resolve_approval_\nrejection_message" as ResolveReject
+participant "execute_function_\ntool_calls" as ExecFnTools
+participant "_FunctionTool\nBatchExecutor" as BatchExec
+participant "_run_single_tool\n[asyncio.Task]" as RunSingle
+participant "_maybe_execute_\ntool_approval" as MaybeApproval
+participant "_execute_single_\ntool_body" as ExecBody
+participant "_invoke_tool_and_\nrun_post_invoke" as InvokePost
+participant "invoke_function_tool\n(FunctionTool)" as InvokeFn
+participant "RunHooks /\nAgentHooks" as Hooks
+participant "execute_custom_\ntool_calls" as ExecCustom
+participant "CustomToolAction" as CustomAction
+
+note over RunLoop, ExecApproved
+  **HITL Resume:** Called after RunState.approve() to
+  re-execute previously interrupted tool calls.
+  Handles FunctionTool and CustomTool paths.
+end note
+
+== Phase 1: Resolve Approved Interruptions ==
+
+RunLoop -> ExecApproved : execute_approved_tools(\n  agent, interruptions,\n  context_wrapper, generated_items,\n  run_config, hooks, all_tools)
+activate ExecApproved
+
+note right of ExecApproved
+  Builds tool_map from all_tools
+  (FunctionTool + named non-FunctionTool)
+end note
+
+loop for each interruption in interruptions
+    ExecApproved -> ResolveRun : _resolve_tool_run(interruption)
+    activate ResolveRun
+
+    ResolveRun -> CtxWrapper : get_approval_status(\n  tool_name, call_id,\n  tool_namespace, tool_lookup_key)
+    activate CtxWrapper
+    CtxWrapper --> ResolveRun : approval_status (True | False | None)
+    deactivate CtxWrapper
+
+    alt approval_status is False (Rejected)
+        ResolveRun -> ResolveReject : resolve_approval_rejection_message(\n  interruption, run_config)
+        activate ResolveReject
+        note right of ResolveReject
+          Priority: per-call rejection_message
+          → run_config.tool_error_formatter
+          → default REJECTION_MESSAGE
+        end note
+        ResolveReject --> ResolveRun : rejection_message
+        deactivate ResolveReject
+        ResolveRun -> ExecApproved : _append_error(rejection_message)\n→ return None
+    else approval_status is None or tool not found
+        ResolveRun -> ExecApproved : _append_error('unclear')\n→ return None
+    else approval_status is True (Approved)
+        ResolveRun --> ExecApproved : (tool_call, FunctionTool,\n tool_name, call_id)
+    end
+    deactivate ResolveRun
+end
+
+== Phase 2: Execute Approved FunctionTool Calls (Parallel) ==
+
+ExecApproved -> ExecFnTools : execute_function_tool_calls(\n  bindings, tool_runs, hooks,\n  context_wrapper, config)
+activate ExecFnTools
+
+ExecFnTools -> BatchExec : _FunctionToolBatchExecutor.execute()
+activate BatchExec
+
+note right of BatchExec
+  resolve_enabled_function_tools()
+  determines the active tool set for
+  the execution agent.
+end note
+
+loop for each ToolRunFunction (parallel asyncio.Tasks)
+    BatchExec -> RunSingle : asyncio.create_task(\n  _run_single_tool(tool_run, order, ...))
+    activate RunSingle
+
+    RunSingle -> RunSingle : normalize_tool_call_for_function_tool(\n  tool_call, func_tool)
+    RunSingle -> CtxWrapper : ToolContext.from_agent_context(\n  context_wrapper, call_id, ...)
+    activate CtxWrapper
+    CtxWrapper --> RunSingle : tool_context
+    deactivate CtxWrapper
+
+    RunSingle -> MaybeApproval : _maybe_execute_tool_approval(\n  func_tool, tool_call, raw_tool_call, span)
+    activate MaybeApproval
+
+    MaybeApproval -> MaybeApproval : function_needs_approval(\n  func_tool, context_wrapper, tool_call)
+
+    alt needs_approval → check stored status
+        MaybeApproval -> CtxWrapper : get_approval_status(tool_name, call_id, ...)
+        activate CtxWrapper
+        CtxWrapper --> MaybeApproval : approval_status
+        deactivate CtxWrapper
+
+        alt approval_status is None → interrupt
+            MaybeApproval --> RunSingle : FunctionToolResult(\n  run_item=ToolApprovalItem)
+        else approval_status is False → rejected
+            MaybeApproval -> ResolveReject : resolve_approval_rejection_message(...)
+            activate ResolveReject
+            ResolveReject --> MaybeApproval : rejection_message
+            deactivate ResolveReject
+            MaybeApproval --> RunSingle : FunctionToolResult(rejection)
+        else approval_status is True → approved
+            MaybeApproval --> RunSingle : None (proceed to execution)
+        end
+    else no approval required
+        MaybeApproval --> RunSingle : None (proceed to execution)
+    end
+    deactivate MaybeApproval
+
+    alt approval_result is None (approved / not required)
+        RunSingle -> ExecBody : _execute_single_tool_body(\n  func_tool, tool_context, agent,\n  tool_call, span, config, hooks)
+        activate ExecBody
+
+        ExecBody -> ExecBody : _execute_tool_input_guardrails(\n  func_tool, tool_context, agent, ...)
+
+        alt input guardrail rejects
+            ExecBody --> RunSingle : rejection_message
+        else guardrail passes
+            ExecBody -> Hooks : asyncio.gather(\n  hooks.on_tool_start(...),\n  agent_hooks.on_tool_start(...))
+            activate Hooks
+            Hooks --> ExecBody : (started)
+            deactivate Hooks
+
+            ExecBody -> InvokePost : asyncio.create_task(\n  _invoke_tool_and_run_post_invoke(\n    func_tool, tool_context,\n    arguments, span, ...))
+            activate InvokePost
+
+            note right of InvokePost
+              asyncio.shield protects the
+              invoke task from cancellation
+              in post-invoke phase.
+            end note
+
+            InvokePost -> InvokeFn : invoke_function_tool(\n  function_tool, context, arguments)
+            activate InvokeFn
+            InvokeFn --> InvokePost : raw_result
+            deactivate InvokeFn
+
+            InvokePost -> InvokePost : set task_state.in_post_invoke_phase = True
+
+            InvokePost -> InvokePost : _execute_tool_output_guardrails(\n  func_tool, tool_context, agent,\n  real_result, ...)
+
+            InvokePost -> Hooks : asyncio.gather(\n  hooks.on_tool_end(...),\n  agent_hooks.on_tool_end(...))
+            activate Hooks
+            Hooks --> InvokePost : (ended)
+            deactivate Hooks
+
+            InvokePost --> ExecBody : final_result
+            deactivate InvokePost
+
+            ExecBody --> RunSingle : FunctionToolResult(\n  tool, output, run_item)
+        end
+        deactivate ExecBody
+    end
+
+    RunSingle --> BatchExec : FunctionToolResult
+    deactivate RunSingle
+end
+
+BatchExec -> BatchExec : _drain_pending_tasks()\n[asyncio.wait FIRST_COMPLETED loop]
+
+note right of BatchExec
+  isolate_parallel_failures=True (default
+  when >1 call) cancels sibling tasks on
+  the first failure.
+end note
+
+BatchExec -> BatchExec : _build_function_tool_results()\n[consume nested agent run results\n& interruptions per tool_run]
+
+BatchExec --> ExecFnTools : (FunctionToolResults,\n ToolInputGuardrailResults,\n ToolOutputGuardrailResults)
+deactivate BatchExec
+
+ExecFnTools --> ExecApproved : list[FunctionToolResult],\nlist[GuardrailResults]
+deactivate ExecFnTools
+
+ExecApproved -> ExecApproved : append FunctionToolResult.run_item\nto generated_items
+
+== Phase 3: Execute Approved CustomTool Calls (Serial) ==
+
+ExecApproved -> ExecCustom : execute_custom_tool_calls(\n  public_agent, calls,\n  context_wrapper, hooks, config)
+activate ExecCustom
+
+loop for each ToolRunCustom (serial)
+    ExecCustom -> CustomAction : CustomToolAction.execute(\n  agent, call, hooks,\n  context_wrapper, config)
+    activate CustomAction
+
+    CustomAction -> CustomAction : evaluate_needs_approval_setting(\n  custom_tool.runtime_needs_approval(), ...)
+
+    alt needs_approval
+        CustomAction -> CustomAction : resolve_approval_status(\n  tool_name, call_id, ...,\n  on_approval=custom_tool.runtime_on_approval())
+        activate CustomAction
+
+        note right of CustomAction
+          resolve_approval_status checks
+          context_wrapper; if status is None
+          and on_approval callback exists,
+          calls on_approval → approve_tool /
+          reject_tool on context_wrapper.
+        end note
+
+        deactivate CustomAction
+
+        alt rejected (False)
+            CustomAction -> ResolveReject : resolve_approval_rejection_message(...)
+            activate ResolveReject
+            ResolveReject --> CustomAction : rejection_message
+            deactivate ResolveReject
+            CustomAction --> ExecCustom : rejection ToolCallOutputItem
+        else status not True → interrupt
+            CustomAction --> ExecCustom : ToolApprovalItem
+        else approved (True)
+            CustomAction -> Hooks : asyncio.gather(\n  hooks.on_tool_start(...),\n  agent_hooks.on_tool_start(...))
+            activate Hooks
+            Hooks --> CustomAction : (started)
+            deactivate Hooks
+
+            CustomAction -> CustomAction : custom_tool.on_invoke_tool(\n  tool_context, tool_input)
+
+            CustomAction -> Hooks : asyncio.gather(\n  hooks.on_tool_end(...),\n  agent_hooks.on_tool_end(...))
+            activate Hooks
+            Hooks --> CustomAction : (ended)
+            deactivate Hooks
+
+            CustomAction --> ExecCustom : ToolCallOutputItem\n(type='custom_tool_call_output')
+        end
+    else no approval required
+        CustomAction -> Hooks : hooks.on_tool_start(...)
+        activate Hooks
+        Hooks --> CustomAction : (started)
+        deactivate Hooks
+        CustomAction -> CustomAction : custom_tool.on_invoke_tool(\n  tool_context, tool_input)
+        CustomAction -> Hooks : hooks.on_tool_end(...)
+        activate Hooks
+        Hooks --> CustomAction : (ended)
+        deactivate Hooks
+        CustomAction --> ExecCustom : ToolCallOutputItem
+    end
+    deactivate CustomAction
+end
+
+ExecCustom --> ExecApproved : list[RunItem]
+deactivate ExecCustom
+
+ExecApproved --> RunLoop : generated_items\n(updated with tool outputs)
+deactivate ExecApproved
+
+note over RunLoop, Hooks
+  **Approval States:**
+  • None  → ToolApprovalItem surfaced as interruption (run pauses again)
+  • True  → Proceed with tool execution
+  • False → Rejection message returned to model as tool output
+end note
+
+@enduml

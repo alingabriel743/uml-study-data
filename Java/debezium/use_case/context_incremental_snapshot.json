@@ -1,0 +1,206 @@
+{
+  "scope": "incremental_snapshot",
+  "title": "Incremental Snapshot",
+  "diagram_type": "use_case",
+  "description": "Operator initiates, pauses, resumes, and monitors incremental snapshots",
+
+  "actors": [
+    {
+      "name": "Operator",
+      "type": "primary",
+      "description": "External actor sending signals to control snapshot lifecycle"
+    },
+    {
+      "name": "NotificationService",
+      "type": "system",
+      "description": "Dispatches status notifications to configured channels (Log, JMX, Sink/Kafka)"
+    },
+    {
+      "name": "SnapshotterService",
+      "type": "system",
+      "description": "Registry holding Snapshotter SPI + SnapshotQuery + SnapshotLock; determines if/how snapshots run"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Initiate Incremental Snapshot",
+      "actor": "Operator",
+      "trigger": "Signal: execute-snapshot (ExecuteSnapshot action, NAME='execute-snapshot')",
+      "primary_flow": [
+        "Operator sends execute-snapshot signal with data collection list",
+        "ExecuteSnapshot.arrived() → dispatcher.getIncrementalSnapshotChangeEventSource().addDataCollectionNamesToSnapshot(signalPayload, snapshotConfiguration)",
+        "AbstractIncrementalSnapshotChangeEventSource.addDataCollectionNamesToSnapshot() expands collection IDs",
+        "context.addDataCollectionNamesToSnapshot(correlationId, expandedIds, additionalConditions, surrogateKey)",
+        "notificationService.incrementalSnapshotNotificationService().notifyStarted(context, partition, offsetContext)",
+        "Snapshot reads first chunk via readChunk()"
+      ],
+      "postcondition": "Snapshot is STARTED; IN_PROGRESS notifications emitted per chunk"
+    },
+    {
+      "id": "UC2",
+      "name": "Pause Incremental Snapshot",
+      "actor": "Operator",
+      "trigger": "Signal: pause-snapshot (PauseIncrementalSnapshot action, NAME='pause-snapshot')",
+      "primary_flow": [
+        "Operator sends pause-snapshot signal",
+        "PauseIncrementalSnapshot.arrived() → dispatcher.getIncrementalSnapshotChangeEventSource().pauseSnapshot(partition, offsetContext)",
+        "AbstractIncrementalSnapshotChangeEventSource.pauseSnapshot(): guard checks snapshotRunning && !isSnapshotPaused",
+        "context.pauseSnapshot()",
+        "progressListener.snapshotPaused(partition)",
+        "notificationService.incrementalSnapshotNotificationService().notifyPaused(context, partition, offsetContext)"
+      ],
+      "postcondition": "Snapshot status is PAUSED; chunk reading stops"
+    },
+    {
+      "id": "UC3",
+      "name": "Resume Incremental Snapshot",
+      "actor": "Operator",
+      "trigger": "Signal: resume-snapshot (ResumeIncrementalSnapshot action, NAME='resume-snapshot')",
+      "primary_flow": [
+        "Operator sends resume-snapshot signal",
+        "ResumeIncrementalSnapshot.arrived() → dispatcher.getIncrementalSnapshotChangeEventSource().resumeSnapshot(partition, offsetContext)",
+        "AbstractIncrementalSnapshotChangeEventSource.resumeSnapshot(): guard checks snapshotRunning && isSnapshotPaused",
+        "context.resumeSnapshot()",
+        "progressListener.snapshotResumed(partition)",
+        "notificationService.incrementalSnapshotNotificationService().notifyResumed(context, partition, offsetContext)",
+        "readChunk(partition, offsetContext) — resumes reading"
+      ],
+      "postcondition": "Snapshot status is RESUMED; chunk reading continues"
+    },
+    {
+      "id": "UC4",
+      "name": "Stop Incremental Snapshot",
+      "actor": "Operator",
+      "trigger": "Signal: stop-snapshot (StopSnapshot action)",
+      "primary_flow": [
+        "Operator sends stop-snapshot signal with optional data collection IDs",
+        "StopSnapshot.arrived() → dispatcher.getIncrementalSnapshotChangeEventSource().requestStopSnapshot(partition, offsetContext, additionalData, dataCollectionIds)",
+        "AbstractIncrementalSnapshotChangeEventSource.requestStopSnapshot(): context.requestSnapshotStop(dataCollectionIds)",
+        "On next readChunk() call, checkAndProcessStopFlag() fires notifyAborted()"
+      ],
+      "postcondition": "Snapshot status is ABORTED"
+    },
+    {
+      "id": "UC5",
+      "name": "Monitor Snapshot Progress",
+      "actor": "Operator",
+      "trigger": "Automatic — triggered internally during snapshot execution",
+      "primary_flow": [
+        "Per chunk: notifyInProgress(context, partition, offsetContext) — includes data_collections, current_collection_in_progress, maximum_key, last_processed_key",
+        "Per table scan completion: notifyTableScanCompleted(context, partition, offsetContext, totalRowsScanned, status) — status: SUCCEEDED | EMPTY | NO_PRIMARY_KEY | SQL_EXCEPTION | UNKNOWN_SCHEMA | SKIPPED",
+        "On full completion: notifyCompleted(context, partition, offsetContext)"
+      ],
+      "notification_channels": ["LogNotificationChannel", "JmxNotificationChannel", "SinkNotificationChannel (Kafka Connect)"],
+      "postcondition": "Operator observes snapshot lifecycle events via configured channels"
+    },
+    {
+      "id": "UC6",
+      "name": "Manage Snapshot Window (Open/Close)",
+      "actor": "System (internal signal)",
+      "trigger": "Internal signals: snapshot-window-open / snapshot-window-close",
+      "primary_flow": [
+        "OpenIncrementalSnapshotWindow.arrived(): offsetContext.getIncrementalSnapshotContext().openWindow(signalPayload.id)",
+        "CloseIncrementalSnapshotWindow.arrived(): dispatcher.getIncrementalSnapshotChangeEventSource().closeWindow(partition, id, offsetContext)",
+        "closeWindow(): context.closeWindow(id) → sendWindowEvents() → readChunk()",
+        "BinlogReadOnly: emitWindowOpen() → updateLowWatermark(); emitWindowClose() → updateHighWatermark()"
+      ],
+      "postcondition": "Windowed deduplication of snapshot vs. streaming events"
+    },
+    {
+      "id": "UC7",
+      "name": "Process Binlog Events During Snapshot",
+      "actor": "BinlogReadOnlyIncrementalSnapshotChangeEventSource",
+      "trigger": "Binlog message, heartbeat, filtered event, or transaction boundary",
+      "primary_flow": [
+        "processMessage(): context.updateWindowState(offsetContext) → if windowClosed: sendWindowEvents() + readChunk(); else deduplicateWindow()",
+        "processHeartbeat() / processTransactionCommittedEvent(): readUntilGtidChange() — advances until GTID watermark reached",
+        "processFilteredEvent() / processTransactionStartedEvent(): updateWindowState → if closed: sendWindowEvents() + readChunk()",
+        "rereadChunk() on schema change for current collection"
+      ],
+      "postcondition": "Snapshot data interleaved correctly with streaming events using GTID watermarks"
+    }
+  ],
+
+  "key_classes": [
+    {
+      "name": "IncrementalSnapshotChangeEventSource",
+      "type": "interface",
+      "package": "io.debezium.pipeline.source.snapshot.incremental",
+      "methods": ["init(P,OffsetContext)", "closeWindow(P,String,OffsetContext)", "pauseSnapshot(P,OffsetContext)", "resumeSnapshot(P,OffsetContext)", "processMessage(P,DataCollectionId,Object,OffsetContext)", "addDataCollectionNamesToSnapshot(SignalPayload,SnapshotConfiguration)", "requestStopSnapshot(P,OffsetContext,Map,List)", "processHeartbeat(P,OffsetContext)", "processFilteredEvent(P,OffsetContext)", "processTransactionStartedEvent(P,OffsetContext)", "processTransactionCommittedEvent(P,OffsetContext)", "processSchemaChange(P,OffsetContext,DataCollectionId)"]
+    },
+    {
+      "name": "AbstractIncrementalSnapshotChangeEventSource",
+      "type": "abstract class",
+      "implements": "IncrementalSnapshotChangeEventSource",
+      "key_fields": ["context: IncrementalSnapshotContext<T>", "window: Map<Struct,Object[]>", "notificationService: NotificationService", "dispatcher: EventDispatcher", "jdbcConnection: JdbcConnection"],
+      "abstract_methods": ["emitWindowOpen(P,OffsetContext)", "emitWindowClose(P,OffsetContext)"]
+    },
+    {
+      "name": "BinlogReadOnlyIncrementalSnapshotChangeEventSource",
+      "type": "abstract class",
+      "extends": "AbstractIncrementalSnapshotChangeEventSource",
+      "extra": "GTID-based watermarking; getExecutedGtidSet() is abstract; used by MySQL and MariaDB connectors",
+      "abstract_methods": ["getExecutedGtidSet(Consumer<GtidSet>)"]
+    },
+    {
+      "name": "IncrementalSnapshotNotificationService",
+      "type": "class",
+      "package": "io.debezium.pipeline.notification",
+      "methods": ["notifyStarted()", "notifyPaused()", "notifyResumed()", "notifyAborted()", "notifyInProgress()", "notifyTableScanCompleted()", "notifyCompleted()"],
+      "status_enum": "TableScanCompletionStatus {EMPTY, NO_PRIMARY_KEY, SKIPPED, SQL_EXCEPTION, SUCCEEDED, UNKNOWN_SCHEMA}",
+      "notification_aggregate_type": "Incremental Snapshot"
+    },
+    {
+      "name": "NotificationService",
+      "type": "class",
+      "package": "io.debezium.pipeline.notification",
+      "composes": ["IncrementalSnapshotNotificationService", "InitialSnapshotNotificationService", "List<NotificationChannel>"],
+      "channels": ["LogNotificationChannel", "SinkNotificationChannel", "JmxNotificationChannel"]
+    },
+    {
+      "name": "SnapshotterService",
+      "type": "class",
+      "package": "io.debezium.snapshot",
+      "implements": "Service",
+      "composes": ["Snapshotter (SPI)", "SnapshotQuery", "SnapshotLock"],
+      "note": "ThreadSafe registry; Snapshotter.shouldSnapshotData() / shouldSnapshotSchema() / shouldStream() determine snapshot mode"
+    }
+  ],
+
+  "signal_actions": [
+    {"name": "ExecuteSnapshot", "signal": "execute-snapshot", "delegates_to": "addDataCollectionNamesToSnapshot()"},
+    {"name": "PauseIncrementalSnapshot", "signal": "pause-snapshot", "delegates_to": "pauseSnapshot()"},
+    {"name": "ResumeIncrementalSnapshot", "signal": "resume-snapshot", "delegates_to": "resumeSnapshot()"},
+    {"name": "StopSnapshot", "signal": "stop-snapshot", "delegates_to": "requestStopSnapshot()"},
+    {"name": "OpenIncrementalSnapshotWindow", "signal": "snapshot-window-open", "delegates_to": "context.openWindow()"},
+    {"name": "CloseIncrementalSnapshotWindow", "signal": "snapshot-window-close", "delegates_to": "closeWindow()"}
+  ],
+
+  "snapshot_status_lifecycle": ["STARTED", "IN_PROGRESS", "TABLE_SCAN_COMPLETED", "COMPLETED", "PAUSED", "RESUMED", "ABORTED"],
+
+  "key_relationships": [
+    "AbstractIncrementalSnapshotChangeEventSource implements IncrementalSnapshotChangeEventSource",
+    "BinlogReadOnlyIncrementalSnapshotChangeEventSource extends AbstractIncrementalSnapshotChangeEventSource",
+    "NotificationService composes IncrementalSnapshotNotificationService",
+    "IncrementalSnapshotNotificationService depends_on NotificationService (delegates notify())",
+    "Signal actions (Pause/Resume/Execute/Stop) delegate to IncrementalSnapshotChangeEventSource via EventDispatcher",
+    "SnapshotterService composes Snapshotter + SnapshotQuery + SnapshotLock",
+    "AbstractIncrementalSnapshotChangeEventSource uses NotificationService for all status events"
+  ],
+
+  "source_files_analyzed": [
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/notification/IncrementalSnapshotNotificationService.java",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/notification/NotificationService.java",
+    "debezium-connector-common/src/main/java/io/debezium/snapshot/SnapshotterService.java",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/source/snapshot/incremental/IncrementalSnapshotChangeEventSource.java",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/source/snapshot/incremental/AbstractIncrementalSnapshotChangeEventSource.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogReadOnlyIncrementalSnapshotChangeEventSource.java",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/signal/actions/snapshotting/PauseIncrementalSnapshot.java",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/signal/actions/snapshotting/ResumeIncrementalSnapshot.java",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/signal/actions/snapshotting/OpenIncrementalSnapshotWindow.java",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/signal/actions/snapshotting/CloseIncrementalSnapshotWindow.java",
+    "debezium-api/src/main/java/io/debezium/spi/snapshot/Snapshotter.java"
+  ]
+}

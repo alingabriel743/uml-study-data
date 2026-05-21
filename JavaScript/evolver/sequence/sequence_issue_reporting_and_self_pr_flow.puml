@@ -1,0 +1,239 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Issue Reporting and Self-PR Creation Flow
+
+actor "Evolver\n(Caller)" as Caller
+
+box "Issue Reporter" #E8F4FD
+    participant "issueReporter" as IssueReporter
+end box
+
+box "Self-PR" #EDF7ED
+    participant "selfPR" as SelfPR
+end box
+
+box "External Utilities" #FFF3E0
+    participant "envFingerprint" as EnvFP
+    participant "sanitize" as Sanitize
+end box
+
+box "System Interfaces" #F3E5F5
+    participant "GitHub API\n(fetch)" as GitHubAPI
+    participant "gh CLI\n(runGh)" as GhCLI
+    participant "Git CLI\n(execSync)" as GitCLI
+    participant "FileSystem" as FS
+end box
+
+' ─────────────────────────────────────────
+' PART 1: Issue Reporting Flow
+' ─────────────────────────────────────────
+
+== Issue Reporting Flow (maybeReportIssue) ==
+
+Caller -> IssueReporter : maybeReportIssue({ signals, recentEvents,\nsessionLog, envFingerprint })
+activate IssueReporter
+
+IssueReporter -> IssueReporter : getConfig()\n<font size=10>reads EVOLVER_AUTO_ISSUE, EVOLVER_ISSUE_REPO</font>
+
+IssueReporter -> IssueReporter : shouldReport(signals, config)\n<font size=10>checks failure_loop_detected OR\n(recurring_error AND high_failure_ratio),\nstreak >= minStreak, cooldown, dedup by errorKey</font>
+
+alt Guard conditions not met (disabled / below threshold / in cooldown)
+    IssueReporter --> Caller : return (skipped)
+else Guard conditions pass
+    IssueReporter -> IssueReporter : getGithubToken()\n<font size=10>reads GITHUB_TOKEN / GH_TOKEN / GITHUB_PAT</font>
+
+    IssueReporter -> EnvFP : captureEnvFingerprint()
+    activate EnvFP
+    EnvFP --> IssueReporter : envFingerprint snapshot
+    deactivate EnvFP
+
+    IssueReporter -> IssueReporter : extractErrorSignature(signals)\n<font size=10>→ title string (max 80 chars)</font>
+
+    IssueReporter -> IssueReporter : buildIssueBody(opts)\n<font size=10>calls extractStreakCount(), formatRecentEvents(),\nredactString(sessionLog), embeds envFingerprint</font>
+
+    IssueReporter -> GitHubAPI : GET /search/issues?q=repo:{repo}+is:issue\n+is:open+in:title+"{titleSig}"\n<font size=10>findExistingIssue(repo, titleSig, token)</font>
+    activate GitHubAPI
+    GitHubAPI --> IssueReporter : { number, url, title } or null
+    deactivate GitHubAPI
+
+    alt Existing issue found (dedup)
+        IssueReporter -> FS : writeState({ lastReportedAt, recentIssueKeys,\nlastIssueUrl, lastSkippedAt })
+        activate FS
+        FS --> IssueReporter : ok
+        deactivate FS
+        IssueReporter --> Caller : return (duplicate suppressed)
+    else No existing issue — create new
+        IssueReporter -> GitHubAPI : POST /repos/{repo}/issues\n{ title: "[Auto] Recurring failure: {errorSig}",\n  body } (timeout 15s)
+        activate GitHubAPI
+        GitHubAPI --> IssueReporter : { number, url }
+        deactivate GitHubAPI
+
+        IssueReporter -> FS : writeState({ lastReportedAt, recentIssueKeys,\nlastIssueUrl, lastIssueNumber })
+        activate FS
+        FS --> IssueReporter : ok
+        deactivate FS
+
+        IssueReporter --> Caller : return (issue created)
+    end
+end
+
+deactivate IssueReporter
+
+' ─────────────────────────────────────────
+' PART 2: Self-PR Creation Flow
+' ─────────────────────────────────────────
+
+== Self-PR Creation Flow (maybeCreatePR) ==
+
+Caller -> SelfPR : maybeCreatePR({ capsule, event,\nmutation, gene, blastRadius })
+activate SelfPR
+
+SelfPR -> SelfPR : guard checks\n<font size=10>EVOLVER_SELF_PR=true, score>=MIN_SCORE,\nstreak>=MIN_STREAK, mutation.category==='optimize',\nmutation.risk==='low', blastRadius within limits,\nall changedFiles are public non-obfuscated</font>
+
+alt Guard conditions not met
+    SelfPR --> Caller : return { attempted: false }
+else Guard conditions pass
+
+    SelfPR -> FS : read self_pr_state.json\n<font size=10>isInCooldown() — elapsed < SELF_PR_COOLDOWN_MS</font>
+    activate FS
+    FS --> SelfPR : state { lastPRAt, recentDiffHashes }
+    deactivate FS
+
+    alt In cooldown
+        SelfPR --> Caller : return { attempted: false, reason: 'cooldown' }
+    else Not in cooldown
+
+        SelfPR -> SelfPR : computeDiffHash(changedFiles, repoRoot)\n<font size=10>SHA256 of file contents → 16-char hex hash</font>
+
+        SelfPR -> SelfPR : isDuplicateDiff(diffHash)\n<font size=10>checks recentDiffHashes in state</font>
+
+        alt Duplicate diff hash
+            SelfPR --> Caller : return { attempted: false, reason: 'duplicate' }
+        else New diff
+
+            SelfPR -> GitCLI : git diff HEAD -- {file}\n<font size=10>(execSync, per changedFile)</font>
+            activate GitCLI
+            GitCLI --> SelfPR : diffContent
+            deactivate GitCLI
+
+            SelfPR -> Sanitize : fullLeakCheck(diffContent)\n<font size=10>detects secrets/tokens in diff</font>
+            activate Sanitize
+            Sanitize --> SelfPR : { clean: true/false }
+            deactivate Sanitize
+
+            alt Secrets / leak detected
+                SelfPR --> Caller : return { attempted: false, reason: 'leak_detected' }
+            else Diff is clean
+
+                SelfPR -> SelfPR : buildPRTitle(mutation)\n<font size=10>'[Auto-Mutation] ' + rationale.slice(0,80)</font>
+
+                SelfPR -> SelfPR : buildPRBody({ capsule, mutation,\ngene, blastRadius })\n<font size=10>markdown with score, streak, files, rationale</font>
+
+                SelfPR -> GhCLI : runGh('repo view {repo}')\n<font size=10>verify repo access (timeout 15s)</font>
+                activate GhCLI
+                GhCLI --> SelfPR : repo info (access confirmed)
+                deactivate GhCLI
+
+                SelfPR -> FS : mkdir self_pr_workdir (tmpDir)\n<font size=10>inside getEvolutionDir()</font>
+                activate FS
+                FS --> SelfPR : tmpDir path
+                deactivate FS
+
+                SelfPR -> GhCLI : runGh('repo clone {repo} {tmpDir}\n-- --depth 1') (timeout 60s)
+                activate GhCLI
+                GhCLI --> SelfPR : clone complete
+                deactivate GhCLI
+
+                SelfPR -> GitCLI : git checkout -b\nevolver-bot/mutation-{capsuleIdShort}
+                activate GitCLI
+                GitCLI --> SelfPR : branch created
+                deactivate GitCLI
+
+                SelfPR -> FS : copyFileSync each changedFile\nfrom repoRoot → tmpDir
+                activate FS
+                FS --> SelfPR : files copied
+                deactivate FS
+
+                SelfPR -> GitCLI : git add -A
+                activate GitCLI
+                GitCLI --> SelfPR : staged
+                deactivate GitCLI
+
+                SelfPR -> GitCLI : git status --porcelain\n<font size=10>verify non-empty diff</font>
+                activate GitCLI
+                GitCLI --> SelfPR : changed files listed
+                deactivate GitCLI
+
+                SelfPR -> GitCLI : git commit -m "{title}"\n<font size=10>author: evolver-bot</font>
+                activate GitCLI
+                GitCLI --> SelfPR : commit SHA
+                deactivate GitCLI
+
+                SelfPR -> GitCLI : git push origin {branch}\n<font size=10>(timeout 30s)</font>
+                activate GitCLI
+                GitCLI --> SelfPR : push ok
+                deactivate GitCLI
+
+                SelfPR -> FS : writeFileSync('.pr_body.md', body)
+                activate FS
+                FS --> SelfPR : ok
+                deactivate FS
+
+                SelfPR -> GhCLI : runGh('pr create --repo {repo}\n--head {branch} --title {title}\n--body-file .pr_body.md\n--label auto-mutation') (timeout 30s)
+                activate GhCLI
+                GhCLI --> SelfPR : pr_url
+                deactivate GhCLI
+
+                SelfPR -> FS : rmSync(tmpDir, { recursive: true })\n<font size=10>cleanup workdir</font>
+                activate FS
+                FS --> SelfPR : removed
+                deactivate FS
+
+                SelfPR -> SelfPR : recordPR(diffHash)\n<font size=10>writeState({ lastPRAt, recentDiffHashes })</font>
+
+                SelfPR --> Caller : return { attempted: true, ok: true,\npr_url, branch, diff_hash }
+
+            end
+        end
+    end
+end
+
+deactivate SelfPR
+
+note over IssueReporter, SelfPR
+  Both flows are **non-fatal**: errors are caught and logged, never re-thrown.
+  Dedup uses SHA256 (16-char hex) stored in respective state files.
+  Issue title format: "[Auto] Recurring failure: {errorSig}"
+  PR branch format:   "evolver-bot/mutation-{capsuleId.slice(0,8)}"
+end note
+
+@enduml

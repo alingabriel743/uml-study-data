@@ -1,0 +1,178 @@
+@startuml activity_training_model_initialization
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #212529
+    EndColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+
+title Training Model Initialization & Weight Loading\n(Lyra-1/train.py — main())
+
+|Config & Accelerator|
+start
+:prepare_config(config)\n<i>Set vae_path, use_lora defaults</i>;
+:Create ProjectConfiguration\n(project_dir, logging_dir);
+:Detect distributed type;
+note right
+  FSDP plugin config or
+  DeepSpeed plugin config
+end note
+:Create Accelerator\n(gradient_accumulation_steps,\nmixed_precision, log_with,\nfsdp_plugin, deepspeed_plugin);
+:Setup logging verbosity;
+if (accelerator.is_main_process?) then (yes)
+    :Create output_dir\nSave config.yaml;
+endif
+
+|Model Initialization|
+:deepspeed_zero_init_disabled_context_manager();
+note right
+  Returns [zero3_init_context_manager(enable=False)]
+  if DeepSpeed plugin active, else []
+  Prevents ZeRO-3 partitioning of VAE
+end note
+if (DeepSpeed plugin active?) then (yes)
+    :Enter zero3_init_disabled context;
+else (no)
+    :No context (empty list);
+endif
+:with ContextManagers(...):\nvae = load_vae(vae_backbone, vae_path);
+:Determine weight_dtype\n<i>fp16 | bf16 based on mixed_precision</i>;
+:transformer = LatentRecon(config);
+if (config.lambda_lpips > 0?) then (yes)
+    :Create LPIPS(net='vgg')\nMove to device;
+endif
+
+:— Pretrained Weight Load —;
+if (config.resume_pretrained_model_ckpt?) then (yes)
+    :torch.load(resume_pretrained_model_ckpt);
+    :transformer.load_state_dict(data['module']);
+endif
+
+:transformer.train()\ntransformer.requires_grad_(False);
+if (config.set_transformer_dtype?) then (yes)
+    :module.to(device, dtype=weight_dtype)\n<i>for all transformer modules</i>;
+endif
+:vae.requires_grad_(False)\nvae.to(device, dtype=weight_dtype);
+if (config.compile_frozen_modules?) then (yes)
+    :torch.compile(vae.encode);
+endif
+
+if (config.model_pipeline['use_lora']?) then (yes)
+    :Create LoraConfig\n(r, lora_alpha,\ntarget_modules=[to_k, to_q,\nto_v, to_out.0]);
+    :transformer.add_adapter(transformer_lora_config);
+endif
+
+|Distributed Wrapping|
+:Define unwrap_model(model)\n<i>accelerator.unwrap_model() +\nhandle compiled module via _orig_mod</i>;
+if (accelerate version >= 0.16.0?) then (yes)
+    :Define save_model_hook\n<i>Saves transformer + optional EMA + optional LoRA</i>;
+    :Define load_model_hook\n<i>Pops model, loads GSLRMLatent.from_pretrained</i>;
+    if (distributed_type NOT FSDP/DEEPSPEED?) then (yes)
+        :accelerator.register_save_state_pre_hook()\naccelerator.register_load_state_pre_hook();
+    endif
+endif
+
+:Configure optimizer params\n<i>trainable parameters or lora_params</i>;
+:Create optimizer (AdamW or other);
+
+if (distributed_type == FSDP?) then (yes)
+    :accelerator.prepare(transformer)\n<i>Advance preparation before optimizer</i>;
+    :Create lr_scheduler;
+    :optimizer, lr_scheduler =\naccelerator.prepare(optimizer, lr_scheduler);
+else (no — DDP / DeepSpeed)
+    :Create lr_scheduler;
+    :transformer, optimizer, lr_scheduler =\naccelerator.prepare(\ntransformer, optimizer, lr_scheduler);
+endif
+
+if (accelerator.is_main_process?) then (yes)
+    :init_trackers(experiment_name, config, init_kwargs);
+endif
+
+|Checkpoint Resume|
+:— resume_from_ckpt(config, accelerator, transformer) —;
+if (config.resume_from_checkpoint set?) then (no)
+    :initial_global_step = 0\nReturn (0, 0, 0, False);
+else (yes)
+    if (config.resume_from_checkpoint_dir\nis not None?) then (yes)
+        :path_ckpt =\njoin(checkpoint_dir, resume_from_checkpoint);
+    else (no)
+        if (resume_from_checkpoint == 'latest'?) then (yes)
+            :path = get_most_recent_checkpoint(output_dir);
+            if (path is None?) then (yes)
+                :Log warning\npath_ckpt = None\n<i>(treat as first run)</i>;
+            else (no)
+                :is_latest_resume = True\npath_ckpt = join(output_dir, path);
+            endif
+        else (explicit path)
+            :path = basename(resume_from_checkpoint)\npath_ckpt = join(output_dir, path);
+        endif
+    endif
+
+    if (path_ckpt is None?) then (yes)
+        :Log "does not exist"\nreset resume_from_checkpoint = None\ninitial_global_step = 0;
+    else (no)
+        :accelerator.print("Resuming from path_ckpt");
+        :TRY: accelerator.load_state(path_ckpt)\n<i>Full optimizer + scheduler + model state</i>;
+        if (load_state succeeded?) then (yes)
+            :loaded_accelerator = True;
+        else (Exception)
+            :FALLBACK: load_model_weights(path_ckpt, transformer);
+            note right
+              Build path:
+              path_ckpt/pytorch_model/
+              mp_rank_00_model_states.pt
+              (DeepSpeed checkpoint format)
+            end note
+            :torch.load(..., map_location='cpu');
+            :Prepend 'module.' prefix\nto all state_dict keys;
+            :transformer.load_state_dict\n(model_state, strict=False);
+            if (load_model_weights failed?) then (yes)
+                :Log warning;
+                if (is_latest_resume AND is_main_process\nAND NOT path.endswith('bkup')?) then (yes)
+                    :shutil.rmtree(path_ckpt)\n<i>Remove broken checkpoint</i>;
+                endif
+                :exit(1);
+            endif
+        endif
+        :global_step = int(path.split('-')[1])\ninitial_global_step = global_step;
+    endif
+    :Return (initial_global_step, global_step,\nfirst_epoch, loaded_accelerator);
+endif
+
+|Config & Accelerator|
+if (config.lr_overwrite?) then (yes)
+    :Update optimizer param_groups lr\nRecreate lr_scheduler;
+endif
+if (initial_global_step == 0 OR\nnot loaded_accelerator AND config.seed?) then (yes)
+    :set_seed(config.seed, device_specific=True);
+endif
+:get_multi_dataloader(config, accelerator)\n→ train_dataloader, test_dataloader;
+
+stop
+
+@enduml

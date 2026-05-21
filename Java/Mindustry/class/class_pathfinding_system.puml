@@ -1,0 +1,335 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam interface {
+    BackgroundColor #D4EDDA
+    BorderColor #28A745
+}
+skinparam note {
+    BackgroundColor #FFF3CD
+    BorderColor #FFC107
+}
+
+title Pathfinding System
+
+package "mindustry.ai" {
+
+    ' ─────────────────────────────────────────────
+    ' Shared interface
+    ' ─────────────────────────────────────────────
+
+    interface PathCost <<interface>> {
+        +getCost(team: int, tile: int): int
+    }
+
+    ' ─────────────────────────────────────────────
+    ' ControlPathfinder subsystem (HPA*)
+    ' ─────────────────────────────────────────────
+
+    package "HPA* Subsystem (ControlPathfinder)" {
+
+        class ControlPathfinder <<service>> {
+            ' Constants
+            +{static} wallImpassableCap: int = 1_000_000
+            +{static} solidCap: int = 7_000
+            +{static} clusterSize: int = 12
+            +{static} costIdGround: int = 0
+            +{static} costIdHover: int = 1
+            +{static} costIdLegs: int = 2
+            +{static} costIdNaval: int = 3
+            +{static} costTypes: Seq<PathCost>
+            ' Fields
+            -clusters: Cluster[][][]
+            -cwidth: int
+            -cheight: int
+            -unitRequests: ObjectMap<Unit, PathRequest>
+            -threadPathRequests: Seq<PathRequest>
+            -fields: LongMap<FieldCache>
+            -fieldList: Seq<FieldCache>
+            -queue: TaskQueue
+            -innerFrontier: PathfindQueue
+            -innerCosts: IntFloatMap
+            -clustersToUpdate: IntSet
+            -clustersToInnerUpdate: IntSet
+            -invalidRequests: ObjectSet<PathRequest>
+            -thread: Thread
+            -invalidated: volatile boolean
+            -usedEdges: IntSet
+            ' Key methods
+            +run(): void
+            +getPathPosition(unit: Unit, destination: Vec2, mainDestination: Vec2, out: Vec2, noResultFound: boolean[]): boolean
+            +initializePathRequest(request: PathRequest, team: int, costId: int, unitX: int, unitY: int, goalX: int, goalY: int): void
+            +clusterAstar(request: PathRequest, pathCost: PathCost, startNodeIndex: int, endNodeIndex: int): IntSeq
+            +innerAstar(team: int, cost: PathCost, minX: int, minY: int, maxX: int, maxY: int, startPos: int, goalPos: int): float
+            +updateCluster(team: int, pathCost: PathCost, cx: int, cy: int): Cluster
+            +updateInnerEdges(team: int, cost: PathCost, cx: int, cy: int, cluster: Cluster): void
+            +updateFields(cache: FieldCache, nsToRun: long): void
+            +addFlowCluster(cache: FieldCache, cx: int, cy: int, addingFrontier: boolean): void
+            +findClosestNode(team: int, pathCost: PathCost, tileX: int, tileY: int): int
+            +clusterChanged(team: int, pathCost: PathCost, cx: int, cy: int): void
+            +{static} raycast(team: int, cost: PathCost, x1: int, y1: int, x2: int, y2: int): boolean
+            +{static} solid(team: int, cost: PathCost, x: int, y: int): boolean
+            +{static} passable(team: int, cost: PathCost, pos: int): boolean
+            +{static} cost(team: int, cost: PathCost, tilePos: int): int
+            +{static} heuristic(a: int, b: int): float
+            +{static} checkEvents(): void
+            +start(): void
+            +stop(): void
+        }
+
+        class PathRequest <<data>> {
+            +unit: Unit
+            +destination: int
+            +team: int
+            +costId: int
+            +resultPath: IntSeq
+            +costs: IntFloatMap
+            +cameFrom: IntIntMap
+            +frontier: PathfindQueue
+            +lastUpdateId: long
+            +notFound: volatile boolean
+            +invalidated: volatile boolean
+            +oldCache: volatile FieldCache
+            +lastRaycastResult: boolean
+            +lastRaycastTile: int
+            +lastWorldUpdate: int
+            +lastTile: int
+            +lastTargetTile: Tile
+            +PathRequest(unit: Unit, team: int, costId: int, destination: int)
+        }
+
+        class FieldCache <<data>> {
+            +cost: PathCost
+            +costId: int
+            +team: int
+            +goalPos: int
+            +frontier: IntQueue
+            +fields: IntMap<int[]>
+            +mapKey: long
+            +lastUpdateId: long
+            +FieldCache(cost: PathCost, costId: int, team: int, goalPos: int)
+        }
+
+        class Cluster <<data>> {
+            +portals: IntSeq[]
+            +portalConnections: LongSeq[][]
+        }
+
+        class NodeIndex <<struct>> {
+            +{static} cluster: int
+            +{static} dir: int
+            +{static} portal: int
+        }
+
+        class IntraEdge <<struct>> {
+            +{static} dir: int
+            +{static} portal: int
+            +{static} cost: float
+        }
+
+        class FieldIndex <<struct>> {
+            +{static} pos: int
+            +{static} costId: int
+            +{static} team: int
+        }
+
+    }
+
+    ' ─────────────────────────────────────────────
+    ' Pathfinder subsystem (Flow Fields)
+    ' ─────────────────────────────────────────────
+
+    package "Flow Field Subsystem (Pathfinder)" {
+
+        class Pathfinder <<service>> {
+            ' Constants
+            +{static} fieldCore: int = 0
+            +{static} maxFields: int = 10
+            +{static} costGround: int = 0
+            +{static} costLegs: int = 1
+            +{static} costNaval: int = 2
+            +{static} costHover: int = 5
+            +{static} maxCosts: int = 8
+            +{static} costTypes: Seq<PathCost>
+            +{static} wwidth: int
+            +{static} wheight: int
+            +{static} impassable: int = -1
+            ' Fields
+            +tiles: int[]
+            -cache: Flowfield[][][]
+            -threadList: Seq<Flowfield>
+            -mainList: Seq<Flowfield>
+            -queue: TaskQueue
+            -thread: Thread
+            -needsRefresh: boolean
+            -lastRefreshTime: long
+            -tmpArray: IntSeq
+            ' Methods
+            +run(): void
+            +getField(team: Team, costType: int, fieldType: int): Flowfield
+            +getTargetTile(tile: Tile, field: Flowfield): Tile
+            +getTargetTile(tile: Tile, field: Flowfield, diagonals: boolean): Tile
+            +getTargetTile(tile: Tile, field: Flowfield, diagonals: boolean, avoidanceId: int): Tile
+            +updateTile(tile: Tile): void
+            +packTile(tile: Tile): int
+            +get(x: int, y: int): int
+            +updateTargets(field: Flowfield): void
+            +updateFrontier(field: Flowfield, nsToRun: long): void
+            +preloadPath(field: Flowfield): void
+            +registerPath(field: Flowfield): void
+            +clearCache(): void
+            +start(): void
+            +stop(): void
+        }
+
+        abstract class Flowfield <<abstract>> {
+            +refreshRate: int
+            +team: Team
+            +cost: PathCost
+            +hasComplete: volatile boolean
+            +dirty: boolean
+            +weights: int[]
+            +completeWeights: int[]
+            +searches: short[]
+            +resolution: int
+            +width: int
+            +height: int
+            +frontier: IntQueue
+            +targets: IntSeq
+            +search: int
+            +lastUpdateTime: long
+            +initialized: boolean
+            +setup(): void
+            +getCost(tiles: int[], pos: int): int
+            +getNextTile(from: Tile): Tile
+            +getNextTile(from: Tile, diagonals: boolean): Tile
+            +hasTargets(): boolean
+            +hasCompleteWeights(): boolean
+            +updateTargetPositions(): void
+            +needsRefresh(): boolean
+            +passable(pos: int): boolean
+            +{abstract} getPositions(out: IntSeq): void
+        }
+
+        class EnemyCoreField <<flowfield>> {
+            -rand: Rand
+            +getPositions(out: IntSeq): void
+        }
+
+        class PositionTarget <<flowfield>> {
+            -position: Position
+            +getPositions(out: IntSeq): void
+        }
+
+        class PathTile <<struct>> {
+            +{static} health: int
+            +{static} team: int
+            +{static} solid: boolean
+            +{static} liquid: boolean
+            +{static} legSolid: boolean
+            +{static} nearLiquid: boolean
+            +{static} nearGround: boolean
+            +{static} nearSolid: boolean
+            +{static} deep: boolean
+            +{static} damages: boolean
+            +{static} teamPassable: boolean
+        }
+
+    }
+
+    ' ─────────────────────────────────────────────
+    ' Shared utility
+    ' ─────────────────────────────────────────────
+
+    class PathfindQueue <<utility>> {
+        +size: int
+        +add(node: int, priority: float): void
+        +poll(): int
+        +clear(): void
+    }
+
+}
+
+' ─────────────────────────────────────────────────────
+' Relationships
+' ─────────────────────────────────────────────────────
+
+' Interface implementations
+ControlPathfinder ..|> Runnable : implements
+Pathfinder ..|> Runnable : implements
+
+' Flowfield hierarchy
+EnemyCoreField --|> Flowfield : extends
+PositionTarget --|> Flowfield : extends
+
+' ControlPathfinder compositions
+ControlPathfinder *-- Cluster : clusters\n[256][team][costId]
+ControlPathfinder *-- PathRequest : unitRequests\n(ObjectMap)
+ControlPathfinder *-- FieldCache : fields\n(LongMap)
+ControlPathfinder *-- PathfindQueue : innerFrontier
+
+' ControlPathfinder uses PathCost
+ControlPathfinder ..> PathCost : costGround/Hover/Legs/Naval
+
+' ControlPathfinder uses generated structs
+ControlPathfinder ..> NodeIndex : makeNodeIndex()
+ControlPathfinder ..> IntraEdge : portalConnections
+ControlPathfinder ..> FieldIndex : LongMap key
+
+' Cluster stores IntraEdge-packed longs
+Cluster ..> IntraEdge : portalConnections\n(packed long)
+
+' FieldCache holds PathCost and is referenced by PathRequest
+FieldCache o-- PathCost : cost
+PathRequest o-- FieldCache : oldCache
+
+' Pathfinder compositions
+Pathfinder *-- Flowfield : cache\n[256][maxCosts][maxFields]
+Pathfinder ..> PathTile : packTile()
+
+' Flowfield uses PathCost
+Flowfield o-- PathCost : cost
+
+' Cross-system dependency
+Pathfinder ..> ControlPathfinder : updateTile()\ndelegate
+
+' PathRequest uses PathfindQueue
+PathRequest o-- PathfindQueue : frontier
+
+note top of ControlPathfinder
+  HPA* (Hierarchical Pathfinding A*)
+  Portal-graph A* + per-destination
+  flow fields per cluster.
+  Thread-safe via TaskQueue.
+  clusterSize = 12 tiles.
+end note
+
+note top of Pathfinder
+  Full-world BFS flow fields
+  (Dijkstra) per team/cost/fieldType.
+  Used for wave enemy targeting via
+  EnemyCoreField.
+end note
+
+note right of PathCost
+  Functional interface.
+  ControlPathfinder: ground, hover, legs, naval.
+  Pathfinder: ground, legs, naval,
+  neoplasm, none, hover.
+end note
+
+@enduml

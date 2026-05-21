@@ -1,0 +1,184 @@
+{
+  "scope": "mysql_streaming_pipeline",
+  "title": "MySQL Streaming Pipeline",
+  "diagram_type": "activity",
+  "description": "MySQL-specific binlog streaming: connection, event reading, offset tracking, and error handling",
+
+  "key_participants": [
+    "MySqlStreamingChangeEventSource",
+    "BinlogStreamingChangeEventSource (abstract parent)",
+    "BinaryLogClient (shyiko library)",
+    "MySqlOffsetContext",
+    "BinlogConnectorConnection",
+    "EventDispatcher",
+    "MySqlErrorHandler",
+    "ErrorHandler (base)",
+    "ChangeEventQueue",
+    "BinlogDatabaseSchema",
+    "BinlogStreamingChangeEventSourceMetrics",
+    "ReselectColumnsPostProcessor",
+    "MySqlReselectColumnsProcessorIT",
+    "MySqlTableMaintenanceStatementsIT"
+  ],
+
+  "activity_flow": [
+    "START: MySqlStreamingChangeEventSource.execute(context, partition, offsetContext)",
+
+    "[INIT] schema.assureNonEmptySchema() — skip if NeverSnapshotter",
+    "[INIT] Determine skippedOperations from connectorConfig",
+
+    "[REGISTER HANDLERS] eventHandlers.put() for each EventType:",
+    "  STOP → handleServerStop",
+    "  HEARTBEAT → handleServerHeartbeat",
+    "  INCIDENT → handleServerIncident",
+    "  ROTATE → handleRotateLogsEvent",
+    "  TABLE_MAP → handleUpdateTableMetadata",
+    "  QUERY → handleQueryEvent",
+    "  TRANSACTION_PAYLOAD → handleTransactionPayload",
+    "  WRITE_ROWS / EXT_WRITE_ROWS → handleInsert (if CREATE not skipped)",
+    "  UPDATE_ROWS / EXT_UPDATE_ROWS → handleUpdate (if UPDATE not skipped)",
+    "  DELETE_ROWS / EXT_DELETE_ROWS → handleDelete (if DELETE not skipped)",
+    "  XID → handleTransactionCompletion",
+    "  GTID → handleGtidEvent (registered only if GTID mode + shouldRecoverUsingGtid)",
+    "  ROWS_QUERY (EventType.ROWS_QUERY) → handleRecordingQuery (if isSqlQueryIncluded)",
+
+    "[CONFIGURE LISTENER] bufferSize==0 → direct listener; else → EventBuffer listener",
+    "[CONFIGURE LISTENER] client.registerEventListener(listener)",
+    "[CONFIGURE LIFECYCLE] client.registerLifecycleListener(ReaderThreadLifecycleListener)",
+
+    "[OFFSET RECOVERY] IF GTID mode enabled AND shouldRecoverUsingGtid:",
+    "  → connection.knownGtidSet() + connection.purgedGtidSet()",
+    "  → connection.filterGtidSet(gtidSourceFilter, offsetContext.gtidSet, available, purged)",
+    "  → IF filteredGtidSet != null: client.setGtidSet(filtered); offsetContext.setCompletedGtidSet(); initializeGtidSet()",
+    "  → ELSE: client.setBinlogFilename(); client.setBinlogPosition(); handle purged GTID set edge case",
+    "[OFFSET RECOVERY] ELSE: client.setBinlogFilename(offsetContext.getSource().binlogFilename()); client.setBinlogPosition()",
+
+    "[SKIP STATE] initialEventsToSkip = offsetContext.eventsToSkipUponRestart()",
+    "[SKIP STATE] startingRowNumber = offsetContext.rowsToSkipUponRestart()",
+    "[SKIP STATE] skipEvent = false",
+
+    "[CONNECT] IF context.isRunning(): client.connect(timeout)",
+    "  → TimeoutException: if duration > 0.9*timeout → throw DebeziumException (timed out); else swallow (shutdown)",
+    "  → AuthenticationException → throw DebeziumException (auth failed)",
+    "  → Throwable → throw DebeziumException (connection failed)",
+    "[KEEPALIVE] IF client.isKeepAlive(): poll binaryLogClientThreads for keepalive thread (50 attempts, 100ms each)",
+
+    "[MAIN LOOP] WHILE context.isRunning(): Thread.sleep(100); waitWhenStreamingPaused(context)",
+
+    "[EVENT RECEIVED via listener] handleEvent(partition, offsetContext, context, event):",
+    "  → null check; offsetContext.setBinlogServerId(eventHeader.getServerId())",
+    "  → IF EventType==ROTATE: offsetContext.setBinlogStartPoint(filename, position)",
+    "  → ELSE IF EventHeaderV4 && position>0: offsetContext.setEventPosition(position, length)",
+    "  → waitWhenStreamingPaused(context)",
+    "  → eventHandlers.getOrDefault(eventType, ignoreEvent).accept(event)",
+    "  → eventDispatcher.dispatchHeartbeatEvent(partition, offsetContext)",
+    "  → offsetContext.completeEvent()",
+
+    "[HANDLER: GTID] handleGtidEvent (MySqlStreamingChangeEventSource override):",
+    "  → GtidEventData.getGtid(); gtidSet.add(gtid)",
+    "  → offsetContext.startGtid(gtid, gtidSet.toString())",
+    "  → setIgnoreDmlEventByGtidSource(false)",
+    "  → IF gtidSourceFilter != null: check UUID; if filtered out → setIgnoreDmlEventByGtidSource(true)",
+    "  → setGtidChanged(gtid) → metrics.onGtidChange(gtid)",
+
+    "[HANDLER: QUERY] handleQueryEvent:",
+    "  → IF sql==BEGIN → handleTransactionBegin(partition, offsetContext, event, threadId)",
+    "  → IF sql==COMMIT → handleTransactionCompletion(partition, offsetContext, event)",
+    "  → ELSE → dispatch as DDL/schema change event",
+
+    "[HANDLER: TABLE_MAP] handleUpdateTableMetadata:",
+    "  → schema.assignTableNumber(tableNumber, tableId)",
+    "  → if not found → informAboutUnknownTableIfRequired",
+
+    "[HANDLER: WRITE_ROWS] handleInsert → handleChange:",
+    "  → schema.getTableId(x.getTableId()); WriteRowsEventData.getRows()",
+    "  → eventDispatcher.dispatchDataChangeEvent(partition, tableId, BinlogChangeRecordEmitter[CREATE])",
+
+    "[HANDLER: UPDATE_ROWS] handleUpdate → handleChange:",
+    "  → eventDispatcher.dispatchDataChangeEvent(partition, tableId, BinlogChangeRecordEmitter[UPDATE])",
+
+    "[HANDLER: DELETE_ROWS] handleDelete → handleChange:",
+    "  → eventDispatcher.dispatchDataChangeEvent(partition, tableId, BinlogChangeRecordEmitter[DELETE])",
+
+    "[HANDLER: XID] handleTransactionCompletion:",
+    "  → eventDispatcher.dispatchTransactionCommittedEvent(partition, offsetContext, timestamp)",
+    "  → offsetContext.commitTransaction(); offsetContext.setBinlogThread(-1L)",
+    "  → skipEvent=false; ignoreDmlEventByGtidSource=false",
+
+    "[HANDLER: ROTATE] handleRotateLogsEvent:",
+    "  → schema.clearTableMappings()",
+
+    "[HANDLER: ROWS_QUERY] handleRecordingQuery (MySQL override):",
+    "  → RowsQueryEventData.getQuery(); offsetContext.setQuery(query)",
+
+    "[HANDLER: TIMESTAMP] setEventTimestamp (MySQL override):",
+    "  → IF GTID event && MySQL 8: use gtidEvent.getOriginalCommitTimestamp() (microsecond resolution)",
+    "  → ELSE: Instant.ofEpochMilli(eventTs) (second resolution)",
+
+    "[DISCONNECT] finally: client.disconnect()",
+
+    "[ERROR HANDLING] MySqlErrorHandler.isRetriable(throwable):",
+    "  → Walk cause chain; IF SQLException with errorCode 1236 (ER_MASTER_FATAL_ERROR_READING_BINLOG) → return false (non-retriable)",
+    "  → ELSE delegate to super.isRetriable() → check communicationExceptions [IOException, SQLException]",
+    "[ERROR HANDLING] ErrorHandler.setProducerThrowable(throwable):",
+    "  → IF retriable AND hasMoreRetries → queue.producerException(RetriableException) → connector restart",
+    "  → ELSE → queue.producerException(ConnectException) → connector stop",
+
+    "[TEST: ReselectColumns] MySqlReselectColumnsProcessorIT (extends BinlogReselectColumnsProcessorIT<MySqlConnector>):",
+    "  → beforeEach: DATABASE.createAndInitialize(); initializeConnectorTestFramework(); getTestDatabaseConnection()",
+    "  → configure: TABLE_INCLUDE_LIST=dbz4321; CUSTOM_POST_PROCESSORS=reselector; post.processors.reselector.type=ReselectColumnsPostProcessor",
+    "  → start connector; produce change events; ReselectColumnsPostProcessor re-queries DB for missing columns",
+    "  → afterEach: connection.close(); schema history cleanup",
+
+    "[TEST: TableMaintenance] MySqlTableMaintenanceStatementsIT (extends BinlogTableMaintenanceStatementsIT<MySqlConnector>):",
+    "  → beforeEach: DATABASE.createAndInitialize(); SNAPSHOT_MODE=NEVER",
+    "  → start connector (binlog only, no snapshot)",
+    "  → consumeRecordsByTopic(createDb + createTable + 0 maintenance) — maintenance statements NOT stored in schema history",
+    "  → assert: records not null; DDL record count matches; database names match",
+    "  → afterEach: stopConnector(); delete schema history file",
+
+    "END"
+  ],
+
+  "key_relationships": [
+    "MySqlStreamingChangeEventSource extends BinlogStreamingChangeEventSource<MySqlPartition, MySqlOffsetContext>",
+    "BinlogStreamingChangeEventSource implements StreamingChangeEventSource<P, O>",
+    "MySqlErrorHandler extends ErrorHandler",
+    "MySqlErrorHandler constructor calls super(MySqlConnector.class, connectorConfig, queue, replacedErrorHandler)",
+    "MySqlReselectColumnsProcessorIT extends BinlogReselectColumnsProcessorIT<MySqlConnector> implements MySqlCommon",
+    "BinlogReselectColumnsProcessorIT extends AbstractReselectProcessorTest<C> implements BinlogConnectorTest<C>",
+    "MySqlTableMaintenanceStatementsIT extends BinlogTableMaintenanceStatementsIT<MySqlConnector> implements MySqlCommon",
+    "BinlogTableMaintenanceStatementsIT extends AbstractBinlogConnectorIT<C>",
+    "BinlogStreamingChangeEventSource depends_on BinaryLogClient (shyiko)",
+    "BinlogStreamingChangeEventSource depends_on EventDispatcher",
+    "BinlogStreamingChangeEventSource depends_on ErrorHandler",
+    "BinlogStreamingChangeEventSource depends_on MySqlOffsetContext (offset tracking)",
+    "BinlogStreamingChangeEventSource depends_on BinlogDatabaseSchema (table mapping)",
+    "BinlogStreamingChangeEventSource depends_on BinlogStreamingChangeEventSourceMetrics",
+    "ErrorHandler uses ChangeEventQueue to propagate exceptions"
+  ],
+
+  "important_notes": [
+    "NON_RETRIABLE MySQL error: code 1236 = ER_MASTER_FATAL_ERROR_READING_BINLOG (e.g. binlog purged on server)",
+    "Retriable communication exceptions: IOException, SQLException (other codes)",
+    "MySQL 8 GTID events carry microsecond-resolution originalCommitTimestamp; fallback to second-resolution epoch millis",
+    "GTID source filtering: connector can exclude specific MySQL server UUIDs from DML replication",
+    "EventBuffer used when bufferSizeForStreamingChangeEventSource > 0 (compressed transaction support)",
+    "keepalive thread polling: up to 50 attempts x 100ms = 5 seconds after connect",
+    "initialEventsToSkip and startingRowNumber handle mid-transaction restart recovery",
+    "Table maintenance statements (ANALYZE, OPTIMIZE, REPAIR TABLE) are NOT stored in schema history",
+    "ReselectColumnsPostProcessor: re-fetches column values from DB after change event (handles NULL/default scenarios)",
+    "SSL modes: DISABLED, PREFERRED, REQUIRED, VERIFY_CA, VERIFY_IDENTITY mapped to BinaryLogClient SSLMode enum"
+  ],
+
+  "source_files_analyzed": [
+    "debezium-connector-mysql/src/main/java/io/debezium/connector/mysql/MySqlErrorHandler.java",
+    "debezium-connector-mysql/src/main/java/io/debezium/connector/mysql/MySqlStreamingChangeEventSource.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogStreamingChangeEventSource.java",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/ErrorHandler.java",
+    "debezium-connector-mysql/src/test/java/io/debezium/connector/mysql/MySqlReselectColumnsProcessorIT.java",
+    "debezium-connector-mysql/src/test/java/io/debezium/connector/mysql/MySqlTableMaintenanceStatementsIT.java",
+    "debezium-connector-binlog/src/test/java/io/debezium/connector/binlog/BinlogReselectColumnsProcessorIT.java",
+    "debezium-connector-binlog/src/test/java/io/debezium/connector/binlog/BinlogTableMaintenanceStatementsIT.java"
+  ]
+}

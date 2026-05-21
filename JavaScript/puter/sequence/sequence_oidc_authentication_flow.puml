@@ -1,0 +1,271 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipantBorderColor #495057
+skinparam sequenceParticipantBackgroundColor #F8F9FA
+skinparam sequenceParticipantFontColor #212529
+skinparam sequenceLifeLineBorderColor #ADB5BD
+skinparam sequenceGroupBorderColor #6C757D
+skinparam sequenceGroupBackgroundColor #E9ECEF55
+skinparam sequenceGroupFontColor #212529
+skinparam sequenceBoxBorderColor #ADB5BD
+skinparam sequenceBoxBackgroundColor #F1F3F555
+skinparam noteBorderColor #6C757D
+skinparam noteBackgroundColor #FFF9C4
+
+title OIDC Authentication and Callback Flow
+
+actor "Browser / Client" as Browser
+
+box "Frontend (GUI)" #EEF7FF
+    participant "GUI\n(openid.js)" as GUI
+end box
+
+box "Backend" #F8F9FA
+    participant "OIDCRouter\n(routers/auth/oidc.js)" as OIDCRouter
+    participant "EdgeRateLimitService" as RateLimit
+    participant "OIDCService\n(services/auth/OIDCService.js)" as OIDCService
+    participant "AuthService\n(services/auth/AuthService.js)" as AuthService
+    participant "TokenService" as TokenService
+    participant "Database" as DB
+end box
+
+participant "Identity Provider\n(IdP)" as IdP
+
+' ============================================================
+' PHASE 1: Authorization Start
+' ============================================================
+group Phase 1 — Authorization Start
+    Browser -> OIDCRouter : GET /auth/oidc/:provider/start\n(flow, embedded_in_popup, msg_id, opener_origin)
+    activate OIDCRouter
+
+    OIDCRouter -> RateLimit : check('oidc-general')
+    activate RateLimit
+    RateLimit --> OIDCRouter : ok
+    deactivate RateLimit
+
+    OIDCRouter -> OIDCService : getProviderConfig(provider)
+    activate OIDCService
+    OIDCService --> OIDCRouter : providerConfig
+    deactivate OIDCService
+
+    note right of OIDCRouter
+        Build statePayload:
+        { provider, redirect_uri,
+          [embedded_in_popup, msg_id,
+          opener_origin],
+          [flow:'revalidate', user_id] }
+    end note
+
+    OIDCRouter -> OIDCService : signState(statePayload)
+    activate OIDCService
+    OIDCService --> OIDCRouter : JWT state (short-lived)
+    deactivate OIDCService
+
+    OIDCRouter -> OIDCService : getAuthorizationUrl(provider, state, flow)
+    activate OIDCService
+    OIDCService --> OIDCRouter : authorizationUrl
+    deactivate OIDCService
+
+    OIDCRouter --> Browser : 302 Redirect → IdP authorization URL
+    deactivate OIDCRouter
+end
+
+' ============================================================
+' PHASE 2: IdP Authorization
+' ============================================================
+group Phase 2 — IdP Authorization
+    Browser -> IdP : GET authorizationUrl\n(client_id, redirect_uri, response_type=code, scope, state)
+    activate IdP
+    IdP --> Browser : 302 Callback with code + state
+    deactivate IdP
+end
+
+' ============================================================
+' PHASE 3: Callback Processing (shared)
+' ============================================================
+group Phase 3 — Callback Processing
+
+    Browser -> OIDCRouter : GET /auth/oidc/callback/{login|signup|revalidate}\n(code, state)
+    activate OIDCRouter
+
+    OIDCRouter -> RateLimit : check('oidc-general')
+    activate RateLimit
+    RateLimit --> OIDCRouter : ok
+    deactivate RateLimit
+
+    OIDCRouter -> OIDCService : getCallbackUrlForFlow(flow)
+    activate OIDCService
+    OIDCService --> OIDCRouter : callbackRedirectUri
+    deactivate OIDCService
+
+    note right of OIDCRouter : Delegates to\nprocessOIDCCallbackRequest_()
+
+    OIDCRouter -> OIDCService : verifyState(state)
+    activate OIDCService
+    OIDCService --> OIDCRouter : stateDecoded (JWT verify)\n[null if invalid/expired → INVALID_OR_EXPIRED_STATE]
+    deactivate OIDCService
+
+    OIDCRouter -> OIDCService : exchangeCodeForTokens(provider, code, callbackRedirectUri)
+    activate OIDCService
+    OIDCService -> IdP : POST token_endpoint\n(code, redirect_uri, client_id, client_secret, grant_type=authorization_code)
+    activate IdP
+    IdP --> OIDCService : { access_token, id_token, ... }
+    deactivate IdP
+    OIDCService --> OIDCRouter : tokens
+    deactivate OIDCService
+
+    OIDCRouter -> OIDCService : getUserInfo(provider, access_token)
+    activate OIDCService
+    OIDCService -> IdP : GET userinfo_endpoint\n(Authorization: Bearer access_token)
+    activate IdP
+    IdP --> OIDCService : { sub, email, email_verified, ... }
+    deactivate IdP
+    OIDCService --> OIDCRouter : userinfo
+    deactivate OIDCService
+
+    ' ---- FLOW BRANCHES ----
+    alt Login Callback (/callback/login)
+
+        OIDCRouter -> OIDCService : findUserByProviderSub(provider, userinfo.sub)
+        activate OIDCService
+        OIDCService -> DB : SELECT user_oidc_providers WHERE sub = ?
+        DB --> OIDCService : user | null
+        OIDCService --> OIDCRouter : existingUser | null
+        deactivate OIDCService
+
+        opt No existing user — auto-create
+            OIDCRouter -> OIDCService : createUserFromOIDC(provider, userinfo)
+            activate OIDCService
+            OIDCService -> DB : INSERT user + INSERT user_oidc_providers
+            DB --> OIDCService : ok
+            OIDCService --> OIDCRouter : outcome
+            deactivate OIDCService
+        end
+
+        opt outcome.failed or user.suspended
+            OIDCRouter -> OIDCRouter : buildOIDCErrorRedirectUrl\n('login', errorCondition, message, stateDecoded)
+            note right of OIDCRouter
+                Popup-aware: adds embedded_in_popup,
+                msg_id, auth_error=1 if stateDecoded
+                has embedded_in_popup+msg_id
+            end note
+            OIDCRouter --> Browser : 302 Error Redirect
+        end
+
+        OIDCRouter -> AuthService : create_session_token(user, { req })
+        activate AuthService
+        AuthService -> DB : create_session_() — write session record
+        activate DB
+        DB --> AuthService : session record
+        deactivate DB
+        AuthService -> TokenService : sign('auth', { type:'session', uuid, user_uid })
+        activate TokenService
+        TokenService --> AuthService : JWT session token
+        deactivate TokenService
+        AuthService --> OIDCRouter : { token: session_token }
+        deactivate AuthService
+
+        OIDCRouter --> Browser : Set-Cookie(puter_auth=session_token;\nSameSite=none; Secure; HttpOnly)\n+ 302 Redirect → target URL
+        deactivate OIDCRouter
+
+    else Signup Callback (/callback/signup)
+
+        OIDCRouter -> OIDCService : findUserByProviderSub(provider, userinfo.sub)
+        activate OIDCService
+        OIDCService --> OIDCRouter : existingUser | null
+        deactivate OIDCService
+
+        alt User already exists — switch to login
+            OIDCRouter -> AuthService : create_session_token(user, { req })
+            activate AuthService
+            AuthService --> OIDCRouter : { token: session_token }
+            deactivate AuthService
+            OIDCRouter --> Browser : Set-Cookie(puter_auth) + 302 Redirect\n[oidc_switched=login]
+            deactivate OIDCRouter
+
+        else New user — create account
+            OIDCRouter -> OIDCService : createUserFromOIDC(provider, userinfo)
+            activate OIDCService
+            OIDCService -> DB : INSERT user + INSERT user_oidc_providers
+            DB --> OIDCService : outcome
+            OIDCService --> OIDCRouter : outcome
+            deactivate OIDCService
+
+            OIDCRouter -> AuthService : create_session_token(user, { req })
+            activate AuthService
+            AuthService --> OIDCRouter : { token: session_token }
+            deactivate AuthService
+
+            OIDCRouter --> Browser : Set-Cookie(puter_auth=session_token)\n+ 302 Redirect → target URL
+            deactivate OIDCRouter
+        end
+
+    else Revalidate Callback (/callback/revalidate)
+
+        OIDCRouter -> OIDCService : findUserByProviderSub(provider, userinfo.sub)
+        activate OIDCService
+        OIDCService --> OIDCRouter : user
+        deactivate OIDCService
+
+        note right of OIDCRouter : Validate user.id === stateDecoded.user_id\n(403 Forbidden if mismatch)
+
+        OIDCRouter -> OIDCRouter : jwt.sign({ user_id, purpose:'revalidate' },\njwt_secret, { expiresIn: 300 })
+
+        OIDCRouter --> Browser : Set-Cookie(puter_revalidation=token;\nmaxAge=300s) + 302 → /auth/revalidate-done
+        deactivate OIDCRouter
+
+    end
+end
+
+' ============================================================
+' PHASE 4: Revalidate Done Page
+' ============================================================
+group Phase 4 — Revalidate Done Page
+    Browser -> OIDCRouter : GET /auth/revalidate-done
+    activate OIDCRouter
+    OIDCRouter --> Browser : HTML page with inline script\n(window.opener.postMessage + window.close())
+    deactivate OIDCRouter
+end
+
+' ============================================================
+' PHASE 5: GUI Popup Flow (openid.js)
+' ============================================================
+group Phase 5 — GUI Popup / Revalidate Coordination
+    GUI -> GUI : openRevalidatePopup(revalidateUrl)
+    activate GUI
+
+    GUI -> Browser : window.open(url, 'puter-revalidate', 'width=500,height=600')
+    note right of GUI
+        addEventListener('message', onMessage)
+        setInterval(300ms) polls popup.closed
+        → rejects TeePromise if closed early
+    end note
+
+    Browser -> GUI : postMessage({ type:'puter-revalidate-done' }, origin)
+    note right of GUI
+        onMessage validates:
+        ev.origin === gui_origin
+        ev.data.type === 'puter-revalidate-done'
+    end note
+
+    GUI -> GUI : donePromise.resolve()
+    deactivate GUI
+end
+
+@enduml

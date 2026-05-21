@@ -1,0 +1,299 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #F0AD4E
+}
+
+title Lyra-1 Checkpointing and I/O Infrastructure
+
+' ─────────────────────────────────────────
+' DDP / TP / PEFT Checkpointer Hierarchy
+' ─────────────────────────────────────────
+package "cosmos_predict1.checkpointer" {
+
+    abstract class AbstractCheckpointer {
+        #config_checkpoint: CheckpointConfig
+        #callbacks: CallBackGroup
+        #_local_dirname: str
+        #strict_resume: bool
+        #load_path: str | None
+        #load_training_state: bool
+        #only_load_scheduler_state: bool
+        #save_thread: Thread | None
+        #verbose: bool
+        #keys_not_to_resume: list
+        #broadcast_via_filesystem: bool
+        --
+        +__init__(config_checkpoint, config_job, callbacks)
+        +{abstract} save(model, optimizer, scheduler, grad_scaler, iteration): None
+        +{abstract} load(model, optimizer, scheduler, grad_scaler): int
+        +finalize(): None
+        #_read_latest_checkpoint_file(): str | None
+        #_write_latest_checkpoint_file(checkpoint_file): None
+        #_check_checkpoint_exists(checkpoint_path): None
+        +save_dirname: str <<property>>
+        +load_dirname: str <<property>>
+        +save_bucket: None <<property>>
+        +load_bucket: None <<property>>
+    }
+
+    class DDPCheckpointer {
+        +KEYS_TO_SAVE: list
+        +KEYS_TO_POSTFIX: dict
+        -mp_world_size: int
+        -rank_dp_w_cp: int
+        -cp_rank: int
+        -mp_rank: int
+        -mp_gloo_pg: ProcessGroup
+        --
+        +__init__(*args, **kwargs)
+        +save(model, optimizer, scheduler, grad_scaler, iteration): None
+        +load(model, optimizer, scheduler, grad_scaler): int
+        +generate_save_state_dict(model, optimizer, scheduler, grad_scaler, iteration): dict
+        +load_broadcast_state_dict(checkpoint_path, model, resume_keys): dict
+        +keys_to_resume_during_load(): Tuple[Set, str | None]
+        +format_checkpoint_filename(model, iteration): str
+        +add_type_postfix_to_checkpoint_path(key, checkpoint_path, model): str
+        -_save_worker(state_dict, checkpoint_file, rank): None
+        -_map_state_dict_path_during_save(state_dict, checkpoint_file, model): dict
+        -_write_trained_data_record(checkpoint_file, trained_data_record): None
+        +print(message): None
+    }
+
+    class TPCheckpointer {
+        --
+        +add_type_postfix_to_checkpoint_path(key, checkpoint_path, model): str
+        ' Appends _mp_{rank}.pt for all non-trainer keys
+    }
+
+    class PEFTCheckpointer {
+        --
+        +__init__(*args, **kwargs)
+        +add_type_postfix_to_checkpoint_path(key, checkpoint_path, model): str
+        +load_broadcast_state_dict(checkpoint_path, model, resume_keys): dict
+        ' Requires broadcast_via_filesystem=True
+        ' Normalizes model_model.pt -> model.pt
+    }
+
+    class StateDictItemPath <<namedtuple>> {
+        +state_dict
+        +save_path
+    }
+}
+
+' ─────────────────────────────────────────
+' FSDP Checkpointer Hierarchy
+' ─────────────────────────────────────────
+package "cosmos_predict1 :: FSDP Checkpointing" {
+
+    class FSDPCheckpointer {
+        #callbacks: CallBackGroup
+        #checkpoint_dir_local: str
+        #strict_resume: bool
+        #load_path: str
+        #load_training_state: bool
+        #save_thread: Thread | None
+        #config_checkpoint: CheckpointConfig
+        --
+        +__init__(config_checkpoint, config_job, callbacks)
+        -_load_ckpt_file_during_init(): Tuple[str | None, bool]
+        +load_model_during_init(model, is_ema, ema_id): None
+        +load_optim_scheduler_during_init(fsdp_model, optimizer, scheduler): None
+        +get_optim_scheduler_state(optim, fsdp_model, scheduler): dict
+        +save(model, optimizer, scheduler, grad_scaler, iteration, async_saving): None
+        -_read_latest_checkpoint_file(): str | None
+        -_check_checkpoint_exists(checkpoint_path, is_raise): bool
+        ' Uses FSDP full state dict with rank0_only offload-to-cpu
+    }
+
+    class DiffusionFSDPCheckpointer {
+        -load_ema_to_reg: bool
+        --
+        +__init__(*args, **kwargs)
+        +load_model_during_init(model, is_ema, ema_id): None
+        ' Adds EMA-to-regular model loading support
+    }
+}
+
+note bottom of FSDPCheckpointer
+  Standalone hierarchy — does NOT
+  inherit from AbstractCheckpointer
+end note
+
+' ─────────────────────────────────────────
+' Storage Backend Hierarchy
+' ─────────────────────────────────────────
+package "cosmos_predict1.utils.easy_io :: Backends" {
+
+    abstract class BaseStorageBackend {
+        #_allow_symlink: bool = False
+        --
+        +{abstract} get(filepath): bytes
+        +{abstract} get_text(filepath): str
+        +allow_symlink: bool <<property>>
+        +name: str <<property>>
+    }
+
+    class LocalBackend {
+        #_allow_symlink: bool = True
+        --
+        +get(filepath): bytes
+        +get_text(filepath, encoding): str
+        +put(obj, filepath): None
+        +put_text(obj, filepath, encoding): None
+        +exists(filepath): bool
+        +isdir(filepath): bool
+        +isfile(filepath): bool
+        +join_path(filepath, *filepaths): str
+        +get_local_path(filepath): contextmanager
+        +copyfile(src, dst): str
+        +copytree(src, dst): str
+        +remove(filepath): None
+        +rmtree(dir_path): None
+        +list_dir_or_file(dir_path, ...): Iterator
+    }
+
+    class HardDiskBackend {
+        --
+        +name: str <<property override>>
+        ' Thin subclass of LocalBackend
+    }
+
+    class HTTPBackend {
+        --
+        +get(filepath): bytes
+        +get_text(filepath, encoding): str
+        +get_local_path(filepath): contextmanager
+    }
+
+    class Boto3Backend {
+        -_client: Boto3Client
+        -path_mapping: dict | None
+        --
+        +__init__(s3_credential_path, path_mapping)
+        -_map_path(filepath): str
+        +get(filepath): bytes
+        +get_text(filepath): str
+        +put(obj, filepath): None
+        +exists(filepath): bool
+        +fast_get(filepath): bytes
+        +fast_put(obj, filepath): None
+        +generate_presigned_url(url, client_method, expires_in): str
+        ' S3/boto3 backend with multi-cluster support
+        ' Resides in Lyra-2 codebase
+    }
+}
+
+' ─────────────────────────────────────────
+' File Client & easy_io Facade
+' ─────────────────────────────────────────
+package "cosmos_predict1.utils.easy_io :: Client & Facade" {
+
+    class FileClient {
+        -{static} _backends: dict
+        -{static} _prefix_to_backends: dict
+        -{static} _instances: dict
+        -client: BaseStorageBackend
+        --
+        +__new__(cls, backend, prefix, **kwargs): FileClient
+        +{static} infer_client(file_client_args, uri): FileClient
+        +{static} register_backend(name, backend, force, prefixes)
+        +{static} parse_uri_prefix(uri): str | None
+        +get(filepath): bytes
+        +get_text(filepath, encoding): str
+        +put(obj, filepath): None
+        +put_text(obj, filepath): None
+        +remove(filepath): None
+        +exists(filepath): bool
+        +isdir(filepath): bool
+        +isfile(filepath): bool
+        +join_path(filepath, *filepaths): str
+        +get_local_path(filepath): contextmanager
+        +list_dir_or_file(dir_path, ...): Iterator
+        ' Singleton pattern via _instances dict
+        ' Deprecated in favour of easy_io functions
+    }
+
+    class easy_io <<module>> {
+        --
+        +get_file_backend(uri, backend_args, enable_singleton, backend_key): BaseStorageBackend
+        +load(file, file_format, fast_backend, ...): Any
+        +dump(obj, file, file_format, fast_backend, ...): None
+        +get(filepath): bytes
+        +put(obj, filepath): None
+        +exists(filepath): bool
+        +isdir(filepath): bool
+        +isfile(filepath): bool
+        +copyfile(src, dst): str
+        +copytree(src, dst): str
+        +remove(filepath): None
+        +list_dir_or_file(dir_path, ...): Iterator
+        +generate_presigned_url(url, ...): str
+        ' Facade + Factory: routes by URI prefix
+        ' Preferred API over FileClient
+    }
+}
+
+' ─────────────────────────────────────────
+' Config / Support Types
+' ─────────────────────────────────────────
+package "Supporting Types" {
+    class CheckpointConfig <<config>> {
+    }
+    class CallBackGroup <<callbacks>> {
+    }
+}
+
+' ─────────────────────────────────────────
+' Inheritance Relationships
+' ─────────────────────────────────────────
+DDPCheckpointer    --|>  AbstractCheckpointer : extends
+TPCheckpointer     --|>  DDPCheckpointer      : extends
+PEFTCheckpointer   --|>  DDPCheckpointer      : extends
+
+DiffusionFSDPCheckpointer --|> FSDPCheckpointer : extends
+
+LocalBackend  --|>  BaseStorageBackend : extends
+HTTPBackend   --|>  BaseStorageBackend : extends
+Boto3Backend  --|>  BaseStorageBackend : extends
+HardDiskBackend --|> LocalBackend      : extends
+
+' ─────────────────────────────────────────
+' Composition / Aggregation
+' ─────────────────────────────────────────
+FileClient  *--  BaseStorageBackend : client
+
+' ─────────────────────────────────────────
+' Dependencies
+' ─────────────────────────────────────────
+AbstractCheckpointer  ..>  easy_io           : uses (exists / load / dump)
+AbstractCheckpointer  ..>  CheckpointConfig  : depends on
+AbstractCheckpointer  ..>  CallBackGroup     : depends on
+
+DDPCheckpointer  ..>  easy_io            : save_worker (dump / load)
+DDPCheckpointer  ..>  StateDictItemPath  : creates
+
+FSDPCheckpointer ..>  easy_io            : uses
+FSDPCheckpointer ..>  CheckpointConfig   : depends on
+FSDPCheckpointer ..>  CallBackGroup      : depends on
+
+easy_io  ..>  BaseStorageBackend  : get_file_backend (URI prefix routing)
+easy_io  ..>  FileClient          : legacy load/dump path (deprecated)
+
+@enduml

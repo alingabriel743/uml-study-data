@@ -1,0 +1,143 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+skinparam ArrowColor #495057
+skinparam ActivityStartColor #212529
+skinparam ActivityEndColor #212529
+
+title World Interpolation Generation Pipeline\n<size:11><i>DiffusionWorldInterpolatorGenerationPipeline.generate()</i></size>
+
+|#E8F4FD|Pipeline Controller|
+|#FFF8E1|VLM Prompt Upsampler|
+|#F3E5F5|Guardrail|
+|#E8F5E9|Text Encoder|
+|#FBE9E7|Tokenizer / Model|
+
+|Pipeline Controller|
+start
+:Receive **generate**(prompt, image_or_video_path, negative_prompt);
+
+if (enable_prompt_upsampler?) then (yes)
+    |VLM Prompt Upsampler|
+    if (offload_prompt_upsampler?) then (yes)
+        :_load_prompt_upsampler_model()\n<size:10>create_vlm_prompt_upsampler(checkpoint_dir)</size>;
+    endif
+    :prepare_dialog(image_or_video_path)\n<size:10>Build VLM dialog with visual context</size>;
+    :run_chat_completion_vlm(prompt_upsampler, dialog)\n<size:10>max_gen_len=400 → upsampled_prompt</size>;
+    if (offload_prompt_upsampler?) then (yes)
+        :Offload prompt_upsampler from GPU;
+    endif
+    |Guardrail|
+    if (disable_guardrail?) then (no)
+        :_run_guardrail_on_prompt_with_offload\n<size:10>Check upsampled_prompt safety</size>;
+        if (prompt is safe?) then (no)
+            #FFB3B3:RETURN None\n<size:10>Blocked by text guardrail</size>;
+            stop
+        endif
+    endif
+else (no — use original prompt)
+    |Guardrail|
+    if (disable_guardrail?) then (no)
+        :_run_guardrail_on_prompt_with_offload\n<size:10>Check original prompt safety</size>;
+        if (prompt is safe?) then (no)
+            #FFB3B3:RETURN None\n<size:10>Blocked by text guardrail</size>;
+            stop
+        endif
+    endif
+endif
+
+|Text Encoder|
+:_run_text_embedding_on_prompt_with_offload\n<size:10>[prompt, negative_prompt]</size>;
+note right
+  Outputs:
+  • prompt_embedding
+  • negative_prompt_embedding
+end note
+
+|Tokenizer / Model|
+if (offload_tokenizer?) then (yes)
+    :_load_tokenizer();
+endif
+
+:get_video_batch(model, prompt_embedding, height, width, fps, num_video_frames)\n<size:10>→ raw_data_batch, state_shape</size>;
+:Compute H, W from state_shape × spatial_compression_factor;
+:read_video_or_image_into_frames_BCTHW\n<size:10>(image_or_video_path, H, W) → input_frames</size>;
+:Compute num_frame_pairs\n<size:10>(default: num_frames // frame_stride)</size>;
+
+|Pipeline Controller|
+:Initialize video_output = [];
+
+repeat
+    |Tokenizer / Model|
+    :_run_tokenizer_encoding\n<size:10>(image_or_video_path, frame_index, frame_stride)</size>;
+    :get_condition_latent(model, image_or_video_path,\nnum_input_frames, state_shape, frame_index, frame_stride)\n<size:10>→ condition_latent</size>;
+    note right
+      Selects boundary frame pair
+      for interpolation segment
+    end note
+
+    :_run_model(condition_latent, negative_prompt_embedding,\nraw_data_batch, state_shape);
+    :generate_video_from_batch_with_loop\n<size:10>(model, data_batch, condition_latent, num_of_loops,\nguidance, state_shape, num_steps, seed)</size>\n<size:10>→ video_np_THWC</size>;
+
+    |Pipeline Controller|
+    if (first frame pair iteration?) then (yes)
+        :Append full segment to video_output;
+    else (no)
+        :Skip first frame (overlap)\nAppend remaining frames to video_output;
+    endif
+    :frame_index++;
+repeat while (frame_index < num_frame_pairs?) is (yes)
+->no (all pairs done);
+
+|Tokenizer / Model|
+:torch.cat(video_output, dim=1)\n<size:10>→ video_tensor (C, total_T, H, W)</size>;
+:Permute + Normalize to uint8\n<size:10>→ video_np [T, H, W, C]</size>;
+
+if (offload_network?) then (yes)
+    :_offload_network();
+endif
+if (offload_tokenizer?) then (yes)
+    :_offload_tokenizer();
+endif
+
+|Guardrail|
+if (disable_guardrail?) then (no)
+    :_run_guardrail_on_video_with_offload(video_np)\n<size:10>Check generated video safety</size>;
+    if (video passes guardrail?) then (no)
+        #FFB3B3:RETURN None\n<size:10>Blocked by video guardrail</size>;
+        stop
+    endif
+endif
+
+|Pipeline Controller|
+#C8E6C9:RETURN (video_np, prompt)\n<size:10>video_np: np.ndarray [T, H, W, C] uint8</size>;
+stop
+
+@enduml

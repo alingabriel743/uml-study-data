@@ -1,0 +1,126 @@
+{
+  "scope": "telegram_frontend_flow",
+  "title": "Telegram Frontend Message Handling",
+  "diagram_type": "activity",
+  "source_files_analyzed": ["frontends/tgapp.py"],
+
+  "entry_points": [
+    "handle_msg(update, ctx)  — triggered by MessageHandler for TEXT & ~COMMAND",
+    "cmd_abort(update, ctx)   — triggered by CommandHandler('/stop')",
+    "cmd_llm(update, ctx)     — triggered by CommandHandler('/llm')"
+  ],
+
+  "activity_flow_handle_msg": [
+    "START: Telegram TEXT message received",
+    "EXTRACT: uid = update.effective_user.id",
+    "DECISION: ALLOWED set non-empty AND uid not in ALLOWED?",
+    "  → YES: reply_text('no') → END",
+    "  → NO: continue",
+    "ACTION: msg = await update.message.reply_text('thinking...')",
+    "ACTION: build prompt string with [FILE:filepath] instruction prepended",
+    "ACTION: dq = agent.put_task(prompt, source='telegram')  [returns a queue]",
+    "ACTION: task = asyncio.create_task(_stream(dq, msg))",
+    "ACTION: ctx.user_data['stream_task'] = task",
+    "END: handler returns (stream runs independently as async task)"
+  ],
+
+  "activity_flow_stream": [
+    "START: _stream(dq, msg) coroutine begins",
+    "LOOP: while True",
+    "  ACTION: await asyncio.sleep(3)  [poll interval]",
+    "  ACTION: drain queue dq → get latest item (dq.get_nowait() loop)",
+    "  DECISION: item is None?",
+    "    → YES: continue (no new data yet)",
+    "    → NO: continue",
+    "  ACTION: raw = item['done'] if done else item['next']",
+    "  ACTION: done = 'done' in item",
+    "  ACTION: show = _clean(raw)  [strip <thinking>/<summary>/<tool_use>/<file_content> tags, collapse newlines]",
+    "  DECISION: len(show) > 4000?",
+    "    → YES: msg = await msg.reply_text('(continued...)'); reset last_text; show = show[-3900:]",
+    "    → NO: continue",
+    "  ACTION: display = show + ' ⏳' if not done else show",
+    "  DECISION: display != last_text?",
+    "    → YES: await msg.edit_text(_to_html(display), parse_mode='HTML')  [fallback: plain text]",
+    "    → NO: skip edit",
+    "  DECISION: done?",
+    "    → NO: continue loop",
+    "    → YES: enter file delivery phase",
+    "  FILE DELIVERY: files = re.findall(r'\\[FILE:([^\\]]+)\\]', show[-1000:])",
+    "  FOR EACH fpath in files:",
+    "    DECISION: path is absolute? → resolve relative to _TEMP_DIR",
+    "    DECISION: file exists?",
+    "      → NO: skip",
+    "      → YES:",
+    "        DECISION: extension in (.png/.jpg/.jpeg/.gif/.webp)?",
+    "          → YES: await msg.reply_photo(open(fpath,'rb'))",
+    "          → NO:  await msg.reply_document(open(fpath,'rb'))",
+    "  ACTION: strip [FILE:...] markers from show",
+    "  DECISION: show.strip() non-empty?",
+    "    → YES: await msg.edit_text(_to_html(show), parse_mode='HTML')  [fallback: plain]",
+    "    → NO: skip final edit",
+    "  ACTION: break",
+    "END"
+  ],
+
+  "activity_flow_cmd_abort": [
+    "START: /stop command received",
+    "ACTION: agent.abort()  [signals agent to stop current task]",
+    "ACTION: task = ctx.user_data.get('stream_task')",
+    "DECISION: task exists AND not task.done()?",
+    "  → YES: task.cancel()",
+    "  → NO: skip",
+    "ACTION: await update.message.reply_text('Aborted')",
+    "END"
+  ],
+
+  "activity_flow_cmd_llm": [
+    "START: /llm command received",
+    "ACTION: args = update.message.text.split()",
+    "DECISION: len(args) > 1 (index argument provided)?",
+    "  → YES:",
+    "    ACTION: n = int(args[1])",
+    "    ACTION: agent.next_llm(n)",
+    "    ACTION: reply_text(f'Switched to [{agent.llm_no}] {agent.get_llm_name()}')",
+    "    [on ValueError/IndexError]: reply_text usage hint",
+    "  → NO (list mode):",
+    "    ACTION: lines = agent.list_llms()  [list of (index, name, is_current)]",
+    "    ACTION: reply_text formatted LLM list with '→' marker on current",
+    "END"
+  ],
+
+  "startup_flow": [
+    "Acquire single-instance socket lock on 127.0.0.1:19527 (exit if already bound)",
+    "Check ALLOWED non-empty (exit if empty — security guard)",
+    "Redirect stdout/stderr to temp/tgapp.log",
+    "threading.Thread(target=agent.run, daemon=True).start()  [agent runs in background thread]",
+    "LOOP (crash-restart): build HTTPXRequest(proxy), ApplicationBuilder.token(...).build()",
+    "Register handlers: /stop→cmd_abort, /llm→cmd_llm, TEXT→handle_msg",
+    "app.run_polling(drop_pending_updates=True, poll_interval=1.0, timeout=30)",
+    "On exception: sleep(10), new event loop, retry"
+  ],
+
+  "key_helpers": {
+    "_clean(t)": "Strip <thinking>, <summary>, <tool_use>, <file_content> tags via regex; collapse 3+ newlines to 2; return '...' if empty",
+    "_to_html(t)": "Convert markdown to Telegram HTML: escape HTML, wrap fenced code blocks in <pre><code>, convert **bold** → <b>, *italic* → <i>, `code` → <code>",
+    "_inline_md(s)": "Sub-helper for inline markdown conversion (bold/italic/code)"
+  },
+
+  "key_relationships": [
+    "handle_msg depends_on agent.put_task → returns queue dq",
+    "handle_msg creates_async_task _stream(dq, msg)",
+    "cmd_abort calls agent.abort() AND cancels stored stream_task",
+    "_stream reads from dq (queue produced by agent), calls _clean, _to_html, msg.edit_text, msg.reply_photo/reply_document",
+    "agent (GeneraticAgent) runs in daemon thread, communicates via queue"
+  ],
+
+  "important_notes": [
+    "Poll interval in _stream is 3 seconds (asyncio.sleep(3))",
+    "Message overflow threshold: 4000 chars → spawn new reply message, keep last 3900 chars",
+    "File attachments encoded as [FILE:path] in agent output, parsed at stream done",
+    "Image extensions: .png .jpg .jpeg .gif .webp → reply_photo; others → reply_document",
+    "Relative file paths resolved against _TEMP_DIR (project root /temp/)",
+    "Auth: ALLOWED set from mykeys['tg_allowed_users']; empty ALLOWED blocks startup entirely",
+    "parse_mode='HTML' with fallback to plain text on edit failure",
+    "Telegram bot token from mykeys['tg_bot_token']; proxy from mykeys['proxy'] (default: http://127.0.0.1:2082)"
+  ]
+}

@@ -1,0 +1,227 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+}
+
+title Steam Multiplayer Session Setup
+
+actor "Game Launch" as Launch
+
+box "Desktop Layer" #E8F4FD
+    participant "DesktopLauncher" as DL
+    participant "SVars" as SVars
+end box
+
+box "Steam Services" #EDF7ED
+    participant "SNet" as SNet
+    participant "SUser" as SUser
+    participant "SWorkshop" as SWorkshop
+    participant "SStats" as SStats
+end box
+
+box "Steam SDK" #FFF8E1
+    participant "SteamMatchmaking\n(smat)" as smat
+    participant "SteamNetworking\n(snet)" as snet
+    participant "SteamFriends\n(friends)" as friends
+    participant "SteamUGC\n(ugc)" as ugc
+    participant "SteamUserStats\n(stats)" as steamStats
+end box
+
+box "Game Core" #FDF2F8
+    participant "Net\n(mindustry)" as Net
+    participant "GameService" as GS
+    participant "SteamConnection" as SCon
+end box
+
+== Initialization ==
+
+Launch -> DL: launch()
+activate DL
+
+DL -> DL: SteamAPI.loadLibraries() + init()
+
+DL -> SNet ** : new SNet(new ArcNetProvider())
+activate SNet
+SNet -> snet : (compose SteamNetworking)
+SNet -> smat : (compose SteamMatchmaking)
+SNet -> friends : (compose SteamFriends)
+SNet -> SNet : Events.on(ClientLoadEvent)\n→ register P2P read loop
+deactivate SNet
+
+DL -> SVars : net = SNet instance
+
+DL -> SStats ** : new SStats()
+activate SStats
+SStats -> steamStats : requestCurrentStats()
+SStats -> SStats : Events.on(ClientLoadEvent)\n→ Timer every 4 min:\nif updated → storeStats()
+deactivate SStats
+DL -> SVars : stats = SStats instance
+
+DL -> SWorkshop ** : new SWorkshop()
+activate SWorkshop
+SWorkshop -> ugc : getSubscribedItems(ids[])
+ugc --> SWorkshop : fileIDs[]
+loop for each fileID
+    SWorkshop -> ugc : getItemInstallInfo(fileID)
+    ugc --> SWorkshop : folderPath
+    SWorkshop -> SWorkshop : classify by extension\n(.msav=Map, .msch=Schematic,\nmod.json/hjson=LoadedMod)
+end
+deactivate SWorkshop
+DL -> SVars : workshop = SWorkshop instance
+
+DL -> SUser ** : new SUser()
+DL -> SVars : user = SUser instance
+
+DL -> friends : getPersonaName()
+friends --> DL : playerName
+DL -> DL : player.name = playerName
+
+DL -> DL : Core.app.addListener:\nupdate loop → SteamAPI.runCallbacks()
+
+== Stats Async Callback ==
+
+steamStats --> SStats : onUserStatsReceived(gameID, steamID, OK)
+activate SStats
+SStats -> GS : service.init()
+deactivate SStats
+
+== Host Server Flow ==
+
+Launch -> DL : hostServer(port)
+activate DL
+DL -> SNet : hostServer(port)
+activate SNet
+SNet -> Net : provider.hostServer(port)
+SNet -> smat : createLobby(LobbyType.Public, playerLimit)
+smat --> SNet : onLobbyCreated(SteamResult.OK, steamID)
+SNet -> SNet : currentLobby = steamID
+SNet -> smat : setLobbyData(steamID, "name", player.name)
+SNet -> smat : setLobbyData(steamID, "mapname", state.map.name())
+SNet -> smat : setLobbyData(steamID, "version", Version.build)
+SNet -> smat : setLobbyData(steamID, "wave", state.wave)
+SNet -> smat : setLobbyData(steamID, "gamemode", state.rules.mode())
+SNet -> smat : setLobbyData(steamID, "banned", bannedSteamHandles)
+deactivate SNet
+deactivate DL
+
+== Client Connect Flow ==
+
+Launch -> Net : connect("steam:<lobbyHandle>", port)
+activate Net
+Net -> SNet : connectClient("steam:<lobbyHandle>", port, successCallback)
+activate SNet
+SNet -> smat : joinLobby(SteamID from handle)
+smat --> SNet : onLobbyEnter(steamIDLobby, chatPermissions, blocked, response)
+
+alt response != Success
+    SNet -> SNet : ui.showErrorMessage(); return
+else response == Success
+    SNet -> smat : getLobbyData(lobby, "version")
+    smat --> SNet : versionString
+    alt version mismatch
+        SNet -> smat : leaveLobby(steamIDLobby)
+        SNet -> SNet : show clientOutdated/serverOutdated; return
+    else version ok
+        SNet -> Net : logic.reset() + net.reset()
+        SNet -> smat : getLobbyOwner(steamIDLobby)
+        smat --> SNet : serverSteamID
+        SNet -> SNet : currentLobby = steamIDLobby\ncurrentServer = serverSteamID
+        SNet -> friends : getFriendPersonaName(currentServer)
+        SNet -> Net : joinCallback.run()
+        SNet -> Net : net.setClientConnected()
+        SNet -> Net : handleClientReceived(new Connect("steam:<serverAccountID>"))
+    end
+end
+deactivate SNet
+deactivate Net
+
+== P2P Session Handshake (Server Side) ==
+
+SNet <- snet : onP2PSessionRequest(steamIDRemote)
+activate SNet
+note right of SNet: Client sends first packet;\nserver must accept session
+SNet -> snet : acceptP2PSessionWithUser(steamIDRemote)
+deactivate SNet
+
+== P2P Packet Send (Server → Client) ==
+
+Net -> SCon ** : new SteamConnection(steamIDRemote)
+activate SCon
+SCon -> SCon : serializer.write(writeBuffer, object)
+SCon -> snet : sendP2PPacket(steamID, writeBuffer,\nP2PSend.Reliable, channel=0)
+deactivate SCon
+
+note right of snet: Packets >= 1000 bytes\nauto-set to Reliable
+
+== P2P Packet Receive Loop ==
+
+loop SteamAPI.runCallbacks() — every frame
+    SNet -> snet : isP2PPacketAvailable(channel=0)
+    snet --> SNet : packetLength > 0
+    SNet -> snet : readP2PPacket(from, readBuffer, channel=0)
+    snet --> SNet : fromSteamID, packetData
+    SNet -> SNet : serializer.read(readCopyBuffer) → Packet
+    alt server mode AND new peer
+        SNet -> SCon ** : new SteamConnection(fromSteamID)
+        SNet -> Net : handleServerReceived(con, new Connect("steam:<fromAccountID>"))
+    end
+    SNet -> Net : handleServerReceived(con, packet)\nor handleClientReceived(packet)
+end
+
+== Achievements & Stats ==
+
+GS -> SVars : stats.stats.setAchievement(name)
+activate GS
+GS -> SVars : stats.onUpdate() → updated = true
+deactivate GS
+
+note over SStats: Timer fires every 4 minutes
+SStats -> steamStats : storeStats() [if updated == true]
+steamStats --> SStats : onUserStatsStored(gameID, OK)
+SStats -> SStats : updated = true
+
+== Disconnect Flow ==
+
+Launch -> SNet : disconnectClient()
+activate SNet
+SNet -> smat : leaveLobby(currentLobby)
+SNet -> snet : closeP2PSessionWithUser(currentServer)
+SNet -> Net : handleClientReceived(new Disconnect())
+SNet -> SNet : currentServer = null\ncurrentLobby = null
+deactivate SNet
+
+smat --> SNet : onLobbyChatUpdate(lobby, who, changer, Left/Disconnected)
+activate SNet
+alt who == currentServer (client view)
+    SNet -> Net : net.disconnect()
+else server view
+    SNet -> snet : closeP2PSessionWithUser(who)
+    SNet -> Net : handleServerReceived(con, Disconnect)
+end
+deactivate SNet
+
+@enduml

@@ -1,0 +1,121 @@
+{
+  "scope": "symfony_integration",
+  "title": "Symfony Framework Auto-Instrumentation",
+  "diagram_type": "use_case",
+  "actors": [
+    "DDTrace Agent (Datadog PHP Tracer)",
+    "Symfony HttpKernel",
+    "Symfony EventDispatcher",
+    "Symfony Router / Container",
+    "AppSec Module",
+    "Developer / Operator"
+  ],
+  "use_cases": [
+    "Instrument Symfony HTTP request lifecycle (Kernel::handle)",
+    "Instrument Symfony Kernel boot (Kernel::boot)",
+    "Discover and catalog all HTTP endpoints (EndpointCatalog::generate)",
+    "Resolve route path template for a given route name (EndpointCatalog::pathForRoute)",
+    "Set HTTP route tag on root span (Tag::HTTP_ROUTE via handle_http_route closure)",
+    "Inject controller/action metadata into span (injectActionInfo)",
+    "Trace EventDispatcher::dispatch with event-name-based span naming",
+    "Trace Symfony console commands (Command::run)",
+    "Track user login success / failure (AppSec automated events)",
+    "Track user signup via Doctrine ORM insert hook",
+    "Track authenticated user access decision",
+    "Trace template rendering (Twig, PhpEngine, DelegatingEngine)",
+    "Handle and annotate exceptions (handleException / handleThrowable)",
+    "Silence noisy stty spans (Terminal::hasSttyAvailable hook)"
+  ],
+  "key_classes": [
+    {
+      "name": "SymfonyIntegration",
+      "namespace": "DDTrace\\Integrations\\Symfony",
+      "extends": "Integration",
+      "key_methods": [
+        "static init(): int — registers all trace_method / hook_method hooks; calls loadSymfony()",
+        "static loadSymfony(): void — installs HttpKernel, EventDispatcher, console, templating, exception, AppSec hooks",
+        "static injectActionInfo($event, $eventName, SpanData $requestSpan): bool — sets symfony.route.action meta on CONTROLLER event"
+      ],
+      "static_fields": ["$frameworkPrefix (string)", "$kernel (Kernel instance)"]
+    },
+    {
+      "name": "EndpointCatalog",
+      "namespace": "DDTrace\\Integrations\\Symfony",
+      "key_methods": [
+        "static generate(ContainerInterface $container): array — memoized; tries cache first, falls back to RouteCollection",
+        "static pathForRoute($routeName, ContainerInterface $container): ?string — resolves URL template from compiled cache files",
+        "private static getCacheDir(ContainerInterface $container): ?string — reads kernel.cache_dir parameter",
+        "private static fromRouterCache($cacheDir): array — parses url_generating_routes.php + url_matching_routes.php",
+        "private static fromRouteCollection(ContainerInterface $container): array — uses RouterInterface::getRouteCollection()",
+        "private static tokensToPathTemplate(array $tokens): string — converts Symfony generator token array to /path/{param} string",
+        "private static extractMethodsByRoute(array $matchData): array — extracts HTTP methods from matcher cache (static + dynamic routes)",
+        "private static pickMethod($methods): string — GET > POST > first key; defaults GET",
+        "private static pickMethodFromMethodList(array $methods): string — GET > POST > first; defaults GET"
+      ]
+    },
+    {
+      "name": "RouteServiceProvider (Laravel test fixture)",
+      "namespace": "App\\Providers",
+      "note": "Laravel RouteServiceProvider used in test environments; not part of Symfony integration logic. Defines web + api route groups.",
+      "key_methods": ["boot()", "map()", "mapWebRoutes()", "mapApiRoutes()"]
+    }
+  ],
+  "endpoint_catalog_flow": [
+    "generate() called → check memo cache",
+    "getCacheDir() → reads kernel.cache_dir from ContainerInterface",
+    "If cacheDir available → fromRouterCache(cacheDir): require url_generating_routes.php (tokens at index 3) + url_matching_routes.php",
+    "extractMethodsByRoute(): parse static routes (matchData[1]) and dynamic routes (matchData[3]) → map routeName → HTTP methods",
+    "tokensToPathTemplate(): iterate tokens in reverse; 'text' → append literal; 'variable' → append {varName}",
+    "pickMethod() / pickMethodFromMethodList() → resolve single HTTP verb (GET preference)",
+    "Output: array of {path, operationName:'http.request', resourceName:'METHOD /path', method}",
+    "If no cache → fromRouteCollection(): RouterInterface::getRouteCollection() → iterate Route objects → getPath() + getMethods()"
+  ],
+  "span_tagging": [
+    "root span name = 'symfony.request', service = app name, meta[span.kind]='server', meta[component]='symfony'",
+    "HttpKernel::handle span → 'symfony.kernel.handle', type=WEB_SERVLET",
+    "HttpKernel::boot span → 'symfony.httpkernel.kernel.boot'",
+    "EventDispatcher::dispatch span → 'symfony.{eventName}' (e.g. symfony.kernel.controller)",
+    "Controller span → 'symfony.controller', resource = 'ClassName::method'",
+    "Console Command span → 'symfony.console.command.run', type=CLI, meta[symfony.console.command.class]",
+    "Template render span → 'symfony.templating.render'",
+    "Exception span → 'symfony.kernel.handleException'",
+    "meta[symfony.route.name] = _route attribute from request",
+    "meta[symfony.route.action] = 'ControllerClass@actionMethod'",
+    "meta[http.route] = resolved path template (e.g. /users/{id})"
+  ],
+  "endpoint_collection_trigger": [
+    "EventDispatcher::dispatch prehook fires",
+    "Checks: !endpoints_collected AND kernel != null AND kernel VERSION not 4.x AND frameworkPrefix == 'symfony'",
+    "Calls EndpointCatalog::generate(container)",
+    "Calls DDTrace\\add_endpoint(path, 'http.request', resourceName, method) for each",
+    "Calls DDTrace\\flush_endpoints()"
+  ],
+  "appsec_integrations": [
+    "Doctrine UnitOfWork::executeInserts → track_user_signup_event_automated (UserInterface entity inserted)",
+    "AbstractFormLoginAuthenticator::onAuthenticationSuccess/Failure (Symfony < 5) → track login events",
+    "AbstractAuthenticationListener::onSuccess/onFailure (Symfony 5/6) → track login events",
+    "FormLoginAuthenticator::onAuthenticationSuccess/Failure (Symfony >= 6) → track login events",
+    "AccessDecisionManagerInterface::decide → track_authenticated_user_event_automated"
+  ],
+  "config_flags": [
+    "DD_TRACE_SYMFONY_HTTP_ROUTE — enables route path template resolution on root span",
+    "DD_HTTP_SERVER_ROUTE_BASED_NAMING — sets rootSpan.resource = route_name",
+    "DD_TRACE_REMOVE_ROOT_SPAN_SYMFONY_MESSENGER — suppress root span for messenger:consume CLI command"
+  ],
+  "key_relationships": [
+    "SymfonyIntegration uses EndpointCatalog to build endpoint catalog from Symfony container",
+    "EndpointCatalog depends_on ContainerInterface (reads cache_dir param, fetches RouterInterface)",
+    "EndpointCatalog reads compiled Symfony cache files: url_generating_routes.php, url_matching_routes.php (Symfony 5+) or UrlGenerator.php (4.3-4.4)",
+    "SymfonyIntegration hooks Symfony\\Component\\HttpKernel\\Kernel (handle, boot, getHttpKernel)",
+    "SymfonyIntegration hooks Symfony\\Component\\HttpKernel\\HttpKernel (handle, handleException, handleThrowable)",
+    "SymfonyIntegration hooks EventDispatcher + ContainerAwareEventDispatcher (dispatch)",
+    "SymfonyIntegration hooks Drupal\\Core\\DrupalKernel for Drupal/Symfony shared flow",
+    "RouteServiceProvider (Laravel) is a test-environment fixture, not part of core Symfony integration"
+  ],
+  "important_notes": "This is a Datadog PHP APM auto-instrumentation library (ddtrace). EndpointCatalog generates a route map at first EventDispatcher::dispatch call (not at init) to ensure Symfony container/router is ready. Cache file approach (url_generating_routes.php) is preferred over live RouteCollection for performance. Symfony versions 2.x/3.x/4.x/5.x/6.x are all supported with conditional hooks. Drupal (which builds on Symfony HttpKernel) is also handled via the same integration with frameworkPrefix switching.",
+  "source_files_analyzed": [
+    "src/DDTrace/Integrations/Symfony/EndpointCatalog.php",
+    "src/DDTrace/Integrations/Symfony/SymfonyIntegration.php",
+    "dockerfiles/testing-environment/Laravel57/app/app/Providers/RouteServiceProvider.php"
+  ]
+}

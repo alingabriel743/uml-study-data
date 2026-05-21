@@ -1,0 +1,256 @@
+{
+  "scope": "annotation_processing_codegen",
+  "title": "Annotation Processing & Code Generation",
+  "diagram_type": "activity",
+  "description": "Compile-time annotation processor pipeline: entity component generation, remote-call stub generation, logic statement I/O, and asset region loading. All processors extend BaseProcessor which extends AbstractProcessor.",
+
+  "shared_infrastructure": {
+    "class": "BaseProcessor extends AbstractProcessor",
+    "lifecycle": [
+      "init(ProcessingEnvironment): initializes Trees, Types, Elements, Filer, Messager; sets rootDirectory from CLASS_OUTPUT path",
+      "process(Set<TypeElement>, RoundEnvironment): guards on round counter (round++ >= rounds → return false); resolves rootDirectory on first call; delegates to abstract process(RoundEnvironment)",
+      "process(RoundEnvironment): overridden by each subclass"
+    ],
+    "key_utilities": [
+      "write(TypeSpec.Builder): sorts superinterfaces/methods/fields, builds JavaFile via JavaPoet, writes via Filer.createSourceFile()",
+      "write(TypeSpec.Builder, Seq<String> imports): same + injects sorted custom imports after package declaration",
+      "elements/types/fields/methods(Class<Annotation>): query RoundEnvironment and wrap results in Selement/Stype/Svar/Smethod wrappers",
+      "err(String, Element): reports ERROR via Messager + Log",
+      "isPrimitive, typeSize, getDefault, simpleName, tname: static helpers for type manipulation"
+    ],
+    "static_fields": ["Types typeu", "Elements elementu", "Filer filer", "Messager messager", "Trees trees", "String packageName = 'mindustry.gen'"]
+  },
+
+  "processors": [
+    {
+      "name": "EntityProcess",
+      "extends": "BaseProcessor",
+      "package": "mindustry.annotations.entity",
+      "supported_annotations": ["@EntityDef", "@GroupDef", "@EntityInterface", "@BaseComponent", "@TypeIOHandler"],
+      "rounds": 3,
+      "state": {
+        "definitions": "Seq<EntityDefinition> — one per @EntityDef",
+        "groupDefs": "Seq<GroupDefinition> — one per @GroupDef",
+        "baseComponents": "Seq<Stype> — all @BaseComponent types",
+        "componentNames": "ObjectMap<String, Stype>",
+        "componentDependencies": "ObjectMap<Stype, Seq<Stype>>",
+        "defComponents": "ObjectMap<Selement, Seq<Stype>>",
+        "varInitializers": "ObjectMap<String, String> — field descriptor → init expression",
+        "methodBlocks": "ObjectMap<String, String> — method descriptor → body source text",
+        "allGroups/allDefs/allInterfaces": "accumulated across all rounds"
+      },
+      "activity_flow": [
+        "START: process(RoundEnvironment) called",
+        "Accumulate: allGroups += elements(@GroupDef), allDefs += elements(@EntityDef), allInterfaces += types(@EntityInterface)",
+        "BRANCH: round == 1?",
+        "  YES → Round 1: Collect base data",
+        "    serializer = TypeIOResolver.resolve(this)",
+        "    baseComponents = types(@BaseComponent)",
+        "    FOR each baseComponent: extract varInitializers (field init expressions via AST) and methodBlocks (method body source text)",
+        "    FOR each baseComponent: register in componentNames map",
+        "    FOR each @EntityInterface: build interface TypeSpec, call write(inter)",
+        "    SPECIAL CASE: components with @EntityDef get no base class — generated class IS the base",
+        "    Inject field initializers into interface builders where varInitializers contains key",
+        "  END Round 1",
+        "BRANCH: round == 2?",
+        "  YES → Round 2: Build group accessors and entity classes",
+        "    FOR each @GroupDef: build GroupDefinition(name, bestType, components, spatial, mapping, collides)",
+        "    Build group accessor interface TypeSpec, call write(accessor)",
+        "    FOR each @EntityDef:",
+        "      Resolve components = getComponents(type) [recursive, cache in defComponents]",
+        "      Resolve groups = groupDefs where all group.components ⊆ entity.components",
+        "      Build entity class TypeSpec.Builder with fields from all components",
+        "      FOR each component field: inject initializer from varInitializers if present",
+        "      FOR each component method:",
+        "        SPECIAL CASE 'add'/'remove': inject group add/remove code for each matching GroupDefinition",
+        "        SPECIAL CASE 'write'/'read': delegate to EntityIO.write()",
+        "        SPECIAL CASE 'writeSync'/'readSync': sync I/O",
+        "        SPECIAL CASE 'writeSyncManual'/'readSyncManual': manual buffer sync",
+        "        SPECIAL CASE 'interpolate': interpolation impl",
+        "        SPECIAL CASE 'snapSync'/'snapInterpolation': snap methods",
+        "        IF abstract/native or no methodBlock: skip; ELSE inject methodBlock source",
+        "      Build reset() method with field defaults from varInitializers or getDefault()",
+        "      Store EntityDefinition(name, builder, type, baseClass, components, groups, fieldSpecs, legacy)",
+        "    FOR each GroupDefinition: write group class stubs",
+        "    Write Groups registry class (groupsBuilder)",
+        "    Write EntityMapping id-lookup class (idBuilder)",
+        "  END Round 2",
+        "BRANCH: round == 3?",
+        "  YES → Round 3: Finalize and write entity & component classes",
+        "    FOR each EntityDefinition: collect imports from component method bodies",
+        "    FOR each EntityDefinition: call write(def.builder, imports)",
+        "    FOR each EntityDefinition with legacy flag: write legacy wrapper class",
+        "  END Round 3",
+        "END"
+      ],
+      "helper_methods": [
+        "getComponent(String name) → Stype: lookup from componentNames",
+        "getComponents(Selement type) → Seq<Stype>: recursive resolution via defComponents cache; always appends baseComponents",
+        "getDependencies(Stype component) → Seq<Stype>: resolves component interface deps recursively; caches in componentDependencies"
+      ],
+      "inner_classes": [
+        "GroupDefinition: name, bestType(ClassName), components(Seq<Stype>), spatial, mapping, collides, manualInclusions",
+        "EntityDefinition: name, builder, naming(Selement), extend(TypeName), components, groups, fieldSpec, legacy"
+      ]
+    },
+    {
+      "name": "RemoteProcess",
+      "extends": "BaseProcessor",
+      "package": "mindustry.annotations.remote",
+      "supported_annotations": ["@Remote", "@TypeIOHandler"],
+      "rounds": 1,
+      "activity_flow": [
+        "START: process(RoundEnvironment) called",
+        "serializer = TypeIOResolver.resolve(this)",
+        "elements = methods(@Remote) — find all @Remote-annotated methods",
+        "orderedElements = elements.copy().sortComparing(Selement::toString) — deterministic ordering",
+        "FOR each method in orderedElements:",
+        "  VALIDATE: must be public AND static → err() if not",
+        "  VALIDATE: annotation.targets() != Loc.none → err() if none",
+        "  packetName = capitalize(method.name()) + 'CallPacket' [+ disambiguator index if collision]",
+        "  CREATE MethodEntry(callLocation, qualifiedMethodName, packetName, targets, variants, called, unreliable, forward, methodID++, element, priority)",
+        "  methods.add(entry)",
+        "CallGenerator.generate(serializer, methods)",
+        "END"
+      ],
+      "delegates_to": "CallGenerator.generate()"
+    },
+    {
+      "name": "CallGenerator",
+      "package": "mindustry.annotations.remote",
+      "type": "utility (static methods only)",
+      "activity_flow": [
+        "START: generate(ClassSerializer serializer, Seq<MethodEntry> methods)",
+        "Create callBuilder = TypeSpec.classBuilder('Call')",
+        "Create register = MethodSpec.methodBuilder('registerPackets')",
+        "FOR each MethodEntry ent in methods:",
+        "  CREATE packet = TypeSpec.classBuilder(ent.packetClassName) extends mindustry.net.Packet",
+        "  IF ent.priority != normal: override getPriority() → return priority.ordinal()",
+        "  makeWriter(packet, ent, serializer): generates write(Writes) — iterates params, writes primitives inline or via serializer.getNetWriter()",
+        "  makeReader(packet, ent, serializer): generates read(Reads,int) — stores DATA=READ.b(LENGTH); generates handled() — sets BAIS.setBytes(DATA), reads each param from READ",
+        "  IF ent.where.isClient: add handleClient() via writeHandleMethod(ent, false)",
+        "  IF ent.where.isServer: add handleServer() via writeHandleMethod(ent, true)",
+        "  IF NOT (isClient AND isServer): add allow(boolean server) to restrict direction",
+        "  register.addStatement: Net.registerPacket(packetClassName::new)",
+        "  ADD fields to packet for each param (skip first param if server method)",
+        "  IF isClient OR target.isAll: writeCallMethod(callBuilder, ent, toAll=true, forwarded=false)",
+        "  IF isServer AND target.isOne: writeCallMethod(callBuilder, ent, toAll=false, forwarded=false)",
+        "  IF isServer AND forward: writeCallMethod(callBuilder, ent, toAll=true, forwarded=true)",
+        "  JavaFile.builder(packageName, packet).writeTo(filer)",
+        "callBuilder.addMethod(register)",
+        "JavaFile.builder(packageName, callBuilder).writeTo(filer)",
+        "END"
+      ],
+      "key_generated_classes": [
+        "Call — public class with static send methods per @Remote method",
+        "XxxCallPacket (per method) — extends Packet; has write/read/handled/handleClient/handleServer"
+      ]
+    },
+    {
+      "name": "LogicStatementProcessor",
+      "extends": "BaseProcessor",
+      "package": "mindustry.annotations.misc",
+      "supported_annotations": ["@RegisterStatement"],
+      "rounds": 1,
+      "activity_flow": [
+        "START: process(RoundEnvironment) called",
+        "CREATE LogicIO class builder with public modifiers",
+        "CREATE write(Object obj, StringBuilder out) method builder",
+        "CREATE read(String[] tokens, int length) → LStatement method builder",
+        "ADD static field allStatements: Seq<Prov<LStatement>> initialized with all registered types' ::new refs",
+        "types = types(@RegisterStatement)",
+        "FOR each Stype c in types:",
+        "  name = c.annotation(@RegisterStatement).value()",
+        "  fields = c.fields() + c.superclass().fields()",
+        "  WRITE branch: if/else-if on obj.getClass() == c.class → append name + each field value (enums use .name())",
+        "  READ branch: if/else-if on tokens[0].equals(name) → new instance, assign each field from tokens[i+1] using valueOf or direct string assign; call result.afterRead(); return result",
+        "write method: endControlFlow",
+        "read method: endControlFlow; addStatement('return null')",
+        "Add write() and read() to LogicIO type",
+        "write(type) → emit LogicIO.java",
+        "END"
+      ],
+      "generated_class": "LogicIO — static write(Object, StringBuilder) and read(String[], int) dispatch methods for all @RegisterStatement types"
+    },
+    {
+      "name": "LoadRegionProcessor",
+      "extends": "BaseProcessor",
+      "package": "mindustry.annotations.misc",
+      "supported_annotations": ["@Load"],
+      "rounds": 1,
+      "activity_flow": [
+        "START: process(RoundEnvironment) called",
+        "CREATE ContentRegions class builder (@SuppressWarnings('deprecation'))",
+        "CREATE loadRegions(MappableContent content) static method builder",
+        "fieldMap = ObjectMap<Stype, Seq<Svar>> — group @Load fields by enclosing type",
+        "FOR each @Load field:",
+        "  VALIDATE: must be public → err() if not",
+        "  fieldMap.get(field.enclosingType()).add(field)",
+        "entries = fieldMap.keys() sorted by type name",
+        "FOR each Stype type in entries:",
+        "  fields = fieldMap.get(type) sorted by field name",
+        "  method.beginControlFlow('if(content instanceof <type>)')",
+        "  FOR each field:",
+        "    an = field.annotation(@Load)",
+        "    dims = count(field.type, '[]') — array dimension count",
+        "    doFallback = !an.fallback().equals('error')",
+        "    IF dims == 0 (scalar):",
+        "      addStatement: ((type)content).field = Core.atlas.find(parsedValue [, fallback])",
+        "    ELSE (array):",
+        "      lengths = an.lengths() or {an.length()}",
+        "      VALIDATE dims == lengths.length → err() if mismatch",
+        "      addStatement: ((type)content).field = new TextureRegion[dim0][dim1]...",
+        "      FOR each dimension: beginControlFlow for-loop INDEX0, INDEX1...",
+        "      addStatement: ((type)content).field[INDEX0][INDEX1]... = Core.atlas.find(parsedValue [, fallback])",
+        "      FOR each dimension: endControlFlow",
+        "  method.endControlFlow",
+        "regionClass.addMethod(method)",
+        "write(regionClass) → emit ContentRegions.java",
+        "END"
+      ],
+      "parse_helper": "parse(String value): interpolates @→content.name, @size→block.size, #1/#2/#→INDEX0/INDEX1 into Java string concatenation expressions",
+      "generated_class": "ContentRegions — static loadRegions(MappableContent) dispatches on content type to populate TextureRegion fields via Core.atlas.find()"
+    }
+  ],
+
+  "key_relationships": [
+    "EntityProcess extends BaseProcessor",
+    "RemoteProcess extends BaseProcessor",
+    "LogicStatementProcessor extends BaseProcessor",
+    "LoadRegionProcessor extends BaseProcessor",
+    "BaseProcessor extends AbstractProcessor (javax.annotation.processing)",
+    "RemoteProcess delegates_to CallGenerator.generate(ClassSerializer, Seq<MethodEntry>)",
+    "EntityProcess delegates_to TypeIOResolver.resolve(this)",
+    "RemoteProcess delegates_to TypeIOResolver.resolve(this)",
+    "EntityProcess uses EntityIO for write/read/sync method body generation",
+    "CallGenerator uses SerializerResolver.locate() to find per-param serializers",
+    "All processors call BaseProcessor.write(TypeSpec.Builder) to emit Java files via JavaPoet + Filer"
+  ],
+
+  "generated_outputs": {
+    "EntityProcess": ["mindustry.gen.<EntityName> classes", "mindustry.gen.<Interface> entity interfaces", "mindustry.gen.Groups registry", "mindustry.gen.EntityMapping id lookup"],
+    "RemoteProcess/CallGenerator": ["mindustry.gen.Call (static send methods)", "mindustry.gen.<Method>CallPacket (one per @Remote method)"],
+    "LogicStatementProcessor": ["mindustry.gen.LogicIO (write/read dispatch)"],
+    "LoadRegionProcessor": ["mindustry.gen.ContentRegions (loadRegions dispatch)"]
+  },
+
+  "important_notes": [
+    "EntityProcess runs 3 rounds (rounds=3); others run 1 round (default)",
+    "BaseProcessor.process() increments round counter and skips if round > rounds",
+    "All processors accumulate annotation elements in allGroups/allDefs/allInterfaces across rounds (EntityProcess)",
+    "JavaPoet (TypeSpec, MethodSpec, FieldSpec, JavaFile) used throughout for code generation",
+    "All output goes to mindustry.gen package",
+    "TypeIOResolver.resolve() scans @TypeIOHandler annotations to build the serializer map used by RemoteProcess and EntityProcess",
+    "SerializerResolver.locate() determines which serializer to use per parameter in CallGenerator",
+    "LoadRegionProcessor parse() supports dynamic tokens: @ (content.name), @size (block.size), # / #1 / #2 (array indices)"
+  ],
+
+  "source_files_analyzed": [
+    "annotations/src/main/java/mindustry/annotations/BaseProcessor.java",
+    "annotations/src/main/java/mindustry/annotations/entity/EntityProcess.java",
+    "annotations/src/main/java/mindustry/annotations/remote/RemoteProcess.java",
+    "annotations/src/main/java/mindustry/annotations/remote/CallGenerator.java",
+    "annotations/src/main/java/mindustry/annotations/misc/LogicStatementProcessor.java",
+    "annotations/src/main/java/mindustry/annotations/misc/LoadRegionProcessor.java"
+  ]
+}

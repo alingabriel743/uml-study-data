@@ -1,0 +1,281 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF9E6
+    BorderColor #C9A800
+}
+
+title Lyra-1 Source Models and Rendering
+
+' ──────────────────────────────────────────
+'  External / Framework base types
+' ──────────────────────────────────────────
+package "PyTorch (external)" <<Rectangle>> {
+    class "nn.Module" as NNModule {
+    }
+    class "torch.autograd.Function" as AutogradFunction {
+        +{static} forward(ctx, ...) : Tensor
+        +{static} backward(ctx, ...) : gradients
+    }
+    class "torch.utils.data.Dataset" as TorchDataset {
+        +__len__() : int
+        +__getitem__(idx) : Any
+    }
+    abstract class "ABC" as ABC {
+    }
+}
+
+' ──────────────────────────────────────────
+'  src.models.recon
+' ──────────────────────────────────────────
+package "src.models.recon" {
+    class LatentRecon {
+        -opt : config
+        -enc_blocks : List[Block]
+        -enc_norm : nn.LayerNorm
+        -block_out : nn.Linear | None
+        -patch_embed : PatchEmbed3D
+        -patch_plucker_embed : PatchEmbed3D
+        -patch_time_embed : PatchEmbed3D
+        -patch_time_embed_tgt : PatchEmbed3D
+        -pos_embedding : PositionalEmbedding
+        -deconv : ConvTranspose3d variant
+        -decoder_cosmos : CosmosDecoder | None
+        -gs : GaussianRenderer | GaussianRendererDeferred
+        -output_dims : int
+        -dnear : float
+        -dfar : float
+        +__init__(opt) : None
+        +forward(data: dict, skip_loss: bool) : dict
+        +forward_gaussians(images_input, plucker_embedding, rays_os, rays_ds, time_embeddings, num_input_multi_views) : Tensor[B,N,14]
+        +gaussian_processing(x, rays_os, rays_ds) : Tensor[B,N,14]
+        +gaussian_pruning(gaussians: Tensor) : Tensor
+        +get_time_embedding(time_embeddings, V, num_input_multi_views) : tuple
+        +reshape_mv_temp_to_batch(x, num_input_multi_views) : Tensor
+        +reshape_mv_batch_to_temp(x, num_input_multi_views) : Tensor
+        -_init_weights(m) : None
+    }
+    note right of LatentRecon
+        Gaussian layout [B,N,14]:
+        0-2: xyz position
+        3:   opacity
+        4-6: scale
+        7-10: rotation (quaternion)
+        11-13: RGB
+    end note
+}
+
+' ──────────────────────────────────────────
+'  src.rendering
+' ──────────────────────────────────────────
+package "src.rendering" {
+    class GaussianRenderer {
+        -opt : config
+        -gs_view_chunk_size : int
+        +__init__(opt) : None
+        +render(gaussians: Tensor[B,N,14], cam_view: Tensor[B,V,4,4], bg_color, intrinsics) : dict
+        +save_ply(gaussians, path, compatible: bool) : None
+        +load_ply(path, compatible: bool) : Tensor
+    }
+    note bottom of GaussianRenderer
+        render() returns:
+        {images_pred[B,V,3,H,W],
+         alphas_pred[B,V,1,H,W],
+         depths_pred[B,V,1,H,W]}
+    end note
+
+    class GaussianRendererDeferred {
+        -opt : config
+        -render_func : Callable
+        -oom_downscale_factors : List[int]
+        -use_3dgut : bool
+        -raster_kwargs : dict
+        +__init__(opt) : None
+        +render(gaussians, cam_view, bg_color, intrinsics, patch_size) : dict
+        +render_deferred(means3D, opacity, scales, rotations, rgbs, viewmat, Ks, backgrounds, H, W, near_plane, far_plane, patch_size) : dict
+        +render_standard(means3D, opacity, scales, rotations, rgbs, viewmat, Ks, backgrounds, H, W, near_plane, far_plane, patch_size) : dict
+        +render_downscale(..., downscale_factor) : dict
+        +save_ply(gaussians, path, compatible: bool) : None
+        +load_ply(path, compatible: bool) : Tensor
+    }
+    note bottom of GaussianRendererDeferred
+        Dispatches to DeferredBP (full image)
+        or DeferredBPPatch (patch-based).
+        Falls back to render_standard when
+        opt.deferred_bp=False.
+    end note
+
+    class DeferredBP {
+        +{static} render(xyz, feature, scale, rotation, opacity, test_w2c, test_intr, W, H, near_plane, far_plane, backgrounds, raster_kwargs) : tuple
+        +{static} forward(ctx, xyz, feature, scale, rotation, opacity, test_w2cs, test_intr, W, H, near_plane, far_plane, backgrounds, raster_kwargs) : (images[B,V,H,W,3], alphas, depths)
+        +{static} backward(ctx, images_grad, alphas_grad, depths_grad) : gradients
+    }
+    note right of DeferredBP
+        forward() runs with no_grad over all views;
+        backward() re-renders each view with
+        enable_grad to accumulate gradients.
+        Decouples forward/backward memory usage.
+    end note
+
+    class DeferredBPPatch {
+        +{static} forward(ctx, xyz, features, scaling, rotation, opacity, C2W, Ks, width, height, near_plane, far_plane, backgrounds, patch_size, raster_kwargs) : (colors[B,V,3,H,W], alphas, depths)
+        +{static} backward(ctx, grad_colors, grad_alphas, grad_depths) : gradients
+    }
+    note right of DeferredBPPatch
+        Patch-based variant: decomposes H×W into
+        tiles, renders each independently via
+        shifted camera principal point (cx,cy offsets).
+        Reduces peak GPU memory.
+    end note
+}
+
+' ──────────────────────────────────────────
+'  src.models.data
+' ──────────────────────────────────────────
+package "src.models.data" {
+    enum DataField {
+        IMAGE_RGB = 'image_rgb'
+        CAMERA_C2W_TRANSFORM = 'camera_c2w_transform'
+        CAMERA_INTRINSICS = 'camera_intrinsics'
+        METRIC_DEPTH = 'metric_depth'
+        DYNAMIC_INSTANCE_MASK = 'dynamic_instance_mask'
+        BACKWARD_FLOW = 'backward_flow'
+        LATENT_RGB = 'latent_rgb'
+        CAPTION
+        OBJECT_BBOX
+        TRAJECTORY
+        LANGUAGE_EMBEDDING
+        POINT_CLOUD
+        META_DATA
+    }
+
+    class Provider {
+        -opt : config
+        -dataset : BaseDataset
+        -scene_scale : float
+        -training : bool
+        -load_latents : bool
+        -data_fields : List[DataField]
+        -image_transform : ImageTransform
+        -num_target_views : int
+        -latent_mean : Tensor | None
+        -latent_std : Tensor | None
+        +__init__(dataset_name, opt, training: bool, num_repeat: int) : None
+        +__len__() : int
+        +__getitem__(idx) : dict
+        +get_item(idx) : dict
+        +_preprocess(file_name, rgbs, c2ws, intrinsics, depths, timesteps, latents, target_index, num_input_multi_views) : dict
+        +get_data_static(idx, frame_indices, view_indices, num_input_multi_views) : dict
+        +get_data_dynamic(idx, frame_indices, view_indices, num_input_multi_views) : dict
+        -_get_indices_static(idx) : tuple
+        -_get_indices_dynamic(idx) : tuple
+        -_norm_camera_scale(c2ws) : Tensor
+        -_setup_image_transforms(sample_size, crop_size, use_flip, max_crop) : None
+    }
+    note right of Provider
+        _preprocess() returns dict with:
+        images_output, intrinsics, cam_view,
+        time_embeddings, c2ws_input,
+        plucker_embedding, rays_os, rays_ds,
+        flip_flag, file_name, target_index,
+        num_input_multi_views
+    end note
+
+    abstract class BaseDataset {
+        +{abstract} available_data_fields() : List[DataField]
+        +{abstract} num_videos() : int
+        +{abstract} num_views(video_idx) : int
+        +{abstract} num_frames(video_idx, view_idx) : int
+        +read(video_idx, frame_idxs, view_idxs, data_fields) : dict
+        +{abstract} _read_data(video_idx, frame_idxs, view_idxs, data_fields) : dict
+        +read_video_metadata(video_idx) : dict
+        +read_view_metadata(video_idx, view_idx) : dict
+    }
+
+    class Radym {
+        -root_path : str
+        -mp4_file_paths : List[Path]
+        -zip_descriptors : LRU cache
+        -depth_folder : str
+        -n_views : int
+        -start_view_idx : int
+        -depth_path : Path | None
+        -camera_path : Path | None
+        -custom_folders : List[str] | None
+        -custom_fields : List[str] | None
+        +__init__(root_path, filter_list_path, num_views, depth_folder, ...) : None
+        +available_data_fields() : List[DataField]
+        +num_videos() : int
+        +num_views(video_idx) : int
+        +num_frames(video_idx, view_idx) : int
+        +_read_data(video_idx, frame_idxs, view_idxs, data_fields) : dict
+        -_get_zip_handle(idx, attr, view_idx, attr_path) : ZipFile
+        -_get_mp4_reader(idx, attr, view_idx) : VideoReader
+    }
+    note bottom of Radym
+        Reads MP4 via decord.VideoReader,
+        depth EXR from zip archives,
+        poses/intrinsics from .npz files.
+        LRU cache for zip file handles.
+    end note
+
+    class RadymWrapper {
+        -is_static : bool
+        -sample_list : List[Path]
+        -num_cameras : int
+        +__init__(is_static, is_multi_view, **kwargs) : None
+        +__len__() : int
+        +count_frames(video_idx) : int
+        +count_cameras(video_idx) : int
+        +get_data(idx, data_fields, frame_indices, view_indices, camera_convention) : dict
+    }
+    note bottom of RadymWrapper
+        Adapter bridging Radym's BaseDataset API
+        to the API expected by Provider.
+        is_static controls static vs dynamic
+        data loading path.
+    end note
+}
+
+' ──────────────────────────────────────────
+'  Inheritance relationships
+' ──────────────────────────────────────────
+LatentRecon --|> NNModule
+DeferredBP --|> AutogradFunction
+DeferredBPPatch --|> AutogradFunction
+Provider --|> TorchDataset
+BaseDataset --|> ABC
+Radym --|> BaseDataset
+RadymWrapper --|> Radym
+
+' ──────────────────────────────────────────
+'  Composition / Aggregation
+' ──────────────────────────────────────────
+LatentRecon o-- GaussianRenderer : self.gs\n(opt.deferred_bp=False)
+LatentRecon o-- GaussianRendererDeferred : self.gs\n(opt.deferred_bp=True)
+Provider *-- BaseDataset : self.dataset
+
+' ──────────────────────────────────────────
+'  Dependencies
+' ──────────────────────────────────────────
+GaussianRendererDeferred ..> DeferredBP : apply() full-image
+GaussianRendererDeferred ..> DeferredBPPatch : apply() patch-based
+Provider ..> DataField : uses for data keys
+LatentRecon ..> Provider : consumes data dict
+
+@enduml

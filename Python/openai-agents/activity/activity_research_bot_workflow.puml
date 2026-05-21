@@ -1,0 +1,160 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF9C4
+    DiamondBorderColor #F9A825
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleBackgroundColor #E9ECEF
+    TitleFontSize 13
+}
+skinparam noteBackgroundColor #FFFDE7
+skinparam noteBorderColor #F9A825
+
+title Research Bot Workflow
+
+|ResearchManager|
+start
+:Receive user **research query**\n//e.g. "Impact of electric vehicles on the grid."//;
+:gen_trace_id()\nOpen trace("Research trace", trace_id=trace_id);
+
+|Printer|
+:Print trace URL\n//https://platform.openai.com/traces/trace?trace_id={trace_id}//;
+:Print "Starting research...";
+
+|ResearchManager|
+:_plan_searches(query);
+
+|Printer|
+:Update status → "Planning searches...";
+
+|#FFF8E1|PlannerAgent|
+:Runner.run(planner_agent)\n//Input: "Query: {query}"//\n//Model: gpt-5.4, reasoning=medium//;
+note right
+  Output type: WebSearchPlan
+  WebSearchItem: { query: str, reason: str }
+end note
+:Produce **WebSearchPlan**\n(5–20 WebSearchItems);
+
+|ResearchManager|
+:result.final_output_as(WebSearchPlan);
+
+|Printer|
+:Mark "planning" done\n→ "Will perform **N** searches";
+
+|ResearchManager|
+:_perform_searches(search_plan)\nOpen custom_span("Search the web");
+
+|Printer|
+:Update status → "Searching...";
+
+|ResearchManager|
+note right
+  asyncio.create_task(_search(item))
+  for every WebSearchItem in search_plan.searches
+  → N concurrent asyncio tasks
+end note
+
+fork
+  |#FCE4EC|SearchAgent|
+  :_search(item_1)\n"Search term: {item.query}\nReason for searching: {item.reason}";
+  :Runner.run(search_agent)\n//gpt-5.4 + WebSearchTool//;
+  if (Exception raised?) then (yes)
+    :Return **None**;
+    note right: num_failed++
+  else (no)
+    :Return **summary** string\n(2–3 paragraphs, <300 words);
+    note right: num_succeeded++
+  endif
+
+fork again
+  |SearchAgent|
+  :_search(item_2)\n"Search term: {item.query}\nReason for searching: {item.reason}";
+  :Runner.run(search_agent)\n//gpt-5.4 + WebSearchTool//;
+  if (Exception raised?) then (yes)
+    :Return **None**;
+  else (no)
+    :Return **summary** string;
+  endif
+
+fork again
+  |SearchAgent|
+  :_search(item_N)\n//··· up to N parallel tasks ···//;
+  :Runner.run(search_agent)\n//gpt-5.4 + WebSearchTool//;
+  if (Exception raised?) then (yes)
+    :Return **None**;
+  else (no)
+    :Return **summary** string;
+  endif
+
+end fork
+
+|ResearchManager|
+repeat
+  :Await next completed task\n(asyncio.as_completed);
+  if (result is not None?) then (yes)
+    :Append summary to results list\nnum_succeeded++;
+  else (no)
+    :num_failed++;
+  endif
+  :Update printer status:\n"Searching... {num_completed}/{total} finished\n({num_succeeded} succeeded, {num_failed} failed)";
+repeat while (More tasks remaining?) is (yes)
+->no;
+
+:Aggregate results → **list[str]**\n(non-None summaries only);
+
+|Printer|
+:Mark "searching" done\n→ "Searches finished: N/total succeeded";
+
+|ResearchManager|
+:_write_report(query, search_results)\nInput: "Original query: {query}\nSummarized search results: {search_results}";
+
+|Printer|
+:Update "writing" → "Thinking about report...";
+
+|#E8F5E9|WriterAgent|
+:Runner.run_streamed(writer_agent)\n//gpt-5-mini, reasoning=medium//;
+note right
+  Structured output type: ReportData
+  { short_summary, markdown_report,
+    follow_up_questions: list[str] }
+end note
+
+while (More stream events?) is (yes)
+  if (time.time() - last_update > 5s\nAND next_message < len(update_messages)?) then (yes)
+    :Emit progress update to Printer:\n"Thinking about report..."\n→ "Planning report structure..."\n→ "Writing outline..."\n→ "Creating sections..."\n→ "Cleaning up formatting..."\n→ "Finalizing report..."\n→ "Finishing report...";
+    :last_update = time.time()\nnext_message++;
+  else (no)
+    :Continue consuming stream events;
+  endif
+endwhile (stream complete)
+
+:result.final_output_as(**ReportData**);
+
+|Printer|
+:mark_item_done("writing");
+
+|ResearchManager|
+:update_item("final_report")\n→ "Report summary\\n\\n{report.short_summary}";
+
+|Printer|
+:Print "=====REPORT====="\nPrint **report.markdown_report**\n//1000+ word structured markdown//;
+:Print "=====FOLLOW UP QUESTIONS====="\nPrint follow_up_questions\n(newline-joined list[str]);
+:printer.end();
+
+|ResearchManager|
+:Close trace context manager\n//observability span ends//;
+stop
+
+@enduml

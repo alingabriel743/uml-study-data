@@ -1,0 +1,106 @@
+{
+  "scope": "conversation_memory_flow",
+  "title": "Conversation Memory & History Flow",
+  "diagram_type": "activity",
+  "key_participants": [
+    "Caller (User/App)",
+    "Agent (uses RemembersConversations)",
+    "GeneratesText (Provider trait)",
+    "RememberConversation (Middleware)",
+    "ConversationStore / DatabaseConversationStore",
+    "QueuedAgentResponse (uses HasQueuedResponseCallbacks)",
+    "InvokeAgent Job (uses InvokesQueuedResponseCallbacks)"
+  ],
+
+  "activity_flow": [
+    "START: Caller sets up conversation context",
+    "BRANCH: New conversation → call agent.forUser(user) → sets conversationUser, clears conversationId",
+    "BRANCH: Continue existing → call agent.continue(conversationId, user) → sets both fields",
+    "BRANCH: Continue last → call agent.continueLastConversation(user) → ConversationStore.latestConversationId(user.id) → sets conversationId",
+    "DECISION: Is agent queued?",
+    "  YES → agent.promptLater() → creates InvokeAgent job → wrapped in QueuedAgentResponse",
+    "    → Caller can register: QueuedAgentResponse.then(Closure) → delegates to InvokeAgent.then() → wraps in SerializableClosure → appended to thenCallbacks[]",
+    "    → Caller can register: QueuedAgentResponse.catch(Closure) → delegates to InvokeAgent.catch() → wraps in SerializableClosure → appended to catchCallbacks[]",
+    "    → Job dispatched to queue",
+    "    → InvokeAgent.handle() called by worker → withCallbacks(fn → agent.prompt(...)) executes",
+    "    → On success: iterates thenCallbacks[], calls each callback(response)",
+    "    → On failure: InvokeAgent.failed(Throwable) → iterates catchCallbacks[], calls each callback(e)",
+    "  NO → agent.prompt() → synchronous execution",
+    "PIPELINE: GeneratesText.prompt(AgentPrompt) starts",
+    "  → gatherMiddlewareFor(agent) checks if agent uses RemembersConversations AND hasConversationParticipant()",
+    "  DECISION: Has conversation participant?",
+    "    YES → prepend RememberConversation middleware to pipeline",
+    "    NO  → skip conversation middleware",
+    "  → pipeline runs through middleware then core handler",
+    "CORE HANDLER (inside pipeline then-closure):",
+    "  → agent is Conversational? → call agent.messages()",
+    "    → DECISION: conversationId set?",
+    "      YES → ConversationStore.getLatestConversationMessages(conversationId, maxMessages=100) → returns Collection<Message>",
+    "      NO  → return []",
+    "  → append new UserMessage(prompt, attachments) to messages",
+    "  → call textGateway.generateText(...messages...) → returns raw response with steps/toolCalls",
+    "  → build AgentResponse (or StructuredAgentResponse) with steps, toolCalls, toolResults",
+    "REMEMBER CONVERSATION MIDDLEWARE (post-response, via .then callback):",
+    "  → DECISION: agent.currentConversation() is null?",
+    "    YES (new conversation):",
+    "      → generateTitle(prompt) → calls provider cheapest model for 3-5 word title",
+    "      → ConversationStore.storeConversation(userId, title) → inserts into agent_conversations → returns UUID",
+    "      → agent.continue(newConversationId, participant) → updates agent state",
+    "    NO → skip creation",
+    "  → ConversationStore.storeUserMessage(conversationId, userId, AgentPrompt) → inserts user role record",
+    "  → ConversationStore.storeAssistantMessage(conversationId, userId, AgentPrompt, AgentResponse) → inserts assistant role record with toolCalls/toolResults/usage/meta",
+    "  → response.withinConversation(conversationId, participant) → attaches conversation context to response",
+    "END: AgentResponse returned to caller (contains conversationId for future calls)"
+  ],
+
+  "key_relationships": [
+    "RemembersConversations trait used_by Agent classes (e.g. AnonymousAgent via Promptable)",
+    "GeneratesText.gatherMiddlewareFor() conditionally injects RememberConversation middleware",
+    "RememberConversation depends_on ConversationStore (injected)",
+    "RememberConversation depends_on TextProvider (for title generation)",
+    "DatabaseConversationStore implements ConversationStore",
+    "HasQueuedResponseCallbacks used_by QueuedAgentResponse",
+    "InvokesQueuedResponseCallbacks used_by InvokeAgent job",
+    "QueuedAgentResponse.then/catch delegates to InvokeAgent.then/catch via dispatchable.getJob()",
+    "InvokeAgent.withCallbacks() wraps agent.prompt() call and iterates thenCallbacks on success",
+    "InvokeAgent.failed() iterates catchCallbacks on failure",
+    "Step data class holds: text, toolCalls[], toolResults[], finishReason, usage, meta (part of AgentResponse)"
+  ],
+
+  "state_managed_by_RemembersConversations": [
+    "conversationId: ?string — null for new, UUID for existing",
+    "conversationUser: ?object — the participant; presence gates memory middleware",
+    "forUser(user): starts fresh conversation for user",
+    "continue(id, user): resumes specific conversation",
+    "continueLastConversation(user): auto-resolves latest conversation from store",
+    "messages(): loads up to maxConversationMessages() (default 100) from store",
+    "hasConversationParticipant(): bool — gate used by GeneratesText middleware injection"
+  ],
+
+  "queued_callback_mechanics": [
+    "Callbacks are serialized via SerializableClosure before being stored on the job",
+    "FakePendingDispatch check in HasQueuedResponseCallbacks prevents callback registration during testing",
+    "thenCallbacks[] invoked with (AgentResponse $response) on success",
+    "catchCallbacks[] invoked with (Throwable $e) on job failure"
+  ],
+
+  "database_tables": [
+    "agent_conversations: id (UUID7), user_id, title, created_at, updated_at",
+    "agent_conversation_messages: id (UUID7), conversation_id, user_id, agent (class), role (user|assistant), content, attachments (JSON), tool_calls (JSON), tool_results (JSON), usage (JSON), meta (JSON)"
+  ],
+
+  "important_notes": "RememberConversation middleware runs post-response (inside .then on the pipeline response). Title generation uses a cheap AI model and falls back to truncated prompt on failure. AnonymousAgent implements Agent+Conversational+HasTools and uses Promptable trait which likely includes RemembersConversations. Step objects are nested inside AgentResponse.steps[] and capture per-step LLM outputs.",
+
+  "source_files_analyzed": [
+    "src/Concerns/RemembersConversations.php",
+    "src/Jobs/Concerns/InvokesQueuedResponseCallbacks.php",
+    "src/Responses/Concerns/HasQueuedResponseCallbacks.php",
+    "src/Responses/QueuedAgentResponse.php",
+    "src/Jobs/InvokeAgent.php",
+    "src/AnonymousAgent.php",
+    "src/Responses/Data/Step.php",
+    "src/Providers/Concerns/GeneratesText.php",
+    "src/Middleware/RememberConversation.php",
+    "src/Storage/DatabaseConversationStore.php"
+  ]
+}

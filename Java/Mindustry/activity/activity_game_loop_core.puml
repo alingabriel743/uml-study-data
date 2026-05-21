@@ -1,0 +1,233 @@
+@startuml
+
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 11
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #495057
+    EndColor #495057
+    BarColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #DEE2E6
+    TitleFontColor #212529
+}
+skinparam noteBackgroundColor #FFF9C4
+skinparam noteBorderColor #CCC68B
+
+title Core Game Loop & Update Tick\n<size:10>Per-frame engine dispatch: Logic.update() → Control.update() → Renderer.update()</size>
+
+|#D9EAD3| Logic |
+start
+:PerfCounter.frame.end() / begin()
+— frame perf boundary;
+:Events.fire(Trigger.update);
+:universe.updateGlobal();
+
+if (settings.modified && !playing?) then (yes)
+    :netServer.admins.forceSave()
+    settings.forceSave();
+endif
+
+:Compute runStateCheck
+(!client && !invalidMap && !editor && canGameOver);
+
+if (state.isGame()?) then (yes)
+    if (!net.client?) then (yes)
+        :Count enemies in waveTeam
+        state.enemies = Groups.unit.count(...);
+    endif
+
+    if (!state.isPaused()?) then (yes)
+        :Events.fire(Trigger.beforeGameUpdate);
+        :state.tick += delta * 60 / state.updateId++;
+        :state.teams.updateTeamStats()
+        MapPreviewLoader.checkPreviews();
+
+        if (fog enabled?) then (yes)
+            :fogControl.update();
+        endif
+
+        if (campaign mode?) then (yes)
+            :sector.info.update()
+            universe.update();
+        endif
+
+        :Time.update() / logicVars.update();
+
+        if (!client && !editor?) then (yes)
+            :updateWeather();
+            :For each active team:
+            fillItems / buildAi.update()
+            rtsAi.update() / prebuildAi spawn;
+        endif
+
+        :state.rules.objectives.update();
+
+        if (waves enabled && !client?) then (yes)
+            :state.wavetime -= Time.delta;
+            if (wavetime <= 0?) then (yes)
+                :runWave()
+                → spawner.spawnEnemies()
+                state.wave++
+                Events.fire(WaveEvent);
+            endif
+        endif
+
+        :Compute envAttrs (rules + weather groups);
+        :Groups.update()
+        — units / buildings / bullets / weather;
+        :Events.fire(Trigger.afterGameUpdate);
+    else (paused)
+        note right: Entire simulation skipped\nwhile paused
+    endif
+
+    if (runStateCheck?) then (yes)
+        :checkGameState();
+    endif
+else (menu / waiting)
+    if (netServer.isWaitingForPlayers\n&& runStateCheck?) then (yes)
+        :checkGameState();
+    endif
+endif
+
+|#CFE2F3| Control |
+
+if (assets == null?) then (yes)
+    :Early return — assets not ready;
+    detach
+endif
+
+:saves.update() — autosave timer tick;
+:assets.update() — async asset loading;
+:input.updateState();
+:sound.update();
+:NaN guard on player.x/y and camera position;
+
+if (state.isGame()?) then (yes)
+    :input.update()
+    input.updateSelectQuadtree();
+
+    if (!paused?) then (yes)
+        :indicators.update();
+    endif
+
+    if (5-second timer elapsed?) then (yes)
+        :platform.updateRPC();
+    endif
+
+    if (campaign && core != null?) then (yes)
+        :Unlock core items;
+    endif
+
+    :Evaluate pause state transitions
+    (background pause / cutscene force-unpause
+    / pause key / afterGameOver lock);
+
+    if (screenshot key tapped?) then (yes)
+        :renderer.takeMapScreenshot();
+    endif
+
+else (menu state)
+    if (!paused?) then (yes)
+        :Time.update();
+    endif
+    if (back key tapped?) then (yes)
+        :platform.hide();
+    endif
+endif
+
+|#FCE5CD| Renderer |
+
+:PerfCounter.render.begin();
+:Lerp camerascale toward scale target (factor 0.1);
+:Read render settings
+(laser opacity / bloom / pixelate
+/ shield+water animation flags);
+
+if (landTime > 0 — cutscene active?) then (yes)
+    if (!paused?) then (yes)
+        :launchAnimator.updateLaunch();
+        :landTime -= Time.delta;
+    endif
+    :camerascale = launchAnimator.zoomLaunch()
+    weatherAlpha = 0;
+else (normal gameplay)
+    :weatherAlpha lerp toward 1;
+endif
+
+if (landTime <= 0 && launchAnimator != null?) then (yes)
+    :launchAnimator.endLaunch()
+    launchAnimator = null;
+endif
+
+:camera.width = screen.width / camerascale
+camera.height = screen.height / camerascale;
+
+if (state.isMenu()?) then (yes)
+    :landTime = 0
+    graphics.clear(black)
+    — skip all game rendering;
+else (game / editor)
+    :minimap.update();
+
+    if (shakeTime > 0?) then (yes)
+        :Apply camShakeOffset to camera;
+    endif
+
+    if (renderer.pixelate?) then (yes)
+        :pixelator.drawPixelate();
+    else (full pipeline)
+        :draw() — full render pipeline;
+        note right
+            Events.fire(preDraw)
+            camera.update() / NaN guard
+            graphics.clear(clearColor) / Draw.reset()
+            Draw.proj(camera)
+            blocks.checkChanges() / processBlocks()
+            ─── Sorted Layer Draw Calls ───
+            Layer.background  → drawBackground()
+            Layer.floor       → blocks.floor.drawFloor()
+            Layer.block       → drawShadows / drawWalls
+            Layer.blockBuild  → Shaders.blockbuild
+            EnvRenderers (env flags)
+            Layer.light       → lights.draw() [if lighting]
+            Layer.darkness    → drawDarkness() [if enabled]
+            Bloom capture (bullet→effect layer)
+            Layer.plans       → overlays.drawBottom()
+            Layer.shields     → Shaders.shield [if animated]
+            Objective + state markers
+            Layer.overlayUI   → overlays.drawTop()
+            Layer.fogOfWar    → fog.drawFog() [if fog]
+            Layer.space       → launchAnimator draw
+            Events.fire(Trigger.draw / drawOver)
+            blocks.drawBlocks()
+            Groups.draw.draw(Drawc::draw)
+            Draw.flush() / Draw.sort(false)
+            Events.fire(Trigger.postDraw)
+        end note
+    endif
+
+    if (shakeTime > 0?) then (yes)
+        :camera.position.sub(camShakeOffset)
+        — restore after shake;
+    endif
+endif
+
+if (frame % 10 == 0?) then (yes)
+    :Check GL errors;
+endif
+
+:PerfCounter.render.end();
+
+stop
+
+@enduml

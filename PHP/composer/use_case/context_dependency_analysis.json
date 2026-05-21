@@ -1,0 +1,140 @@
+{
+  "scope": "dependency_analysis",
+  "title": "Dependency Analysis",
+  "diagram_type": "use_case",
+  "description": "Analyzing dependency graph: why a package is required, what prohibits an upgrade, and outdated packages",
+
+  "actors": [
+    {
+      "name": "Developer",
+      "role": "Primary actor invoking CLI commands to inspect dependency relationships"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Find Why Package Is Installed",
+      "command": "composer depends <package> [--recursive|-r] [--tree|-t] [--locked]",
+      "aliases": ["composer why <package>"],
+      "class": "DependsCommand",
+      "description": "Shows which installed packages require the given package. Traces dependency chain upward to root.",
+      "options": ["--recursive (-r): resolve up to root", "--tree (-t): nested tree output", "--locked: read from composer.lock"],
+      "triggers": "doExecute($input, $output, inverted=false)"
+    },
+    {
+      "id": "UC2",
+      "name": "Find Why Package Cannot Be Installed",
+      "command": "composer prohibits <package> <version-constraint> [--recursive|-r] [--tree|-t] [--locked]",
+      "aliases": ["composer why-not <package> <version>"],
+      "class": "ProhibitsCommand",
+      "description": "Shows which installed packages prevent the given package+version from being installed (conflict detection). Requires both package name and version constraint args.",
+      "options": ["--recursive (-r)", "--tree (-t)", "--locked"],
+      "triggers": "doExecute($input, $output, inverted=true)"
+    },
+    {
+      "id": "UC3",
+      "name": "List Outdated Packages",
+      "command": "composer outdated [package] [--all|-a] [--direct|-D] [--strict] [--major-only|-M] [--minor-only|-m] [--patch-only|-p] [--locked] [--no-dev] [--format|-f text|json] [--ignore] [--sort-by-age|-A]",
+      "class": "OutdatedCommand",
+      "description": "Proxy command: delegates to `composer show --latest [--outdated]`. Lists installed packages with available updates, color-coded by semver severity.",
+      "proxy_target": "ShowCommand (via Application::run with show --latest --outdated args)",
+      "is_proxy": true
+    }
+  ],
+
+  "class_hierarchy": [
+    "BaseCommand (abstract, Symfony Command base)",
+    "  └── BaseDependencyCommand (abstract) — DependsCommand, ProhibitsCommand",
+    "  └── BaseCommand — OutdatedCommand (proxy, not extends BaseDependencyCommand)"
+  ],
+
+  "key_classes": [
+    {
+      "class": "BaseDependencyCommand",
+      "type": "abstract",
+      "extends": "BaseCommand",
+      "constants": ["ARGUMENT_PACKAGE='package'", "ARGUMENT_CONSTRAINT='version'", "OPTION_RECURSIVE='recursive'", "OPTION_TREE='tree'"],
+      "key_methods": [
+        "doExecute(InputInterface, OutputInterface, bool $inverted=false): int — core logic",
+        "printTable(OutputInterface, array $results): void — flat table output",
+        "printTree(array $results, string $prefix, int $level): void — recursive tree output",
+        "initStyles(OutputInterface): void — sets 5 color styles",
+        "writeTreeLine(string $line): void — writes with ANSI fallback"
+      ]
+    },
+    {
+      "class": "DependsCommand",
+      "extends": "BaseDependencyCommand",
+      "traits": ["CompletionTrait"],
+      "methods": ["configure(): void", "execute(): int → parent::doExecute($input, $output) [inverted=false]"]
+    },
+    {
+      "class": "ProhibitsCommand",
+      "extends": "BaseDependencyCommand",
+      "traits": ["CompletionTrait"],
+      "methods": ["configure(): void", "execute(): int → parent::doExecute($input, $output, true) [inverted=true]"]
+    },
+    {
+      "class": "OutdatedCommand",
+      "extends": "BaseCommand",
+      "traits": ["CompletionTrait"],
+      "methods": [
+        "configure(): void",
+        "execute(): int — builds ArrayInput args for 'show --latest', calls $this->getApplication()->run($input, $output)",
+        "isProxyCommand(): bool → true"
+      ]
+    }
+  ],
+
+  "doExecute_flow": [
+    "1. requireComposer() → dispatch CommandEvent(PluginEvents::COMMAND)",
+    "2. Build repos: RootPackageRepository + (locked ? locker.getLockedRepository : localRepo) + PlatformRepository",
+    "3. Wrap in InstalledRepository",
+    "4. Parse ARGUMENT_PACKAGE (needle) and ARGUMENT_CONSTRAINT (textConstraint, default '*')",
+    "5. installedRepo.findPackagesWithReplacersAndProviders(needle) — throw if empty",
+    "6. installedRepo.findPackage(needle, textConstraint) — if not found, search defaultRepos or create temp platform pkg",
+    "7. inverted=true: collect replaces from found packages into needles[]",
+    "8. Parse textConstraint via VersionParser if not '*'",
+    "9. installedRepo.getDependents(needles, constraint, inverted, recursive)",
+    "10. Output: empty → writeError info; renderTree=true → initStyles + printTree; else → printTable",
+    "11. inverted + constraint → suggest 'composer require/update --dry-run' hint"
+  ],
+
+  "key_relationships": [
+    "DependsCommand extends BaseDependencyCommand",
+    "ProhibitsCommand extends BaseDependencyCommand",
+    "BaseDependencyCommand extends BaseCommand",
+    "OutdatedCommand extends BaseCommand (NOT BaseDependencyCommand)",
+    "OutdatedCommand delegates_to ShowCommand via Application::run",
+    "BaseDependencyCommand depends_on InstalledRepository (getDependents)",
+    "BaseDependencyCommand depends_on CompositeRepository + RepositoryFactory (fallback package lookup)",
+    "BaseDependencyCommand depends_on VersionParser (constraint parsing)",
+    "BaseDependencyCommand depends_on PackageInfo (URL for hyperlinks in output)"
+  ],
+
+  "inverted_flag_semantics": {
+    "inverted=false (depends/why)": "Find packages that DEPEND ON the needle — normal forward lookup",
+    "inverted=true (prohibits/why-not)": "Find packages that CONFLICT WITH needle+constraint — reverse/conflict lookup; includes replaced package names in needles; return code swapped (0=found conflict, 1=no conflict)"
+  },
+
+  "output_modes": [
+    "Table (default): printTable → rows of [package-name, version, link-type, target(constraint)] rendered via renderTable",
+    "Tree (--tree): printTree → recursive ASCII/Unicode tree with color-coded depth levels"
+  ],
+
+  "important_notes": [
+    "OutdatedCommand is a pure proxy — all filtering logic lives in ShowCommand",
+    "ProhibitsCommand requires TWO positional args (package + version constraint); DependsCommand requires only one",
+    "Both depends/prohibits support --locked to read from composer.lock instead of vendor/",
+    "Circular dependency detection in printTree: children===false signals abort with warning",
+    "Color-cycling uses 5 colors (green/yellow/cyan/magenta/blue) by depth level in tree mode"
+  ],
+
+  "source_files_analyzed": [
+    "src/Composer/Command/DependsCommand.php",
+    "src/Composer/Command/ProhibitsCommand.php",
+    "src/Composer/Command/OutdatedCommand.php",
+    "src/Composer/Command/BaseDependencyCommand.php"
+  ]
+}

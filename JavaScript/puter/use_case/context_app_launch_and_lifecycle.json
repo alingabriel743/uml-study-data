@@ -1,0 +1,198 @@
+{
+  "scope": "app_launch_and_lifecycle",
+  "title": "Application Launch and Lifecycle",
+  "diagram_type": "use_case",
+  "description": "Launching, running, and stopping desktop apps; app init on system start",
+
+  "actors": [
+    "User",
+    "GUISystem",
+    "App (PortalProcess/PseudoProcess)",
+    "ServiceManager",
+    "InitProcess"
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Launch App on System Init",
+      "actor": "GUISystem",
+      "description": "LaunchOnInitService._init() reads gui_params.launch_options.on_initialized and runs each command (e.g., 'window-call') at GUI startup",
+      "trigger": "Service _init() lifecycle hook fires after GUI ready",
+      "key_flow": [
+        "LaunchOnInitService._init() reads this.$puter.gui_params.launch_options",
+        "Iterates on_initialized command array",
+        "Calls run_(command) -> dispatches to commands['window-call'] -> window[fn_name](...args)"
+      ]
+    },
+    {
+      "id": "UC2",
+      "name": "Launch Desktop App",
+      "actor": "User",
+      "description": "User or system calls launch_app(options); creates PortalProcess/PseudoProcess, opens UIWindow with iframe",
+      "key_flow": [
+        "launch_app(options) fetches app_info via puter.apps.get()",
+        "Checks privateAccess; may redirect to fallbackApp",
+        "Acquires user-app token via fetchUserAppTokenForLaunch()",
+        "Creates PortalProcess or PseudoProcess with uuid",
+        "svc_process.register(process) -> ProcessService.register_() + attach_to_parent_()",
+        "Opens UIWindow({iframe_url, title, icon, ...}) with app URL + auth params",
+        "process.chstatus(PROCESS_RUNNING)",
+        "On UIWindow remove: svc_process.unregister(process.uuid)"
+      ]
+    },
+    {
+      "id": "UC3",
+      "name": "Launch App via IPC (App-to-App)",
+      "actor": "App (PortalProcess/PseudoProcess)",
+      "description": "A running app calls ExecService.launchApp() via IPC to spawn a child app",
+      "key_flow": [
+        "ExecService._init() registers IPC handler 'launchApp'",
+        "launchApp({app_name, args, pseudonym, file_paths}, {ipc_context})",
+        "Resolves parent process from ipc_context.caller.process",
+        "Creates IPC connection (svc_ipc.add_connection) between parent and child",
+        "Calls launch_app(launch_options) internally",
+        "On child IPC_ATTACHED: sends 'childAppLaunched' postMessage to parent",
+        "On child window remove: sends 'appClosed' postMessage to parent"
+      ]
+    },
+    {
+      "id": "UC4",
+      "name": "Connect to Existing App Instance",
+      "actor": "App (PortalProcess/PseudoProcess)",
+      "description": "App calls connectToInstance() via IPC to connect to a running process by name",
+      "key_flow": [
+        "ExecService.connectToInstance({app_name, args}, {ipc_context})",
+        "Validates caller (currently restricted to 'phoenix' -> 'puter-linux')",
+        "svc_process.select_by_name(app_name) -> returns matching processes",
+        "svc_ipc.add_connection({source, target}) creates bidirectional IPC link",
+        "process.handle_connection(connection.backward, args)",
+        "Returns {appInstanceID: connection.forward.uuid, usesSDK: true}"
+      ]
+    },
+    {
+      "id": "UC5",
+      "name": "Stop / Close Application",
+      "actor": "User",
+      "description": "User closes app window; ProcessService.unregister() removes from process tree, orphaned children reparented to InitProcess",
+      "key_flow": [
+        "UIWindow 'remove' event fires",
+        "svc_process.unregister(process.uuid)",
+        "Removes from processes_map, processes array, parent's tree list",
+        "Orphaned children get parent = NULL_UUID (InitProcess)",
+        "attach_to_parent_() re-attaches children under InitProcess"
+      ]
+    },
+    {
+      "id": "UC6",
+      "name": "Initialize Services at Startup",
+      "actor": "GUISystem",
+      "description": "ServiceManager orchestrates ordered service startup based on dependencies",
+      "key_flow": [
+        "ServiceManager.register(name, factory, options) called for each service",
+        "factory.create({parameters, context}) instantiates service",
+        "maybe_init_(name): checks TService.get_depends()",
+        "If deps satisfied -> init_service_(name): sets status=Initializing, calls service_impl.init(), sets status=Running",
+        "If deps pending -> tracks in waiting_[dependency] set",
+        "On service Running: notifies init_listeners_ and triggers waiting dependents via maybe_init_()",
+        "aget(name) / wait_for_init([deps]) provides async dependency-aware service access"
+      ]
+    },
+    {
+      "id": "UC7",
+      "name": "Run INITRC Apps on GUI Ready",
+      "actor": "GUISystem",
+      "description": "ProcessService handles 'gui:ready' event and auto-launches apps listed in INITRC",
+      "key_flow": [
+        "ProcessService._init(): creates root InitProcess(uuid=NULL_UUID), calls register_(root)",
+        "__on_gui:ready() event fires after GUI is ready",
+        "Iterates ProcessService.INITRC list (currently empty by default)",
+        "svc_exec.launchApp({app_name}) for each INITRC entry"
+      ]
+    }
+  ],
+
+  "key_classes": [
+    {
+      "name": "LaunchOnInitService",
+      "extends": "Service",
+      "file": "src/gui/src/services/LaunchOnInitService.js",
+      "methods": ["_construct()", "_init()", "run_(command)"],
+      "notes": "Reads gui_params.launch_options.on_initialized; dispatches window-call commands at startup"
+    },
+    {
+      "name": "ServiceManager",
+      "extends": "AdvancedBase",
+      "file": "src/putility/src/system/ServiceManager.js",
+      "methods": ["register(name, factory, options)", "get(name)", "aget(name)", "wait_for_init(depends)", "maybe_init_(name)", "init_service_(name)", "get_waiting_for_(depends)"],
+      "statuses": ["Registering", "Pending", "Initializing", "Running"],
+      "notes": "Dependency-aware service lifecycle; services wait for deps before init"
+    },
+    {
+      "name": "ProcessService",
+      "extends": "Service",
+      "file": "src/gui/src/services/ProcessService.js",
+      "methods": ["_init()", "__on_gui:ready()", "register(process)", "unregister(uuid)", "get_init()", "get_by_uuid(uuid)", "get_children_of(uuid)", "select_by_name(name)"],
+      "notes": "Manages process tree; root is InitProcess with NULL_UUID; orphaned children reparented to init"
+    },
+    {
+      "name": "ExecService",
+      "extends": "Service",
+      "file": "src/gui/src/services/ExecService.js",
+      "methods": ["_init()", "launchApp({app_name,args,pseudonym,file_paths}, {ipc_context})", "connectToInstance({app_name,args}, {ipc_context})", "register_param_provider(fn)"],
+      "notes": "Exposed to apps via IPC; wraps launch_app helper; manages parent-child IPC connections"
+    },
+    {
+      "name": "Process",
+      "file": "src/gui/src/definitions.js",
+      "methods": ["chstatus(status)", "onchange(field, cb)"],
+      "notes": "Base class; ipc_status starts as PROCESS_IPC_PENDING"
+    },
+    {
+      "name": "InitProcess",
+      "extends": "Process",
+      "notes": "Singleton; uuid=NULL_UUID='00000000-0000-0000-0000-000000000000'; root of process tree"
+    },
+    {
+      "name": "PortalProcess",
+      "extends": "Process",
+      "notes": "Represents a real app running in an iframe; has references.iframe and references.el_win"
+    },
+    {
+      "name": "PseudoProcess",
+      "extends": "Process",
+      "notes": "Represents built-in virtual apps like 'explorer' and 'trash' (no iframe)"
+    }
+  ],
+
+  "key_relationships": [
+    "LaunchOnInitService extends Service; uses gui_params at startup",
+    "ProcessService extends Service; owns process tree rooted at InitProcess",
+    "ProcessService depends_on ExecService (calls svc_exec.launchApp for INITRC)",
+    "ExecService extends Service; calls launch_app() helper; depends_on IPCService",
+    "launch_app() creates PortalProcess or PseudoProcess and calls ProcessService.register()",
+    "ServiceManager orchestrates all service lifecycles with dependency graph",
+    "InitProcess is the root parent for all processes (NULL_UUID parent)",
+    "On app close: ProcessService.unregister() reparents children to InitProcess"
+  ],
+
+  "important_notes": [
+    "ProcessService.INITRC is empty by default (commented out 'puter-linux')",
+    "LaunchOnInitService supports only 'window-call' command type at init",
+    "launch_app handles private access control with fallback app redirect (max depth 1)",
+    "User-app tokens fetched per-launch from /auth/get-user-app-token",
+    "GODMODE apps get super auth_token directly in iframe URL instead of per-app token",
+    "ExecService.connectToInstance is currently hardcoded: only 'phoenix' can connect to 'puter-linux'",
+    "ServiceManager.get() returns undefined (not error) if service is not yet Running",
+    "ServiceManager.aget() blocks until service reaches Running state"
+  ],
+
+  "source_files_analyzed": [
+    "src/gui/src/services/LaunchOnInitService.js",
+    "src/putility/src/system/ServiceManager.js",
+    "src/gui/src/services/ProcessService.js",
+    "src/gui/src/services/ExecService.js",
+    "src/gui/src/helpers/launch_app.js",
+    "src/gui/src/definitions.js (grep)"
+  ]
+}

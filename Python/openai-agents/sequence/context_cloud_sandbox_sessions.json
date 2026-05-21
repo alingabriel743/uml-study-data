@@ -1,0 +1,225 @@
+{
+  "scope": "cloud_sandbox_sessions",
+  "title": "Cloud Sandbox Sessions (Blaxel / Cloudflare / Vercel / Runloop)",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Caller",
+    "BaseSandboxClient",
+    "BlaxelSandboxClient",
+    "CloudflareSandboxClient",
+    "VercelSandboxClient",
+    "RunloopSandboxClient",
+    "BlaxelSandboxSession",
+    "CloudflareSandboxSession",
+    "VercelSandboxSession",
+    "RunloopSandboxSession",
+    "BaseSandboxSession",
+    "BlaxelSDK (SandboxInstance)",
+    "CloudflareWorkerHTTP",
+    "VercelSDK (AsyncSandbox)",
+    "RunloopSDK (AsyncRunloopSDK)"
+  ],
+
+  "class_hierarchy": [
+    "BlaxelSandboxClient extends BaseSandboxClient",
+    "CloudflareSandboxClient extends BaseSandboxClient",
+    "VercelSandboxClient extends BaseSandboxClient",
+    "RunloopSandboxClient extends BaseSandboxClient",
+    "BlaxelSandboxSession extends BaseSandboxSession",
+    "CloudflareSandboxSession extends BaseSandboxSession",
+    "VercelSandboxSession extends BaseSandboxSession",
+    "RunloopSandboxSession extends BaseSandboxSession",
+    "BlaxelSandboxSessionState extends SandboxSessionState",
+    "CloudflareSandboxSessionState extends SandboxSessionState",
+    "VercelSandboxSessionState extends SandboxSessionState",
+    "RunloopSandboxSessionState extends SandboxSessionState"
+  ],
+
+  "interaction_flow": {
+    "blaxel_create": [
+      "Caller → BlaxelSandboxClient: create(snapshot, manifest, options: BlaxelSandboxClientOptions)",
+      "BlaxelSandboxClient → BlaxelSDK: SandboxInstance.create_if_not_exists(create_config {name, image, memory, region, envs, ports, ttl})",
+      "BlaxelSDK → BlaxelSandboxClient: blaxel_sandbox (SandboxInstance)",
+      "BlaxelSandboxClient → BlaxelSandboxClient: _get_sandbox_url(blaxel_sandbox) → sandbox_url",
+      "BlaxelSandboxClient → BlaxelSandboxSession: from_state(BlaxelSandboxSessionState, sandbox=blaxel_sandbox, token)",
+      "BlaxelSandboxClient → BaseSandboxClient: _wrap_session(inner, instrumentation) → SandboxSession",
+      "BlaxelSandboxClient → Caller: SandboxSession"
+    ],
+    "blaxel_start": [
+      "Caller → BlaxelSandboxSession: start()",
+      "BlaxelSandboxSession → BlaxelSDK: sandbox.process.exec({command: 'mkdir -p {root}', wait_for_completion: true, timeout: 10000})",
+      "BlaxelSandboxSession → BaseSandboxSession: super().start()",
+      "BaseSandboxSession → BaseSandboxSession: _ensure_backend_started() → _probe_workspace_root_for_preserved_resume() → _prepare_backend_workspace() → materialize manifest"
+    ],
+    "blaxel_ws_pty": [
+      "BlaxelSandboxSession → _build_ws_url(sandbox_url, token, session_id, cwd, cols=80, rows=24)",
+      "_build_ws_url: base.replace('https://', 'wss://') + '/terminal/ws?token=&cols=&rows=&sessionId=&workingDir='",
+      "BlaxelSandboxSession → aiohttp.ClientSession: ws_connect(ws_url) → ClientWebSocketResponse"
+    ],
+    "blaxel_shutdown": [
+      "Caller → BlaxelSandboxSession: shutdown()",
+      "BlaxelSandboxSession → BlaxelSandboxSession: pty_terminate_all()",
+      "BlaxelSandboxSession → BlaxelSDK: sandbox.delete()  [only if pause_on_exit=False]",
+      "Note: pause_on_exit=True keeps sandbox alive; Blaxel auto-resumes on next connection"
+    ],
+    "blaxel_resume": [
+      "Caller → BlaxelSandboxClient: resume(BlaxelSandboxSessionState)",
+      "BlaxelSandboxClient → BlaxelSDK: SandboxInstance.get(sandbox_name)  [if pause_on_exit]",
+      "Alt: BlaxelSandboxClient → BlaxelSDK: create_if_not_exists(config)  [if get() fails or pause_on_exit=False]",
+      "BlaxelSandboxClient → BlaxelSandboxSession: from_state(state, sandbox, token)",
+      "BlaxelSandboxClient: inner._skip_start = True  [if reconnected]",
+      "BlaxelSandboxClient → Caller: SandboxSession"
+    ],
+
+    "cloudflare_create": [
+      "Caller → CloudflareSandboxClient: create(snapshot, manifest, options: CloudflareSandboxClientOptions {worker_url, api_key})",
+      "CloudflareSandboxClient: validate manifest.root == '/workspace'",
+      "CloudflareSandboxClient → CloudflareWorkerHTTP: POST {worker_url}/v1/sandbox (Authorization: Bearer {api_key})",
+      "CloudflareWorkerHTTP → CloudflareSandboxClient: {id: sandbox_id}",
+      "CloudflareSandboxClient → CloudflareSandboxSession: __init__(state: CloudflareSandboxSessionState{worker_url, sandbox_id}, api_key)",
+      "CloudflareSandboxClient → BaseSandboxClient: _wrap_session(inner) → SandboxSession",
+      "CloudflareSandboxClient → Caller: SandboxSession"
+    ],
+    "cloudflare_http_routing": [
+      "CloudflareSandboxSession._url(path) = '{worker_url}/v1/sandbox/{sandbox_id}/{path}'",
+      "CloudflareSandboxSession._ws_pty_url() = 'wss://{worker_url}/v1/sandbox/{sandbox_id}/pty?cols={cols}&rows={rows}'",
+      "HTTP session lazy-created: _session() creates aiohttp.ClientSession with Authorization header if api_key present"
+    ],
+    "cloudflare_running_check": [
+      "CloudflareSandboxSession: running() → GET {_url('running')} → {running: bool}"
+    ],
+    "cloudflare_resume": [
+      "Caller → CloudflareSandboxClient: resume(CloudflareSandboxSessionState)",
+      "CloudflareSandboxClient → CloudflareSandboxSession: from_state(state)",
+      "CloudflareSandboxSession → CloudflareWorkerHTTP: GET /v1/sandbox/{sandbox_id}/running",
+      "CloudflareSandboxSession → CloudflareSandboxClient: reconnected=bool",
+      "CloudflareSandboxClient: _set_start_state_preserved(reconnected)",
+      "CloudflareSandboxClient → Caller: SandboxSession"
+    ],
+    "cloudflare_shutdown": [
+      "Note: CloudflareSandboxSession has no explicit shutdown(); inherits BaseSandboxSession.shutdown() no-op",
+      "Cloudflare sandbox lifecycle is managed server-side (TTL/expiry)"
+    ],
+
+    "vercel_create": [
+      "Caller → VercelSandboxClient: create(snapshot, manifest, options: VercelSandboxClientOptions)",
+      "VercelSandboxClient: _resolve_manifest_root(manifest) → overrides root to '/vercel/sandbox' if default",
+      "VercelSandboxClient → VercelSandboxSession: from_state(VercelSandboxSessionState{sandbox_id='', project_id, team_id, timeout_ms, runtime, ...}, token)",
+      "VercelSandboxSession → VercelSandboxSession: _ensure_sandbox()",
+      "VercelSandboxSession → VercelSDK: _create_sandbox_with_retry(source, ports, timeout, resources, runtime, token, project_id, team_id, interactive, env, network_policy)",
+      "VercelSDK → VercelSandboxSession: AsyncSandbox instance",
+      "VercelSandboxSession → VercelSDK: sandbox.wait_for_status(RUNNING, timeout=45s)",
+      "VercelSandboxSession: state.sandbox_id = sandbox.sandbox_id",
+      "VercelSandboxClient → BaseSandboxClient: _wrap_session(inner) → SandboxSession",
+      "VercelSandboxClient → Caller: SandboxSession"
+    ],
+    "vercel_running_check": [
+      "VercelSandboxSession: running() → sandbox.refresh() → sandbox.status == SandboxStatus.RUNNING"
+    ],
+    "vercel_shutdown": [
+      "Caller → VercelSandboxSession: shutdown()",
+      "VercelSandboxSession → VercelSandboxSession: _stop_attached_sandbox()",
+      "VercelSandboxSession → VercelSDK: sandbox.stop()",
+      "VercelSandboxSession → VercelSDK: sandbox.client.aclose()",
+      "VercelSandboxSession: self._sandbox = None"
+    ],
+    "vercel_resume": [
+      "Caller → VercelSandboxClient: resume(VercelSandboxSessionState)",
+      "Alt snapshot path: probe._restore_snapshot_reference_id(state.snapshot) → snapshot_id",
+      "  VercelSandboxSession → VercelSDK: _ensure_sandbox(source=SnapshotSource(snapshot_id))",
+      "Alt reconnect path (sandbox_id present): AsyncSandbox.get(sandbox_id, token, project_id, team_id)",
+      "  VercelSDK → VercelSandboxClient: sandbox",
+      "  sandbox.wait_for_status(RUNNING, timeout=45s)",
+      "Alt fallback: _ensure_sandbox() to create fresh",
+      "VercelSandboxClient → Caller: SandboxSession"
+    ],
+
+    "runloop_create": [
+      "Caller → RunloopSandboxClient: create(snapshot, manifest, options: RunloopSandboxClientOptions)",
+      "RunloopSandboxClient: validate manifest root vs user_parameters home",
+      "RunloopSandboxClient → RunloopSDK: _upsert_runloop_managed_secrets(managed_secrets)",
+      "RunloopSandboxClient → RunloopSDK: sdk.devbox.create(timeout=timeouts.create_s, blueprint_id/name, env_vars, name, user_parameters, launch_parameters, tunnel, gateways, mcp, metadata, secrets)",
+      "RunloopSDK → RunloopSandboxClient: devbox (with devbox.id)",
+      "RunloopSandboxClient → RunloopSandboxSession: from_state(RunloopSandboxSessionState{devbox_id, ...}, sdk, devbox)",
+      "RunloopSandboxClient → BaseSandboxClient: _wrap_session(inner) → SandboxSession",
+      "RunloopSandboxClient → Caller: SandboxSession"
+    ],
+    "runloop_start": [
+      "Caller → RunloopSandboxSession: start()",
+      "If _skip_start=True AND snapshot.restorable(): check fingerprint → restore snapshot or re-apply ephemeral manifest",
+      "If _skip_start=True AND NOT restorable(): _reapply_ephemeral_manifest_on_resume()",
+      "Else: super().start() → full manifest materialization"
+    ],
+    "runloop_shutdown": [
+      "Caller → RunloopSandboxSession: shutdown()",
+      "If pause_on_exit=True: devbox.suspend(timeout) → devbox.await_suspended()",
+      "If pause_on_exit=False: devbox.shutdown(timeout=timeouts.cleanup_s)"
+    ],
+    "runloop_resume": [
+      "Caller → RunloopSandboxClient: resume(RunloopSandboxSessionState)",
+      "RunloopSandboxClient → RunloopSDK: sdk.devbox.from_id(devbox_id) → devbox",
+      "RunloopSandboxClient → RunloopSDK: devbox.get_info(timeout=keepalive_s) → info.status",
+      "If status=='suspended': devbox.resume() → devbox.await_running()",
+      "If status=='resuming': devbox.await_running()",
+      "If status!='running': raise → fallback to recreate",
+      "Fallback: sdk.devbox.create(blueprint_id/name, env_vars, ...) → new devbox",
+      "RunloopSandboxClient → RunloopSandboxSession: from_state(state, sdk, devbox)",
+      "RunloopSandboxClient: inner._skip_start = state.pause_on_exit AND reconnected",
+      "RunloopSandboxClient → Caller: SandboxSession"
+    ],
+    "runloop_exposed_port": [
+      "RunloopSandboxSession → RunloopSDK: devbox.get_tunnel_url(port, timeout)",
+      "If empty: devbox.net.enable_tunnel(auth_mode='open', http_keep_alive=True, wake_on_http=False) → retry get_tunnel_url()"
+    ]
+  },
+
+  "key_relationships": [
+    "All four clients extend BaseSandboxClient[OptionsT] and implement create/resume/delete/deserialize_session_state",
+    "All four sessions extend BaseSandboxSession and override start()/shutdown(); Cloudflare uses BaseSandboxSession.shutdown() no-op",
+    "BaseSandboxClient._wrap_session() wraps inner BaseSandboxSession into public SandboxSession with Instrumentation",
+    "BlaxelSandboxClient depends_on BlaxelSDK (SandboxInstance.create_if_not_exists / get)",
+    "CloudflareSandboxClient depends_on aiohttp (HTTP/WS to Cloudflare Worker at worker_url)",
+    "VercelSandboxClient depends_on vercel.sandbox.AsyncSandbox (create / get / wait_for_status)",
+    "RunloopSandboxClient depends_on runloop_api_client.AsyncRunloopSDK (devbox.create / devbox.from_id)",
+    "BlaxelSandboxSession uses _build_ws_url() to construct wss:// terminal URL",
+    "CloudflareSandboxSession uses _url(path) and _ws_pty_url() to build HTTP/WS paths",
+    "VercelSandboxSession lazily creates Vercel sandbox via _ensure_sandbox() on first operation",
+    "RunloopSandboxSession uses _ensure_tunnel_url(port) for exposed port resolution via devbox tunnels"
+  ],
+
+  "path_normalization": {
+    "blaxel": "normalize_path() inherited from BaseSandboxSession; workspace root default '/home/user'",
+    "cloudflare": "_normalize_path_for_io() → _normalize_path_for_remote_io() (runtime helper-assisted); workspace root fixed '/workspace'",
+    "vercel": "normalize_path() lexical PurePosixPath normalization against manifest.root; validates path does not escape root; default root '/vercel/sandbox'",
+    "runloop": "PurePosixPath normalization relative to runloop_home (/home/user or /root); validates relative_to(home)"
+  },
+
+  "ws_url_construction": {
+    "blaxel": "_build_ws_url(sandbox_url, token, session_id, cwd, cols, rows) → '{sandbox_url_as_wss}/terminal/ws?token=&cols=&rows=&sessionId=&workingDir='",
+    "cloudflare": "_ws_pty_url(cols, rows) → '{worker_url_as_wss}/v1/sandbox/{sandbox_id}/pty?cols=&rows='"
+  },
+
+  "session_state_fields": {
+    "BlaxelSandboxSessionState": ["sandbox_name", "image", "memory", "region", "base_env_vars", "labels", "ttl", "pause_on_exit", "timeouts", "sandbox_url", "exposed_port_public"],
+    "CloudflareSandboxSessionState": ["worker_url", "sandbox_id"],
+    "VercelSandboxSessionState": ["sandbox_id", "project_id", "team_id", "timeout_ms", "runtime", "resources", "env", "interactive", "workspace_persistence", "snapshot_expiration_ms", "network_policy"],
+    "RunloopSandboxSessionState": ["devbox_id", "blueprint_id", "blueprint_name", "base_env_vars", "pause_on_exit", "name", "timeouts", "exposed_ports", "user_parameters", "launch_parameters", "tunnel", "gateways", "mcp", "metadata", "secret_refs"]
+  },
+
+  "important_notes": [
+    "Blaxel: PTY sessions use dedicated WS connections per process; _build_ws_url converts HTTPS sandbox URL to WSS; pause_on_exit skips delete on shutdown",
+    "Cloudflare: manifest root is FIXED to '/workspace'; sandbox_id comes from server via POST /v1/sandbox; no explicit shutdown (server-managed TTL)",
+    "Vercel: sandbox lazily created on first _ensure_sandbox() call; supports two workspace_persistence modes: 'tar' (default) and 'snapshot'; no PTY support",
+    "Runloop: devbox is the compute primitive; suspend/resume cycle for pause_on_exit; tunnel for exposed ports; _skip_start optimization skips full manifest replay on reconnect",
+    "All backends: resume() tries to reconnect before recreating; _skip_start flag enables fast-resume path that skips full manifest materialization"
+  ],
+
+  "source_files_analyzed": [
+    "src/agents/extensions/sandbox/blaxel/sandbox.py",
+    "src/agents/extensions/sandbox/cloudflare/sandbox.py",
+    "src/agents/extensions/sandbox/vercel/sandbox.py",
+    "src/agents/extensions/sandbox/runloop/sandbox.py",
+    "src/agents/sandbox/session/base_sandbox_session.py",
+    "src/agents/sandbox/session/sandbox_client.py"
+  ]
+}

@@ -1,0 +1,254 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequence {
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+}
+skinparam noteBackgroundColor #FFF9C4
+skinparam noteBorderColor #F9A825
+
+title Package Download and Installation
+
+actor "Installer" as installer
+participant "InstallationManager" as instMgr
+participant "LibraryInstaller" as libInstaller
+participant "DownloadManager" as dlMgr
+participant "FileDownloader /\nArchiveDownloader" as downloader
+participant "HttpDownloader" as httpDl
+participant "Cache" as cache
+participant "Filesystem" as fs
+participant "EventDispatcher" as events
+participant "InstalledRepository" as repo
+
+' ─── SETUP ───────────────────────────────────────────────────────────────────
+installer -> dlMgr : setPreferDist(true) / setPreferSource(false)
+installer -> dlMgr : setSourceFallback(true)
+
+installer -> instMgr : execute(repo, operations[], devMode, runScripts, downloadOnly)
+activate instMgr
+
+note over instMgr
+  Operations are batched;
+  composer-plugin packages
+  are isolated in their own batch
+end note
+
+instMgr -> instMgr : downloadAndExecuteBatch(repo, batch, ...)
+activate instMgr
+
+' ─── PHASE 1: DOWNLOAD (parallel via React Promises) ─────────────────────────
+note over instMgr, downloader #E3F2FD
+  **PHASE 1 — DOWNLOAD** (all packages in batch downloaded in parallel)
+end note
+
+loop for each non-uninstall operation in batch
+    instMgr -> libInstaller : download(package, prevPackage)
+    activate libInstaller
+
+    libInstaller -> libInstaller : getInstallPath(package)
+
+    libInstaller -> dlMgr : download(package, downloadPath, prevPackage)
+    activate dlMgr
+
+    dlMgr -> dlMgr : getAvailableSources(package, prevPackage)
+    note right of dlMgr
+      Returns ordered list e.g. ['dist','source']
+      based on preferDist / preferSource flags
+      and resolvePackageInstallPreference()
+    end note
+
+    dlMgr -> dlMgr : package->setInstallationSource(source)
+    dlMgr -> dlMgr : getDownloaderForPackage(package)
+    note right of dlMgr : Looks up downloader by distType or sourceType
+
+    dlMgr -> downloader : download(package, targetDir, prevPackage)
+    activate downloader
+
+    downloader -> downloader : processUrl(package, url)
+
+    downloader -> events : dispatch(PRE_FILE_DOWNLOAD, package, url)
+    activate events
+    events --> downloader : (plugins may update URL / cacheKey)
+    deactivate events
+
+    alt Cache HIT
+        downloader -> cache : sha1(cacheKey)
+        activate cache
+        cache --> downloader : cachedHash
+        deactivate cache
+
+        downloader -> cache : copyTo(cacheKey, fileName)
+        activate cache
+        cache --> downloader : true (file copied)
+        deactivate cache
+
+        downloader -> downloader : verify hash_file('sha1') == distSha1Checksum
+        note right : Checksum check skipped if\npackage has no distSha1Checksum
+
+    else Cache MISS
+        downloader -> httpDl : addCopy(processedUrl, fileName, transportOptions)
+        activate httpDl
+        note right of httpDl : Returns PromiseInterface;\nHTTP transfer is non-blocking
+
+        alt HTTP Success
+            httpDl --> downloader : accept callback — file saved to tmpPath
+            deactivate httpDl
+
+            downloader -> cache : copyFrom(cacheKey, fileName)
+            activate cache
+            cache --> downloader : (cached for future use)
+            deactivate cache
+
+            downloader -> downloader : verify hash_file('sha1') == distSha1Checksum
+
+        else HTTP Failure (retryable)
+            note over downloader, httpDl #FFEBEE
+              Retry up to 3 times per URL;
+              then try next URL in distUrls list.
+              IrrecoverableDownloadException /
+              MaxFileSizeExceededException → no retry.
+              HTTP 4xx (non-5xx) → retries = 0.
+            end note
+        end
+
+    end
+
+    downloader -> events : dispatch(POST_FILE_DOWNLOAD, package)
+    activate events
+    events --> downloader
+    deactivate events
+
+    downloader --> dlMgr : PromiseInterface
+    deactivate downloader
+
+    opt Source Fallback (sourceFallback=true && dist failed)
+        dlMgr -> dlMgr : retry download() with next source (e.g. 'source')
+        note right : Falls back to VCS source\nif dist download fails
+    end
+
+    dlMgr --> libInstaller : PromiseInterface
+    deactivate dlMgr
+
+    libInstaller --> instMgr : PromiseInterface
+    deactivate libInstaller
+end
+
+instMgr -> instMgr : waitOnPromises(downloadPromises)
+note right : Blocks until ALL package\ndownloads in the batch complete
+
+opt downloadOnly = true
+    instMgr -> instMgr : runCleanup(cleanupPromises)
+    instMgr --> installer : (return — skip install phase)
+end
+
+' ─── PHASE 2: PREPARE + INSTALL (sequential batches, parallel within) ─────────
+note over instMgr, fs #E8F5E9
+  **PHASE 2 — PREPARE + INSTALL** (sequential per batch)
+end note
+
+instMgr -> instMgr : executeBatch(repo, batch, ...)
+activate instMgr
+
+loop for each operation in batch
+    instMgr -> libInstaller : prepare(opType, package, prevPackage)
+    activate libInstaller
+    libInstaller -> dlMgr : prepare(opType, package, targetDir, prevPackage)
+    activate dlMgr
+    dlMgr -> downloader : prepare(package, targetDir, prevPackage)
+    note right : No-op for FileDownloader;\nVCS downloaders may clone here
+    downloader --> dlMgr
+    dlMgr --> libInstaller
+    deactivate dlMgr
+    libInstaller --> instMgr
+    deactivate libInstaller
+
+    instMgr -> libInstaller : install(repo, package)
+    activate libInstaller
+    libInstaller -> libInstaller : installCode(package)
+    libInstaller -> dlMgr : install(package, downloadPath)
+    activate dlMgr
+    dlMgr -> dlMgr : getDownloaderForPackage(package)
+    dlMgr -> downloader : install(package, targetDir)
+    activate downloader
+
+    alt FileDownloader (non-archive dist)
+        downloader -> fs : emptyDirectory(targetDir)
+        activate fs
+        fs --> downloader
+        deactivate fs
+        downloader -> fs : rename(tmpFile, targetDir/distFilename)
+        activate fs
+        fs --> downloader
+        deactivate fs
+        downloader -> downloader : chmod binaries
+
+    else ArchiveDownloader (zip / tar)
+        downloader -> fs : ensureDirectoryExists(vendor/composer/<hex8>)
+        activate fs
+        fs --> downloader : tmpExtractDir
+        deactivate fs
+        downloader -> downloader : extract(package, archiveFile, tmpExtractDir)
+        note right : Abstract — ZipDownloader\nor TarDownloader implements this
+        downloader -> fs : unlink(archiveFile)
+        activate fs
+        fs --> downloader
+        deactivate fs
+
+        alt Single top-level directory in archive
+            downloader -> fs : rename(tmpExtractDir/topDir, targetDir)
+            activate fs
+            fs --> downloader
+            deactivate fs
+        else Multiple top-level entries
+            downloader -> fs : rename(tmpExtractDir, targetDir) [merge if target exists]
+            activate fs
+            fs --> downloader
+            deactivate fs
+        end
+
+        downloader -> fs : removeDirectoryAsync(tmpExtractDir)
+        activate fs
+        fs --> downloader
+        deactivate fs
+    end
+
+    downloader --> dlMgr : PromiseInterface
+    deactivate downloader
+    dlMgr --> libInstaller
+    deactivate dlMgr
+    libInstaller --> instMgr : PromiseInterface
+    deactivate libInstaller
+
+    instMgr -> instMgr : cleanupPromises[i]() → downloader->cleanup()
+    note right : Removes leftover tmp files
+
+    instMgr -> repo : write(devMode, installationManager)
+    activate repo
+    repo --> instMgr : (package persisted to installed.json / lock)
+    deactivate repo
+end
+
+instMgr -> instMgr : waitOnPromises(installPromises)
+
+instMgr -> events : dispatchPackageEvent(POST_PACKAGE_INSTALL / UPDATE / UNINSTALL)
+activate events
+events --> instMgr
+deactivate events
+
+deactivate instMgr
+deactivate instMgr
+
+instMgr --> installer : (batch complete)
+deactivate instMgr
+
+@enduml

@@ -1,0 +1,555 @@
+{
+  "scope": "appsec_module",
+  "title": "Application Security (AppSec) Module",
+  "diagram_type": "class",
+  "architecture_overview": "Bilingual module: PHP C extension (client) communicates with a Rust helper process (server) over a Unix domain socket using msgpack protocol. The Rust helper runs libddwaf for WAF-based attack detection. Remote Config (RC) updates arrive via shared memory.",
+
+  "classes": [
+    {
+      "name": "ddappsec_globals",
+      "language": "C",
+      "file": "src/extension/ddappsec.h",
+      "type": "module_globals (ZEND)",
+      "fields": [
+        "enabled_configuration enabled : 2",
+        "bool active : 1",
+        "bool to_be_configured : 1",
+        "bool skip_rshutdown : 1",
+        "bool during_request_shutdown : 1"
+      ],
+      "methods": [
+        "dd_appsec_rinit_once(void)",
+        "dd_appsec_rshutdown(bool ignore_verdict)"
+      ]
+    },
+    {
+      "name": "enabled_configuration",
+      "language": "C",
+      "type": "enum",
+      "values": ["APPSEC_UNSET_STATE=0", "APPSEC_ENABLED_VIA_REMCFG", "APPSEC_FULLY_ENABLED", "APPSEC_FULLY_DISABLED"]
+    },
+    {
+      "name": "dd_result",
+      "language": "C",
+      "type": "enum",
+      "file": "src/extension/dddefs.h",
+      "values": ["dd_success=0", "dd_network", "dd_should_block", "dd_should_redirect", "dd_should_record", "dd_error", "dd_try_later", "dd_helper_error"]
+    },
+    {
+      "name": "dd_conn",
+      "language": "C",
+      "file": "src/extension/network.h",
+      "type": "struct",
+      "fields": ["sockaddr_un addr", "int socket"],
+      "methods": [
+        "dd_conn_init(conn, path, path_len): int",
+        "dd_conn_destroy(conn): int",
+        "dd_conn_check_credentials(conn): dd_result",
+        "dd_conn_sendv(conn, iovecs): dd_result",
+        "dd_conn_recv(conn, data, data_len): dd_result",
+        "dd_conn_set_timeout(conn, comm_type, ms): dd_result",
+        "dd_conn_connected(conn): bool"
+      ]
+    },
+    {
+      "name": "dd_command_spec",
+      "language": "C",
+      "file": "src/extension/commands_helpers.h",
+      "type": "struct",
+      "fields": [
+        "const char* name",
+        "size_t name_len",
+        "size_t num_args",
+        "outgoing_cb: fn(mpack_writer_t*, void*) -> dd_result",
+        "incoming_cb: fn(mpack_node_t, void*) -> dd_result",
+        "config_features_cb: fn(mpack_node_t, void*) -> dd_result"
+      ],
+      "methods": [
+        "dd_command_exec(conn, spec, ctx): dd_result",
+        "dd_command_exec_req_info(conn, spec, req_info): dd_result",
+        "dd_command_exec_cred(conn, spec, ctx): dd_result",
+        "dd_command_proc_resp_verd_span_data(root, ctx): dd_result",
+        "dd_command_process_meta(root, span)",
+        "dd_command_process_metrics(root, span): bool",
+        "dd_command_process_config_features(root, ctx): dd_result"
+      ]
+    },
+    {
+      "name": "block_params",
+      "language": "C",
+      "file": "src/extension/request_abort.h",
+      "type": "struct",
+      "fields": [
+        "zend_string* security_response_id",
+        "dd_response_type response_type",
+        "int response_code",
+        "zend_string* redirection_location"
+      ],
+      "constants": ["DEFAULT_BLOCKING_RESPONSE_CODE=403", "DEFAULT_REDIRECTION_RESPONSE_CODE=303", "DEFAULT_RESPONSE_TYPE=response_type_auto"]
+    },
+    {
+      "name": "dd_response_type",
+      "language": "C",
+      "type": "enum",
+      "values": ["response_type_auto=0", "response_type_html=1", "response_type_json=2"]
+    },
+    {
+      "name": "req_info",
+      "language": "C",
+      "file": "src/extension/commands_ctx.h",
+      "type": "struct",
+      "fields": [
+        "const char* command_name",
+        "zend_object* root_span",
+        "zend_string* client_ip",
+        "struct block_params block_params"
+      ]
+    },
+    {
+      "name": "req_info_init",
+      "language": "C",
+      "file": "src/extension/commands/request_init.h",
+      "type": "struct",
+      "fields": [
+        "struct req_info req_info",
+        "zend_array* superglob_equiv",
+        "zend_string* entity"
+      ],
+      "methods": ["dd_request_init(conn, req_info_init): dd_result"],
+      "note": "Embeds req_info (composition). Packs server.request.query/method/cookies/headers/uri/body etc."
+    },
+    {
+      "name": "req_exec_opts",
+      "language": "C",
+      "file": "src/extension/commands/request_exec.h",
+      "type": "struct",
+      "fields": [
+        "zend_string* rasp_rule",
+        "zend_string* subctx_id",
+        "bool subctx_last_call"
+      ],
+      "methods": ["dd_request_exec(conn, data, req_exec_opts, block_params): dd_result"]
+    },
+    {
+      "name": "request_stage",
+      "language": "C",
+      "type": "enum",
+      "file": "src/extension/request_lifecycle.h",
+      "values": ["REQUEST_STAGE_REQUEST_BEGIN", "REQUEST_STAGE_MID_REQUEST", "REQUEST_STAGE_REQUEST_END"]
+    },
+    {
+      "name": "RequestLifecycle",
+      "language": "C",
+      "file": "src/extension/request_lifecycle.h",
+      "type": "module (free functions)",
+      "methods": [
+        "dd_req_lifecycle_startup()",
+        "dd_req_lifecycle_rinit(bool force)",
+        "dd_req_lifecycle_rshutdown(bool ignore_verdict, bool force)",
+        "dd_req_lifecycle_set_blocked()",
+        "dd_req_lifecycle_is_blocked(): bool",
+        "dd_req_lifecycle_abort(stage, dd_result, block_params): zend_array*",
+        "dd_req_lifecycle_get_cur_span(): zend_object*",
+        "dd_req_lifecycle_get_client_ip(): zend_string*"
+      ]
+    },
+    {
+      "name": "RequestAbort",
+      "language": "C",
+      "file": "src/extension/request_abort.h",
+      "type": "module (free functions)",
+      "methods": [
+        "dd_request_abort_startup()",
+        "dd_request_abort_shutdown()",
+        "dd_request_abort_static_page(block_params)",
+        "dd_request_abort_static_page_spec(block_params, server): zend_array*",
+        "dd_request_abort_redirect(block_params)",
+        "dd_request_abort_redirect_spec(block_params, server): zend_array*",
+        "dd_request_abort_destroy_block_params(block_params)"
+      ]
+    },
+    {
+      "name": "HelperManager",
+      "language": "C",
+      "file": "src/extension/helper_process.h",
+      "type": "module (free functions)",
+      "enums": ["helper_runtime: UNKNOWN=0, CPP=1, RUST=2"],
+      "methods": [
+        "dd_helper_startup()",
+        "dd_helper_shutdown()",
+        "dd_helper_gshutdown()",
+        "dd_helper_rshutdown()",
+        "dd_helper_get_runtime(): helper_runtime",
+        "dd_helper_set_runtime(helper_runtime)",
+        "dd_helper_is_rust(): bool",
+        "dd_helper_mgr_acquire_conn(client_init_func, ctx): dd_conn*",
+        "dd_helper_mgr_cur_conn(): dd_conn*",
+        "dd_helper_close_conn()",
+        "dd_appsec_maybe_enable_helper(enable_appsec, appsec_activation, appsec_conf): bool"
+      ]
+    },
+    {
+      "name": "Rasp",
+      "language": "C",
+      "file": "src/extension/rasp.h",
+      "type": "module (free functions)",
+      "methods": [
+        "dd_rasp_startup()",
+        "dd_rasp_shutdown()",
+        "dd_rasp_account_duration_us(double duration_us)",
+        "dd_rasp_reset_globals()",
+        "dd_rasp_req_finish()"
+      ]
+    },
+    {
+      "name": "Tags",
+      "language": "C",
+      "file": "src/extension/tags.h",
+      "type": "module (free functions)",
+      "methods": [
+        "dd_tags_startup()",
+        "dd_tags_shutdown()",
+        "dd_tags_rinit()",
+        "dd_tags_rshutdown()",
+        "dd_tags_add_tags(span, superglob_equiv)",
+        "dd_tags_set_user_event_triggered()",
+        "dd_tags_set_event_user_id(zstr)",
+        "dd_tags_add_appsec_json_frag(zstr)"
+      ]
+    },
+    {
+      "name": "ServiceManager",
+      "language": "Rust",
+      "file": "helper-rust/src/service.rs",
+      "fields": ["inner: Mutex<ServiceManagerInner>"],
+      "inner_fields": ["services: HashMap<ServiceFixedConfig, Weak<Service>>", "last_service: Option<Arc<Service>>"],
+      "methods": [
+        "new() -> ServiceManager",
+        "get_service(config, tel_collector) -> Arc<Service>",
+        "notify_of_rc_updates(shmem_path)",
+        "service_count() -> usize [test only]"
+      ]
+    },
+    {
+      "name": "Service",
+      "language": "Rust",
+      "file": "helper-rust/src/service.rs",
+      "fields": [
+        "fixed_config: ServiceFixedConfig",
+        "limiter: Limiter",
+        "schema_sampler: Option<SchemaSampler>",
+        "rc_update_lock: Mutex<RcUpdateState>",
+        "waf: UpdateableWafInstance",
+        "config_snapshot: ArcSwap<ConfigSnapshot>",
+        "logs_collector: TelemetryLogsCollector",
+        "worker_count: WorkerCountState"
+      ],
+      "methods": [
+        "new(fixed_config, tel_submitter) -> Service",
+        "fixed_config() -> &ServiceFixedConfig",
+        "telemetry_settings() -> &TelemetrySettings",
+        "configured_waf_timeout() -> Option<Duration>",
+        "new_context() -> libddwaf::Context",
+        "config_snapshot() -> Guard<Arc<ConfigSnapshot>>",
+        "should_force_keep() -> bool",
+        "waf_version() -> &str",
+        "should_extract_schema(api_sec_samp_key) -> bool",
+        "poll_and_apply_rc() -> Result<()>",
+        "apply_config(state, cfg_dir) -> Result<()>",
+        "apply_config_file(cfg, rc_path, ...) -> Result<()>",
+        "increment_worker_count()",
+        "decrement_worker_count()",
+        "take_pending_init_diagnostics_legacy() -> Option<InitDiagnosticsLegacy>"
+      ],
+      "traits": ["TelemetryLogsGenerator", "TelemetryMetricsGenerator"]
+    },
+    {
+      "name": "ServiceFixedConfig",
+      "language": "Rust",
+      "file": "helper-rust/src/service.rs",
+      "fields": [
+        "always_enabled: bool",
+        "waf_settings: WafSettings",
+        "rem_cfg_settings: RemoteConfigSettings",
+        "telemetry_settings: TelemetrySettings"
+      ],
+      "methods": [
+        "new(always_enabled, waf_settings, rem_cfg_settings, telemetry_settings)",
+        "config_sync_settings() -> (&RemoteConfigSettings, &TelemetrySettings)",
+        "new_from_config_sync(args) -> Option<Self>"
+      ],
+      "traits": ["Eq", "PartialEq", "Hash", "Clone"]
+    },
+    {
+      "name": "ConfigSnapshot",
+      "language": "Rust",
+      "file": "helper-rust/src/service.rs",
+      "fields": [
+        "asm_enabled: bool",
+        "auto_user_instrum: AutoUserInstrumMode",
+        "rules_version: Option<String>"
+      ],
+      "methods": [
+        "new(asm_always_enabled, rules_version)",
+        "with_asm_features(asm_always_enabled, asm_enabled, auto_user_instrum)",
+        "with_new_rules_version(rules_version)"
+      ]
+    },
+    {
+      "name": "AutoUserInstrumMode",
+      "language": "Rust",
+      "type": "enum",
+      "values": ["Undefined (default)", "Unknown", "Disabled", "Identification", "Anonymization"]
+    },
+    {
+      "name": "UpdateableWafInstance",
+      "language": "Rust",
+      "file": "helper-rust/src/service/updateable_waf.rs",
+      "fields": ["inner: Arc<UpdateableWafInstanceInner>"],
+      "inner_fields": [
+        "prot_state: Mutex<ProtectedState {builder: Builder, initial_ruleset_added: bool}>",
+        "waf_handle: ArcSwap<Handle>",
+        "initial_ruleset: WafObject"
+      ],
+      "methods": [
+        "new(ruleset, config, diagnostics) -> Result<Self>",
+        "current() -> Arc<Handle>",
+        "add_or_update_config(path, ruleset, diagnostics) -> Result<()>",
+        "remove_config(path) -> Result<bool>",
+        "update() -> Result<Arc<Handle>>",
+        "config_paths(filter) -> WafArray",
+        "config_paths_count(filter) -> u32"
+      ],
+      "traits": ["Clone"],
+      "note": "Thread-safe WAF: lock-free reads via ArcSwap, writes serialized via Mutex<Builder>. Auto-restores initial_ruleset if all ASM_DD configs removed."
+    },
+    {
+      "name": "WafRuleset",
+      "language": "Rust",
+      "file": "helper-rust/src/service/waf_ruleset.rs",
+      "fields": ["doc: WafObject", "rules_version: Option<String>"],
+      "methods": [
+        "new(doc, rules_version)",
+        "from_file(path) -> Result<WafRuleset>",
+        "from_default_file() -> Result<WafRuleset>",
+        "from_slice(slice) -> Result<WafRuleset>",
+        "rules_version() -> Option<&str>"
+      ],
+      "traits": ["From<WafRuleset> for WafObject"]
+    },
+    {
+      "name": "Client",
+      "language": "Rust",
+      "file": "helper-rust/src/client.rs",
+      "fields": [
+        "id: u64",
+        "service_manager: &'static ServiceManager",
+        "service: Option<TrackedService>",
+        "sidecar_settings: Option<SidecarSettings>",
+        "metrics_last_registered: Cell<Option<Instant>>"
+      ],
+      "methods": [
+        "new(service_manager) -> Client",
+        "entrypoint(stream, sidecar_ready, cancel_token) [async]",
+        "get_service() -> &Service"
+      ]
+    },
+    {
+      "name": "TrackedService",
+      "language": "Rust",
+      "file": "helper-rust/src/client.rs",
+      "fields": ["service: Arc<Service>"],
+      "note": "RAII wrapper: increments worker_count on new/clone, decrements on drop. Deref to Service."
+    },
+    {
+      "name": "Command",
+      "language": "Rust",
+      "type": "enum",
+      "file": "helper-rust/src/client/protocol.rs",
+      "values": [
+        "ClientInit(Box<ClientInitArgs>)",
+        "ConfigSync(Box<ConfigSyncArgs>)",
+        "RequestInit(Box<RequestInitArgs>)",
+        "RequestExec(Box<RequestExecArgs>)",
+        "RequestShutdown(Box<RequestShutdownArgs>)"
+      ]
+    },
+    {
+      "name": "CommandResponse",
+      "language": "Rust",
+      "type": "enum",
+      "file": "helper-rust/src/client/protocol.rs",
+      "values": ["FatalError", "ClientInit(ClientInitResp)", "ConfigSync", "ConfigFeatures(ConfigFeaturesResp)", "RequestInit(RequestInitResp)", "RequestExec(RequestExecResp)", "RequestShutdown(RequestShutdownResp)"]
+    },
+    {
+      "name": "ClientInitArgs",
+      "language": "Rust",
+      "fields": ["pid: u32", "ddappsec_version: String", "php_version: String", "appsec_enabled: Option<bool>", "waf_config: WafSettings", "remote_config: RemoteConfigSettings", "telemetry_settings: TelemetrySettings", "sidecar_settings: SidecarSettings"]
+    },
+    {
+      "name": "ClientInitResp",
+      "language": "Rust",
+      "fields": ["status: String", "version: &str", "errors: Vec<String>", "meta: HashMap<String,String>", "metrics: HashMap<String,f64>", "helper_runtime: Option<String>"]
+    },
+    {
+      "name": "RequestInitArgs",
+      "language": "Rust",
+      "fields": ["data: WafMap"]
+    },
+    {
+      "name": "RequestInitResp",
+      "language": "Rust",
+      "fields": ["actions: &Vec<ActionInstance>", "triggers: &Vec<String>", "force_keep: bool", "settings: HashMap<&str, String>"]
+    },
+    {
+      "name": "RequestExecArgs",
+      "language": "Rust",
+      "fields": ["data: WafMap", "options: RequestExecOptions"]
+    },
+    {
+      "name": "RequestExecOptions",
+      "language": "Rust",
+      "fields": ["run_type: WafRunType", "subctx_id: Option<String>", "subctx_last_call: bool"],
+      "methods": ["regular() -> Self"]
+    },
+    {
+      "name": "WafRunType",
+      "language": "Rust",
+      "type": "enum",
+      "values": ["NonRasp", "RaspRule(String)"]
+    },
+    {
+      "name": "RequestExecResp",
+      "language": "Rust",
+      "fields": ["actions: Vec<ActionInstance>", "triggers: Vec<String>", "force_keep: bool", "settings: HashMap<String,String>"]
+    },
+    {
+      "name": "RequestShutdownArgs",
+      "language": "Rust",
+      "fields": ["data: WafMap", "api_sec_samp_key: u64", "queue_id: u64", "input_truncated: bool"]
+    },
+    {
+      "name": "RequestShutdownResp",
+      "language": "Rust",
+      "fields": ["actions: Vec<ActionInstance>", "triggers: Vec<String>", "force_keep: bool", "settings: HashMap<String,String>", "meta: HashMap<Cow<str>,String>", "metrics: HashMap<Cow<str>,f64>"]
+    },
+    {
+      "name": "ActionInstance",
+      "language": "Rust",
+      "fields": ["action: &str", "parameters: HashMap<String,String>"]
+    },
+    {
+      "name": "WafSettings",
+      "language": "Rust",
+      "fields": ["rules_file: Option<String>", "waf_timeout_us: Option<u64>", "trace_rate_limit: u32", "obfuscator_key_regex: Option<String>", "obfuscator_value_regex: Option<String>", "schema_extraction: SchemaExtraction"]
+    },
+    {
+      "name": "RemoteConfigSettings",
+      "language": "Rust",
+      "fields": ["enabled: bool", "shmem_path: PathBuf"],
+      "methods": ["new(enabled, shmem_path)", "shmem_path() -> Option<&Path>"]
+    },
+    {
+      "name": "TelemetrySettings",
+      "language": "Rust",
+      "fields": ["service_name: String", "env_name: String"]
+    },
+    {
+      "name": "SidecarSettings",
+      "language": "Rust",
+      "fields": ["session_id: String", "runtime_id: String"]
+    },
+    {
+      "name": "SchemaExtraction",
+      "language": "Rust",
+      "fields": ["enabled: bool", "sampling_period: f64"]
+    },
+    {
+      "name": "InitDiagnosticsLegacy",
+      "language": "Rust",
+      "fields": ["rules_loaded: u32", "rules_failed: u32", "rules_errors: String"],
+      "methods": ["merge(other)"],
+      "traits": ["SpanMetricsGenerator"]
+    },
+    {
+      "name": "CommandCodec",
+      "language": "Rust",
+      "file": "helper-rust/src/client/protocol.rs",
+      "note": "msgpack framing: 4-byte marker 'dds\\0' + uint32 size LE + msgpack payload. Max 4MB.",
+      "traits": ["Decoder<Item=Command>", "Encoder<CommandResponse>"]
+    },
+    {
+      "name": "Server",
+      "language": "Rust",
+      "file": "helper-rust/src/server.rs",
+      "type": "module (free function)",
+      "methods": ["run_server(config, cancel_token) -> Result<()> [async]"],
+      "note": "Binds Unix socket, creates ServiceManager (leaked as 'static), registers RC callbacks, spawns Client per connection"
+    }
+  ],
+
+  "key_relationships": [
+    "ServiceManager creates/caches Service instances (HashMap<ServiceFixedConfig, Weak<Service>>)",
+    "Service owns UpdateableWafInstance (composition)",
+    "Service owns ConfigSnapshot via ArcSwap (atomic swap on RC update)",
+    "Service owns ServiceFixedConfig (immutable, used as cache key)",
+    "UpdateableWafInstance wraps libddwaf::Handle (Arc<Handle> via ArcSwap) and libddwaf::Builder (Mutex)",
+    "Client holds &'static ServiceManager and Option<TrackedService>",
+    "TrackedService wraps Arc<Service> with RAII worker count tracking",
+    "Command/CommandResponse are protocol DTOs carried over dd_conn (C) / UnixStream (Rust)",
+    "ClientInitArgs contains WafSettings + RemoteConfigSettings + TelemetrySettings + SidecarSettings",
+    "RequestInitArgs/RequestExecArgs/RequestShutdownArgs carry WafMap data to WAF",
+    "ActionInstance is returned in all Resp types to signal blocking/redirect actions",
+    "req_info_init embeds req_info (composition), req_info embeds block_params",
+    "dd_command_spec uses function pointers for outgoing_cb/incoming_cb (strategy pattern)",
+    "HelperManager manages dd_conn lifecycle; acquired conn is used by all command functions",
+    "RequestLifecycle calls RequestAbort on dd_should_block/dd_should_redirect results",
+    "WafRuleset converts to libddwaf::WafObject via From trait",
+    "RcUpdateState holds ConfigPoller + AsmFeatureConfigManager + TelemetryMetricsCollector"
+  ],
+
+  "key_flows": [
+    "Request init: PHP rinit -> dd_req_lifecycle_rinit -> dd_helper_mgr_acquire_conn -> dd_request_init(conn, req_info_init) -> helper runs WAF -> returns actions/triggers -> if dd_should_block, dd_req_lifecycle_abort -> dd_request_abort_static_page/redirect",
+    "Request exec (RASP): PHP hook -> dd_request_exec(conn, data, req_exec_opts{rasp_rule}, block_params) -> helper runs WAF with rasp context -> returns block verdict",
+    "Request shutdown: rshutdown -> dd_request_shutdown -> helper finalizes WAF context -> returns schema/metrics",
+    "RC update: sidecar notifies -> ServiceManager.notify_of_rc_updates -> Service.poll_and_apply_rc -> apply_config -> waf.add_or_update_config / waf.update -> config_snapshot updated atomically",
+    "WAF update cycle: add_or_update_config (locks builder, no rebuild) -> update() (rebuilds Handle, ArcSwap store) -> current() (lock-free load of Arc<Handle>)",
+    "Client lifecycle: Server accepts UnixStream -> Client::new -> entrypoint -> client_init command -> get/create Service -> request_init/exec/shutdown loop -> disconnect"
+  ],
+
+  "important_notes": [
+    "Protocol: msgpack tuples [command_name, [args...]], framed with 'dds\\0' header + uint32 little-endian size, max 4MB",
+    "WAF thread safety: ArcSwap<Handle> for lock-free concurrent reads; Mutex<Builder> for serialized config updates",
+    "Initial ruleset is auto-restored when all ASM_DD remote configs are removed",
+    "RC products handled: ASM_DD (rules), ASM (customizations), ASM_DATA (IP lists), ASM_FEATURES (enable/disable)",
+    "RASP support: req_exec_opts.rasp_rule identifies RASP rule, WafRunType::RaspRule in Rust protocol",
+    "Blocking: dd_should_block -> response_type_auto/html/json with response_code 403 or redirect 303",
+    "Schema extraction: sampled by SchemaSampler, controlled by WafSettings.schema_extraction",
+    "AutoUserInstrumMode controls automated user identification/anonymization mode from ASM_FEATURES",
+    "helper_runtime enum tracks whether C++ or Rust helper is running",
+    "TrackedService RAII increments/decrements worker_count for metrics"
+  ],
+
+  "source_files_analyzed": [
+    "appsec/src/extension/ddappsec.h",
+    "appsec/src/extension/dddefs.h",
+    "appsec/src/extension/network.h",
+    "appsec/src/extension/commands_helpers.h",
+    "appsec/src/extension/commands_ctx.h",
+    "appsec/src/extension/request_abort.h",
+    "appsec/src/extension/request_lifecycle.h",
+    "appsec/src/extension/helper_process.h",
+    "appsec/src/extension/rasp.h",
+    "appsec/src/extension/tags.h",
+    "appsec/src/extension/commands/request_init.h",
+    "appsec/src/extension/commands/request_init.c",
+    "appsec/src/extension/commands/request_exec.h",
+    "appsec/src/extension/commands/request_exec.c",
+    "appsec/helper-rust/src/service.rs",
+    "appsec/helper-rust/src/service/updateable_waf.rs",
+    "appsec/helper-rust/src/service/waf_ruleset.rs",
+    "appsec/helper-rust/src/client.rs",
+    "appsec/helper-rust/src/client/protocol.rs",
+    "appsec/helper-rust/src/server.rs"
+  ]
+}

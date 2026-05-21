@@ -1,0 +1,140 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #DEE2E6
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title Text Generation Flow
+
+|#DDE8F5|GeneratesText|
+start
+:Receive **AgentPrompt** via TextProvider::prompt(AgentPrompt);
+:Generate invocation UUID via Str::uuid7();
+:Gather pipeline middleware\n(FakeGateway recording / RememberConversation / agent-defined middleware);
+:Send AgentPrompt through pipeline();
+:Dispatch **PromptingAgent** event;
+
+if (agent instanceof Conversational?) then (yes)
+  :Load prior messages\nfrom agent.messages();
+else (no)
+  :messages = [];
+endif
+
+:Append UserMessage(prompt.prompt, attachments) to messages;
+:Register tool callbacks via\ntextGateway()->onToolInvocation(invoking, invoked);
+
+if (agent instanceof HasStructuredOutput?) then (yes)
+  :schema = agent.schema(JsonSchemaTypeFactory);
+else (no)
+  :schema = null;
+endif
+
+:Resolve TextGenerationOptions::forAgent(agent);
+:Call textGateway()->generateText(\n  provider, model, instructions, messages,\n  tools, schema, options, timeout);
+
+|#FFF4CC|TextGateway|
+:buildTextRequestBody(\n  provider, model, instructions,\n  messages, tools, schema, options);
+:mapMessagesToInput(messages, instructions)\n  [User]       → mapUserMessage() + mapAttachments()\n  [Assistant]  → mapAssistantMessage() + toolCalls + reasoningBlocks\n  [ToolResult] → mapToolResultMessage() → function_call_output entries;
+
+if (tools provided?) then (yes)
+  :mapTools(tools, provider)\nset tool_choice = 'auto';
+endif
+
+if (schema provided?) then (yes)
+  if (OpenAI provider?) then (yes)
+    :buildSchemaFormat(schema)\n→ json_schema format;
+  else (Anthropic)
+    if (Native structured output supported?) then (yes)
+      :output_config (Anthropic native beta);
+    else (no)
+      :buildStructuredOutputTool()\n→ synthetic 'output_structured_data' tool;
+    endif
+  endif
+endif
+
+:Apply provider-specific options\n(maxTokens, temperature, providerOptions);
+:HTTP POST to API endpoint\n(withErrorHandling());
+:response.json() → raw response data;
+:validateTextResponse(data);
+
+if (data has error OR status = 'failed'?) then (yes)
+  #FFCCCC:Throw AiException;
+  stop
+else (no)
+endif
+
+|#E4F5E4|ParsesTextResponses|
+note right: processResponse() is recursive —\nloops until FinishReason::Stop\nor maxSteps is reached
+
+repeat
+  :extractText(output) → last output content text;
+  :extractToolCalls(output) → filter function_call items;
+  :extractReasonings(output) → filter reasoning items;
+  :extractCitations(output) → filter url_citation annotations;
+  :extractUsage(data)\n→ Usage(inputTokens, outputTokens, cached, reasoning);
+  :extractFinishReason(data)\n→ FinishReason (Stop | ToolCalls | Length | Error);
+  :mapToolCallsWithReasoning(toolCalls, reasonings)\n→ ToolCall[];
+  :Create Step(text, toolCalls, [], finishReason, usage, Meta);
+  :Push AssistantMessage to messages collection;
+
+  if (finishReason == ToolCalls\nAND filled(toolCalls)\nAND steps.count < maxSteps?) then (yes)
+
+    |#F5E4F5|InvokesTools|
+    repeat
+      :findTool(toolCall.name, tools)\n[match by class_basename];
+      if (tool found?) then (yes)
+        :Dispatch **InvokingTool** event\nvia invokingToolCallback;
+        :tool.handle(new Request(arguments));
+        :Dispatch **ToolInvoked** event\nvia toolInvokedCallback;
+        :Create ToolResult(id, name, arguments, result, resultId);
+      else (no)
+        :Skip tool call;
+      endif
+    repeat while (more toolCalls to process?) is (yes)
+    -> all toolCalls processed;
+    :Update Step with collected toolResults;
+    :Push ToolResultMessage to messages;
+
+    |#FFF4CC|TextGateway|
+    :continueWithToolResults()\n→ build follow-up body\n{model, previous_response_id, tool_results_input};
+    :HTTP POST to API (follow-up call);
+    :validateTextResponse();
+
+    |#E4F5E4|ParsesTextResponses|
+  endif
+repeat while (finishReason == ToolCalls AND below maxSteps?) is (yes)
+-> FinishReason::Stop or maxSteps reached;
+
+if (structured output requested?) then (yes)
+  :Return **StructuredTextResponse**\n(structuredData, text, combinedUsage, Meta)\n.withToolCallsAndResults().withSteps();
+else (no)
+  :Return **TextResponse**\n(text, combinedUsage, Meta)\n.withMessages().withSteps();
+endif
+
+|#DDE8F5|GeneratesText|
+if (schema filled?) then (yes)
+  :Wrap response as **StructuredAgentResponse**;
+else (no)
+  :Wrap response as **AgentResponse**;
+endif
+
+:Attach toolCallsAndResults and steps\nto AgentResponse;
+:Dispatch **AgentPrompted** event;
+end
+
+@enduml

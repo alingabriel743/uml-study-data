@@ -1,0 +1,191 @@
+@startuml activity_agent_handoff_routing
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #212529
+    EndColor #212529
+    BarColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam noteBorderColor #6C757D
+skinparam noteBackgroundColor #FFF3CD
+skinparam noteFontSize 11
+
+title Agent Handoff Routing
+
+|Runner|
+start
+:Initialize run: set **current_agent** = starting_agent\nCreate **RunContextWrapper**\nSet should_run_agent_start_hooks = True;
+
+repeat
+  :Increment current_turn;
+  if (current_turn > max_turns?) then (yes)
+    #FFD6D6:Raise **MaxTurnsExceeded**;
+    stop
+  else (no)
+  endif
+
+  :Collect all_tools = get_all_tools(current_agent)\nCollect handoffs = get_handoffs(current_agent);
+  note right
+    Disabled handoffs (is_enabled=False
+    or callable returns False) are hidden
+    from the LLM tool list at runtime.
+  end note
+
+  :Build **handoff_map** = { handoff.tool_name → Handoff }\nExpose each handoff as function tool\n**"transfer_to_<agent_name>"** to LLM;
+
+|LLM / Model|
+  :Run LLM inference with current_agent\ninstructions, input history, all tools\n(including handoff tools);
+  :Generate model response\n(may include function_call outputs);
+
+|Runner|
+  :process_model_response():\nIterate over response.output items;
+
+  :Classify each function_tool output:\nCheck if output.name ∈ handoff_map;
+
+  if (Any output matches a handoff tool?) then (yes)
+    :Collect run_handoffs: list[ToolRunHandoff];
+
+    if (len(run_handoffs) > 1?) then (yes)
+      :Keep first handoff only\nAppend "Multiple handoffs detected, ignoring\nthis one." ToolCallOutputItem for each extra;
+      note right
+        SpanError recorded:
+        "Multiple handoffs requested"
+        with list of requested agents.
+      end note
+    else (no — exactly one)
+    endif
+
+    :Select actual_handoff = run_handoffs[0]\n(ToolRunHandoff: handoff + tool_call);
+
+|Handoff|
+    :on_invoke_handoff(context_wrapper, tool_call.arguments);
+
+    if (input_type set on Handoff?) then (yes)
+      :Validate JSON payload via TypeAdapter\nagainst input_type schema;
+      if (Validation fails?) then (yes)
+        #FFD6D6:Raise validation error;
+        stop
+      else (no)
+      endif
+      :Call on_handoff(ctx, validated_input)\nfor side-effects / metadata logging;
+    else (no input_type)
+      if (on_handoff callback set?) then (yes)
+        :Call on_handoff(ctx)\nfor side-effects only;
+      else (no)
+      endif
+    endif
+    :Return **new_agent** (captured Agent instance);
+
+|Runner|
+    :Create HandoffOutputItem:\ntool_call_output_item(tool_call,\n'{"assistant": new_agent.name}')\nAppend to new_step_items;
+
+|Hooks|
+    fork
+      :RunHooks.on_handoff(\ncontext, from_agent, to_agent);
+    fork again
+      :AgentHooks.on_handoff(\ncontext, agent=new_agent,\nsource=from_agent);
+    end fork
+    note right
+      Both hooks fire in parallel
+      via asyncio.gather().
+    end note
+
+|Runner|
+    :Resolve input_filter:\nhandoff.input_filter takes precedence\nover run_config.handoff_input_filter;
+    :Resolve nest_handoff_history:\nhandoff.nest_handoff_history overrides\nrun_config.nest_handoff_history;
+
+    if (Server-managed conversation?) then (yes)
+      if (input_filter set?) then (yes)
+        #FFD6D6:Raise UserError:\n"Cannot use input_filter with\nserver-managed conversation";
+        stop
+      else (no)
+      endif
+      if (nest_handoff_history set?) then (yes)
+        :Log warning; disable nest_handoff_history;
+      else (no)
+      endif
+    else (no)
+    endif
+
+    if (input_filter set?) then (yes)
+      :Build HandoffInputData(\ninput_history, pre_handoff_items,\nnew_items, run_context);
+      :filtered = await input_filter(handoff_input_data);
+      :Extract filtered:\noriginal_input, pre_step_items, new_step_items;
+      if (filtered.input_items set?) then (yes)
+        :Split: session_step_items = new_items\nmodel receives filtered.input_items;
+        note right
+          Allows session history to
+          differ from model input.
+        end note
+      else (no)
+      endif
+    elseif (should_nest_history?) then (yes)
+      :Build HandoffInputData;
+      :nest_handoff_history(data, handoff_history_mapper)\nCollapse prior transcript into\n<CONVERSATION HISTORY> summary block;
+      :session_step_items = full new_items\nnew_step_items = filtered input_items;
+    else (no filter / nesting)
+      :Pass full conversation history\nto new agent unchanged;
+      note right
+        Default behavior: new agent
+        sees entire prior conversation.
+      end note
+    endif
+
+    :Return SingleStepResult(\n  next_step = NextStepHandoff(new_agent),\n  original_input, model_response,\n  new_step_items, session_step_items);
+
+    :Close current agent_span (reset_current=True)\ncurrent_span = None;
+    :Switch: current_agent = new_agent\nrun_state._current_agent = current_agent\nshould_run_agent_start_hooks = True\nrun_state._current_step = NextStepRunAgain();
+
+    if (Streaming mode?) then (yes)
+      :Emit AgentUpdatedStreamEvent(\nnew_agent=current_agent)\nto event queue;
+    else (no)
+    endif
+
+    note right
+      Handoff stays within the same
+      Runner.run() call — no new run started.
+      Input guardrails apply only to first agent;
+      output guardrails only to final agent.
+    end note
+
+  else (no handoff — regular tools or final output)
+    :Execute function tools / computer actions;
+    :Check for FinalOutput or\nNextStepRunAgain decision;
+    if (FinalOutput reached?) then (yes)
+      :Return RunResult\n(last_agent = current_agent);
+      stop
+    else (continue)
+    endif
+  endif
+
+repeat while (NextStepRunAgain — continue loop)
+
+stop
+
+@enduml

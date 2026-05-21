@@ -1,0 +1,199 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #DEE2E6
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #F1F3F5
+    DividerBorderColor #6C757D
+    DividerBackgroundColor #DEE2E6
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Server Launch and Command Registration
+
+actor "main()" as main
+participant "HeadlessApplication" as app
+participant "ServerLauncher" as launcher
+participant "Core.app" as coreapp
+participant "Vars / ContentLoader" as vars
+participant "Mods" as mods
+participant "Events" as events
+participant "Logic" as logic
+participant "NetServer" as netserver
+participant "Administration" as admin
+participant "CommandHandler\n(clientCommands)" as clientcmd
+participant "Net" as net
+participant "ServerControl" as servercontrol
+participant "CommandHandler\n(handler)" as consolecmd
+participant "Timer" as timer
+
+== Bootstrap ==
+
+main -> vars : new Platform()\nnet = new Net(platform.getNet())
+main -> app : new HeadlessApplication(new ServerLauncher(), crashHandler)
+activate app
+app -> launcher : init()
+activate launcher
+
+== ServerLauncher.init() — Configuration & Content ==
+
+launcher -> vars : Core.settings.setDataDirectory("config")
+launcher -> vars : loadSettings(); init()
+launcher -> vars : UI.loadColors()
+launcher -> vars : Fonts.loadContentIconsHeadless()
+launcher -> vars : content.createBaseContent()
+launcher -> mods : loadScripts()
+launcher -> vars : content.createModContent(); content.init()
+launcher -> vars : bases.load()
+
+== ServerLauncher.init() — Listener Registration ==
+
+note over coreapp : Listener order:\nasyncCore.begin → Logic\n→ NetServer → ServerControl\n→ asyncCore.end
+
+launcher -> coreapp : addListener(asyncCore.begin wrapper)
+launcher -> coreapp : addListener(logic = new Logic())
+activate logic
+
+launcher -> coreapp : addListener(netServer = new NetServer())
+activate netserver
+
+note over netserver : NetServer constructor
+netserver -> admin : new Administration()
+activate admin
+admin --> netserver : admins
+deactivate admin
+
+netserver -> clientcmd : new CommandHandler("/")
+activate clientcmd
+
+group NetServer — Packet Handler Registration
+    netserver -> net : handleServer(Connect.class,\n  check IP/subnet ban → fire ConnectionEvent)
+    netserver -> net : handleServer(Disconnect.class,\n  call onDisconnect(player, reason))
+    netserver -> net : handleServer(ConnectPacket.class,\n  validate uuid/usid/name/mods/version/whitelist\n  → create Player → assignTeam()\n  → sendWorldData(player) → fire PlayerConnect)
+end
+
+group NetServer — Client Command Registration
+    netserver -> clientcmd : registerCommands()\n[/help, /t, /a, /votekick, /vote]
+end
+
+launcher -> coreapp : addListener(new ServerControl(args))
+activate servercontrol
+
+note over servercontrol : ServerControl constructor → setup(args)
+
+group ServerControl.setup() — Settings & Console Commands
+    servercontrol -> coreapp : Core.settings.defaults(\n  bans, admins, shufflemode, globalrules)
+    servercontrol -> consolecmd : new CommandHandler("")
+    activate consolecmd
+    servercontrol -> consolecmd : registerCommands()\n[~40 console commands:\nhost, stop, maps, status, kick,\nban, admin, save, load, ...]
+end
+
+group ServerControl.setup() — Event Subscriptions
+    servercontrol -> events : on(GameOverEvent, gameOverListener)
+    servercontrol -> events : on(WorldLoadEvent, reset autosaveCount)
+    servercontrol -> events : run(Trigger.update, autosave + autoPause logic)
+    servercontrol -> events : run(Trigger.socketConfigChanged, toggleSocket)
+    servercontrol -> events : on(PlayEvent, apply globalrules)
+    servercontrol -> events : on(ServerLoadEvent, start stdin scanner thread)
+end
+
+servercontrol -> timer : schedule(\n  admins.forceSave() + Core.settings.forceSave(),\n  every 60 s)
+activate timer
+
+servercontrol -> servercontrol : toggleSocket(Config.socketInput.bool())
+
+group ServerControl.setup() — Deferred Startup (Core.app.post)
+    servercontrol -> coreapp : post(deferred startup block)
+    note right of coreapp
+        Deferred so all listeners
+        are fully init'd first
+    end note
+end
+
+launcher -> coreapp : addListener(asyncCore.end wrapper)
+
+== ServerLauncher.init() — Mod Init & Server Load Event ==
+
+launcher -> mods : eachClass(Mod::init)
+launcher -> events : fire(new ServerLoadEvent())
+activate events
+
+events -> servercontrol : [ServerLoadEvent] → start\n"Server Controls" stdin thread
+deactivate events
+
+== NetServer.init() — Mod Client Commands ==
+
+coreapp -> netserver : init()
+netserver -> mods : eachClass(mod ->\n  mod.registerClientCommands(clientCommands))
+mods --> netserver : (mod commands added to clientCommands)
+
+== ServerControl — Deferred Block Executes ==
+
+coreapp -> servercontrol : [deferred post] execute startup block
+activate servercontrol
+
+opt autoUpdate enabled
+    servercontrol -> vars : SaveIO.load(autosave)
+    vars --> servercontrol : map/rules loaded
+
+    servercontrol -> netserver : openServer()
+    activate netserver
+    netserver -> net : host(Config.port.num())
+    net --> netserver : TCP/UDP listeners bound on port 6567
+    deactivate netserver
+end
+
+loop for each startup command in args / Config.startCommands
+    servercontrol -> consolecmd : handleMessage(command)
+    consolecmd --> servercontrol : command executed
+end
+deactivate servercontrol
+
+== "host" Console Command Flow (example) ==
+
+note over consolecmd : When operator types "host <map>"
+
+consolecmd -> logic : reset()
+consolecmd -> vars : world.loadMap(map, rules)
+consolecmd -> logic : play()
+consolecmd -> netserver : openServer()
+activate netserver
+netserver -> net : host(Config.port.num())
+net --> netserver : TCP/UDP listeners bound on port 6567
+netserver --> consolecmd : server open
+deactivate netserver
+
+deactivate consolecmd
+deactivate clientcmd
+deactivate logic
+deactivate servercontrol
+deactivate netserver
+deactivate launcher
+deactivate app
+
+@enduml

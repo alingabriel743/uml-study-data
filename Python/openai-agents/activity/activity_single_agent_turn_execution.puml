@@ -1,0 +1,198 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #28A745
+    EndColor #DC3545
+    BarColor #495057
+}
+
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleBackgroundColor #E9ECEF
+}
+
+skinparam note {
+    BackgroundColor #E7F3FE
+    BorderColor #3D9AD1
+    FontColor #212529
+}
+
+title Single Agent Turn Execution\n<size:11>run_single_turn() — run_loop.py | One complete agent turn: prompt → model → response → next step</size>
+
+|Runner|
+start
+:run_single_turn(\nbindings, all_tools, original_input,\ngenerated_items, hooks, context_wrapper, run_config);
+
+:Convert original_input → turn_input list\nItemHelpers.input_to_new_input_list();
+
+if (should_run_agent_start_hooks?) then (yes)
+    :Fire **on_agent_start()**\n[RunHooks + AgentHooks in parallel];
+endif
+
+fork
+    :get_system_prompt(context_wrapper);
+fork again
+    :get_prompt(context_wrapper);
+end fork
+
+:Resolve output_schema\nget_output_schema(execution_agent);
+
+:Resolve enabled handoffs\nget_handoffs(execution_agent, context_wrapper);
+note right
+  Each Handoff checked:
+  is_enabled (bool or callable)
+  evaluated at runtime
+end note
+
+:Prepare turn input items\n_prepare_turn_input_items(\noriginal_input, generated_items,\nreasoning_item_id_policy)\nor server_conversation_tracker.prepare_input();
+
+|Model Layer|
+note right : **get_new_response()**
+
+:Apply optional input filter\nmaybe_filter_model_input() → ModelInputData;
+note right
+  RunConfig.call_model_input_filter
+  transforms input before sending
+  to the model (optional)
+end note
+
+:Deduplicate input items;
+
+:Resolve model & model_settings\nmaybe_reset_tool_choice if\ntool_use_tracker indicates needed;
+
+:Fire **on_llm_start()**\n[RunHooks + AgentHooks in parallel];
+
+repeat
+    :model.get_response(\nsystem_instructions, input,\nmodel_settings, tools,\noutput_schema, handoffs)\nvia get_response_with_retry();
+repeat while (Retry required?) is (yes — rewind_session_items()\n+ server_conversation_tracker.rewind_input())
+->no;
+
+:Accumulate usage\ncontext_wrapper.usage.add(response.usage);
+
+:Fire **on_llm_end()**\n[RunHooks + AgentHooks in parallel];
+
+:Return **ModelResponse**(output, usage, response_id);
+
+|Turn Resolution|
+note right : **process_model_response()** — turn_resolution.py
+
+:Iterate response.output items\nClassify each item by type;
+
+fork
+    :message_output\n→ MessageOutputItem\n\nreasoning\n→ ReasoningItem;
+fork again
+    :function_call (handoff name match)\n→ ToolRunHandoff\n\nfunction_call (tool name match)\n→ ToolRunFunction;
+fork again
+    :computer_use_call\n→ ToolRunComputerAction\n\nshell_call → ToolRunShellCall\nlocal_shell_call → ToolRunLocalShellCall\napply_patch_call → ToolRunApplyPatchCall;
+fork again
+    :mcp_call / mcp_list_tools /\nmcp_approval_request\n→ MCP items\n\nfile_search / web_search /\ncode_interpreter / image_generation\n→ hosted tool items (no local exec);
+end fork
+
+:Return **ProcessedResponse**\n(new_items, handoffs, functions,\ncomputer_actions, local_shell_calls,\nshell_calls, mcp_approval_requests,\ninterruptions, custom_tool_calls, tools_used);
+
+:tool_use_tracker.record_processed_response();
+
+note right : **execute_tools_and_side_effects()** — turn_resolution.py
+
+:Build tool execution plan\n_build_plan_for_fresh_turn(\nprocessed_response, agent,\ncontext_wrapper, approval_items_by_call_id);
+
+:Deduplicate tool call items\n_dedupe_tool_call_items() → new_step_items;
+
+|Tool Execution|
+
+:Execute tool plan\n_execute_tool_plan(\nplan, bindings, hooks, context_wrapper, run_config);
+note right
+  Per FunctionTool:
+  ① Fire on_tool_start() [RunHooks + AgentHooks]
+  ② Apply tool_input_guardrail (if configured)
+  ③ Execute tool asynchronously
+  ④ Apply tool_output_guardrail (if configured)
+  ⑤ Fire on_tool_end() [RunHooks + AgentHooks]
+  Also executes: computer_results, shell_results,
+  apply_patch_results, local_shell_results
+end note
+
+:Build tool result items\n_build_tool_result_items()\nappend results to new_step_items;
+
+:Collect tool interruptions\n_collect_tool_interruptions()\nfrom function / shell / apply_patch results;
+
+:Append approved MCP callback results\n_append_mcp_callback_results();
+
+|Turn Resolution|
+
+if (Interruptions present?) then (yes)
+    :Return **SingleStepResult**\nnext_step = **NextStepInterruption**\n(interruptions: list[ToolApprovalItem]);
+    note right
+      Human-in-the-loop approval required.
+      Run is paused; resumption goes through
+      resolve_interrupted_turn()
+    end note
+    stop
+endif
+
+if (Handoffs in ProcessedResponse?) then (yes)
+    :execute_handoffs()\n→ apply handoff.input_filter (if set)\n→ nest_handoff_history (if configured);
+    :Fire **on_handoff()**\n[RunHooks + AgentHooks in parallel];
+    :Return **SingleStepResult**\nnext_step = **NextStepHandoff**(new_agent);
+    note right
+      Handoffs are exposed as tools to the LLM:
+      transfer_to_<agent_name>
+      New agent takes over in next loop iteration
+    end note
+    stop
+endif
+
+if (tool_use_behavior produces final output?) then (yes)
+    note right
+      'stop_on_first_tool'   → use first tool result
+      {stop_at_tool_names}   → match by tool name
+      callable behavior      → is_final_output == True
+      Default: 'run_llm_again' (tool results feed back into loop)
+    end note
+    :Extract final output\nfrom matching tool result;
+    :Fire **on_agent_end()**\n[RunHooks + AgentHooks in parallel];
+    :Return **SingleStepResult**\nnext_step = **NextStepFinalOutput**(output);
+    stop
+endif
+
+if (has_tools_or_approvals_to_run()?) then (yes)
+    :Return **SingleStepResult**\nnext_step = **NextStepRunAgain**\n(tool results appended to input);
+    note right
+      Runner loop re-enters run_single_turn()
+      with accumulated tool results.
+      Continues until max_turns exceeded.
+    end note
+    stop
+endif
+
+note right : No pending tools — produce final answer
+
+if (output_schema is structured JSON?) then (yes)
+    :Validate JSON response\noutput_schema.validate_json();
+    note right
+      AgentOutputSchema validates the
+      model's structured output before
+      returning as final
+    end note
+endif
+
+:Fire **on_agent_end()**\n[RunHooks + AgentHooks in parallel];
+
+:Return **SingleStepResult**\nnext_step = **NextStepFinalOutput**(output);
+
+stop
+
+@enduml

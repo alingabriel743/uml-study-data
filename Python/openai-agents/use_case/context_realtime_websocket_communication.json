@@ -1,0 +1,218 @@
+{
+  "scope": "realtime_websocket_communication",
+  "title": "Realtime WebSocket Communication",
+  "diagram_type": "use_case",
+  "description": "Client connects via WebSocket; audio and events are streamed bidirectionally to/from agent. The server bridges a browser/client WebSocket connection to the OpenAI Realtime API over a persistent WebSocket connection, orchestrating audio streaming, tool approvals, guardrails, and agent handoffs.",
+
+  "actors": [
+    {
+      "name": "Client (Browser)",
+      "role": "external",
+      "description": "Web browser or any WebSocket client connecting to /ws/{session_id}"
+    },
+    {
+      "name": "RealtimeWebSocketManager",
+      "role": "system_boundary",
+      "description": "FastAPI server component (server.py); manages per-session connections, routes client messages, serializes events back to client"
+    },
+    {
+      "name": "RealtimeSession",
+      "role": "internal",
+      "description": "Core session class (session.py); implements RealtimeModelListener; owns event queue, history, tool-call tasks, guardrail tasks"
+    },
+    {
+      "name": "OpenAI Realtime API",
+      "role": "external_system",
+      "description": "OpenAI WebSocket endpoint; bidirectional stream of model events and client events (OpenAIRealtimeWebSocketModel)"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Connect WebSocket Session",
+      "actor": "Client (Browser)",
+      "description": "Client opens WS to /ws/{session_id}. Manager accepts, creates RealtimeRunner with starting agent, calls runner.run(model_config), enters async context, registers RealtimeSession as model listener, connects to OpenAI Realtime API, emits initial history_updated event.",
+      "entry_point": "manager.connect(websocket, session_id)",
+      "key_steps": [
+        "websocket.accept()",
+        "get_starting_agent() → RealtimeAgent",
+        "RealtimeRunner(agent).run(model_config) → RealtimeSession context",
+        "session.__aenter__() → model.connect(model_config)",
+        "asyncio.create_task(_process_events(session_id))"
+      ]
+    },
+    {
+      "id": "UC2",
+      "name": "Stream Audio to Agent",
+      "actor": "Client (Browser)",
+      "description": "Client sends {type:'audio', data:[int16...]} frames. Manager converts int16 array to bytes and forwards to session.",
+      "entry_point": "manager.send_audio(session_id, audio_bytes)",
+      "key_steps": [
+        "struct.pack('<Nh', *int16_data) → audio_bytes",
+        "session.send_audio(audio_bytes) → model.send_event(RealtimeModelSendAudio)"
+      ]
+    },
+    {
+      "id": "UC3",
+      "name": "Receive Audio from Agent",
+      "actor": "Client (Browser)",
+      "description": "Session receives RealtimeModelAudioEvent from model, emits RealtimeAudio session event. Manager serializes audio as base64 and sends to client WebSocket.",
+      "event_flow": "RealtimeModelAudioEvent → RealtimeAudio → websocket.send_text({type:'audio', audio:<base64>})"
+    },
+    {
+      "id": "UC4",
+      "name": "Commit Audio Buffer",
+      "actor": "Client (Browser)",
+      "description": "Client sends {type:'commit_audio'}. Manager forwards input_audio_buffer.commit as raw client event to the model to force-end current input turn.",
+      "entry_point": "manager.send_client_event(session_id, {type:'input_audio_buffer.commit'})",
+      "key_steps": [
+        "session.model.send_event(RealtimeModelSendRawMessage(message={type:'input_audio_buffer.commit'}))"
+      ]
+    },
+    {
+      "id": "UC5",
+      "name": "Send Image to Agent",
+      "actor": "Client (Browser)",
+      "description": "Client sends {type:'image', data_url, text} for inline images, or {image_start}/{image_chunk}/{image_end} for chunked images. Manager assembles and sends RealtimeUserInputMessage with input_image + input_text content.",
+      "entry_point": "manager.send_user_message(session_id, RealtimeUserInputMessage)",
+      "key_steps": [
+        "session.send_message(message) → model.send_event(RealtimeModelSendUserInput)",
+        "Chunked path: accumulate image_buffers[id].chunks, join on image_end, then send"
+      ]
+    },
+    {
+      "id": "UC6",
+      "name": "Interrupt Agent Response",
+      "actor": "Client (Browser)",
+      "description": "Client sends {type:'interrupt'}. Manager calls session.interrupt(), which sends RealtimeModelSendInterrupt to model, stopping current playback.",
+      "entry_point": "manager.interrupt(session_id)",
+      "key_steps": [
+        "session.interrupt() → model.send_event(RealtimeModelSendInterrupt())"
+      ]
+    },
+    {
+      "id": "UC7",
+      "name": "Approve Tool Call",
+      "actor": "Client (Browser)",
+      "description": "After receiving tool_approval_required event, client sends {type:'tool_approval_decision', call_id, approve:true, always?}. Manager calls session.approve_tool_call(call_id, always=always).",
+      "entry_point": "manager.approve_tool_call(session_id, call_id, always=always)",
+      "key_steps": [
+        "session.approve_tool_call(call_id) → resumes _handle_tool_call with approval",
+        "Tool invoked, result sent back to model via send_event(RealtimeModelSendToolOutput)"
+      ]
+    },
+    {
+      "id": "UC8",
+      "name": "Reject Tool Call",
+      "actor": "Client (Browser)",
+      "description": "Client sends {type:'tool_approval_decision', call_id, approve:false, always?}. Manager calls session.reject_tool_call(call_id). Session sends rejection message back to model.",
+      "entry_point": "manager.reject_tool_call(session_id, call_id, always=always)",
+      "key_steps": [
+        "session.reject_tool_call(call_id) → _send_tool_rejection() → send DEFAULT_APPROVAL_REJECTION_MESSAGE"
+      ]
+    },
+    {
+      "id": "UC9",
+      "name": "Execute Function Tool (async)",
+      "actor": "RealtimeSession",
+      "description": "Model emits function_call event. Session evaluates if approval needed. If not (or approved), runs the tool as async task. Result sent back to model.",
+      "key_steps": [
+        "on_event(function_call) → _enqueue_tool_call_task() or _handle_tool_call()",
+        "_function_needs_approval() → evaluate_needs_approval_setting()",
+        "If needs approval: emit RealtimeToolApprovalRequired, suspend in _pending_tool_calls",
+        "If no approval: invoke_function_tool() → send_event(RealtimeModelSendToolOutput)"
+      ]
+    },
+    {
+      "id": "UC10",
+      "name": "Handle Agent Handoff",
+      "actor": "RealtimeSession",
+      "description": "During tool call, session detects a Handoff object. Updates current agent, sends session update with new agent settings, emits RealtimeHandoffEvent.",
+      "key_steps": [
+        "_handle_tool_call detects Handoff",
+        "update_agent(new_agent) → model.send_event(RealtimeModelSendSessionUpdate)",
+        "emit RealtimeHandoffEvent(from_agent, to_agent)"
+      ]
+    },
+    {
+      "id": "UC11",
+      "name": "Enforce Output Guardrails",
+      "actor": "RealtimeSession",
+      "description": "During transcript_delta events, session accumulates text. Once debounce threshold (default 100 chars) is reached, enqueues guardrail check task. If guardrail trips, sends interrupt + emits RealtimeGuardrailTripped.",
+      "key_steps": [
+        "on_event(transcript_delta) → accumulate _item_transcripts",
+        "_enqueue_guardrail_task(text, response_id)",
+        "_run_output_guardrails() → if tripped: model.send_event(interrupt) + emit RealtimeGuardrailTripped"
+      ]
+    },
+    {
+      "id": "UC12",
+      "name": "Stream Session Events to Client",
+      "actor": "RealtimeWebSocketManager",
+      "description": "Background task _process_events iterates over session events and serializes them to the client WebSocket as JSON.",
+      "event_types_forwarded": [
+        "agent_start", "agent_end", "handoff", "tool_start", "tool_end",
+        "tool_approval_required", "audio", "audio_interrupted", "audio_end",
+        "history_updated", "history_added", "guardrail_tripped",
+        "raw_model_event", "error", "input_audio_timeout_triggered"
+      ]
+    },
+    {
+      "id": "UC13",
+      "name": "Disconnect Session",
+      "actor": "Client (Browser)",
+      "description": "On WebSocketDisconnect, manager exits session context (cleanup), removes all session/context/websocket entries.",
+      "entry_point": "manager.disconnect(session_id)",
+      "key_steps": [
+        "session_context.__aexit__() → session.close() → _cleanup()",
+        "Cancel guardrail and tool-call tasks, disconnect model"
+      ]
+    }
+  ],
+
+  "key_relationships": [
+    "RealtimeWebSocketManager uses RealtimeRunner to create RealtimeSession",
+    "RealtimeSession implements RealtimeModelListener (on_event callback)",
+    "RealtimeSession wraps OpenAIRealtimeWebSocketModel (bidirectional WebSocket to OpenAI)",
+    "RealtimeWebSocketManager routes client messages to RealtimeSession methods",
+    "RealtimeSession emits RealtimeSessionEvent objects consumed by RealtimeWebSocketManager._process_events",
+    "RealtimeSession holds _pending_tool_calls dict (call_id → tool/agent/approval_item)",
+    "RealtimeSession manages RealtimeAgent and supports handoff to another RealtimeAgent"
+  ],
+
+  "key_classes": {
+    "RealtimeWebSocketManager": {
+      "file": "examples/realtime/app/server.py",
+      "attributes": ["active_sessions: dict[str, RealtimeSession]", "session_contexts: dict[str, Any]", "websockets: dict[str, WebSocket]"],
+      "methods": ["connect(websocket, session_id)", "disconnect(session_id)", "send_audio(session_id, audio_bytes)", "send_client_event(session_id, event)", "send_user_message(session_id, message)", "approve_tool_call(session_id, call_id, always)", "reject_tool_call(session_id, call_id, always)", "interrupt(session_id)", "_process_events(session_id)", "_serialize_event(event)"]
+    },
+    "RealtimeSession": {
+      "file": "src/agents/realtime/session.py",
+      "inherits": "RealtimeModelListener",
+      "attributes": ["_model: RealtimeModel", "_current_agent: RealtimeAgent", "_event_queue: asyncio.Queue[RealtimeSessionEvent]", "_history: list[RealtimeItem]", "_pending_tool_calls: dict[str, tuple]", "_guardrail_tasks", "_tool_call_tasks"],
+      "methods": ["__aenter__() → RealtimeSession", "send_message(message)", "send_audio(audio, commit)", "interrupt()", "update_agent(agent)", "on_event(event)", "approve_tool_call(call_id, always)", "reject_tool_call(call_id, always)", "_handle_tool_call(event, agent_snapshot)", "_run_output_guardrails(text, response_id)"]
+    }
+  },
+
+  "websocket_endpoint": "FastAPI /ws/{session_id} (server.py line 222)",
+  "model_config": {
+    "model_name": "gpt-realtime-1.5",
+    "turn_detection": "server_vad (prefix_padding_ms=300, silence_duration_ms=500, interrupt_response=True)"
+  },
+  "audio_format": "int16 PCM (client-side array packed via struct), base64-encoded in server→client direction",
+  "image_transfer": "Single {type:'image'} or chunked {image_start/image_chunk/image_end} protocol; assembled into RealtimeUserInputMessage with input_image + input_text content",
+  "tool_approval_flow": "Model emits function_call → session checks needs_approval → if required: suspend in _pending_tool_calls + emit tool_approval_required to client → client sends tool_approval_decision → approve/reject routes back to _handle_tool_call or _send_tool_rejection",
+  "guardrails": "Output guardrails run on transcript deltas with debounce threshold (default 100 chars); if tripped, model is interrupted and RealtimeGuardrailTripped event emitted",
+
+  "source_files_analyzed": [
+    "examples/realtime/app/server.py",
+    "src/agents/realtime/session.py",
+    "src/agents/realtime/events.py (grep)",
+    "src/agents/realtime/model_events.py (grep)",
+    "src/agents/realtime/model_inputs.py (grep)",
+    "src/agents/realtime/openai_realtime.py (grep)",
+    "src/agents/realtime/runner.py (grep)",
+    "docs/streaming.md"
+  ]
+}

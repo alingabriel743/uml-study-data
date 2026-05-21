@@ -1,0 +1,206 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #ADB5BD
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #E9ECEF
+}
+
+title Browser Automation Tool Execution
+
+actor "Agent (LLM)" as Agent
+
+participant "GenericAgentHandler\n(ga.py)" as Handler
+participant "web_execute_js /\nweb_scan / code_run\n(ga.py)" as GAFuncs
+participant "simphtml\n(execute_js_rich / get_html)" as Simphtml
+participant "TMWebDriver\n(TMWebDriver.py)" as Driver
+participant "WebSocket /\nHTTP Server\n(ws:{port} / http:{port+1})" as Server
+participant "JSExecutor\n(browser WS client)" as JSExec
+participant "Browser Tab" as Browser
+
+== JS Execution Path ==
+
+Agent -> Handler : tool call: do_web_execute_js\n(script, switch_tab_id, no_monitor)
+activate Handler
+
+Handler -> GAFuncs : web_execute_js\n(script, switch_tab_id, no_monitor)
+activate GAFuncs
+
+opt driver is None
+    GAFuncs -> Driver : first_init_driver() → TMWebDriver()
+    activate Driver
+    Driver -> Server : start_ws_server() + start_http_server()
+    activate Server
+    Server --> Driver : servers running (daemon threads)
+    deactivate Server
+    Driver --> GAFuncs : driver instance
+    deactivate Driver
+end
+
+opt switch_tab_id provided
+    GAFuncs -> Driver : driver.default_session_id = switch_tab_id
+end
+
+GAFuncs -> Simphtml : execute_js_rich(script, driver, no_monitor)
+activate Simphtml
+
+opt no_monitor is False
+    Simphtml -> Driver : get_html(driver, extra_js=monitor_js)\n[pre-execution DOM snapshot]
+    activate Driver
+    Driver --> Simphtml : baseline HTML snapshot
+    deactivate Driver
+end
+
+Simphtml -> Driver : execute_js(script)
+activate Driver
+
+Driver -> Driver : resolve session_id\n(default / fallback to alive session)
+Driver -> Driver : exec_id = uuid4()\npayload = {id, code[, tabId]}
+
+alt WebSocket session (ws / ext_ws)
+    Driver -> Server : session.ws_client.send_message(payload)
+    activate Server
+    Server -> JSExec : WebSocket frame → payload
+    activate JSExec
+else HTTP long-poll session
+    Driver -> Server : session.http_queue.put(payload)
+    activate Server
+    Server -> JSExec : GET /api/longpoll → receives payload
+    activate JSExec
+end
+
+JSExec -> Browser : executes JavaScript
+activate Browser
+Browser --> JSExec : JS result / error
+deactivate Browser
+
+alt result received
+    JSExec -> Driver : WS message {type:'result', id:exec_id, result, newTabs:[]}
+    Driver -> Driver : results[exec_id] = {success:True, data, newTabs}
+else error received
+    JSExec -> Driver : WS message {type:'error', id:exec_id, error}
+    Driver -> Driver : results[exec_id] = {success:False, data}
+else ack received (long running)
+    JSExec -> Driver : WS message {type:'ack', id:exec_id}
+    Driver -> Driver : acks[exec_id] = True\n(resets timeout window)
+end
+
+deactivate JSExec
+deactivate Server
+
+Driver -> Driver : poll results every 0.2s\nuntil exec_id present or timeout
+Driver --> Simphtml : {data: result['data'], newTabs: [...]}
+deactivate Driver
+
+opt no_monitor is False (page not reloaded)
+    Simphtml -> Driver : get_html(driver)\n[post-execution DOM snapshot]
+    activate Driver
+    Driver --> Simphtml : updated HTML snapshot
+    deactivate Driver
+    Simphtml -> Simphtml : find_changed_elements(before, after)\n→ dom_diff summary
+end
+
+Simphtml --> GAFuncs : {js_return, status, reloaded,\nnewTabs, transients, dom_diff}
+deactivate Simphtml
+
+GAFuncs --> Handler : result dict
+deactivate GAFuncs
+
+Handler -> Handler : optionally save js_return to file\nformat via smart_format
+Handler --> Agent : yield status string\n+ StepOutcome(result_json)
+deactivate Handler
+
+== Page Scan Path ==
+
+Agent -> Handler : tool call: do_web_scan\n(tabs_only, switch_tab_id, text_only)
+activate Handler
+
+Handler -> GAFuncs : web_scan(tabs_only, switch_tab_id, text_only)
+activate GAFuncs
+
+GAFuncs -> Driver : driver.get_all_sessions() → tabs list
+activate Driver
+Driver --> GAFuncs : sessions map
+deactivate Driver
+
+opt switch_tab_id provided
+    GAFuncs -> Driver : driver.default_session_id = switch_tab_id
+end
+
+opt not tabs_only
+    GAFuncs -> Simphtml : get_html(driver, cutlist=True, maxchars=35000)
+    activate Simphtml
+    Simphtml -> Driver : execute_js(js_findMainList + 'return findMainList(document.body);')
+    activate Driver
+    Driver --> Simphtml : raw JS result
+    deactivate Driver
+    Simphtml --> GAFuncs : simplified / truncated HTML string
+    deactivate Simphtml
+end
+
+GAFuncs --> Handler : {status, metadata:{tabs, active_tab}, content: html}
+deactivate GAFuncs
+
+Handler --> Agent : StepOutcome(page scan result)
+deactivate Handler
+
+== Code Run Path ==
+
+Agent -> Handler : tool call: do_code_run\n(type, code/script, timeout, cwd)
+activate Handler
+
+Handler -> GAFuncs : code_run(code, code_type, timeout, cwd, code_cwd, stop_signal)
+activate GAFuncs
+
+alt code_type == 'python'
+    GAFuncs -> GAFuncs : write code to tempfile (.ai.py)\nprepend code_run_header.py\ncmd = [sys.executable, -X utf8, -u, tmp_path]
+else code_type == 'powershell'
+    GAFuncs -> GAFuncs : cmd = [powershell, -Command, code]
+else code_type == 'bash'
+    GAFuncs -> GAFuncs : cmd = [bash, -c, code]
+end
+
+GAFuncs -> GAFuncs : subprocess.Popen(cmd,\nstdout=PIPE, stderr=STDOUT)
+GAFuncs -> GAFuncs : stream_reader thread\nreads stdout line-by-line
+
+loop streaming output
+    GAFuncs --> Handler : yield progress string (stdout lines)
+end
+
+alt timeout or stop_signal
+    GAFuncs -> GAFuncs : kill process
+end
+
+GAFuncs --> Handler : {status, stdout, exit_code}
+deactivate GAFuncs
+
+Handler --> Agent : StepOutcome(code run result)
+deactivate Handler
+
+@enduml

@@ -1,0 +1,210 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 2
+skinparam sequenceParticipant underline
+skinparam sequenceBoxBackgroundColor #E9ECEF
+skinparam sequenceBoxBorderColor #6C757D
+skinparam sequenceLifeLineBorderColor #495057
+skinparam sequenceGroupBackgroundColor #F1F3F5
+skinparam sequenceGroupBorderColor #6C757D
+skinparam noteBorderColor #ADB5BD
+skinparam noteBackgroundColor #FFF9DB
+
+title User Signup and Email Verification Flow
+
+actor       "Client"                  as Client
+participant "SignupRouter\nPOST /signup" as SignupRouter
+participant "EdgeRateLimitService"    as RateLimit
+participant "AuthAuditService"        as AuditService
+participant "EventService"            as EventService
+participant "CleanEmailService"       as CleanEmail
+participant "Database"                as DB
+participant "GroupService"            as GroupService
+participant "AuthService"             as AuthService
+participant "SessionService"          as SessionService
+database    "Redis"                   as Redis
+participant "TokenService"            as TokenService
+participant "EmailService"            as EmailService
+participant "UserService"             as UserService
+
+== Request Intake & Guards ==
+
+Client -> SignupRouter : POST /signup\n{ username, email, password,\n  is_temp, referral_code,\n  send_confirmation_code }
+activate SignupRouter
+
+SignupRouter -> RateLimit : check('signup')
+activate RateLimit
+alt Rate limit exceeded
+    RateLimit --> SignupRouter : 429 Too Many Requests
+    SignupRouter --> Client : 429 Too Many Requests
+end
+RateLimit --> SignupRouter : OK
+deactivate RateLimit
+
+SignupRouter -> AuditService : record({ action: 'signup:real' | 'signup:temp', body })
+activate AuditService
+AuditService --> SignupRouter : recorded
+deactivate AuditService
+
+SignupRouter -> EventService : emit('puter.signup', event)
+activate EventService
+EventService --> SignupRouter : event.allow = true/false
+deactivate EventService
+
+note over SignupRouter : Bot trap check:\nif p102xyzname != '' → silent drop
+
+== Input Validation & Email Cleaning ==
+
+SignupRouter -> SignupRouter : validate username, email, password\n(regex, length, reserved words)
+
+SignupRouter -> CleanEmail : clean(email)
+activate CleanEmail
+CleanEmail --> SignupRouter : clean_email
+deactivate CleanEmail
+
+SignupRouter -> CleanEmail : validate(clean_email)
+activate CleanEmail
+CleanEmail --> SignupRouter : valid / invalid
+deactivate CleanEmail
+
+== Duplicate Check & User Persistence ==
+
+SignupRouter -> DB : SELECT EXISTS WHERE\n(email OR clean_email) AND email_confirmed=1
+activate DB
+DB --> SignupRouter : exists?
+deactivate DB
+
+alt Duplicate confirmed email found
+    SignupRouter --> Client : 400 Email already in use
+end
+
+SignupRouter -> DB : SELECT * FROM user\nWHERE email=? AND password IS NULL\n(pseudo-user lookup)
+activate DB
+DB --> SignupRouter : pseudo_user | null
+deactivate DB
+
+alt No pseudo_user — new user INSERT
+    SignupRouter -> DB : INSERT INTO user\n( username, email, clean_email,\n  password=bcrypt(password), uuid=uuidv4(),\n  email_confirm_code=6-digit,\n  email_confirm_token=uuidv4(),\n  free_storage, ... )
+    activate DB
+    DB --> SignupRouter : new user id
+    deactivate DB
+else Pseudo-user found — UPDATE existing record
+    SignupRouter -> DB : UPDATE user SET\n  username, password=bcrypt, uuid,\n  email_confirm_code, email_confirm_token,\n  requires_email_confirmation=1\nWHERE id=pseudo_user.id
+    activate DB
+    DB --> SignupRouter : OK
+    deactivate DB
+    SignupRouter -> GroupService : remove_users(default_temp_group)
+    activate GroupService
+    GroupService --> SignupRouter : OK
+    deactivate GroupService
+end
+
+SignupRouter -> DB : UPDATE user SET last_activity_ts=now() WHERE id=?
+activate DB
+DB --> SignupRouter : OK
+deactivate DB
+
+SignupRouter -> GroupService : add_users({ uid: default_user_group, users: [username] })
+activate GroupService
+GroupService --> SignupRouter : OK
+deactivate GroupService
+
+SignupRouter -> EventService : emit('puter.signup.success',\n{ user_id, user_uuid, email, username })
+activate EventService
+EventService --> SignupRouter : OK
+deactivate EventService
+
+SignupRouter -> DB : SELECT * FROM user WHERE id=?\n(fetch created/updated user)
+activate DB
+DB --> SignupRouter : user record
+deactivate DB
+
+== Session & Token Creation ==
+
+SignupRouter -> AuthService : create_session_token(user, { req })
+activate AuthService
+
+AuthService -> AuthService : create_session_(user, meta)\nextract IP, user-agent, host from req
+
+AuthService -> SessionService : create_session(user, meta)
+activate SessionService
+
+SessionService -> DB : INSERT INTO sessions\n( uuid, user_id, meta,\n  last_activity, created_at )
+activate DB
+DB --> SessionService : OK
+deactivate DB
+
+SessionService -> Redis : SET session-cache:{uuid} (TTL 300s)\nSADD user-sessions:{user_id}
+activate Redis
+Redis --> SessionService : OK
+deactivate Redis
+
+SessionService --> AuthService : session { uuid, user_uid, user_id, meta }
+deactivate SessionService
+
+AuthService -> TokenService : sign('auth', { type:'session',\n  uuid, user_uid }) → JWT
+activate TokenService
+TokenService --> AuthService : session_token (JWT)
+deactivate TokenService
+
+AuthService --> SignupRouter : { session, token: session_token }
+deactivate AuthService
+
+SignupRouter -> AuthService : create_gui_token(user, session)
+activate AuthService
+AuthService -> TokenService : sign('auth', { type:'gui',\n  uuid: session.uuid, user_uid }) → JWT
+activate TokenService
+TokenService --> AuthService : gui_token (JWT)
+deactivate TokenService
+AuthService --> SignupRouter : gui_token
+deactivate AuthService
+
+== Email Verification Dispatch ==
+
+opt Email confirmation required\n(email_confirmation_required OR requires_email_confirmation = true)
+    alt send_confirmation_code = true
+        SignupRouter -> EmailService : send_email_verification_code(\n  email_confirm_code, email)\n→ template: 'email_verification_code'\n→ code: hyphenize(6-digit code)
+        activate EmailService
+        EmailService --> SignupRouter : sent
+        deactivate EmailService
+    else send_confirmation_code = false
+        SignupRouter -> EmailService : send_email_verification_token(\n  email_confirm_token, email, user_uuid)\n→ template: 'email_verification_link'\n→ link: {origin}/confirm-email-by-token\n  ?user_uuid=&token=
+        activate EmailService
+        EmailService --> SignupRouter : sent
+        deactivate EmailService
+    end
+end
+
+== Post-Signup Setup ==
+
+SignupRouter -> UserService : generate_default_fsentries({ user })
+activate UserService
+UserService --> SignupRouter : default filesystem entries created
+deactivate UserService
+
+SignupRouter -> EventService : emit('user.save_account', { user })\n[if not temp user]
+activate EventService
+EventService --> SignupRouter : OK
+deactivate EventService
+
+== Response ==
+
+SignupRouter --> Client : Set-Cookie: session_token (HttpOnly)\n200 OK { token: gui_token,\n  user: { username, uuid, email,\n    email_confirmed,\n    requires_email_confirmation,\n    is_temp, taskbar_items,\n    referral_code } }
+deactivate SignupRouter
+
+@enduml

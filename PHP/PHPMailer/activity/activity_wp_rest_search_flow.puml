@@ -1,0 +1,176 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #DEE2E6
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title WordPress REST Search Flow\n<size:11><i>GET /wp/v2/search — WP_REST_Search_Controller (WordPress 5.0+)</i></size>
+
+|Client|
+start
+:Send **GET /wp/v2/search**\n?search=…&type=…&subtype=…&page=…;
+
+|WP_REST_Search_Controller|
+:Route matched: register_routes()\nmaps GET /search → get_items();
+
+note right
+  permission_callback =
+  get_items_permission_check()
+end note
+
+:**get_items_permission_check**($request);
+
+note right
+  Always returns **true**
+  Search endpoint is public —
+  no authentication required
+end note
+
+:Proceed to parameter sanitization;
+
+:**sanitize_subtypes**($subtypes, $request, $parameter);
+:wp_parse_slug_list($subtypes)\n— normalize input to array of slugs;
+:rest_parse_request_arg($subtypes, $request, $parameter)\n— validate each slug against registered enum;
+
+if (Validation failed?) then (yes)
+    :Return **WP_Error**\n(invalid subtype values);
+    |Client|
+    :Receive **400 Bad Request**;
+    stop
+else (no)
+endif
+
+|WP_REST_Search_Controller|
+if ('any' present in subtypes?) then (yes)
+    :Collapse subtypes → **['any']**\n(overrides all other subtype filters);
+else (no)
+    :Resolve handler to filter valid subtypes;
+    :**get_search_handler**($request)\n— resolve handler by type param;
+
+    if (Type missing or not registered?) then (yes)
+        :Return **WP_Error**\n'rest_search_invalid_type' 400;
+        |Client|
+        :Receive **400 Bad Request**;
+        stop
+    else (no)
+    endif
+
+    |WP_REST_Search_Controller|
+    :array_intersect($subtypes, $handler->get_subtypes())\n— keep only subtypes supported by handler;
+endif
+
+:**get_items**($request) — main collection handler;
+:**get_search_handler**($request)\n— look up handler by $request->get_param('type');
+
+if (Handler lookup failed?) then (yes)
+    :Return **WP_Error**\n'rest_search_invalid_type' 400;
+    |Client|
+    :Receive **400 Bad Request**;
+    stop
+else (no)
+endif
+
+|WP_REST_Search_Handler|
+:**search_items**(WP_REST_Request $request)\n— delegate DB query to concrete handler subclass;
+note right
+  Returns: ['ids' => [...], 'total' => N]
+  RESULT_IDS + RESULT_TOTAL constants
+end note
+:Return search result array;
+
+|WP_REST_Search_Controller|
+if (Result missing 'ids' or 'total' keys?) then (yes)
+    :Return **WP_Error**\n'rest_search_handler_error' 500;
+    |Client|
+    :Receive **500 Internal Server Error**;
+    stop
+else (no)
+endif
+
+|WP_REST_Search_Controller|
+:array_map('absint', $result['ids'])\n— cast all IDs to positive integers;
+:Calculate pagination:\n$total, $page, $per_page\n$max_pages = ceil($total / $per_page);
+
+if ($page > $max_pages AND $total > 0?) then (yes)
+    :Return **WP_Error**\n'rest_search_invalid_page_number' 400;
+    |Client|
+    :Receive **400 Bad Request**;
+    stop
+else (no)
+endif
+
+|WP_REST_Search_Controller|
+:Loop over $ids\n→ prepare_item_for_response($id, $request);
+
+note right
+  For each item:
+  • get_search_handler() called again per item
+  • get_fields_for_response() — determine included fields
+  • handler->prepare_item($id, $fields) — fetch item data
+  • add_additional_fields_to_object() — registered field extensions
+  • filter_response_by_context($data, 'view'|'embed') — strip out-of-context fields
+  • handler->prepare_item_links($id) — HAL links (abstract)
+  • Append 'collection' link → rest_url('wp/v2/search')
+  • response->add_links($links)
+end note
+
+fork
+    |WP_REST_Search_Handler|
+    :**prepare_item**($id, $fields)\n— concrete subclass fetches item data;
+    :Return item data array;
+fork again
+    |WP_REST_Search_Handler|
+    :**prepare_item_links**($id)\n— concrete subclass returns HAL links;
+    :Return links array;
+end fork
+
+|WP_REST_Search_Controller|
+:Collect prepared items\ninto $results array;
+
+:rest_ensure_response($results)\n— wrap in WP_REST_Response;
+
+:Set response headers:\n**X-WP-Total**: $total\n**X-WP-TotalPages**: $max_pages;
+
+if ($page > 1?) then (yes)
+    :Add **Link: prev** header;
+else (no)
+endif
+
+if ($page < $max_pages?) then (yes)
+    :Add **Link: next** header;
+else (no)
+endif
+
+:Return **WP_REST_Response**\n(paginated collection with HAL links);
+
+|Client|
+:Receive **200 OK**\nJSON array of search results\n+ pagination headers;
+stop
+
+@enduml

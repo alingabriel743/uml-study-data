@@ -1,0 +1,135 @@
+{
+  "scope": "server_admin_and_kick_flow",
+  "title": "Server Administration and Player Kick Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "ServerControl",
+    "NetServer",
+    "NetConnection",
+    "Administration",
+    "VoteSession",
+    "Player",
+    "SNet"
+  ],
+
+  "interaction_flow": [
+    "=== FLOW 1: Console Kick Command ===",
+    "ServerControl → handler.register('kick'): finds Player by name",
+    "ServerControl → Player: target.kick(KickReason.kick)",
+    "Player → NetConnection: kick(KickReason.kick)",
+    "NetConnection → NetConnection: kick(reason=null, kickType, kickDuration=30000)",
+    "NetConnection → Administration: handleKicked(uuid, address, kickDuration)",
+    "Administration → Administration: kickedIPs.put(ip, expiry); info.timesKicked++; info.lastKicked=expiry",
+    "NetConnection → Call: kick(con, KickReason.kick)  [sends packet to client]",
+    "NetConnection → NetConnection: kickDisconnect() → close()",
+    "NetConnection → Administration: save()",
+    "NetConnection → NetConnection: kicked = true",
+
+    "=== FLOW 2: Console Ban Command ===",
+    "ServerControl → handler.register('ban'): parse type (id/name/ip)",
+    "ServerControl → Administration: banPlayerID(uuid) [sets PlayerInfo.banned=true, fires PlayerBanEvent]",
+    "ServerControl → Administration: banPlayerIP(ip) [adds to bannedIPs, fires PlayerIpBanEvent]",
+    "SNet → SNet: [listens PlayerIpBanEvent] updateBans(ip) → smat.setLobbyData('banned', steamBanList)",
+    "ServerControl → [each online player]: if isIDBanned → player.con.kick(KickReason.banned)",
+
+    "=== FLOW 3: In-Game Admin adminRequest (ban case) ===",
+    "AdminClient → NetServer: adminRequest(player, other, AdminAction.ban, params)  [@Remote Loc.client→Loc.server]",
+    "NetServer → NetServer: check player.admin || player.isLocal() [deny if false]",
+    "NetServer → Administration: admins.banPlayerID(other.con.uuid)",
+    "NetServer → Administration: admins.banPlayerIP(other.con.address)",
+    "NetServer → Player(other): other.kick(KickReason.banned)",
+    "Player(other) → NetConnection: kick(KickReason.banned, 30000)",
+    "NetConnection → Administration: handleKicked(uuid, address, 30000)",
+
+    "=== FLOW 3b: adminRequest (kick case) ===",
+    "AdminClient → NetServer: adminRequest(player, other, AdminAction.kick, params)",
+    "NetServer → Player(other): other.kick(KickReason.kick)",
+
+    "=== FLOW 4: Votekick Flow ===",
+    "Player → NetServer: /votekick [target] [reason]  [client command]",
+    "NetServer → NetServer: guard checks (enableVotekick, ≥3 players, no ongoing vote, cooldown)",
+    "NetServer → VoteSession: new VoteSession(found)  [starts Timer task for voteDuration=30s]",
+    "NetServer → VoteSession: session.vote(initiator, +1)",
+    "VoteSession → VoteSession: votes++; voted.put(uuid, sign); voted.put(lastIP, sign)",
+    "VoteSession → Call: sendMessage(score tally broadcast to all)",
+    "VoteSession → VoteSession: checkPass() → votes >= votesRequired()?",
+    "NetServer → NetServer: currentlyKicking = session",
+
+    "OtherPlayer → NetServer: /vote y/n",
+    "NetServer → VoteSession: currentlyKicking.vote(player, sign)",
+    "VoteSession → VoteSession: checkPass()",
+
+    "[if votes >= votesRequired() (2 + bonus if >4 players)]",
+    "VoteSession → Call: sendMessage('Vote passed, banned for N minutes')",
+    "VoteSession → Player(target): p.kick(KickReason.vote, kickDuration*1000)  [kickDuration=3600s]",
+    "Player(target) → NetConnection: kick(KickReason.vote, 3600000ms)",
+    "NetConnection → Administration: handleKicked(uuid, address, 3600000)",
+    "VoteSession → VoteSession: currentlyKicking = null; task.cancel()",
+
+    "[if Timer fires before quorum]",
+    "Timer → VoteSession: task callback → checkPass() fails",
+    "VoteSession → Call: sendMessage('Vote failed')",
+    "VoteSession → NetServer: currentlyKicking = null",
+
+    "=== FLOW 5: Reconnect Ban Enforcement ===",
+    "Client → NetServer: Connect packet (TCP)",
+    "NetServer → Administration: isIPBanned(ip) || isSubnetBanned(ip)",
+    "Administration → Administration: isSubnetBanned: subnetBans.contains(ip::startsWith)",
+    "[if banned] NetServer → NetConnection: con.kick(KickReason.banned)",
+
+    "Client → NetServer: ConnectPacket (uuid, usid, name, version)",
+    "NetServer → Administration: isIDBanned(uuid) || isNameBanned(name)",
+    "NetServer → Administration: getKickTime(uuid, ip) → max(info.lastKicked, kickedIPs[ip])",
+    "[if Time.millis() < kickTime] NetServer → NetConnection: con.kick(KickReason.recentKick)",
+
+    "=== FLOW 6: Subnet-Ban Console Command ===",
+    "ServerControl → handler.register('subnet-ban add <ip>')",
+    "ServerControl → Administration: admins.addSubnetBan(ip) → subnetBans.add(ip); save()",
+    "[on next connection from matching prefix] NetServer → Administration: isSubnetBanned(ip) → true",
+    "NetServer → NetConnection: con.kick(KickReason.banned)"
+  ],
+
+  "key_relationships": [
+    "ServerControl implements ApplicationListener; holds CommandHandler handler",
+    "ServerControl accesses NetServer via Vars.netServer (singleton)",
+    "NetServer holds Administration admins; contains inner class VoteSession",
+    "NetServer holds int votesRequired() = 2 + (playerCount > 4 ? 1 : 0)",
+    "NetServer.adminRequest() is @Remote(targets=Loc.client, called=Loc.server) — RPC from in-game admin client",
+    "NetConnection.kick(KickReason,long) calls admins.handleKicked() when kickDuration>0",
+    "Administration.handleKicked(uuid, ip, duration) persists ban expiry in kickedIPs map and PlayerInfo.lastKicked",
+    "Administration.banPlayerIP() fires PlayerIpBanEvent",
+    "SNet listens to PlayerIpBanEvent/PlayerIpUnbanEvent → updates Steam lobby 'banned' metadata",
+    "VoteSession is an inner class of NetServer; currentlyKicking field guards one active vote"
+  ],
+
+  "key_data_structures": [
+    "Administration.kickedIPs: ObjectMap<String,Long>  — IP→expiry timestamp",
+    "Administration.bannedIPs: Seq<String>  — IP ban list",
+    "Administration.subnetBans: Seq<String>  — prefix-matched subnet bans",
+    "Administration.bannedNames: Seq<Pattern>  — regex-based name bans",
+    "Administration.playerInfo: ObjectMap<String,PlayerInfo>  — UUID→PlayerInfo",
+    "PlayerInfo fields: id, banned(bool), admin(bool), lastKicked(long), timesKicked(int), ips(Seq<String>), names(Seq<String>)",
+    "VoteSession fields: target(Player), voted(ObjectIntMap<String>), task(Timer.Task), votes(int)",
+    "NetServer.kickDuration = 3600s (1 hour), voteDuration = 30s, voteCooldown = 300s"
+  ],
+
+  "important_notes": [
+    "KickReason.kick and KickReason.banned both use 30s kick-duration in NetConnection.kick(KickReason); KickReason.vote uses kickDuration*1000 (1 hour)",
+    "NetConnection.kick() is idempotent: 'if(kicked) return' guard prevents double-kick",
+    "VoteSession uses both uuid and lastIP as vote keys to prevent duplicate voting from same origin",
+    "Admin votekick cancel: /vote c by admin → cancels task, sets currentlyKicking=null",
+    "Admin guard in adminRequest: checks player.admin || player.isLocal(); also blocks admin-on-admin actions",
+    "SNet (Steam) only updates ban list for steam: prefixed IPs; normal IP bans ignored for Steam lobby visibility",
+    "subnet-ban uses prefix matching: isSubnetBanned checks subnetBans.contains(ip::startsWith)",
+    "Name bans use case-insensitive regex patterns via Pattern.compile(regex, CASE_INSENSITIVE)",
+    "forceSave() writes: player-data, ip-kicks, ip-bans, whitelist-ids, banned-subnets, banned-names to Core.settings (JSON)"
+  ],
+
+  "source_files_analyzed": [
+    "server/src/mindustry/server/ServerControl.java",
+    "core/src/mindustry/core/NetServer.java",
+    "core/src/mindustry/net/Administration.java",
+    "core/src/mindustry/net/NetConnection.java",
+    "desktop/src/mindustry/desktop/steam/SNet.java"
+  ]
+}

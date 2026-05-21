@@ -1,0 +1,204 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Text-to-World Inference Pipeline
+
+actor "User / Script\n(text2world.py)" as User
+
+participant "DiffusionText2World\nGenerationPipeline" as Pipeline
+participant "BaseWorldGeneration\nPipeline" as BasePipeline
+participant "GuardrailPresets" as Guardrail
+participant "PromptUpsampler\n(run_chat_completion)" as Upsampler
+participant "CosmosT5\nTextEncoder" as T5Encoder
+participant "inference_utils" as InfUtils
+participant "DiffusionT2WModel" as DiffModel
+participant "save_video\n(utils.io)" as SaveVideo
+
+== Initialization ==
+
+User -> Pipeline : demo(args)\n__init__(guidance, num_steps,\nheight, width, fps,\nnum_video_frames, seed)
+activate Pipeline
+
+Pipeline -> BasePipeline : __init__(config)
+activate BasePipeline
+note right of BasePipeline
+  Loads:
+  • T5 text encoder
+  • Tokenizer / VAE
+  • Guardrail models
+  • Network (DiffusionT2WModel)
+end note
+BasePipeline --> Pipeline : initialized
+deactivate BasePipeline
+
+Pipeline -> Pipeline : create_prompt_upsampler\n(checkpoint_dir)
+note right : Loads Cosmos-UpsamplePrompt1\n12B-Text2World LLM (if enabled)
+
+== Inference: pipeline.generate(prompt) ==
+
+User -> Pipeline : generate(prompt, negative_prompt,\nword_limit_to_skip_upsampler)
+activate Pipeline
+
+group Safety Check #1 — Raw Prompt
+    Pipeline -> BasePipeline : _run_guardrail_on_prompt\n_with_offload(prompt)
+    activate BasePipeline
+    BasePipeline -> Guardrail : run_text_guardrail(prompt)
+    activate Guardrail
+    Guardrail --> BasePipeline : is_safe: bool
+    deactivate Guardrail
+    BasePipeline --> Pipeline : is_safe
+    deactivate BasePipeline
+
+    alt Prompt is UNSAFE
+        Pipeline --> User : return None
+    end
+end
+
+group Prompt Upsampling (if enabled & word_count ≤ limit)
+    Pipeline -> Pipeline : _run_prompt_upsampler_on_prompt\n_with_offload(prompt)
+    activate Pipeline
+    Pipeline -> Upsampler : run_chat_completion(model, prompt)
+    activate Upsampler
+    Upsampler --> Pipeline : upsampled_prompt: str
+    deactivate Upsampler
+    deactivate Pipeline
+end
+
+group Safety Check #2 — Upsampled Prompt
+    Pipeline -> BasePipeline : _run_guardrail_on_prompt\n_with_offload(upsampled_prompt)
+    activate BasePipeline
+    BasePipeline -> Guardrail : run_text_guardrail(upsampled_prompt)
+    activate Guardrail
+    Guardrail --> BasePipeline : is_safe: bool
+    deactivate Guardrail
+    BasePipeline --> Pipeline : is_safe
+    deactivate BasePipeline
+
+    alt Upsampled Prompt is UNSAFE
+        Pipeline --> User : return None
+    end
+end
+
+group Text Embedding
+    Pipeline -> BasePipeline : _run_text_embedding_on_prompt\n_with_offload([prompt, negative_prompt])
+    activate BasePipeline
+    BasePipeline -> T5Encoder : encode(prompts: list[str])
+    activate T5Encoder
+    T5Encoder --> BasePipeline : embeddings: list[Tensor]\nmasks: list[Tensor]
+    deactivate T5Encoder
+    BasePipeline --> Pipeline : prompt_embedding, neg_embedding\n(Tensor [1, 512, D])
+    deactivate BasePipeline
+end
+
+group Diffusion Model — Latent Generation
+    Pipeline -> Pipeline : _run_model_with_offload\n(prompt_embedding, neg_embedding)
+    activate Pipeline
+
+    Pipeline -> Pipeline : _load_network()\n_load_tokenizer()
+    note right : GPU offload management
+
+    Pipeline -> Pipeline : _run_model\n(embedding, neg_embedding)
+    activate Pipeline
+
+    Pipeline -> InfUtils : get_video_batch(model,\nprompt_embedding, neg_embedding,\nheight, width, fps, num_video_frames)
+    activate InfUtils
+    InfUtils -> InfUtils : prepare_data_batch\n(height, width, num_frames,\nfps, prompt_embedding)
+    note right : Builds CUDA tensor batch\nwith video params
+    InfUtils --> Pipeline : data_batch: dict\nstate_shape: [C,T,H,W]
+    deactivate InfUtils
+
+    Pipeline -> InfUtils : generate_world_from_text\n(model, state_shape, is_negative_prompt,\ndata_batch, guidance=7.0, num_steps=35, seed)
+    activate InfUtils
+    InfUtils -> DiffModel : generate_samples_from_batch\n(data_batch, guidance, state_shape,\nnum_steps, is_negative_prompt, seed)
+    activate DiffModel
+    note right of DiffModel
+      Diffusion denoising loop
+      (35 steps by default)
+      Di-T architecture with
+      context parallelism support
+    end note
+    DiffModel --> InfUtils : latent: Tensor [B,C,T,H,W]
+    deactivate DiffModel
+    InfUtils --> Pipeline : latent sample Tensor
+    deactivate InfUtils
+
+    deactivate Pipeline
+
+    Pipeline -> Pipeline : _offload_network()
+    note right : Free GPU memory
+
+    Pipeline -> Pipeline : _run_tokenizer_decoding(sample: Tensor)
+    activate Pipeline
+    Pipeline -> DiffModel : decode(sample)
+    activate DiffModel
+    note right of DiffModel
+      VAE decode (Cosmos-Tokenize1-CV8x8x8)
+      8× temporal, 8×8 spatial decompression
+      Latent → pixel space → clamp/normalize
+    end note
+    DiffModel --> Pipeline : video: uint8 np.ndarray [T,H,W,C]
+    deactivate DiffModel
+    deactivate Pipeline
+
+    Pipeline -> Pipeline : _offload_tokenizer()
+    note right : Free GPU memory
+
+    deactivate Pipeline
+end
+
+group Safety Check #3 — Generated Video
+    Pipeline -> BasePipeline : _run_guardrail_on_video\n_with_offload(video)
+    activate BasePipeline
+    BasePipeline -> Guardrail : run_video_guardrail(video)
+    activate Guardrail
+    Guardrail --> BasePipeline : is_safe: bool
+    deactivate Guardrail
+    BasePipeline --> Pipeline : is_safe
+    deactivate BasePipeline
+
+    alt Video is UNSAFE
+        Pipeline --> User : return None
+    end
+end
+
+Pipeline --> User : (video: np.ndarray [T,H,W,C] uint8,\nprompt: str)
+deactivate Pipeline
+
+== Output ==
+
+User -> SaveVideo : save_video(video, fps, H, W,\nvideo_save_quality=5, video_save_path)
+activate SaveVideo
+SaveVideo --> User : .mp4 written to disk
+deactivate SaveVideo
+
+User -> User : write prompt .txt\nalongside video
+
+@enduml

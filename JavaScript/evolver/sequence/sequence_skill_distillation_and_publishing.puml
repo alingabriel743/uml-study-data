@@ -1,0 +1,180 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    DividerBackgroundColor #DEE2E6
+    GroupBackgroundColor #E9ECEF
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Skill Distillation and Publishing Flow
+
+actor "Caller / GEP" as Caller
+participant "skillDistiller\n(skillDistiller.js)" as Distiller
+participant "FileSystem\n(GEP_ASSETS_DIR)" as FS
+participant "sanitize\n(sanitize.js)" as Sanitize
+participant "llmReview\n(llmReview.js)" as LlmReview
+participant "child_process\n(execFileSync)" as ChildProc
+participant "policyCheck\n(policyCheck.js)" as Policy
+participant "skillPublisher\n(skillPublisher.js)" as Publisher
+participant "a2aProtocol\n(a2aProtocol.js)" as A2A
+participant "Hub API" as Hub
+
+== Initiation ==
+
+Caller -> Distiller : autoDistill()
+activate Distiller
+
+Distiller -> Distiller : shouldDistill()\n[check SKILL_DISTILLER env,\nmin capsule threshold, interval]
+
+alt shouldDistill() === false
+    Distiller --> Caller : { ok: false, reason: "interval_not_met"\n| "insufficient_capsules"\n| "SKILL_DISTILLER=false" }
+    deactivate Distiller
+end
+
+== Data Collection & Pattern Analysis ==
+
+Distiller -> FS : collectDistillationData()\n[reads capsules.json, genes.json,\nevents.jsonl from GEP_ASSETS_DIR]
+activate FS
+FS --> Distiller : { successCapsules, allCapsules, grouped }
+deactivate FS
+
+Distiller -> Distiller : computeDataHash(capsules)
+note right : idempotent_skip if same\nhash as last run
+
+Distiller -> Distiller : analyzePatterns(data)\n→ { high_frequency (count≥5),\nstrategy_drift, coverage_gaps }
+
+Distiller -> Distiller : synthesizeGeneFromPatterns\n(data, analysis, genes)\n→ Gene object
+
+== Payload Sanitization ==
+
+Distiller -> Sanitize : sanitizePayload(capsule)
+activate Sanitize
+
+Sanitize -> Sanitize : deep-clone capsule\n(does NOT modify original)
+Sanitize -> Sanitize : redactString(str)\n[Bearer tokens, sk-*, AWS keys,\nGitHub, npm, private keys,\nemails, .env refs → [REDACTED]]
+
+Sanitize --> Distiller : sanitizedCapsule
+deactivate Sanitize
+
+== LLM Review (Optional Gate) ==
+
+Distiller -> LlmReview : runLlmReview\n({ diff, gene, signals, mutation })
+activate LlmReview
+
+LlmReview -> LlmReview : isLlmReviewEnabled()\n[checks EVOLVER_LLM_REVIEW env]
+
+alt EVOLVER_LLM_REVIEW !== 'true'
+    LlmReview --> Distiller : null (review skipped)
+else LLM review enabled
+    LlmReview -> LlmReview : buildReviewPrompt\n({ diff, gene, signals, mutation })
+    LlmReview -> ChildProc : execFileSync(node,\n['-e', reviewScript, tmpFile],\ntimeout: 30s)
+    activate ChildProc
+    ChildProc --> LlmReview : review output
+    deactivate ChildProc
+    LlmReview --> Distiller : { approved: bool,\nconfidence: 0.0–1.0,\nconcerns: [],\nsummary: string }
+end
+deactivate LlmReview
+
+alt llmReview.approved === false
+    Distiller --> Caller : { ok: false, reason: "llm_review_rejected" }
+    deactivate Distiller
+end
+
+== Policy Check ==
+
+Distiller -> Policy : checkConstraints(gene, ...)\n[blast radius, forbidden_paths,\nmax_files, validation commands]
+activate Policy
+
+Policy -> Policy : isForbiddenPath(path, forbiddenPaths)
+Policy -> Policy : isConstraintCountedPath(path, policy)
+Policy -> Policy : isValidationCommandAllowed(cmd)\n[blocks: rm -rf, node -e/--eval/--print]
+Policy -> Policy : classifyBlastSeverity(...)
+
+Policy --> Distiller : { ok: bool, reason?: string }
+deactivate Policy
+
+alt policy check fails
+    Distiller --> Caller : { ok: false, reason: "policy_violation: <reason>" }
+    deactivate Distiller
+end
+
+== Gene Validation & State Persistence ==
+
+Distiller -> Distiller : validateSynthesizedGene(gene, existingGenes)\n[validates type/id/signals_match/strategy;\nauto-prefixes id with gene_distilled_;\ncaps max_files; deduplicates id;\nstrips unsafe validation cmds]
+
+alt validateSynthesizedGene invalid
+    Distiller --> Caller : { ok: false, reason: "validation_failed",\nerrors: string[] }
+    deactivate Distiller
+end
+
+Distiller -> Distiller : writeDistillerState\n({ last_distillation_at,\nlast_data_hash,\ndistillation_count })
+
+== Skill Publishing ==
+
+Distiller -> Publisher : publishSkillToHub(gene, opts)\n{ category, tags }
+activate Publisher
+
+Publisher -> Publisher : sanitizeSignalsMatch(signals_match)\n[lazy require — circular dep guard]
+Publisher -> Publisher : sanitizeSkillName(gene.id)\n[strips gene_distilled_ prefix,\ntimestamps → kebab-case]
+Publisher -> Publisher : geneToSkillMd(gene)\n[renders SKILL.md: name, description,\nWhen to Use, Trigger Signals,\nPreconditions, Strategy,\nConstraints, Validation, Metadata]
+
+Publisher -> A2A : getHubUrl()
+activate A2A
+Publisher -> A2A : getNodeId()
+Publisher -> A2A : buildHubHeaders()
+A2A --> Publisher : { hubUrl, nodeId, headers }
+deactivate A2A
+
+Publisher -> Hub : POST /a2a/skill/store/publish\n{ sender_id, skill_id: "skill_*",\ncontent: SKILL.md,\ncategory, tags }\ntimeout: 15s
+activate Hub
+
+alt HTTP 201 / 200 (created / ok)
+    Hub --> Publisher : 201 Created / 200 OK
+    deactivate Hub
+else HTTP 409 (conflict — skill already exists)
+    Hub --> Publisher : 409 Conflict
+    deactivate Hub
+
+    Publisher -> Publisher : updateSkillOnHub\n(nodeId, skillId, content, opts, gene)
+
+    Publisher -> Hub : PUT /a2a/skill/store/update\n{ sender_id, skill_id, content,\ncategory, tags,\nchangelog: "Iterative evolution update" }\ntimeout: 15s
+    activate Hub
+    Hub --> Publisher : 200–299 OK
+    deactivate Hub
+end
+
+Publisher --> Distiller : { ok: boolean,\nresult?: object,\nerror?: string }
+deactivate Publisher
+
+== Response ==
+
+Distiller --> Caller : { ok: boolean,\ngene: Gene,\nreason?: string }
+deactivate Distiller
+
+@enduml

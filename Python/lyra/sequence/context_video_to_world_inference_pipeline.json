@@ -1,0 +1,88 @@
+{
+  "scope": "video_to_world_inference_pipeline",
+  "title": "Video-to-World Inference Pipeline",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Caller",
+    "DiffusionVideo2WorldGenerationPipeline",
+    "VLMPromptUpsampler",
+    "Guardrail",
+    "TextEncoder (T5)",
+    "inference_utils",
+    "DiffusionV2WModel (tokenizer+DiT)",
+    "VideoDecoder"
+  ],
+  "class_hierarchy": [
+    "BaseWorldGenerationPipeline <|-- DiffusionText2WorldGenerationPipeline",
+    "DiffusionText2WorldGenerationPipeline <|-- DiffusionVideo2WorldGenerationPipeline",
+    "DiffusionText2WorldGenerationPipeline <|-- DiffusionText2WorldMultiviewGenerationPipeline",
+    "DiffusionVideo2WorldGenerationPipeline uses DiffusionV2WModel"
+  ],
+  "interaction_flow": [
+    "Caller → DiffusionVideo2WorldGenerationPipeline: generate(prompt, image_or_video_path, negative_prompt)",
+    "DiffusionVideo2WorldGenerationPipeline → VLMPromptUpsampler: _run_prompt_upsampler_on_prompt_with_offload(image_or_video_path) [if enable_prompt_upsampler]",
+    "  VLMPromptUpsampler → VLMPromptUpsampler: prepare_dialog(image_or_video_path)",
+    "  VLMPromptUpsampler → VLMPromptUpsampler: run_chat_completion_vlm(dialog) → enhanced_prompt",
+    "DiffusionVideo2WorldGenerationPipeline → Guardrail: _run_guardrail_on_prompt_with_offload(prompt) [if not disable_guardrail]",
+    "DiffusionVideo2WorldGenerationPipeline → TextEncoder: _run_text_embedding_on_prompt_with_offload([prompt, negative_prompt]) → prompt_embeddings",
+    "DiffusionVideo2WorldGenerationPipeline → DiffusionVideo2WorldGenerationPipeline: _run_model_with_offload(prompt_embedding, image_or_video_path, negative_prompt_embedding)",
+    "  _run_model_with_offload → self: _run_tokenizer_encoding(image_or_video_path)",
+    "    _run_tokenizer_encoding → inference_utils: get_condition_latent(model, input_image_or_video_path, num_input_frames, state_shape)",
+    "      get_condition_latent → inference_utils: read_video_or_image_into_frames_BCTHW(input_path, H, W) → input_frames [B,C,T,H,W]",
+    "        read_video_or_image_into_frames_BCTHW → io: load_from_fileobj(input_path) → (frames, meta_data)",
+    "        read_video_or_image_into_frames_BCTHW → transforms_F: resize(input_tensor, (H,W)) [if H,W set]",
+    "        read_video_or_image_into_frames_BCTHW → einops: rearrange TCHW → BCTHW",
+    "      get_condition_latent → inference_utils: create_condition_latent_from_input_frames(model, input_frames, num_frames_condition)",
+    "        create_condition_latent_from_input_frames → torch: pad frames to pixel_chunk_duration length → encode_input_frames",
+    "        create_condition_latent_from_input_frames → DiffusionV2WModel: model.encode(encode_input_frames) → condition_latent [B,C,T,H,W]",
+    "  _run_model_with_offload → self: _run_model(embedding, condition_latent, negative_prompt_embedding)",
+    "    _run_model → inference_utils: get_video_batch(model, prompt_embedding, negative_prompt_embedding, height, width, fps, num_video_frames)",
+    "      get_video_batch → inference_utils: prepare_data_batch(...) → data_batch dict",
+    "      get_video_batch → DiffusionV2WModel: model.tokenizer.get_latent_num_frames(num_video_frames) → state_shape [C,T,H,W]",
+    "    _run_model → inference_utils: generate_world_from_video(model, state_shape, data_batch, condition_latent, num_input_frames, guidance, num_steps, seed)",
+    "      generate_world_from_video → torch: pad condition_latent to state_shape[1] if needed",
+    "      generate_world_from_video → inference_utils: compute_num_latent_frames(model, num_input_frames) → num_of_latent_condition",
+    "      generate_world_from_video → DiffusionV2WModel: model.generate_samples_from_batch(data_batch, guidance, state_shape, num_steps, is_negative_prompt, seed, condition_latent, num_condition_t, condition_augment_sigma=0.001) → sample latents",
+    "  _run_model_with_offload → self: _run_tokenizer_decoding(sample)",
+    "    _run_tokenizer_decoding → DiffusionV2WModel: model.decode(sample) → video tensor [B,3,T,H,W]",
+    "    _run_tokenizer_decoding → torch: clamp+permute+uint8 → np.ndarray [T,H,W,C] range [0,255]",
+    "DiffusionVideo2WorldGenerationPipeline → Guardrail: _run_guardrail_on_video_with_offload(video) [if not disable_guardrail]",
+    "DiffusionVideo2WorldGenerationPipeline → Caller: return (video_frames_np [T,H,W,C], final_prompt)"
+  ],
+  "key_relationships": [
+    "DiffusionVideo2WorldGenerationPipeline inherits DiffusionText2WorldGenerationPipeline",
+    "DiffusionText2WorldGenerationPipeline inherits BaseWorldGenerationPipeline",
+    "DiffusionVideo2WorldGenerationPipeline._load_model() instantiates DiffusionV2WModel (not DiffusionT2WModel)",
+    "DiffusionVideo2WorldGenerationPipeline._run_model() calls inference_utils.generate_world_from_video()",
+    "DiffusionVideo2WorldGenerationPipeline._run_tokenizer_encoding() calls inference_utils.get_condition_latent()",
+    "get_condition_latent() delegates to read_video_or_image_into_frames_BCTHW() then create_condition_latent_from_input_frames()",
+    "create_condition_latent_from_input_frames() calls model.encode() on padded frames",
+    "generate_world_from_video() calls model.generate_samples_from_batch() with condition_latent+num_condition_t",
+    "DiffusionV2WModel provides encode(), decode(), generate_samples_from_batch() interface"
+  ],
+  "key_methods": {
+    "DiffusionVideo2WorldGenerationPipeline.generate": "Entry point: prompt + image_or_video_path + negative_prompt → (np.ndarray[T,H,W,C], str)",
+    "DiffusionVideo2WorldGenerationPipeline._run_model_with_offload": "Orchestrates: tokenizer encoding → model inference → tokenizer decoding with GPU offload support",
+    "DiffusionVideo2WorldGenerationPipeline._run_tokenizer_encoding": "Calls get_condition_latent() → returns condition_latent Tensor",
+    "DiffusionVideo2WorldGenerationPipeline._run_model": "Calls get_video_batch() + generate_world_from_video() → returns sample latent Tensor",
+    "inference_utils.read_video_or_image_into_frames_BCTHW": "Loads mp4/jpg/png → normalizes to [-1,1] → resizes → returns BCTHW bfloat16 CUDA tensor",
+    "inference_utils.get_condition_latent": "Resolves H,W from state_shape, reads frames, creates padded condition latent",
+    "inference_utils.create_condition_latent_from_input_frames": "Pads input frames to pixel_chunk_duration, calls model.encode(). Supports 'first_and_last_1' condition_location",
+    "inference_utils.generate_world_from_video": "Pads condition_latent if needed, computes latent frame count, calls model.generate_samples_from_batch(condition_augment_sigma=0.001)",
+    "inference_utils.get_video_batch": "Builds data_batch dict (video zeros, t5 embeddings, image_size, fps, num_frames) + computes state_shape from tokenizer"
+  },
+  "important_notes": [
+    "condition_augment_sigma=0.001 (DEFAULT_AUGMENT_SIGMA) applied during video conditioning",
+    "condition_location 'first_and_last_1' is a special mode that encodes first+last frames separately",
+    "Frames are normalized to [-1,1] (pixel/128 - 1) as bfloat16 on CUDA",
+    "state_shape = [C, T_latent, H//spatial_factor, W//spatial_factor] derived from tokenizer compression factors",
+    "VLM prompt upsampler (video2world) uses visual context from video; text2world uses LLM text upsampler",
+    "GPU offloading: network, tokenizer, text encoder, prompt upsampler, guardrail can each be offloaded independently",
+    "Model name mapping via MODEL_NAME_DICT e.g. 'Cosmos-Predict1-7B-Video2World' → config name",
+    "Output shape: np.ndarray uint8 [T, H, W, C] range [0, 255]"
+  ],
+  "source_files_analyzed": [
+    "Lyra-1/cosmos_predict1/diffusion/inference/world_generation_pipeline.py",
+    "Lyra-1/cosmos_predict1/diffusion/inference/inference_utils.py"
+  ]
+}

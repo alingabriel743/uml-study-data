@@ -1,0 +1,214 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #DEE2E6
+    GroupHeaderFontColor #212529
+    DividerBackgroundColor #CED4DA
+    DividerBorderColor #6C757D
+    NoteBorderColor #ADB5BD
+    NoteBackgroundColor #FFF3CD
+}
+skinparam ArrowFontSize 11
+skinparam NotesFontSize 11
+
+title MCP Server Tool Integration
+
+actor "User / App" as user
+participant "MCPServerManager" as mgr
+participant "_ServerWorker\n(parallel mode)" as worker
+participant "MCPServer\n(Stdio / SSE / StreamableHttp)" as server
+participant "ClientSession\n(mcp lib)" as session
+participant "Agent / Runner" as runner
+participant "ToolFilter /\nToolFilterContext" as filter
+
+== Manager Lifecycle: Connect Phase ==
+
+user -> mgr : async with MCPServerManager(servers)
+activate mgr
+
+mgr -> mgr : __aenter__() → connect_all()
+
+alt connect_in_parallel = False
+    loop for each server
+        mgr -> mgr : _attempt_connect(server)
+        mgr -> server : _run_with_timeout(\n  server.connect(),\n  connect_timeout_seconds\n)
+        activate server
+    end
+else connect_in_parallel = True
+    mgr -> worker : _get_worker(server)
+    activate worker
+    mgr -> worker : worker.connect()\nvia _submit("connect")
+    worker -> server : server.connect() [with timeout]
+    activate server
+    worker --> mgr : (result via asyncio.Queue)
+    note right of worker
+      _ServerWorker maintains task-affinity
+      required by AnyIO cancel scopes
+    end note
+end
+
+group Server.connect() internals [_MCPServerWithClientSession]
+    server -> server : create_streams()\nvia AsyncExitStack\n→ transport (read, write)
+    server -> session : ClientSession(read, write, timeout)\nvia exit_stack
+    activate session
+    session --> server : session instance
+    server -> session : await session.initialize()
+    session --> server : server_initialize_result
+    server -> server : self.session = session
+end
+
+server --> mgr : connect success
+
+alt on connection error
+    mgr -> mgr : _record_failure(server, exc)
+    note right of mgr
+      drop_failed_servers=True (default):
+      failed servers excluded from active_servers.
+      strict=True: raises on first failure.
+    end note
+end
+
+mgr -> mgr : _refresh_active_servers()
+mgr --> user : manager (active_servers populated)
+
+== Agent Run: list_tools ==
+
+user -> runner : Runner.run(agent, input)
+activate runner
+runner -> server : list_tools(run_context, agent)
+activate server
+
+alt cache_tools_list=True AND cache is valid
+    server --> runner : cached _tools_list (filtered)
+    note right of server
+      cache_tools_list=True avoids
+      per-run round-trips to the server.
+      Invalidate via invalidate_tools_cache().
+    end note
+else cache miss or cache_dirty
+    server -> server : _run_with_retries(\n  _maybe_serialize_request(\n    session.list_tools()\n  )\n)
+    note right of server
+      Retry loop: up to max_retry_attempts
+      with exponential backoff:
+      delay = base * 2^(attempt-1)
+    end note
+
+    alt _serialize_session_requests = True
+        server -> server : acquire _request_lock
+    end
+
+    server -> session : session.list_tools()
+    activate session
+    session --> server : result.tools
+    deactivate session
+    server -> server : _tools_list = result.tools\n_cache_dirty = False
+
+    alt tool_filter is not None
+        server -> filter : _apply_tool_filter(\n  tools, run_context, agent\n)
+        activate filter
+
+        alt static ToolFilterStatic (dict)
+            filter -> filter : apply allowed_tool_names allowlist
+            filter -> filter : remove blocked_tool_names from remaining
+        else callable (dynamic filter)
+            filter -> filter : build ToolFilterContext(\n  run_context, agent, server_name\n)
+            loop for each tool
+                filter -> filter : tool_filter_func(context, tool)\n→ bool | Awaitable[bool]
+            end
+        end
+
+        filter --> server : filtered_tools
+        deactivate filter
+    end
+
+    server --> runner : filtered_tools
+end
+deactivate server
+
+== Agent Run: call_tool (with Approval Check) ==
+
+runner -> server : _get_needs_approval_for_tool(tool, agent)
+activate server
+server --> runner : needs_approval (bool / callable)
+deactivate server
+
+alt needs_approval = True
+    runner -> user : pause: approval required for tool
+    user --> runner : approve / reject
+end
+
+runner -> server : call_tool(tool_name, arguments, meta=None)
+activate server
+
+server -> server : _validate_required_parameters(\n  tool_name, arguments\n)
+note right of server
+  Validates required fields
+  against cached tool schema.
+end note
+
+alt tool_meta_resolver configured
+    note right of server
+      MCPUtil layer resolves _meta
+      (tenant IDs, trace context)
+      BEFORE invoking call_tool().
+    end note
+end
+
+server -> server : _run_with_retries(\n  session.call_tool(\n    tool_name, arguments [, meta]\n  )\n)
+server -> session : session.call_tool(tool_name, arguments)
+activate session
+session --> server : CallToolResult
+deactivate session
+
+alt MCP tool call fails
+    alt failure_error_function set
+        server -> server : failure_error_function(error)\n→ model-visible error text
+    else failure_error_function = None
+        server -> server : raise exception
+    end
+end
+
+server --> runner : CallToolResult
+deactivate server
+runner --> user : final_output
+
+== Manager Lifecycle: Cleanup Phase ==
+
+user -> mgr : (context manager exit)
+mgr -> mgr : __aexit__() → cleanup_all()
+
+loop for each server in reversed(_all_servers)
+    alt connect_in_parallel = True
+        mgr -> worker : worker.cleanup()\nvia _submit("cleanup")
+        worker -> server : server.cleanup()
+        server -> server : async with _cleanup_lock\n→ exit_stack.aclose()
+        server --> worker : done
+        worker --> mgr : worker loop exits
+        deactivate worker
+    else serial mode
+        mgr -> server : _run_with_timeout(\n  server.cleanup(),\n  cleanup_timeout_seconds\n)
+        server -> server : async with _cleanup_lock\n→ exit_stack.aclose()
+        server --> mgr : done
+    end
+    deactivate server
+    deactivate session
+end
+
+mgr --> user : context manager exited
+deactivate mgr
+
+@enduml

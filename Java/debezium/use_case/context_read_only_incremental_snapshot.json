@@ -1,0 +1,153 @@
+{
+  "scope": "read_only_incremental_snapshot",
+  "title": "Read-Only Incremental Snapshot",
+  "diagram_type": "use_case",
+  "description": "Read-replica use cases: performing incremental snapshots without locking the primary database, driven by GTID watermarks.",
+
+  "actors": [
+    {
+      "name": "ReadReplicaDatabase",
+      "type": "external_system",
+      "description": "MySQL/MariaDB read replica; source of binlog events and GTID set queries. No locks acquired."
+    },
+    {
+      "name": "BinlogSourceTask",
+      "type": "system",
+      "description": "Abstract task entry point (extends BaseSourceTask). Validates snapshot feasibility and binlog configuration (ROW format, FULL row image). Initiates processing pipeline."
+    },
+    {
+      "name": "Operator",
+      "type": "human",
+      "description": "Sends signals (via signal table/topic) to add/stop data collections for incremental snapshot."
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Configure Read-Only Connection",
+      "actor": "BinlogSourceTask",
+      "description": "Set read.only=true in BinlogConnectorConfig. BinlogConnectorConfig.READ_ONLY_CONNECTION field (Boolean, default false). Exposed via isReadOnlyConnection().",
+      "key_config": "BinlogConnectorConfig.READ_ONLY_CONNECTION ('read.only', boolean, default=false)"
+    },
+    {
+      "id": "UC2",
+      "name": "Validate Snapshot Feasibility",
+      "actor": "BinlogSourceTask",
+      "description": "BinlogSourceTask.validateSnapshotFeasibility(snapshotter, offsetContext, connection): checks snapshotter.shouldSnapshotData(), inspects earliest binlog filename for purge warnings.",
+      "method": "validateSnapshotFeasibility(Snapshotter, O offsetContext, BinlogConnectorConnection)"
+    },
+    {
+      "id": "UC3",
+      "name": "Validate Binlog Configuration",
+      "actor": "BinlogSourceTask",
+      "description": "BinlogSourceTask.validateBinlogConfiguration(snapshotter, connection): if shouldStream(), verifies isBinlogFormatRow() and isBinlogRowImageFull() on connection.",
+      "method": "validateBinlogConfiguration(Snapshotter, BinlogConnectorConnection)"
+    },
+    {
+      "id": "UC4",
+      "name": "Resolve Snapshot Strategy (No Lock)",
+      "actor": "BinlogSourceTask",
+      "description": "SnapshotterService bundles Snapshotter + SnapshotQuery + SnapshotLock. For read-only mode, SnapshotLock is NoneSnapshotLock: tableLockingStatement() returns Optional.empty() — no DDL lock issued on the primary.",
+      "participants": ["SnapshotterService", "Snapshotter", "SnapshotLock (NoneSnapshotLock)"]
+    },
+    {
+      "id": "UC5",
+      "name": "Add Data Collections to Snapshot",
+      "actor": "Operator",
+      "description": "Signal triggers addDataCollectionNamesToSnapshot(SignalPayload, SnapshotConfiguration). Reads additionalData from signal payload, delegates to AbstractIncrementalSnapshotChangeEventSource.",
+      "method": "addDataCollectionNamesToSnapshot(SignalPayload<P>, SnapshotConfiguration)"
+    },
+    {
+      "id": "UC6",
+      "name": "Process Binlog Message (Update Window)",
+      "actor": "ReadReplicaDatabase",
+      "description": "processMessage(partition, dataCollectionId, key, offsetContext): calls context.updateWindowState(offsetContext). If window closes → sendWindowEvents + readChunk. Else if window non-empty and deduplication needed → deduplicateWindow.",
+      "method": "processMessage(P, DataCollectionId, Object key, OffsetContext)"
+    },
+    {
+      "id": "UC7",
+      "name": "Process Heartbeat Event",
+      "actor": "ReadReplicaDatabase",
+      "description": "processHeartbeat(partition, offsetContext): calls readUntilGtidChange — loops while snapshotRunning and reachedHighWatermark(currentGtid), closing window and reading chunks.",
+      "method": "processHeartbeat(P, OffsetContext)"
+    },
+    {
+      "id": "UC8",
+      "name": "Process Filtered / Transaction Events",
+      "actor": "ReadReplicaDatabase",
+      "description": "processFilteredEvent and processTransactionStartedEvent both call updateWindowState; if closed → sendWindowEvents + readChunk. processTransactionCommittedEvent calls readUntilGtidChange.",
+      "methods": [
+        "processFilteredEvent(P, OffsetContext)",
+        "processTransactionStartedEvent(P, OffsetContext)",
+        "processTransactionCommittedEvent(P, OffsetContext)"
+      ]
+    },
+    {
+      "id": "UC9",
+      "name": "Track GTID Watermarks",
+      "actor": "ReadReplicaDatabase",
+      "description": "On window open: emitWindowOpen → updateLowWatermark → getExecutedGtidSet(context::setLowWatermark). On window close: emitWindowClose → updateHighWatermark → getExecutedGtidSet(context::setHighWatermark). Abstract method getExecutedGtidSet(Consumer<GtidSet>) implemented by concrete subclass.",
+      "methods": [
+        "emitWindowOpen(P, OffsetContext) → updateLowWatermark()",
+        "emitWindowClose(P, OffsetContext) → updateHighWatermark()",
+        "getExecutedGtidSet(Consumer<GtidSet>) [abstract]"
+      ]
+    },
+    {
+      "id": "UC10",
+      "name": "Re-read Chunk on Server Identity Change",
+      "actor": "ReadReplicaDatabase",
+      "description": "In emitWindowClose: if context.hasServerIdentifierChanged() → rereadChunk(partition, offsetContext). Guards against server failover mid-snapshot.",
+      "method": "emitWindowClose checks hasServerIdentifierChanged() → rereadChunk(P, OffsetContext)"
+    },
+    {
+      "id": "UC11",
+      "name": "Stop Snapshot",
+      "actor": "Operator",
+      "description": "Signal triggers requestStopSnapshot(partition, offsetContext, additionalData, dataCollectionIds), delegates to parent AbstractIncrementalSnapshotChangeEventSource.",
+      "method": "requestStopSnapshot(P, OffsetContext, Map<String,Object>, List<String>)"
+    },
+    {
+      "id": "UC12",
+      "name": "Manage Snapshot Context State",
+      "actor": "BinlogSourceTask",
+      "description": "BinlogReadOnlyIncrementalSnapshotContext stores GTID watermarks, window state in offsets. Key operations: setLowWatermark(GtidSet), setHighWatermark(GtidSet), reachedHighWatermark(String), updateWindowState(OffsetContext), closeWindow(), watermarksChanged(), hasServerIdentifierChanged(), getCurrentGtid(OffsetContext).",
+      "class": "BinlogReadOnlyIncrementalSnapshotContext<T> extends AbstractIncrementalSnapshotContext<T>"
+    }
+  ],
+
+  "key_relationships": [
+    "BinlogReadOnlyIncrementalSnapshotChangeEventSource extends AbstractIncrementalSnapshotChangeEventSource<P, TableId>",
+    "BinlogReadOnlyIncrementalSnapshotChangeEventSource depends_on BinlogReadOnlyIncrementalSnapshotContext (via getContext())",
+    "BinlogReadOnlyIncrementalSnapshotChangeEventSource depends_on BinlogConnectorConfig (gets GtidSetFactory)",
+    "BinlogReadOnlyIncrementalSnapshotChangeEventSource depends_on EventDispatcher (sendWindowEvents, sendEvent)",
+    "BinlogReadOnlyIncrementalSnapshotContext extends AbstractIncrementalSnapshotContext<T>",
+    "BinlogReadOnlyIncrementalSnapshotContext reads GTID_KEY from BinlogSourceInfo (via OffsetContext.getSourceInfo())",
+    "BinlogSourceTask extends BaseSourceTask; validates via Snapshotter + BinlogConnectorConnection",
+    "BinlogTaskContext extends CdcSourceTaskContext<BinlogConnectorConfig>; holds Configuration + BinlogConnectorConfig",
+    "SnapshotterService composes Snapshotter + SnapshotQuery + SnapshotLock (immutable, thread-safe)",
+    "NoneSnapshotLock implements SnapshotLock; tableLockingStatement returns Optional.empty() — no lock on primary"
+  ],
+
+  "important_notes": [
+    "No table locks: NoneSnapshotLock.tableLockingStatement() returns Optional.empty(). Primary is never locked.",
+    "GTID-based windowing: low watermark captured at window open, high watermark at window close. readUntilGtidChange loops until high watermark reached.",
+    "Server identity guard: if GTID server ID changes mid-snapshot (replica failover), emitWindowClose triggers rereadChunk to ensure consistency.",
+    "Abstract design: BinlogReadOnlyIncrementalSnapshotChangeEventSource is abstract; getExecutedGtidSet(Consumer<GtidSet>) is implemented by MySQL/MariaDB subclasses.",
+    "BinlogConnectorConfig.READ_ONLY_CONNECTION field ('read.only', boolean, default=false) enables read-only replica mode.",
+    "Signal-driven: addDataCollectionNamesToSnapshot and requestStopSnapshot are invoked via signal payloads (not direct API calls).",
+    "SnapshotterService is @ThreadSafe and @Immutable for all three components (Snapshotter, SnapshotQuery, SnapshotLock)."
+  ],
+
+  "source_files_analyzed": [
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogReadOnlyIncrementalSnapshotChangeEventSource.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogReadOnlyIncrementalSnapshotContext.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogSourceTask.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogTaskContext.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogConnectorConfig.java (READ_ONLY_CONNECTION, isReadOnlyConnection)",
+    "debezium-connector-common/src/main/java/io/debezium/snapshot/SnapshotterService.java",
+    "debezium-connector-mysql/src/main/java/io/debezium/connector/mysql/snapshot/lock/NoneSnapshotLock.java",
+    "debezium-api/src/main/java/io/debezium/spi/snapshot/Snapshotter.java (interface)"
+  ]
+}

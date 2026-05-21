@@ -1,0 +1,102 @@
+{
+  "scope": "responses_websocket_session",
+  "title": "Responses WebSocket Session",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Caller",
+    "responses_websocket_session (context manager)",
+    "MultiProvider",
+    "OpenAIProvider",
+    "ResponsesWebSocketSession",
+    "Runner",
+    "OpenAIResponsesWSModel",
+    "WebSocketConnection",
+    "OpenAI Responses API (WS)"
+  ],
+  "interaction_flow": [
+    "Caller → responses_websocket_session: async with responses_websocket_session(api_key, base_url, websocket_base_url, ...)",
+    "responses_websocket_session → MultiProvider: __init__(openai_use_responses=True, openai_use_responses_websocket=True, openai_prefix_mode, ...)",
+    "responses_websocket_session → MultiProvider: .openai_provider (get shared OpenAIProvider)",
+    "responses_websocket_session → ResponsesWebSocketSession: __init__(provider=provider, run_config=RunConfig(model_provider=MultiProvider))",
+    "responses_websocket_session → ResponsesWebSocketSession: __post_init__ → _validate_provider_alignment() checks MultiProvider.openai_provider is same provider instance",
+    "responses_websocket_session → Caller: yield session",
+    "Caller → ResponsesWebSocketSession: session.run(starting_agent, input, **kwargs)  OR  session.run_streamed(...)",
+    "ResponsesWebSocketSession → ResponsesWebSocketSession: _prepare_runner_kwargs('run', kwargs) — injects run_config, raises if run_config already present",
+    "ResponsesWebSocketSession → Runner: Runner.run(starting_agent, input, run_config=RunConfig, ...)",
+    "Runner → OpenAIResponsesWSModel: get_response(system_instructions, input, model_settings, tools, output_schema, handoffs, tracing, previous_response_id, conversation_id, prompt)",
+    "OpenAIResponsesWSModel → OpenAIResponsesWSModel: _fetch_response(..., stream=False)",
+    "OpenAIResponsesWSModel → OpenAIResponsesModel: _build_response_create_kwargs(system_instructions, input, model_settings, tools, output_schema, handoffs, stream=True, ...) → create_kwargs dict",
+    "_build_response_create_kwargs → ItemHelpers: input_to_new_input_list(input)",
+    "_build_response_create_kwargs → Converter: convert_tool_choice(), convert_tools(), get_response_format(output_schema)",
+    "OpenAIResponsesWSModel → OpenAIResponsesWSModel: _iter_websocket_response_events(create_kwargs)  [async generator]",
+    "_iter_websocket_response_events → _iter_websocket_response_events: _get_websocket_request_timeouts(request_timeout) → _WebsocketRequestTimeouts(lock, connect, send, recv)",
+    "_iter_websocket_response_events → _iter_websocket_response_events: _get_ws_request_lock() → asyncio.Lock (per event loop)",
+    "_iter_websocket_response_events → _await_websocket_with_timeout: (request_lock.acquire(), timeout.lock, 'request lock wait')",
+    "_iter_websocket_response_events → _iter_websocket_response_events: _prepare_websocket_request(create_kwargs) → (frame={type:'response.create', stream:True, ...}, ws_url, handshake_headers)",
+    "_prepare_websocket_request → AsyncOpenAI: _refresh_openai_client_api_key_if_supported(client)",
+    "_prepare_websocket_request → _iter_websocket_response_events: _merge_websocket_headers(extra_headers) + _prepare_websocket_url(extra_query)",
+    "_iter_websocket_response_events → _await_websocket_with_timeout: (_ensure_websocket_connection(ws_url, headers, connect_timeout), timeout.connect, 'connect')",
+    "_ensure_websocket_connection → _ensure_websocket_connection: check cached connection reusability (_is_websocket_connection_reusable) — reuse if OPEN + same identity + same event loop",
+    "_ensure_websocket_connection → WebSocketConnection: _open_websocket_connection(ws_url, headers, connect_timeout) if not reusable",
+    "_ensure_websocket_connection → _iter_websocket_response_events: return connection",
+    "_iter_websocket_response_events → _await_websocket_with_timeout: (connection.send(json.dumps(request_frame)), timeout.send, 'send')",
+    "_await_websocket_with_timeout → WebSocketConnection: send frame to OpenAI Responses API (WS)",
+    "[loop] _iter_websocket_response_events → _await_websocket_with_timeout: (connection.recv(), timeout.recv, 'receive')",
+    "_await_websocket_with_timeout → WebSocketConnection: recv() — raw frame bytes/str from API",
+    "_iter_websocket_response_events → _iter_websocket_response_events: json.loads(frame) → payload dict",
+    "_iter_websocket_response_events → _iter_websocket_response_events: _construct_response_stream_event_from_payload(payload) → ResponseStreamEvent",
+    "_iter_websocket_response_events → _fetch_response: yield event (response.created, response.output_item.*, response.completed, etc.)",
+    "_iter_websocket_response_events → _iter_websocket_response_events: if event_type == 'error' or 'response.error' → raise ResponsesWebSocketError",
+    "_iter_websocket_response_events → _iter_websocket_response_events: if terminal event (response.completed / response.failed / response.incomplete) → return (stop loop)",
+    "_iter_websocket_response_events → _iter_websocket_response_events: finally release request_lock",
+    "[non-stream path] _fetch_response → _fetch_response: consume all events; on ResponseCompletedEvent capture event.response",
+    "_fetch_response → _fetch_response: if final_response is None after loop → raise RuntimeError",
+    "_fetch_response → OpenAIResponsesWSModel: return Response",
+    "OpenAIResponsesWSModel → get_response: return Response",
+    "get_response → Runner: return ModelResponse(output=response.output, usage=Usage(...), response_id=response.id, request_id=None)",
+    "[context exit] Caller → responses_websocket_session: __aexit__",
+    "responses_websocket_session → ResponsesWebSocketSession: session.aclose()",
+    "ResponsesWebSocketSession → MultiProvider: _validate_provider_alignment().aclose()",
+    "MultiProvider → OpenAIResponsesWSModel: close() — increments _ws_client_close_generation, drops WS connection"
+  ],
+  "key_relationships": [
+    "ResponsesWebSocketSession frozen dataclass wraps OpenAIProvider + RunConfig(MultiProvider)",
+    "OpenAIResponsesWSModel extends OpenAIResponsesModel (inherits get_response, stream_response, _build_response_create_kwargs)",
+    "OpenAIResponsesWSModel overrides _fetch_response to always use websocket (_iter_websocket_response_events), ignoring HTTP path",
+    "_iter_websocket_response_events depends_on _await_websocket_with_timeout for all network I/O phases",
+    "_iter_websocket_response_events depends_on _ensure_websocket_connection for persistent connection caching",
+    "ResponsesWebSocketSession delegates to Runner.run / Runner.run_streamed with injected RunConfig",
+    "MultiProvider routes model IDs by prefix, uses openai_prefix_mode ('alias'|'model_id') and unknown_prefix_mode"
+  ],
+  "error_handling": [
+    "TimeoutError raised per phase: 'request lock wait', 'connect', 'send', 'receive' — wraps asyncio.TimeoutError",
+    "ResponsesWebSocketError raised on error/response.error event frames",
+    "Pre-event disconnect wraps as RuntimeError with _openai_agents_ws_replay_safety='safe'|'unsafe'",
+    "Post-event (mid-stream) errors tagged _openai_agents_ws_response_started=True, replay_safety='unsafe'",
+    "On CancelledError or non-terminal GeneratorExit: force-abort connection (_force_abort_websocket_connection) + clear state",
+    "On other exceptions mid-stream: drop connection (_drop_websocket_connection)",
+    "get_retry_advice: stateful requests (previous_response_id/conversation_id) are not retried if response started"
+  ],
+  "connection_lifecycle": [
+    "Connection cached in self._ws_connection; reused across turns if URL+headers identity matches and connection.state=='OPEN'",
+    "Each request serialized via asyncio.Lock (_ws_request_lock, per event loop)",
+    "close() force-aborts if lock held mid-request; otherwise gracefully drops",
+    "_ws_client_close_generation prevents retry on stale close-triggered disconnect"
+  ],
+  "websocket_frame_format": {
+    "request_frame": {"type": "response.create", "stream": true, "model": "...", "input": "...", "tools": "...", "instructions": "..."},
+    "event_types": ["response.created", "response.output_item.added", "response.output_item.done", "response.completed", "response.failed", "response.incomplete", "response.error", "error"]
+  },
+  "important_notes": [
+    "WS transport always streams; get_response() internally consumes the stream to produce a single Response",
+    "No request_id on WS responses (no x-request-id header on WS upgrade; ModelResponse.request_id=None)",
+    "openai_use_responses=True + openai_use_responses_websocket=True required on MultiProvider",
+    "Caller must drain streamed iterators before context exits to avoid force-closing the shared WS connection",
+    "run_config must NOT be passed to session.run()/run_streamed() — session injects it automatically",
+    "openai_prefix_mode='model_id' for endpoints that expect namespaced model IDs literally"
+  ],
+  "source_files_analyzed": [
+    "src/agents/responses_websocket_session.py",
+    "src/agents/models/openai_responses.py (lines 377-897: OpenAIResponsesModel, lines 898-1480: OpenAIResponsesWSModel)"
+  ]
+}

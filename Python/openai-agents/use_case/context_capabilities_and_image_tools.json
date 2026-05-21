@@ -1,0 +1,134 @@
+{
+  "scope": "capabilities_and_image_tools",
+  "title": "Capabilities and Image Tool Execution",
+  "diagram_type": "use_case",
+  "description": "Agent uses capability-based tools (e.g., view_image) to inspect visual content inside a sandbox workspace.",
+
+  "actors": [
+    "Agent (LLM / SandboxAgent)",
+    "Filesystem Capability",
+    "ViewImageTool",
+    "BaseSandboxSession",
+    "WorkspacePathPolicy"
+  ],
+
+  "use_cases": [
+    "UC1: Configure sandbox capabilities (Capabilities.default() + optional extras)",
+    "UC2: Bind capability to sandbox session (Capability.bind(session))",
+    "UC3: Expose image tool to agent (Filesystem.tools() → [ViewImageTool, SandboxApplyPatchTool])",
+    "UC4: Invoke view_image tool with path argument",
+    "UC5: Resolve workspace path (absolute or relative)",
+    "UC6: Read image file from sandbox session",
+    "UC7: Detect image MIME type (PNG/JPEG/GIF/WEBP/BMP/TIFF/SVG)",
+    "UC8: Encode image as base64 data URL",
+    "UC9: Return ToolOutputImage to the model",
+    "UC10: Handle error — file not found",
+    "UC11: Handle error — unsupported file type",
+    "UC12: Handle error — image exceeds 10 MB size limit"
+  ],
+
+  "relationships": [
+    "Filesystem extends Capability",
+    "ViewImageTool extends FunctionTool",
+    "ViewImageTool uses BaseSandboxSession (read, _workspace_path_policy)",
+    "Filesystem composes ViewImageTool (instantiates with session + run_as user)",
+    "Filesystem composes SandboxApplyPatchTool",
+    "FilesystemToolSet bundles [ViewImageTool, SandboxApplyPatchTool]",
+    "Capabilities.default() aggregates [Filesystem, Shell, Compaction]",
+    "SandboxAgent.capabilities includes Filesystem (and optionally Skills, etc.)",
+    "UC4 includes UC5, UC6",
+    "UC6 extends UC10 (FileNotFoundError / WorkspaceReadNotFoundError)",
+    "UC6 extends UC11 (unsupported MIME)",
+    "UC6 extends UC12 (payload > 10 MB)",
+    "UC7 extends UC11 (MIME detection fails → unsupported)",
+    "UC8 depends on UC7 (MIME type required for data URL prefix)"
+  ],
+
+  "key_classes": {
+    "ViewImageTool": {
+      "parent": "FunctionTool",
+      "decorator": "@dataclass(init=False)",
+      "class_vars": {
+        "tool_name": "\"view_image\"",
+        "args_model": "ViewImageArgs",
+        "tool_description": "Loads an image from the sandbox workspace and returns it as a structured image output."
+      },
+      "instance_fields": ["session: BaseSandboxSession", "user: str | User | None"],
+      "constructor_params": ["session: BaseSandboxSession", "user: str | User | None = None", "needs_approval: bool | Callable = False"],
+      "key_methods": [
+        "_invoke(_: object, raw_input: str) -> ToolOutputImage | str",
+        "run(args: ViewImageArgs) -> ToolOutputImage | str"
+      ]
+    },
+    "ViewImageArgs": {
+      "parent": "BaseModel",
+      "fields": ["path: str (min_length=1, absolute or relative workspace path)"]
+    },
+    "Capability": {
+      "parent": "BaseModel",
+      "fields": ["type: str", "session: BaseSandboxSession | None", "run_as: User | None"],
+      "methods": ["bind(session)", "bind_run_as(user)", "tools() -> list[Tool]", "process_manifest(manifest)", "instructions(manifest) -> str | None", "sampling_params(dict) -> dict", "process_context(context) -> list", "clone() -> Capability"]
+    },
+    "Filesystem": {
+      "parent": "Capability",
+      "extra_fields": ["configure_tools: FilesystemToolConfigurator | None"],
+      "tools_method": "instantiates FilesystemToolSet(view_image=ViewImageTool(session, user=run_as), apply_patch=SandboxApplyPatchTool(session, user=run_as))"
+    },
+    "Capabilities": {
+      "methods": ["default() -> [Filesystem(), Shell(), Compaction()]"]
+    },
+    "FilesystemToolSet": {
+      "fields": ["view_image: ViewImageTool", "apply_patch: SandboxApplyPatchTool"]
+    }
+  },
+
+  "tool_execution_flow": [
+    "1. Agent calls view_image({\"path\": \"images/dot.png\"})",
+    "2. ViewImageTool._invoke() → parses JSON → ViewImageArgs",
+    "3. ViewImageTool.run(args) resolves path via session._workspace_path_policy()",
+    "4. session.read(resolved_path, user=self.user) → file_obj (io.BytesIO)",
+    "5. payload = file_obj.read(_MAX_IMAGE_BYTES + 1)",
+    "6. _coerce_payload_bytes(payload) → bytes",
+    "7. Guard: len(payload) > 10MB → return error string",
+    "8. _detect_image_mime_type(resolved_path, payload) → mime_type | None",
+    "9. Guard: mime_type is None → return error string",
+    "10. _encode_data_url(mime_type, payload) → 'data:image/png;base64,...'",
+    "11. return ToolOutputImage(image_url=data_url) to model"
+  ],
+
+  "error_cases": [
+    "FileNotFoundError | WorkspaceReadNotFoundError → 'image path `{display_path}` was not found'",
+    "General read exception → 'unable to read image at `{display_path}`: {ExcType}'",
+    "TypeError from _coerce_payload_bytes → 'unable to read image at ...: {exc}'",
+    "len(payload) > 10MB → 'image path ... exceeded the allowed size of 10MB; resize or compress ...'",
+    "MIME detection failure → 'image path ... is not a supported image file'"
+  ],
+
+  "supported_mime_types": ["image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp", "image/tiff", "image/svg+xml", "fallback via mimetypes.guess_type"],
+
+  "security_notes": [
+    "Error messages use relative display_path, never provider-internal absolute paths",
+    "needs_approval callback can gate tool calls on path patterns (e.g., 'sensitive/' prefix)",
+    "user identity propagated from capability.run_as → session.read(user=...)"
+  ],
+
+  "integration_context": [
+    "Filesystem capability included in Capabilities.default()",
+    "SandboxAgent sets capabilities=[...] at construction time",
+    "At run time, Runner binds session to each capability via capability.bind(session)",
+    "Capability.tools() is called to generate the live tool list for the model",
+    "view_image tool name appears in SandboxAgent instructions as a callable tool"
+  ],
+
+  "source_files_analyzed": [
+    "src/agents/sandbox/capabilities/tools/view_image.py",
+    "src/agents/sandbox/capabilities/capability.py",
+    "src/agents/sandbox/capabilities/capabilities.py",
+    "src/agents/sandbox/capabilities/filesystem.py",
+    "src/agents/sandbox/capabilities/tools/__init__.py",
+    "tests/sandbox/capabilities/test_view_image_tool.py",
+    "examples/sandbox/sandbox_agent_capabilities.py",
+    "docs/sandbox_agents.md",
+    "docs/tools.md"
+  ]
+}

@@ -1,0 +1,184 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+}
+skinparam noteBackgroundColor #FFF9C4
+skinparam noteBorderColor #F9A825
+
+title Package Alias Resolution
+
+actor Caller as caller
+participant "PoolBuilder" as pb
+participant "Request" as req
+participant "Repository" as repo
+participant "BasePackage" as base
+participant "AliasPackage /\nCompleteAliasPackage" as alias
+participant "VersionParser" as vp
+participant "CompilingMatcher" as cm
+participant "EventDispatcher" as ed
+participant "Pool" as pool
+
+== Pool Build Initialization ==
+
+caller -> pb : buildPool(repositories[], request)
+activate pb
+
+pb -> req : getRestrictedPackages()
+activate req
+req --> pb : restrictedPackagesList[]
+deactivate req
+
+pb -> req : getUpdateAllowList()
+activate req
+req --> pb : updateAllowList[]
+deactivate req
+
+note over pb : Lock packages not in allowList\n(if allowList is non-empty)
+
+pb -> req : getFixedOrLockedPackages()
+activate req
+req --> pb : lockedPackages[]
+deactivate req
+
+loop for each locked package
+    pb -> pb : loadPackage(request, repos, package, propagateUpdate=false)
+end
+
+pb -> req : getRequires()
+activate req
+req --> pb : packagesToLoad[]
+deactivate req
+
+== Package Loading Loop ==
+
+loop while packagesToLoad is not empty
+    pb -> pb : loadPackagesMarkedForLoading(request, repositories)
+    activate pb
+
+    pb -> repo : loadPackages(batch[50], acceptableStabilities, stabilityFlags, loadedPerRepo)
+    activate repo
+    repo --> pb : {packages[], namesFound[]}
+    deactivate repo
+
+    loop for each loaded package
+        pb -> pb : loadPackage(request, repos, package, propagateUpdate)
+        activate pb
+
+        pb -> base : (store) packages[index] = package
+        note over pb : If instanceof AliasPackage:\n  aliasMap[hash(getAliasOf())][index] = package
+
+        == Root Alias Check ==
+
+        opt propagateUpdate AND rootAliases[name][version] exists
+            note over pb : Unwrap existing AliasPackage first\nvia getAliasOf() to get true base
+
+            alt package instanceof AliasPackage
+                pb -> base : getAliasOf()
+                activate base
+                base --> pb : basePackage
+                deactivate base
+            else package is BasePackage
+                note over pb : basePackage = package (as-is)
+            end
+
+            alt basePackage instanceof CompletePackage
+                pb -> alias : new CompleteAliasPackage(basePackage, alias_normalized, alias)
+            else
+                pb -> alias : new AliasPackage(basePackage, alias_normalized, alias)
+            end
+            activate alias
+
+            alias -> alias : parent::__construct(aliasOf->getName())
+            alias -> vp : parseStability(version)
+            activate vp
+            vp --> alias : stability
+            deactivate vp
+
+            loop for each Link::TYPE (requires, devRequires, conflicts, provides, replaces)
+                alias -> alias : replaceSelfVersionDependencies(links, type)
+                note over alias : Replace 'self.version' constraints\nwith Constraint('=', this->version)\nFor CONFLICT/PROVIDE/REPLACE: keep both\nFor REQUIRE: replace original, set hasSelfVersionRequires=true
+            end
+
+            alias --> pb : aliasPackage
+            deactivate alias
+
+            pb -> alias : setRootPackageAlias(true)
+            pb -> base : (store) packages[newIndex] = aliasPackage
+            note over pb : aliasMap[hash(aliasPackage.getAliasOf())][newIndex] = aliasPackage
+        end
+
+        pb -> base : getRequires()
+        activate base
+        base --> pb : requires[]
+        deactivate base
+
+        loop for each required name
+            pb -> pb : markPackageNameForLoading(request, requireName, constraint)
+        end
+
+        deactivate pb
+    end
+
+    deactivate pb
+end
+
+== Temporary Constraints Filter ==
+
+note over pb : Apply temporaryConstraints to prune candidates
+
+loop for each package where NOT instanceof AliasPackage
+    pb -> cm : match(constraint, OP_EQ, package.version)
+    activate cm
+    cm --> pb : matched?
+    deactivate cm
+
+    pb -> pb : collect aliases via aliasMap[hash(package)]
+
+    loop for each alias version
+        pb -> cm : match(constraint, OP_EQ, aliasVersion)
+        activate cm
+        cm --> pb : matched?
+        deactivate cm
+    end
+
+    opt NO version matched (package + all aliases)
+        pb -> pb : unset packages[index] for package and all aliases
+        note over pb : Entire package+alias group removed\nfrom candidate pool
+    end
+end
+
+== Pool Creation ==
+
+pb -> ed : dispatch(PRE_POOL_CREATE, event{packages, rootAliases, ...})
+activate ed
+ed --> pb : event->getPackages() → updated packages list
+deactivate ed
+
+pb -> pool : new Pool(packages[], unacceptableFixedOrLockedPackages[])
+activate pool
+note over pool : setPackages: assign sequential IDs 1..N\nIndex by name: packageByName[name][] = package\n(aliases appear as first-class entries)
+pool --> pb : pool instance
+deactivate pool
+
+pb -> pb : runSecurityAdvisoryFilter(pool, repos, request)
+pb -> pb : runFilterListFilter(pool, repos, request)
+pb -> pb : optimize(request, pool) via PoolOptimizer
+
+pb --> caller : return Pool
+deactivate pb
+
+@enduml

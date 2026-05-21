@@ -1,0 +1,204 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #495057
+    LifeLineBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    ActorBorderColor #495057
+    ActorBackgroundColor #E9ECEF
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Connector Configuration Validation Flow
+
+actor "Kafka Connect\nRuntime" as KafkaConnect
+
+participant "Connector\n(Binlog/MongoDB/JdbcSink)" as Connector
+
+participant "ConnectorConfig\n(BinlogConnectorConfig\nMongoDbConnectorConfig\nJdbcSinkConnectorConfig)" as ConnectorConfig
+
+participant "CommonConnectorConfig\n/ Configuration" as Configuration
+
+participant "Field.Set\n(ALL_FIELDS)" as FieldSet
+
+participant "Field" as Field
+
+participant "Field.Validator\n(type + custom)" as Validator
+
+participant "ConfigValue /\nValidationOutput" as ConfigValue
+
+== Path 1: Kafka Connect Pre-flight Validation (validate()) ==
+
+KafkaConnect -> Connector : validate(Map<String,String> connectorConfigs)
+activate Connector
+
+Connector -> Configuration : validate(ALL_FIELDS, configMap)
+activate Configuration
+
+Configuration -> FieldSet : build Map<fieldName, ConfigValue>\n(one ConfigValue per field)
+activate FieldSet
+FieldSet --> Configuration : fieldConfigValueMap
+deactivate FieldSet
+
+Configuration -> FieldSet : forEachMissingDependent(missing ->\n  configValue.addErrorMessage("missing required dep"))
+activate FieldSet
+FieldSet --> Configuration : (dependent errors recorded)
+deactivate FieldSet
+
+loop for each top-level field in ALL_FIELDS
+    Configuration -> Field : field.validate(config, fields::fieldWithName,\n  configValuesByFieldName)
+    activate Field
+
+    Field -> Validator : typeValidator.validate(config, field, problems)\n[auto-assigned per Kafka Type]
+    activate Validator
+    Validator -> ConfigValue : addErrorMessage(problem)\n[only if type mismatch]
+    activate ConfigValue
+    ConfigValue --> Validator : (error accumulated)
+    deactivate ConfigValue
+    Validator --> Field : errorCount
+    deactivate Validator
+
+    alt custom validator registered (withValidation)
+        Field -> Validator : customValidator.validate(config, field, problems)\n[e.g. validateTopicName, validateTableExcludeList]
+        activate Validator
+        Validator -> ConfigValue : addErrorMessage(problem)\n[only if constraint violated]
+        activate ConfigValue
+        ConfigValue --> Validator : (error accumulated)
+        deactivate ConfigValue
+        Validator --> Field : errorCount
+        deactivate Validator
+    end
+
+    Field -> Field : recursively validate dependents\n(driven by parent field's current value)
+
+    Field --> Configuration : total error count
+    deactivate Field
+end
+
+Configuration --> Connector : Map<String, ConfigValue>
+deactivate Configuration
+
+Connector --> KafkaConnect : Map<String, ConfigValue>
+deactivate Connector
+
+alt ConfigValue entries contain errorMessages
+    note over KafkaConnect : Connector REJECTED\nKafka Connect UI displays\nper-field error messages
+else all ConfigValue.errorMessages empty
+    note over KafkaConnect : Connector ACCEPTED\n(valid configuration)
+end
+
+|||
+
+== Path 2: Start-time Validation (Connector.start()) ==
+
+KafkaConnect -> Connector : start(Map<String,String> configMap)
+activate Connector
+
+Connector -> ConnectorConfig : new ConnectorConfig(configMap)\n[builds typed config object]
+activate ConnectorConfig
+ConnectorConfig --> Connector : connectorConfig instance
+deactivate ConnectorConfig
+
+Connector -> Configuration : connectorConfig.validateAndRecord(\n  ALL_FIELDS, LOGGER::error)
+activate Configuration
+
+note right of Configuration
+  validateAndRecord() wraps validate()
+  with a ValidationOutput that formats
+  each problem as:
+  "The '{field}' value '{val}' is invalid: {problem}"
+  and passes it to Consumer<String>
+  (e.g. LOGGER::error)
+end note
+
+Configuration -> Configuration : validate(fields, (f,v,problem) ->\n  consumer.accept(formatted message))
+activate Configuration
+
+loop for each top-level field
+    Configuration -> Field : field.validate(config, problems)
+    activate Field
+    Field -> Validator : typeValidator.validate(config, field, problems)
+    activate Validator
+    Validator -> ConfigValue : problems.accept(field, value, problemMessage)\n[ValidationOutput callback]
+    activate ConfigValue
+    ConfigValue --> Validator : (error logged via LOGGER::error)
+    deactivate ConfigValue
+    Validator --> Field : errorCount
+    deactivate Validator
+    Field -> Validator : customValidator.validate(config, field, problems)
+    activate Validator
+    Validator -> ConfigValue : problems.accept(field, value, problemMessage)
+    activate ConfigValue
+    ConfigValue --> Validator : (error logged)
+    deactivate ConfigValue
+    Validator --> Field : errorCount
+    deactivate Validator
+    Field --> Configuration : total errors for field
+    deactivate Field
+end
+
+Configuration --> Configuration : return false if any errors
+deactivate Configuration
+
+Configuration --> Connector : boolean valid
+deactivate Configuration
+
+alt valid == false
+    Connector -> Connector : throw ConnectException(\n  "Error configuring connector;\n   check the logs for details")
+    note over Connector : Connector FAILS TO START\nAll errors already logged
+else valid == true
+    note over Connector : Connector STARTS SUCCESSFULLY
+end
+
+deactivate Connector
+
+|||
+
+== Path 3: JdbcSink Additional Validation ==
+
+KafkaConnect -> Connector : start(Map<String,String> configMap)\n[JdbcSinkConnector]
+activate Connector
+
+Connector -> ConnectorConfig : new JdbcSinkConnectorConfig(configMap)
+activate ConnectorConfig
+ConnectorConfig -> Configuration : config.validateAndRecord(ALL_FIELDS, LOGGER::error)
+activate Configuration
+Configuration --> ConnectorConfig : boolean valid
+deactivate Configuration
+
+alt valid == false
+    ConnectorConfig -> Connector : throw ConnectException("Invalid config")
+else
+    ConnectorConfig -> ConnectorConfig : check: column.exclude.list AND\n  column.include.list both defined?
+    alt both include + exclude lists defined
+        ConnectorConfig -> Connector : throw ConnectException(\n  "Cannot define both column.exclude.list\n   and column.include.list")
+    else configuration is clean
+        ConnectorConfig --> Connector : validated config object
+    end
+end
+deactivate ConnectorConfig
+
+deactivate Connector
+
+@enduml

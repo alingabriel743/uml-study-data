@@ -1,0 +1,316 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #6C757D
+}
+
+title JDBC Sink Connector Write Flow
+
+actor "Kafka Connect\nFramework" as KafkaConnect
+
+participant "JdbcSinkConnectorTask" as Task
+participant "JdbcSinkConnectorConfig" as Config
+participant "SessionFactory" as SF
+participant "DatabaseDialectResolver" as DialectResolver
+participant "JdbcChangeEventSink" as Sink
+participant "JdbcKafkaSinkRecord" as SinkRecord
+participant "CollectionNamingStrategy" as NamingStrategy
+participant "DatabaseDialect" as Dialect
+participant "Buffer\n(RecordBuffer /\nReducedRecordBuffer)" as Buffer
+participant "RecordWriter\n(DefaultRecordWriter)" as Writer
+participant "HibernateSession\n(StatelessSession)" as Session
+participant "PreparedStatement" as PS
+
+== Connector Initialization ==
+
+KafkaConnect -> Task : start(Map<String,String> props)
+activate Task
+
+Task -> Config : new JdbcSinkConnectorConfig(props)
+activate Config
+note right of Config
+  Validates:
+  • insertMode (INSERT / UPSERT / UPDATE)
+  • deleteEnabled, truncateEnabled
+  • batchSize, flushMaxRetries
+  • primaryKeyMode + primaryKeyFields
+  • schemaEvolutionMode (NONE / BASIC)
+end note
+Config --> Task : config
+deactivate Config
+
+Task -> SF : config.getHibernateConfiguration()\n       .buildSessionFactory()
+activate SF
+SF --> Task : sessionFactory
+deactivate SF
+
+Task -> DialectResolver : resolve(config, sessionFactory)
+activate DialectResolver
+DialectResolver --> Task : DatabaseDialect
+deactivate DialectResolver
+
+Task -> Task : createRecordWriter()\n[UnnestRecordWriter if postgresUnnestInsert,\n else DefaultRecordWriter]
+
+Task -> Sink : new JdbcChangeEventSink(\n  config, session, dialect,\n  recordWriter, connectorContext)
+activate Sink
+Sink --> Task : sink
+deactivate Sink
+
+deactivate Task
+
+== Record Write: put() Entry Point ==
+
+KafkaConnect -> Task : put(Collection<SinkRecord> records)
+activate Task
+
+Task -> Sink : execute(records)
+activate Sink
+
+loop for each SinkRecord in records
+
+    Sink -> SinkRecord : new JdbcKafkaSinkRecord(kafkaSinkRecord, config)
+    activate SinkRecord
+    SinkRecord --> Sink : jdbcSinkRecord
+    deactivate SinkRecord
+
+    alt isSchemaChange()
+        Sink -> Sink : skip record\n[log warning — DDL events ignored]
+
+    else isTruncate() and truncateEnabled
+        Sink -> Sink : flushBuffers(upsertBufferByTable)
+        Sink -> Sink : flushBuffers(deleteBufferByTable)
+        Sink -> Writer : checkAndApplyTableChangesIfNeeded(\n  collectionId, record) → TableDescriptor
+        activate Writer
+        Writer --> Sink : tableDescriptor
+        deactivate Writer
+        Sink -> Writer : writeTruncate(collectionId)
+        activate Writer
+        note right of Writer : TRUNCATE TABLE <table>;\ncommit immediately
+        Writer --> Sink
+        deactivate Writer
+
+    else isDelete() or isTombstone() and deleteEnabled
+
+        Sink -> NamingStrategy : resolveCollectionName(\n  record, collectionNameFormat)
+        activate NamingStrategy
+        NamingStrategy --> Sink : tableName
+        deactivate NamingStrategy
+
+        Sink -> Dialect : getCollectionId(tableName)
+        activate Dialect
+        Dialect --> Sink : collectionId
+        deactivate Dialect
+
+        note over Sink : If upsert buffer non-empty for this table:\nflush or remove conflicting record first
+        Sink -> Buffer : deleteBuffer.add(record)
+        activate Buffer
+        Buffer --> Sink : recordsToFlush (when batchSize reached)
+        deactivate Buffer
+
+        opt batchSize reached
+            Sink -> Sink : flushBufferWithRetries(\n  collectionId, toFlush, tableDescriptor)
+        end
+
+    else INSERT / UPDATE (default upsert path)
+
+        Sink -> NamingStrategy : resolveCollectionName(\n  record, collectionNameFormat)
+        activate NamingStrategy
+        NamingStrategy --> Sink : tableName
+        deactivate NamingStrategy
+
+        Sink -> Dialect : getCollectionId(tableName)
+        activate Dialect
+        Dialect --> Sink : collectionId
+        deactivate Dialect
+
+        note over Sink : If delete buffer non-empty for this table:\nflush or remove conflicting record first
+
+        Sink -> Writer : checkAndApplyTableChangesIfNeeded(\n  collectionId, record)
+        activate Writer
+        note right of Writer
+          schemaEvolutionMode=BASIC:
+          • CREATE TABLE if not exists
+          • ALTER TABLE ADD COLUMN for new fields
+        end note
+        Writer --> Sink : tableDescriptor
+        deactivate Writer
+
+        Sink -> Dialect : resolveMissingFields(\n  record, tableDescriptor)
+        activate Dialect
+        Dialect --> Sink : (schema OK or fields resolved)
+        deactivate Dialect
+
+        Sink -> Buffer : upsertBuffer.add(record)
+        activate Buffer
+        Buffer --> Sink : recordsToFlush (when batchSize reached)
+        deactivate Buffer
+
+        opt batchSize reached
+            Sink -> Sink : flushBufferWithRetries(\n  collectionId, toFlush, tableDescriptor)
+        end
+    end
+
+end
+
+== Final Flush (End of Batch) ==
+
+Sink -> Sink : flushBuffers(upsertBufferByTable)
+Sink -> Sink : flushBuffers(deleteBufferByTable)
+
+deactivate Sink
+Task --> KafkaConnect
+deactivate Task
+
+== Flush Pipeline (executeWithRetries) ==
+
+note over Sink, Writer
+  executeWithRetries() wraps each flush call.
+  Up to flushMaxRetries (default 5) attempts,
+  flushRetryDelayMs (default 1000ms) between tries.
+  Retries only on retriable communication exceptions.
+end note
+
+activate Sink
+Sink -> Writer : executeWithRetries('flush records',\n  () -> flushBuffer())
+activate Writer
+
+Writer -> Writer : write(tableDescriptor,\n  List<JdbcSinkRecord> records)
+Writer -> Writer : getSqlStatementInfo(table, records)
+
+alt insertMode = DELETE
+    Writer -> Dialect : getDeleteStatement(table, record)
+    activate Dialect
+    Dialect --> Writer : sql (DELETE WHERE pk=?)
+    deactivate Dialect
+else insertMode = INSERT
+    Writer -> Dialect : getBatchInsertStatement() /\ngetInsertStatement(table, record)
+    activate Dialect
+    Dialect --> Writer : sql (INSERT INTO ...)
+    deactivate Dialect
+else insertMode = UPSERT
+    Writer -> Dialect : getBatchUpsertStatement() /\ngetUpsertStatement(table, record)
+    activate Dialect
+    Dialect --> Writer : sql (INSERT ... ON CONFLICT DO UPDATE)
+    deactivate Dialect
+else insertMode = UPDATE
+    Writer -> Dialect : getUpdateStatement(table, record)
+    activate Dialect
+    Dialect --> Writer : sql (UPDATE ... SET ... WHERE pk=?)
+    deactivate Dialect
+end
+
+Writer -> Session : beginTransaction()
+activate Session
+Session --> Writer : transaction
+deactivate Session
+
+Writer -> Session : doWork(processBatch(statementInfo, records))
+activate Session
+
+Session -> PS : prepareStatement(sql)
+activate PS
+PS --> Session : preparedStatement
+deactivate PS
+
+Session -> Session : QueryBinderResolver\n.resolve(preparedStatement) → QueryBinder
+
+loop for each JdbcSinkRecord
+
+    alt DELETE
+        Session -> Dialect : bindKeyValuesToQuery(\n  record, queryBinder, startIndex=1)
+        activate Dialect
+        Dialect --> Session : List<ValueBindDescriptor>
+        deactivate Dialect
+    else INSERT / UPSERT
+        Session -> Dialect : bindKeyValuesToQuery(record, queryBinder)
+        activate Dialect
+        Dialect --> Session
+        deactivate Dialect
+        Session -> Dialect : bindNonKeyValuesToQuery(record, queryBinder)
+        activate Dialect
+        Dialect --> Session
+        deactivate Dialect
+    else UPDATE
+        Session -> Dialect : bindNonKeyValuesToQuery(record, queryBinder)
+        activate Dialect
+        Dialect --> Session
+        deactivate Dialect
+        Session -> Dialect : bindKeyValuesToQuery(record, queryBinder)
+        activate Dialect
+        Dialect --> Session
+        deactivate Dialect
+    end
+
+    Session -> PS : addBatch()
+    activate PS
+    PS --> Session
+    deactivate PS
+
+end
+
+Session -> PS : executeBatch()
+activate PS
+PS --> Session : int[] batchResult
+deactivate PS
+
+alt any result = EXECUTE_FAILED
+    Session -> Session : throw BatchUpdateException
+end
+
+Session --> Writer : (batch executed)
+deactivate Session
+
+alt success
+    Writer -> Session : transaction.commit()
+    activate Session
+    Session --> Writer : committed
+    deactivate Session
+else exception
+    Writer -> Session : transaction.rollback()
+    activate Session
+    Session --> Writer : rolled back
+    deactivate Session
+    Writer -> Writer : rethrow (triggers retry logic)
+end
+
+Writer --> Sink
+deactivate Writer
+deactivate Sink
+
+== Offset Commit ==
+
+KafkaConnect -> Task : preCommit(currentOffsets)
+activate Task
+Task -> Task : flush(flushedOffsets)\n[markProcessed() advances offset+1\n markNotProcessed() rewinds on failure]
+Task --> KafkaConnect : committedOffsets
+deactivate Task
+
+@enduml

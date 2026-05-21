@@ -1,0 +1,284 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #DEE2E6
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam note {
+    BackgroundColor #FFF3CD
+    BorderColor #856404
+    FontColor #212529
+}
+
+title Network Server Management
+
+' ==============================
+' 1. SERVER STARTUP
+' ==============================
+|ServerControl|
+start
+:setup(args);
+:Initialize Logger, Formatter\nTime.deltaProvider;
+:registerCommands();
+:Register Event Listeners\n(GameOverEvent, WorldLoadEvent,\nTrigger.update, PlayEvent);
+:Schedule periodic save every 60s\nadmins.forceSave() + Core.settings.forceSave();
+:toggleSocket(Config.socketInput);
+
+|NetServer|
+:Register packet handlers\n(Connect, ConnectPacket, Disconnect);
+
+|ServerControl|
+:On ServerLoadEvent:\nStart stdin input thread;
+
+note right
+  **Server Loaded**
+  Runtime event loops begin:
+  connection handling · command
+  processing · world sync · autosave
+end note
+
+' ==============================
+' 2. PLAYER CONNECTION VALIDATION
+' ==============================
+
+|NetServer|
+:<<event>> Receive Connect packet;
+if (IP Banned or Subnet Banned?) then (yes)
+  #FFCCCC:con.kick(KickReason.banned);
+  detach
+else (no)
+endif
+:Receive ConnectPacket;
+if (con.kicked — already terminated?) then (yes)
+  #FFCCCC:Return — skip processing;
+  detach
+else (no)
+endif
+if (Steam address?) then (yes)
+  :Override uuid from Steam address;
+else (no)
+endif
+
+|Administration|
+if (isIDBanned(uuid) or isNameBanned(name)?) then (yes)
+  #FFCCCC:kick(KickReason.banned);
+  detach
+else (no)
+endif
+if (getKickTime(uuid, ip) > Time.millis()?) then (yes)
+  #FFCCCC:kick(KickReason.recentKick);
+  detach
+else (no)
+endif
+if (playerLimit exceeded and not admin?) then (yes)
+  #FFCCCC:kick(KickReason.playerLimit);
+  detach
+else (no)
+endif
+if (Mod incompatibility detected?) then (yes)
+  #FFCCCC:kick with incompatibility detail message;
+  detach
+else (no)
+endif
+if (Not isWhitelisted(uuid, usid)?) then (yes)
+  :Save player info via Call.infoMessage;
+  #FFCCCC:kick(KickReason.whitelist);
+  detach
+else (no)
+endif
+if (Version or client type mismatch?) then (yes)
+  #FFCCCC:kick(typeMismatch / customClient /\nserverOutdated / clientOutdated);
+  detach
+else (no)
+endif
+if (Strict mode: duplicate name or uuid/usid?) then (yes)
+  #FFCCCC:kick(nameInUse / idInUse);
+  detach
+else (no)
+endif
+if (Name empty after fixName(packet.name)?) then (yes)
+  #FFCCCC:kick(KickReason.nameEmpty);
+  detach
+else (no)
+endif
+
+|NetServer|
+:admins.updatePlayerJoined(uuid, ip, name);
+:Player.create()\nAssign admin status, team, name, locale, color;
+:sendWorldData(player)\nNetworkIO.writeWorld → DeflaterOutputStream\n→ player.con.sendStream(WorldStream);
+:Events.fire(PlayerConnect(player));
+:connectConfirm(player) [Remote call from client\nafter world data received];
+:player.add();
+:Events.fire(PlayerConnectionConfirmed)\ncon.hasConnected = true;
+if (showConnectMessages?) then (yes)
+  :Call.sendMessage("[player] has connected");
+else (no)
+endif
+if (MOTD != "off"?) then (yes)
+  :player.sendMessage(Config.motd.string());
+else (no)
+endif
+#CCFFCC:Events.fire(PlayerJoin(player));
+
+' ==============================
+' 3. SERVER COMMAND PROCESSING
+' ==============================
+
+|ServerControl|
+:Read command line\n(stdin thread or TCP socket input);
+:Core.app.post(() → handleCommandString(line));
+
+|CommandHandler|
+:handler.handleMessage(line) — dispatch to registered command;
+if (host [map] [mode]?) then (yes)
+  :logic.reset()\nworld.loadMap(map, mode)\nlogic.play() + netServer.openServer();
+elseif (stop?) then (yes)
+  :net.closeServer()\ncancelPlayTask()\nstate.set(State.menu);
+elseif (kick <name>?) then (yes)
+  :player.kick(KickReason.kick);
+elseif (ban <type> <target>?) then (yes)
+  :admins.banPlayerID / banPlayerIP / banPlayer\nKick all newly-banned connected players;
+elseif (unban <ip/id>?) then (yes)
+  :admins.unbanPlayerIP / unbanPlayerID;
+elseif (admin add/remove <id>?) then (yes)
+  :admins.adminPlayer / unAdminPlayer\nUpdate player.admin flag live;
+elseif (whitelist add/remove?) then (yes)
+  :admins.whitelist / unwhitelist(id);
+elseif (config [name] [value]?) then (yes)
+  :Config.set(value)\nCore.settings.forceSave();
+elseif (say <message>?) then (yes)
+  :Call.sendMessage("[Server]: message");
+elseif (save / load / loadautosave?) then (yes)
+  :SaveIO.save / load(file)\nnetServer.openServer();
+elseif (gameover?) then (yes)
+  :Events.fire(GameOverEvent);
+elseif (pause on/off?) then (yes)
+  :state.set(State.paused / State.playing);
+elseif (runwave?) then (yes)
+  :logic.runWave();
+else (subnet-ban / name-ban / dos-ban\nplayerlimit / etc.)
+  :Execute specialised admin command\nUpdate admins record + apply to live players;
+endif
+
+' ==============================
+' 4. ADMIN ACTION ENFORCEMENT
+' ==============================
+
+|NetServer|
+:adminRequest(player, other, action)\n[Remote call from in-game client];
+if (!player.admin and !player.isLocal?) then (yes)
+  #FFCCCC:Log "ACCESS DENIED" warning → return;
+  detach
+else (no)
+endif
+if (other == null or\n(other.admin and !isLocal)?) then (yes)
+  #FFCCCC:Log warning and return;
+  detach
+else (no)
+endif
+:Events.fire(AdminRequestEvent);
+|Administration|
+if (action == ban?) then (yes)
+  :admins.banPlayerID(uuid)\nadmins.banPlayerIP(address)\nother.kick(KickReason.banned);
+elseif (action == kick?) then (yes)
+  :other.kick(KickReason.kick);
+elseif (action == wave?) then (yes)
+  :logic.skipWave();
+elseif (action == trace?) then (yes)
+  :admins.getInfo(uuid)\nBuild TraceInfo object\nCall.traceInfo(player.con, other, info);
+else (switchTeam)
+  :other.team(newTeam);
+endif
+
+' ==============================
+' 5. WORLD STATE BROADCAST (SYNC)
+' ==============================
+
+|NetServer|
+:update() — invoked each game frame;
+if (state.isGame() and net.server()?) then (yes)
+  if (PvP: fewer than 2 teams have players?) then (yes)
+    :Auto-pause game;
+  else (no)
+    :sync();
+    fork
+      :writeBlockSnapshots()\nCall.blockSnapshot(sent, bytes)\nfor each synced building;
+    fork again
+      :For each connected player:\nwriteEntitySnapshot(player)\nCall.entitySnapshot(con, snapshotID);
+    end fork
+    if (healthSyncTime interval reached?) then (yes)
+      :Call.buildHealthUpdate\nfor buildings with changed health;
+    else (no)
+    endif
+    if (planPreviewSyncTime reached?) then (yes)
+      :Sync client build plan\npreviews between players;
+    else (no)
+    endif
+    if (blockSyncTime interval reached?) then (yes)
+      :Full block sync broadcast;
+    else (no)
+    endif
+  endif
+else (no)
+endif
+
+' ==============================
+' 6. AUTOSAVE & AUTO-PAUSE
+' ==============================
+
+|ServerControl|
+:Trigger.update event fires each frame;
+if (state.isPlaying() and Config.autosave?) then (yes)
+  if (autosaveCount spacing interval reached?) then (yes)
+    :Find existing auto_ saves\nDelete oldest if count >= autosaveAmount;
+    :fileName = "auto_<map>_<date>.msav";
+    :SaveIO.save(file);
+    :Log "Autosave completed";
+  else (no)
+  endif
+else (no)
+endif
+if (Config.autoPause enabled?) then (yes)
+  if (No players currently online?) then (yes)
+    :state.set(State.paused)\nautoPaused = true;
+  elseif (autoPaused and players have joined?) then (yes)
+    :state.set(State.playing)\nautoPaused = false;
+  else (no)
+  endif
+else (no)
+endif
+
+' ==============================
+' 7. GAME OVER / MAP ROTATION
+' ==============================
+
+:Events.on(GameOverEvent)\ngameOverListener invoked;
+:Log game-over info (wave count / winner team);
+:maps.getNextMap(lastMode, state.map);
+if (Next map found?) then (yes)
+  :Call.infoMessage(winner + next map details);
+  :state.gameOver = true\nCall.updateGameOver(winner);
+  :play(() →\nworld.loadMap(nextMap, nextMap.applyRules(lastMode)));
+else (no map available)
+  :netServer.kickAll(KickReason.gameover);
+  :net.closeServer()\nstate.set(State.menu);
+endif
+
+stop
+
+@enduml

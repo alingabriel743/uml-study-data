@@ -1,0 +1,107 @@
+{
+  "scope": "guardrail_processing_flow",
+  "title": "Guardrail Processing Flow",
+  "diagram_type": "activity",
+  "description": "Safety guardrail checks on prompts and video outputs: running text and video guardrails with optional offloading",
+
+  "key_actors": [
+    "BaseWorldGenerationPipeline",
+    "guardrail_presets (module)",
+    "GuardrailRunner",
+    "Blocklist",
+    "LlamaGuard3",
+    "VideoContentSafetyFilter",
+    "RetinaFaceFilter"
+  ],
+
+  "initialization_flow": [
+    "START: __init__ called with disable_guardrail, offload_guardrail_models, has_text_input flags",
+    "DECISION: disable_guardrail == True? → SKIP all guardrail loading → END init path",
+    "DECISION: offload_guardrail_models == True? → SKIP eager loading (load lazily at runtime) → END init path",
+    "DECISION: has_text_input == True? → _load_text_guardrail() → GuardrailRunner([Blocklist, LlamaGuard3])",
+    "_load_video_guardrail() → GuardrailRunner([VideoContentSafetyFilter], postprocessors=[RetinaFaceFilter])"
+  ],
+
+  "prompt_guardrail_flow": [
+    "START: _run_guardrail_on_prompt_with_offload(prompt: str)",
+    "DECISION: offload_guardrail_models == True? → YES: _load_text_guardrail() (lazy load)",
+    "CALL: _run_guardrail_on_prompt(prompt)",
+    "  → guardrail_presets.run_text_guardrail(prompt, self.text_guardrail)",
+    "    → GuardrailRunner.run_safety_check(prompt)",
+    "      → Blocklist.check(prompt): returns (is_safe, message)",
+    "      → LlamaGuard3.check(prompt): returns (is_safe, message)",
+    "    → is_safe == False? → log.critical('GUARDRAIL BLOCKED: {message}') → return False",
+    "    → is_safe == True? → return True",
+    "DECISION: offload_guardrail_models == True? → YES: _offload_guardrail_models() (del, gc, cuda empty_cache)",
+    "RETURN: is_safe (bool)"
+  ],
+
+  "video_guardrail_flow": [
+    "START: _run_guardrail_on_video_with_offload(video: np.ndarray)",
+    "DECISION: offload_guardrail_models == True? → YES: _load_video_guardrail() (lazy load)",
+    "CALL: _run_guardrail_on_video(video)",
+    "  → guardrail_presets.run_video_guardrail(video, self.video_guardrail)",
+    "    → GuardrailRunner.run_safety_check(video)",
+    "      → VideoContentSafetyFilter.check(video): returns (is_safe, message)",
+    "    → is_safe == False? → log.critical('GUARDRAIL BLOCKED: {message}') → return None",
+    "    → is_safe == True? → GuardrailRunner.postprocess(video)",
+    "      → RetinaFaceFilter.process(video): blur detected faces",
+    "      → return processed_frames",
+    "DECISION: offload_guardrail_models == True? → YES: _offload_guardrail_models() (del, gc, cuda empty_cache)",
+    "RETURN: video (np.ndarray) or None if blocked"
+  ],
+
+  "offload_flow": [
+    "_offload_guardrail_models(): del text_guardrail, del video_guardrail, gc.collect(), torch.cuda.empty_cache()"
+  ],
+
+  "caller_usage_patterns": [
+    "diffusion/world_generation_pipeline.py: is_safe = _run_guardrail_on_prompt_with_offload(prompt) → if not is_safe: skip generation",
+    "diffusion/world_generation_pipeline.py: video = _run_guardrail_on_video_with_offload(video) → if video is None: abort",
+    "autoregressive/world_generation_pipeline.py: same pattern for both prompt and video",
+    "diffusion/gen3c_pipeline.py: same pattern for both prompt and video"
+  ],
+
+  "key_conditions": [
+    "disable_guardrail=True → entire guardrail system bypassed at init and runtime",
+    "offload_guardrail_models=True → models NOT loaded at init; loaded just-in-time before each check then deleted after",
+    "offload_guardrail_models=False → models pre-loaded at init; stay in GPU memory throughout",
+    "has_text_input=True → text_guardrail loaded; False → only video_guardrail loaded",
+    "Prompt blocked → return False (caller skips generation)",
+    "Video blocked → return None (caller discards output)"
+  ],
+
+  "text_guardrail_components": [
+    "Blocklist: keyword/pattern-based filter",
+    "LlamaGuard3: LLM-based safety classifier"
+  ],
+
+  "video_guardrail_components": [
+    "VideoContentSafetyFilter: content safety classifier for video frames",
+    "RetinaFaceFilter: face detection + blur postprocessor (runs only if video passes safety check)"
+  ],
+
+  "method_signatures": {
+    "_load_text_guardrail": "() -> None  [sets self.text_guardrail = GuardrailRunner]",
+    "_load_video_guardrail": "() -> None  [sets self.video_guardrail = GuardrailRunner]",
+    "_run_guardrail_on_prompt": "(prompt: str) -> bool",
+    "_run_guardrail_on_prompt_with_offload": "(prompt: str) -> bool",
+    "_run_guardrail_on_video": "(video: np.ndarray) -> np.ndarray | None",
+    "_run_guardrail_on_video_with_offload": "(video: np.ndarray) -> np.ndarray | None",
+    "_offload_guardrail_models": "() -> None  [del models, gc, cuda empty_cache]",
+    "guardrail_presets.run_text_guardrail": "(prompt: str, runner: GuardrailRunner) -> bool",
+    "guardrail_presets.run_video_guardrail": "(frames: np.ndarray, runner: GuardrailRunner) -> np.ndarray | None",
+    "GuardrailRunner.run_safety_check": "(input) -> (bool, str)",
+    "GuardrailRunner.postprocess": "(frames) -> np.ndarray"
+  },
+
+  "source_files_analyzed": [
+    "Lyra-1/cosmos_predict1/utils/base_world_generation_pipeline.py",
+    "Lyra-1/cosmos_predict1/auxiliary/guardrail/common/presets.py",
+    "Lyra-1/cosmos_predict1/diffusion/inference/world_generation_pipeline.py",
+    "Lyra-1/cosmos_predict1/autoregressive/inference/world_generation_pipeline.py",
+    "Lyra-1/cosmos_predict1/diffusion/inference/gen3c_pipeline.py"
+  ],
+
+  "important_notes": "Two parallel guardrail tracks: (1) text/prompt guardrail using Blocklist+LlamaGuard3, (2) video guardrail using VideoContentSafetyFilter+RetinaFaceFilter face blur. Both support lazy offload mode (load→check→unload) for GPU memory management. A blocked prompt returns False (bool), a blocked video returns None. The RetinaFaceFilter runs as a postprocessor ONLY when video passes the safety check — it blurs faces rather than blocking. disable_guardrail=True bypasses everything."
+}

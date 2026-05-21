@@ -1,0 +1,203 @@
+@startuml extensions_models_litellm
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+title Extensions – LiteLLM & AnyLLM Models
+
+' ─────────────────────────────────────────
+' Abstract Base Interfaces
+' ─────────────────────────────────────────
+package "agents.models.interface" {
+
+    abstract class Model {
+        +{abstract} get_response(system_instructions, input, model_settings,\n  tools, output_schema, handoffs, tracing,\n  *, previous_response_id, conversation_id, prompt) : ModelResponse
+        +{abstract} stream_response(system_instructions, input, model_settings,\n  tools, output_schema, handoffs, tracing,\n  *, previous_response_id, conversation_id, prompt) : AsyncIterator[TResponseStreamEvent]
+        +get_retry_advice(request: ModelRetryAdviceRequest) : ModelRetryAdvice | None
+        +close() : None
+    }
+
+    abstract class ModelProvider {
+        +{abstract} get_model(model_name: str | None) : Model
+        +aclose() : None
+    }
+}
+
+' ─────────────────────────────────────────
+' LiteLLM Extension
+' ─────────────────────────────────────────
+package "agents.extensions.models.litellm" {
+
+    class LitellmProvider {
+        +DEFAULT_MODEL : str = "gpt-4.1"
+        --
+        +get_model(model_name: str | None) : LitellmModel
+    }
+    note right of LitellmProvider
+      Routes model calls through LiteLLM.
+      API keys set via environment variables.
+      No constructor arguments required.
+    end note
+
+    class LitellmModel {
+        +model : str
+        +base_url : str | None
+        +api_key : str | None
+        +should_replay_reasoning_content : ShouldReplayReasoningContent | None
+        --
+        +__init__(model, base_url, api_key,\n  should_replay_reasoning_content)
+        +get_retry_advice(request) : ModelRetryAdvice | None
+        +get_response(...) : ModelResponse
+        +stream_response(...) : AsyncIterator[TResponseStreamEvent]
+        -_fetch_response(..., stream: bool) : ModelResponse | tuple
+        -_get_reasoning_effort(model_settings) : Any | None
+        -_fix_tool_message_ordering(messages) : list
+        -_convert_gemini_extra_content_to_provider_specific_fields(messages) : list
+        -_merge_headers(model_settings) : dict
+        -_remove_not_given(value) : Any
+    }
+    note bottom of LitellmModel
+      Always routes via litellm.acompletion()
+      (chat_completions path only).
+      Fixes tool message ordering for Anthropic/Gemini.
+      Supports reasoning_effort forwarding.
+    end note
+
+    class LitellmConverter {
+        +{static} convert_message_to_openai(message: litellm.Message, model) : ChatCompletionMessage
+        +{static} convert_annotations_to_openai(message: litellm.Message) : list[Annotation] | None
+        +{static} convert_tool_call_to_openai(tool_call, model) : ChatCompletionMessageFunctionToolCall
+    }
+
+    class InternalChatCompletionMessage {
+        +reasoning_content : str
+        +thinking_blocks : list[dict[str, Any]] | None
+    }
+    note right of InternalChatCompletionMessage
+      Carries extended-thinking data
+      (Anthropic Claude) without
+      modifying the OpenAI base type.
+    end note
+
+    class InternalToolCall {
+        +extra_content : dict[str, Any] | None
+    }
+    note right of InternalToolCall
+      Carries Gemini thought_signature
+      as provider-specific metadata.
+    end note
+}
+
+' ─────────────────────────────────────────
+' AnyLLM Extension
+' ─────────────────────────────────────────
+package "agents.extensions.models.any_llm" {
+
+    class AnyLLMProvider {
+        +api_key : str | None
+        +base_url : str | None
+        +api : Literal["responses", "chat_completions"] | None
+        --
+        +__init__(*, api_key, base_url, api)
+        +get_model(model_name: str | None) : AnyLLMModel
+    }
+    note right of AnyLLMProvider
+      Routes model calls through any-llm SDK.
+      API keys from provider-specific env vars.
+      DEFAULT_MODEL = "openai/{get_default_model()}"
+    end note
+
+    class AnyLLMModel {
+        +model : str
+        +base_url : str | None
+        +api_key : str | None
+        +api : Literal["responses", "chat_completions"] | None
+        -_provider_name : str
+        -_provider_model : str
+        -_provider_cache : dict[bool, Any]
+        --
+        +__init__(model, base_url, api_key, api)
+        +get_retry_advice(request) : ModelRetryAdvice | None
+        +get_response(...) : ModelResponse
+        +stream_response(...) : AsyncIterator[TResponseStreamEvent]
+        -_selected_api() : Literal["responses", "chat_completions"]
+        -_supports_responses() : bool
+        -_get_response_via_responses(...) : ModelResponse
+        -_stream_response_via_responses(...) : AsyncIterator
+        -_fetch_response(..., stream) : ModelResponse | tuple
+        -_fetch_responses_response(..., stream) : Response | AsyncIterator
+        -_get_provider() : Any
+        -{static} _split_model_name(model) : tuple[str, str]
+        -{static} _validate_api(api) : Literal[...] | None
+        -{static} _make_any_llm_responses_params(payload) : Any
+        -_build_responses_extra_kwargs(model_settings) : dict
+        -_build_responses_transport_kwargs(model_settings) : dict
+        -_merge_headers(model_settings) : dict
+    }
+    note bottom of AnyLLMModel
+      Auto-selects API: uses "responses" if
+      provider.SUPPORTS_RESPONSES, else "chat_completions".
+      Model name must use "provider/model" format
+      (e.g. "openai/gpt-4.1", "openrouter/openai/gpt-5.4-mini").
+    end note
+
+    class _AnyLLMResponsesParamsShim {
+        -_payload : dict
+        --
+        +__init__(**payload)
+        +model_dump(*, exclude_none: bool) : dict
+    }
+    note right of _AnyLLMResponsesParamsShim
+      Fallback shim when any-llm
+      types are not importable.
+    end note
+}
+
+' ─────────────────────────────────────────
+' External / OpenAI Base Types
+' ─────────────────────────────────────────
+package "openai.types.chat (external)" <<Rectangle>> {
+    class ChatCompletionMessage <<external>> {
+    }
+    class ChatCompletionMessageFunctionToolCall <<external>> {
+    }
+}
+
+' ─────────────────────────────────────────
+' Inheritance Relationships
+' ─────────────────────────────────────────
+LitellmModel --|> Model
+LitellmProvider --|> ModelProvider
+
+AnyLLMModel --|> Model
+AnyLLMProvider --|> ModelProvider
+
+InternalChatCompletionMessage --|> ChatCompletionMessage
+InternalToolCall --|> ChatCompletionMessageFunctionToolCall
+
+' ─────────────────────────────────────────
+' Composition / Factory Relationships
+' ─────────────────────────────────────────
+LitellmProvider ..> LitellmModel : <<creates>> get_model()
+AnyLLMProvider ..> AnyLLMModel : <<creates>> get_model()
+
+LitellmModel ..> LitellmConverter : <<uses>> convert messages
+LitellmConverter ..> InternalChatCompletionMessage : <<produces>>
+LitellmConverter ..> InternalToolCall : <<produces>>
+
+AnyLLMModel ..> _AnyLLMResponsesParamsShim : <<uses if any-llm\ntypes unavailable>>
+
+@enduml

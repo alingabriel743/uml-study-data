@@ -1,0 +1,118 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activityBackgroundColor #F8F9FA
+skinparam activityBorderColor #495057
+skinparam activityArrowColor #495057
+skinparam activityFontColor #212529
+skinparam partitionBackgroundColor #E9ECEF
+skinparam partitionBorderColor #6C757D
+skinparam noteBackgroundColor #FFF9C4
+skinparam noteBorderColor #F0C040
+
+title Parallel SMT Consumer Processing
+
+|Main Thread|
+start
+:processRecords(List<SourceRecord> records);
+note right
+  **ParallelSmtConsumerProcessor**
+  transform only → Consumer<SourceRecord>
+  ----
+  **ParallelSmtAndConvertConsumerProcessor<R>**
+  transform + convert → Consumer<R>
+end note
+
+:Log: submitting N records for processing;
+
+:Submit all records as callables\nto ExecutorService (recordService);
+note right
+  Future<T>[] recordFutures = new Future[N]
+  Each callable submitted independently
+end note
+
+fork
+  |ExecutorService Worker 1|
+  :TransformRecord[0].call()
+  transformations.transform(record[0])
+  → SourceRecord (or null if filtered);
+
+fork again
+  |ExecutorService Worker 2|
+  :TransformRecord[1].call()
+  transformations.transform(record[1])
+  → SourceRecord (or null if filtered);
+
+fork again
+  |ExecutorService Worker N|
+  :TransformRecord[N-1].call()
+  transformations.transform(record[N-1])
+  → SourceRecord (or null if filtered);
+  note right
+    **+Convert step**
+    (ParallelSmtAndConvertConsumerProcessor only)
+    convertor.apply(transformedRecord) → R
+  end note
+
+end fork
+
+|Main Thread|
+note right
+  Worker threads ran concurrently.
+  Main thread now collects results in
+  original insertion order via Future[i].get()
+end note
+
+while (More records to collect?) is (yes)
+
+  :Future[i].get()
+  → transformed record (blocks if not yet done);
+
+  if (record != null?) then (yes — passed filter)
+
+    |Consumer|
+    :consumer.accept(record);
+    note right
+      **ParallelSmtConsumerProcessor**:
+        Consumer<SourceRecord>.accept(SourceRecord)
+      **ParallelSmtAndConvertConsumerProcessor**:
+        Consumer<R>.accept(R)
+    end note
+
+    |Main Thread|
+    if (StopEngineException thrown?) then (yes)
+      |RecordCommitter|
+      :committer.markProcessed(originalRecord[i]);
+
+      |Main Thread|
+      :Re-throw StopEngineException;
+      kill
+
+    else (no — success)
+    endif
+
+  else (no — null / filtered out)
+    :Skip consumer call\n(record filtered by transformations);
+  endif
+
+  |RecordCommitter|
+  :committer.markProcessed(originalRecord[i]);
+  note right
+    Always marked processed,
+    even if filtered (null record)
+  end note
+
+  |Main Thread|
+
+endwhile (no — all N records processed)
+
+|RecordCommitter|
+:committer.markBatchFinished();
+
+|Main Thread|
+stop
+
+@enduml

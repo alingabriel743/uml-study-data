@@ -1,0 +1,272 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #F9A825
+}
+
+title Realtime – Core Session & Runner
+
+' ─────────────────────────────────────
+' External / base references (stubs)
+' ─────────────────────────────────────
+package "agents (base)" #D6EAF8 {
+    abstract class AgentBase {
+        +name: str
+        +tools: list[Tool]
+        +mcp_servers: list
+        +input_guardrails: list[InputGuardrail]
+    }
+
+    class RunContextWrapper<TContext> {
+        +context: TContext
+    }
+}
+
+' ─────────────────────────────────────
+' realtime/model.py
+' ─────────────────────────────────────
+package "realtime.model" {
+
+    abstract class RealtimeModel {
+        +{abstract} connect(options: RealtimeModelConfig): None
+        +{abstract} add_listener(listener: RealtimeModelListener): None
+        +{abstract} remove_listener(listener: RealtimeModelListener): None
+        +{abstract} send_event(event: RealtimeModelSendEvent): None
+        +{abstract} close(): None
+    }
+
+    abstract class RealtimeModelListener {
+        +{abstract} on_event(event: RealtimeModelEvent): None
+    }
+
+    class RealtimeModelConfig <<TypedDict>> {
+        +api_key: str | Callable (NotRequired)
+        +url: str (NotRequired)
+        +headers: dict[str, str] (NotRequired)
+        +initial_model_settings: RealtimeSessionModelSettings (NotRequired)
+        +playback_tracker: RealtimePlaybackTracker (NotRequired)
+        +call_id: str (NotRequired)
+    }
+
+    class RealtimePlaybackTracker {
+        -_format: RealtimeAudioFormat | None
+        -_current_item: tuple[str, int] | None
+        -_elapsed_ms: float | None
+        +on_play_bytes(item_id, item_content_index, bytes): None
+        +on_play_ms(item_id, item_content_index, ms): None
+        +on_interrupted(): None
+        +set_audio_format(format: RealtimeAudioFormat): None
+        +get_state(): RealtimePlaybackState
+    }
+
+    class RealtimePlaybackState <<TypedDict>> {
+        +current_item_id: str | None
+        +current_item_content_index: int | None
+        +elapsed_ms: float | None
+    }
+
+    RealtimePlaybackTracker ..> RealtimePlaybackState : produces
+}
+
+' ─────────────────────────────────────
+' realtime/config.py (key types)
+' ─────────────────────────────────────
+package "realtime.config" {
+
+    class RealtimeSessionModelSettings <<TypedDict>> {
+        +model_name: RealtimeModelName (NotRequired)
+        +instructions: str (NotRequired)
+        +voice: str (NotRequired)
+        +modalities: list[str] (NotRequired)
+        +audio: RealtimeAudioConfig (NotRequired)
+        +turn_detection: RealtimeTurnDetectionConfig (NotRequired)
+        +tool_choice: ToolChoice (NotRequired)
+        +tracing: RealtimeModelTracingConfig (NotRequired)
+    }
+
+    class RealtimeRunConfig <<TypedDict>> {
+        +model_settings: RealtimeSessionModelSettings (NotRequired)
+        +output_guardrails: list[OutputGuardrail] (NotRequired)
+        +guardrails_settings: RealtimeGuardrailsSettings (NotRequired)
+        +tracing_disabled: bool (NotRequired)
+        +async_tool_calls: bool (NotRequired)
+        +tool_error_formatter: ToolErrorFormatter (NotRequired)
+    }
+}
+
+' ─────────────────────────────────────
+' realtime/agent.py
+' ─────────────────────────────────────
+package "realtime.agent" {
+
+    class RealtimeAgent<TContext> <<dataclass>> {
+        +instructions: str | Callable | None
+        +prompt: Prompt | None
+        +handoffs: list[RealtimeAgent | Handoff]
+        +output_guardrails: list[OutputGuardrail]
+        +hooks: RealtimeAgentHooks | None
+        +clone(**kwargs): RealtimeAgent
+        +get_system_prompt(run_context: RunContextWrapper): str | None
+    }
+
+    note right of RealtimeAgent
+      No model/modelSettings/outputType
+      (handled at session level).
+      voice can be set per-agent but
+      cannot change after first agent speaks.
+      Supports handoffs to other RealtimeAgents.
+    end note
+}
+
+' ─────────────────────────────────────
+' realtime/session.py
+' ─────────────────────────────────────
+package "realtime.session" {
+
+    class RealtimeSession {
+        -_model: RealtimeModel
+        -_current_agent: RealtimeAgent
+        -_context_wrapper: RunContextWrapper
+        -_history: list[RealtimeItem]
+        -_model_config: RealtimeModelConfig
+        -_run_config: RealtimeRunConfig
+        -_base_model_settings: RealtimeSessionModelSettings
+        -_event_queue: asyncio.Queue[RealtimeSessionEvent]
+        -_pending_tool_calls: dict[str, tuple]
+        -_interrupted_response_ids: set[str]
+        -_guardrail_tasks: set[asyncio.Task]
+        -_closed: bool
+        +enter(): RealtimeSession
+        +close(): None
+        +send_message(message: RealtimeUserInput): None
+        +send_audio(audio: bytes, commit: bool): None
+        +interrupt(): None
+        +update_agent(agent: RealtimeAgent): None
+        +on_event(event: RealtimeModelEvent): None
+        +approve_tool_call(call_id, always): None
+        +reject_tool_call(call_id, ...): None
+        +model: RealtimeModel
+    }
+
+    note bottom of RealtimeSession
+      Async context manager + async iterator.
+      Receives model events, manages conversation
+      history, dispatches tool calls, runs output
+      guardrails, and handles agent handoffs.
+      Emits: RealtimeAudio, RealtimeError,
+      RealtimeHandoffEvent, RealtimeToolStart/End,
+      RealtimeToolApprovalRequired, RealtimeGuardrailTripped,
+      RealtimeAgentStartEvent, RealtimeAgentEndEvent, ...
+    end note
+}
+
+' ─────────────────────────────────────
+' realtime/runner.py
+' ─────────────────────────────────────
+package "realtime.runner" {
+
+    class RealtimeRunner {
+        -_starting_agent: RealtimeAgent
+        -_config: RealtimeRunConfig | None
+        -_model: RealtimeModel
+        +__init__(starting_agent, model, config)
+        +run(context, model_config): RealtimeSession
+    }
+
+    note bottom of RealtimeRunner
+      Entry point for realtime voice agents.
+      Defaults model to OpenAIRealtimeWebSocketModel.
+      run() returns a RealtimeSession before connecting;
+      connection is established in __aenter__.
+      Usage: async with await runner.run() as session
+    end note
+}
+
+' ─────────────────────────────────────
+' realtime/openai_realtime.py
+' ─────────────────────────────────────
+package "realtime.openai_realtime" {
+
+    class OpenAIRealtimeWebSocketModel {
+        +model: str
+        -_websocket: ClientConnection | None
+        -_websocket_task: asyncio.Task | None
+        -_listeners: list[RealtimeModelListener]
+        -_audio_state_tracker: ModelAudioTracker
+        -_playback_tracker: RealtimePlaybackTracker | None
+        -_tracing_config: RealtimeModelTracingConfig | None
+        -_call_id: str | None
+        -_transport_config: TransportConfig | None
+        +connect(options: RealtimeModelConfig): None
+        +add_listener(listener: RealtimeModelListener): None
+        +remove_listener(listener: RealtimeModelListener): None
+        +send_event(event: RealtimeModelSendEvent): None
+        +close(): None
+        -_listen_for_messages(): None
+        -_handle_ws_event(event: dict): None
+        -_emit_event(event: RealtimeModelEvent): None
+        -_update_session_config(model_settings): None
+        -_cancel_response(): None
+    }
+
+    note right of OpenAIRealtimeWebSocketModel
+      Default transport: WebSocket to
+      wss://api.openai.com/v1/realtime
+      Spawns background asyncio.Task
+      to receive incoming messages.
+      Supports call_id for SIP/Calls API.
+    end note
+}
+
+' ─────────────────────────────────────
+' Relationships
+' ─────────────────────────────────────
+
+' Inheritance / Implementation
+RealtimeAgent --|> AgentBase : extends
+RealtimeSession ..|> RealtimeModelListener : implements
+OpenAIRealtimeWebSocketModel --|> RealtimeModel : extends
+
+' RealtimeSession composition
+RealtimeSession *--> RealtimeModel : _model
+RealtimeSession *--> RealtimeAgent : _current_agent
+RealtimeSession *--> RunContextWrapper : _context_wrapper
+RealtimeSession o--> RealtimeModelConfig : _model_config
+RealtimeSession o--> RealtimeRunConfig : _run_config
+
+' RealtimeRunner factory
+RealtimeRunner ..> RealtimeSession : <<creates>> run()
+RealtimeRunner o--> RealtimeAgent : _starting_agent
+RealtimeRunner o--> RealtimeModel : _model
+
+' OpenAI model listener registry
+OpenAIRealtimeWebSocketModel "1" o--> "0..*" RealtimeModelListener : _listeners
+
+' Playback
+OpenAIRealtimeWebSocketModel o--> RealtimePlaybackTracker : optional
+RealtimeModelConfig o--> RealtimePlaybackTracker : optional
+
+' Config references
+RealtimeModelConfig o--> RealtimeSessionModelSettings : initial_model_settings
+RealtimeRunConfig o--> RealtimeSessionModelSettings : model_settings
+
+' RealtimeAgent self-referencing handoffs
+RealtimeAgent "0..*" o--> RealtimeAgent : handoffs
+
+@enduml

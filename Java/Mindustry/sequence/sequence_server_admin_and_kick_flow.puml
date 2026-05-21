@@ -1,0 +1,247 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    GroupBorderColor #495057
+    GroupHeaderFontColor #212529
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF3CD
+    BorderColor #856404
+    FontColor #212529
+}
+
+title Server Administration and Player Kick Flow
+
+actor "Console / Operator" as Console
+participant "ServerControl" as SC
+participant "NetServer" as NS
+participant "AdminClient\n(in-game admin)" as AC
+participant "VoteSession" as VS
+participant "Player" as P
+participant "NetConnection" as NC
+participant "Administration" as Admin
+participant "SNet\n(Steam)" as SNet
+actor "Connecting Client" as Client
+actor "Timer" as Timer
+
+' ══════════════════════════════════════════════════════
+== FLOW 1: Console Kick Command ==
+' ══════════════════════════════════════════════════════
+
+Console -> SC : /kick <playerName>
+activate SC
+SC -> SC : handler.register('kick')\nfinds Player by name
+SC -> P : target.kick(KickReason.kick)
+activate P
+P -> NC : kick(KickReason.kick)
+activate NC
+NC -> NC : idempotent guard:\nif(kicked) return
+NC -> Admin : handleKicked(uuid, address, 30000ms)
+activate Admin
+Admin -> Admin : kickedIPs.put(ip, expiry)\ninfo.timesKicked++\ninfo.lastKicked = expiry
+Admin --> NC : persisted
+deactivate Admin
+NC -> Client : send KickPacket(KickReason.kick)
+NC -> NC : kickDisconnect() → close()
+NC -> Admin : save()
+NC -> NC : kicked = true
+deactivate NC
+deactivate P
+deactivate SC
+
+' ══════════════════════════════════════════════════════
+== FLOW 2: Console Ban Command ==
+' ══════════════════════════════════════════════════════
+
+Console -> SC : /ban <id|name|ip>
+activate SC
+SC -> Admin : banPlayerID(uuid)\n[sets PlayerInfo.banned=true,\nfires PlayerBanEvent]
+activate Admin
+Admin --> SC
+deactivate Admin
+SC -> Admin : banPlayerIP(ip)\n[adds to bannedIPs,\nfires PlayerIpBanEvent]
+activate Admin
+Admin -> SNet : <<event>> PlayerIpBanEvent
+activate SNet
+SNet -> SNet : updateBans(ip)\nsmat.setLobbyData('banned', steamBanList)
+deactivate SNet
+Admin --> SC
+deactivate Admin
+loop each online player
+    SC -> NC : if isIDBanned → con.kick(KickReason.banned)
+    activate NC
+    NC -> Admin : handleKicked(uuid, address, 30000ms)
+    activate Admin
+    Admin --> NC
+    deactivate Admin
+    NC -> Client : send KickPacket(KickReason.banned)
+    deactivate NC
+end
+deactivate SC
+
+' ══════════════════════════════════════════════════════
+== FLOW 3: In-Game Admin Request (ban / kick via RPC) ==
+' ══════════════════════════════════════════════════════
+
+AC -> NS : adminRequest(player, other,\nAdminAction.ban | .kick, params)\n[@Remote Loc.client→Loc.server]
+activate NS
+NS -> NS : check player.admin || player.isLocal()\ncheck !other.admin (no admin-on-admin)
+alt AdminAction.ban
+    NS -> Admin : admins.banPlayerID(other.con.uuid)
+    activate Admin
+    Admin --> NS
+    deactivate Admin
+    NS -> Admin : admins.banPlayerIP(other.con.address)
+    activate Admin
+    Admin --> NS
+    deactivate Admin
+    NS -> P : other.kick(KickReason.banned)
+    activate P
+    P -> NC : kick(KickReason.banned, 30000ms)
+    activate NC
+    NC -> Admin : handleKicked(uuid, address, 30000ms)
+    activate Admin
+    Admin --> NC
+    deactivate Admin
+    NC -> Client : send KickPacket(KickReason.banned)
+    deactivate NC
+    deactivate P
+else AdminAction.kick
+    NS -> P : other.kick(KickReason.kick)
+    activate P
+    P -> NC : kick(KickReason.kick, 30000ms)
+    activate NC
+    NC -> Admin : handleKicked(uuid, address, 30000ms)
+    activate Admin
+    Admin --> NC
+    deactivate Admin
+    NC -> Client : send KickPacket(KickReason.kick)
+    deactivate NC
+    deactivate P
+end
+deactivate NS
+
+' ══════════════════════════════════════════════════════
+== FLOW 4: Votekick Flow ==
+' ══════════════════════════════════════════════════════
+
+P -> NS : /votekick <target> <reason>
+activate NS
+NS -> NS : guard checks:\nenableVotekick, ≥3 players,\nno ongoing vote, cooldown elapsed
+NS -> VS : new VoteSession(target)\n[starts Timer task, voteDuration=30s]
+activate VS
+NS -> VS : session.vote(initiator, +1)
+VS -> VS : votes++\nvoted.put(uuid, sign)\nvoted.put(lastIP, sign)
+VS -> P : sendMessage(score tally broadcast)
+VS -> VS : checkPass()\nvotes >= votesRequired()?
+note right of NS : votesRequired() =\n2 + (playerCount>4 ? 1 : 0)
+NS -> NS : currentlyKicking = session
+NS --> P
+deactivate NS
+
+actor "OtherPlayer" as OP
+OP -> NS : /vote y | n
+activate NS
+NS -> VS : currentlyKicking.vote(player, sign)
+VS -> VS : votes++\ncheckPass()
+alt votes >= votesRequired()
+    VS -> P : sendMessage('Vote passed,\nbanned for N minutes')
+    VS -> P : target.kick(KickReason.vote, 3600000ms)
+    activate P
+    P -> NC : kick(KickReason.vote, 3600000ms)
+    activate NC
+    NC -> Admin : handleKicked(uuid, address, 3600000ms)
+    activate Admin
+    Admin -> Admin : kickedIPs.put(ip, expiry)\ninfo.lastKicked = expiry
+    Admin --> NC
+    deactivate Admin
+    NC -> Client : send KickPacket(KickReason.vote)
+    deactivate NC
+    deactivate P
+    VS -> VS : currentlyKicking = null\ntask.cancel()
+else Timer fires before quorum
+    Timer -> VS : task callback
+    VS -> VS : checkPass() fails
+    VS -> OP : sendMessage('Vote failed')
+    VS -> NS : currentlyKicking = null
+end
+deactivate VS
+deactivate NS
+
+' ══════════════════════════════════════════════════════
+== FLOW 5: Reconnect Ban Enforcement ==
+' ══════════════════════════════════════════════════════
+
+Client -> NS : TCP Connect packet
+activate NS
+NS -> Admin : isIPBanned(ip) || isSubnetBanned(ip)
+activate Admin
+Admin -> Admin : subnetBans.contains(ip::startsWith)
+Admin --> NS : banned?
+deactivate Admin
+alt IP or subnet banned
+    NS -> NC : con.kick(KickReason.banned)
+    activate NC
+    NC -> Client : send KickPacket(KickReason.banned)
+    deactivate NC
+end
+
+Client -> NS : ConnectPacket(uuid, usid, name, version)
+NS -> Admin : isIDBanned(uuid) || isNameBanned(name)
+activate Admin
+note right of Admin : name bans use\ncase-insensitive regex\nPattern.compile(regex,\nCASE_INSENSITIVE)
+Admin --> NS : banned?
+deactivate Admin
+NS -> Admin : getKickTime(uuid, ip)\n→ max(info.lastKicked, kickedIPs[ip])
+activate Admin
+Admin --> NS : kickExpiry
+deactivate Admin
+alt Time.millis() < kickExpiry
+    NS -> NC : con.kick(KickReason.recentKick)
+    activate NC
+    NC -> Client : send KickPacket(KickReason.recentKick)
+    deactivate NC
+end
+deactivate NS
+
+' ══════════════════════════════════════════════════════
+== FLOW 6: Subnet-Ban Console Command ==
+' ══════════════════════════════════════════════════════
+
+Console -> SC : /subnet-ban add <ip-prefix>
+activate SC
+SC -> Admin : admins.addSubnetBan(ip)\n→ subnetBans.add(ip); save()
+activate Admin
+Admin --> SC : persisted
+deactivate Admin
+deactivate SC
+note over NS, Admin : On next connection from\nmatching prefix:\nisSubnetBanned(ip) → true\n→ con.kick(KickReason.banned)
+
+@enduml

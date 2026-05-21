@@ -1,0 +1,100 @@
+{
+  "scope": "text_streaming_flow",
+  "title": "Text Streaming Flow",
+  "diagram_type": "activity",
+  "description": "Streaming text generation via SSE parsing, stream event emission (TextStart, TextDelta, TextEnd, ReasoningDelta), and Vercel protocol output",
+
+  "key_actors": [
+    "Gateway (HandlesTextStreaming trait)",
+    "ParsesServerSentEvents trait",
+    "StreamEvent hierarchy",
+    "CanStreamUsingVercelProtocol trait",
+    "HTTP Client (provider stream body)"
+  ],
+
+  "activity_flow": [
+    "START: Gateway.processTextStream(invocationId, provider, model, tools, schema, options, streamBody, depth)",
+    "INIT: generate messageId (UUID v7); set flags: streamStartEmitted=false, textStartEmitted=false; currentText=''; pendingToolCalls=[]",
+    "LOOP: foreach ParsesServerSentEvents.parseServerSentEvents(streamBody) as $data",
+    "  [SSE PARSE]: readLine(streamBody) byte-by-byte → trim → skip blank or non-data: lines → skip '[DONE]' → json_decode → yield decoded object",
+    "  BRANCH on event type:",
+    "  [error] → yield Error event → RETURN (terminate stream)",
+    "  [stream-start trigger] → if !streamStartEmitted → emit StreamStart(provider, model) → streamStartEmitted=true",
+    "  [text delta] → if !textStartEmitted → emit TextStart(messageId) → textStartEmitted=true; accumulate currentText; emit TextDelta(messageId, deltaText)",
+    "  [text done] → if textStartEmitted → emit TextEnd(messageId); textStartEmitted=false (Anthropic resets per block)",
+    "  [reasoning delta] → if !reasoningStartEmitted → emit ReasoningStart(reasoningId) → reasoningStartEmitted=true; emit ReasoningDelta(reasoningId, delta)",
+    "  [reasoning done] → emit ReasoningEnd(reasoningId); reset reasoningId",
+    "  [tool_call accumulation] → accumulate pendingToolCalls[] with id/name/arguments fragments",
+    "  [tool_call complete] → emit ToolCall event (OpenAI: on function_call_arguments.done; Anthropic: on content_block_stop with tool_use; Groq: post-loop)",
+    "  [provider tool events] → emit ProviderToolEvent (server_tool_use blocks, web_search etc.)",
+    "  [usage/completion data] → capture Usage(inputTokens, outputTokens, cacheTokens, reasoningTokens)",
+    "END LOOP",
+    "POST-LOOP BRANCH:",
+    "  [pendingToolCalls filled] → call handleStreamingToolCalls()",
+    "    TOOL EXECUTION LOOP: foreach mappedToolCalls → findTool → executeTool → new ToolResult → emit ToolResult event",
+    "    DEPTH CHECK: if depth+1 < maxSteps → build next request body → HTTP POST (stream=true) → recursive processTextStream(depth+1)",
+    "    DEPTH EXCEEDED → emit StreamEnd('stop', Usage(0,0))",
+    "  [no tool calls] → emit StreamEnd(finishReason, usage)",
+    "VERCEL OUTPUT: CanStreamUsingVercelProtocol.toVercelProtocolResponse()",
+    "  response()->stream(): iterate events → skip null toVercelProtocolArray() → buffer StreamEnd for last → output 'data: {json}\\n\\n' per event → output 'data: [DONE]\\n\\n'",
+    "  Headers: Content-Type=text/event-stream, x-vercel-ai-ui-message-stream=v1, Cache-Control=no-cache"
+  ],
+
+  "gateway_variations": {
+    "openai_responses_api": "Event types: response.created, response.output_text.delta, response.output_text.done, response.reasoning_summary_text.delta, response.output_item.done, response.function_call_arguments.delta/.done, response.completed",
+    "anthropic": "Event types: message_start, content_block_start (block types: text/thinking/tool_use/server_tool_use), content_block_delta (text_delta/thinking_delta/input_json_delta/signature_delta/citations_delta), content_block_stop, message_delta. Supports citations (CitationEvent) and thinking blocks.",
+    "groq_chat_completions": "Delta format: choices[0].delta.content. TextEnd emitted post-loop. Tool calls via delta.tool_calls[]. finish_reason=tool_calls triggers tool loop."
+  },
+
+  "stream_events": [
+    "StreamStart(id, provider, model, timestamp) → Vercel: null",
+    "TextStart(id, messageId, timestamp) → Vercel: {type:'text-start', id:messageId}",
+    "TextDelta(id, messageId, delta, timestamp) → Vercel: {type:'text-delta', id:messageId, delta:text}",
+    "TextEnd(id, messageId, timestamp) → Vercel: {type:'text-end', id:messageId}",
+    "ReasoningStart(id, reasoningId, timestamp) → Vercel: null",
+    "ReasoningDelta(id, reasoningId, delta, timestamp) → Vercel: null",
+    "ReasoningEnd(id, reasoningId, timestamp) → Vercel: null",
+    "ToolCall(id, toolCall, timestamp) → Vercel: serialized tool call",
+    "ToolResult(id, toolResult, isStreaming, metadata, timestamp) → Vercel: serialized tool result (skipped if no prior ToolCall)",
+    "ProviderToolEvent(id, toolId, type, data, status, timestamp) → Vercel: null",
+    "Error(id, code, message, retryable, timestamp) → Vercel: null",
+    "StreamEnd(id, finishReason, usage, timestamp) → Vercel: usage/finish data (sent last)"
+  ],
+
+  "key_methods": [
+    "ParsesServerSentEvents::parseServerSentEvents($streamBody): Generator — reads SSE line-by-line, strips 'data:' prefix, skips blanks/[DONE], json_decodes, yields",
+    "ParsesServerSentEvents::readLine($streamBody): string — byte-by-byte read until \\n to prevent batching",
+    "HandlesTextStreaming::processTextStream(..., $streamBody, int $depth=0): Generator — core SSE→events pipeline",
+    "HandlesTextStreaming::handleStreamingToolCalls(...): Generator — executes tools, emits ToolResult, recurses via processTextStream",
+    "HandlesTextStreaming::mapStreamToolCalls(array): array<ToolCall> — maps raw arrays to ToolCall DTOs",
+    "HandlesTextStreaming::generateEventId(): string — Str::uuid7() lowercase",
+    "CanStreamUsingVercelProtocol::toVercelProtocolResponse(): Response — Laravel streaming response, SSE format",
+    "StreamEvent::withInvocationId(string): self — attaches invocationId to event",
+    "StreamEvent::toVercelProtocolArray(): ?array — returns Vercel-compatible array or null to skip output",
+    "StreamEvent::broadcast(Channel, bool): void — broadcasts event over Laravel Echo/Pusher"
+  ],
+
+  "key_conditions": [
+    "textStartEmitted guard: TextStart emitted only once per text block (lazy, on first non-empty delta)",
+    "reasoningStartEmitted guard: ReasoningStart emitted only once per reasoning block",
+    "streamStartEmitted guard: StreamStart emitted only once per stream (multi-step tool loops deduplicated by CanStreamUsingVercelProtocol)",
+    "depth < maxSteps: agentic loop continues recursively; default maxSteps = round(count(tools)*1.5)",
+    "data === '[DONE]': parseServerSentEvents returns (terminates generator)",
+    "json_last_error === JSON_ERROR_NONE && decoded !== null: malformed SSE lines silently skipped",
+    "ToolResult skipped in Vercel output if no prior ToolCall in same stream (cross-step deduplication)"
+  ],
+
+  "important_notes": "All stream events carry invocationId (UUID) for correlation. Each event gets a unique UUID v7 ID. The pipeline is a PHP Generator chain — lazy, pull-based. Multiple gateways share the same ParsesServerSentEvents trait but implement their own HandlesTextStreaming variant per provider's event format. CanStreamUsingVercelProtocol is used on StreamableAgentResponse. The Vercel x-vercel-ai-ui-message-stream:v1 header signals UI SDK compatibility.",
+
+  "source_files_analyzed": [
+    "src/Gateway/Concerns/ParsesServerSentEvents.php",
+    "src/Gateway/OpenAi/Concerns/HandlesTextStreaming.php",
+    "src/Gateway/Anthropic/Concerns/HandlesTextStreaming.php",
+    "src/Gateway/Groq/Concerns/HandlesTextStreaming.php",
+    "src/Responses/Concerns/CanStreamUsingVercelProtocol.php",
+    "src/Streaming/Events/StreamEvent.php",
+    "src/Streaming/Events/TextStart.php",
+    "src/Streaming/Events/TextDelta.php",
+    "src/Streaming/Events/TextEnd.php"
+  ]
+}

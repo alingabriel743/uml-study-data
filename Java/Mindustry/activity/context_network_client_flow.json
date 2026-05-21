@@ -1,0 +1,227 @@
+{
+  "scope": "network_client_flow",
+  "title": "Network Client Connection & Sync",
+  "diagram_type": "activity",
+  "key_participants": ["ArcNetProvider", "NetClient", "NetworkIO", "PacketSerializer", "Net", "Player", "GameState"],
+
+  "activity_phases": [
+    {
+      "phase": "1_connection_initiation",
+      "label": "Connection Initiation",
+      "steps": [
+        "UI calls ArcNetProvider.connectClient(ip, port, success)",
+        "Daemon thread: client.stop() [cleanup previous]",
+        "Spawn 'Net Client' daemon thread: client.run()",
+        "client.connect(5000, ip, port, port) [TCP+UDP, 5s timeout]",
+        "[on success] success.run()",
+        "[on failure AND isConnecting()] net.handleException(e)"
+      ]
+    },
+    {
+      "phase": "2_tcp_handshake",
+      "label": "TCP Handshake & ConnectPacket Send",
+      "steps": [
+        "ArcNetProvider.NetListener.connected() fires",
+        "Build Connect packet with addressTCP from connection.getRemoteAddressTCP()",
+        "Post to main thread: net.handleClientReceived(Connect)",
+        "NetClient handles Connect.class:",
+        "  → reset(): clears removed set, Groups, chat, sets connecting=true, quiet=false, clientLoaded=false",
+        "  → validate net.client() still active [else disconnectQuietly()]",
+        "  → show loadfrag '@connecting.data' with cancel button",
+        "  → build ConnectPacket: name, locale, mods, mobile, versionType, color, usid, uuid",
+        "  → validate uuid != null [else showErrorMessage + disconnectQuietly]",
+        "  → net.send(ConnectPacket, reliable=true) [TCP]"
+      ]
+    },
+    {
+      "phase": "3_world_data_receipt",
+      "label": "World Data Receipt",
+      "steps": [
+        "Server sends @Remote worldDataBegin → client receives:",
+        "  → Groups.clear(), removed.clear(), logic.reset()",
+        "  → connecting=true, net.setClientLoaded(false)",
+        "  → show loadfrag '@connecting.data'",
+        "Server streams WorldStream packet (compressed, via ArcConnection.sendStream)",
+        "  → InputStreamSender sends StreamBegin(total, type) then StreamChunk[] via TCP",
+        "NetClient handles WorldStream.class:",
+        "  → NetworkIO.loadWorld(new InflaterInputStream(data.stream))",
+        "  → finishConnecting()"
+      ]
+    },
+    {
+      "phase": "3a_loadWorld",
+      "label": "NetworkIO.loadWorld() — World Deserialization",
+      "steps": [
+        "DataInputStream wraps InflaterInputStream",
+        "Time.clear()",
+        "state.rules = JsonIO.read(Rules.class, readUTF())",
+        "state.mapLocales = JsonIO.read(MapLocales.class, readUTF())",
+        "state.map = new Map(SaveWriter.readStringMap(stream))",
+        "Read: state.wave (int), state.wavetime (float), state.tick (double)",
+        "Read: GlobalVars.rand.seed0/seed1 (longs)",
+        "Groups.clear(); player.reset(); player.read(read); player.id=id; player.add()",
+        "SaveWriter.readContentHeader(stream)",
+        "SaveWriter.readContentPatches(stream)",
+        "SaveWriter.readMap(stream, world.context)",
+        "SaveWriter.readTeamBlocks(stream)",
+        "SaveWriter.readMarkers(stream)",
+        "SaveWriter.readCustomChunks(stream)",
+        "[finally] content.setTemporaryMapper(null)"
+      ]
+    },
+    {
+      "phase": "3b_finishConnecting",
+      "label": "finishConnecting()",
+      "steps": [
+        "state.set(State.playing)",
+        "connecting = false",
+        "ui.join.hide()",
+        "net.setClientLoaded(true)",
+        "Core.app.post(Call::connectConfirm)  [notifies server]",
+        "Time.runTask(40f, platform::updateRPC)",
+        "Core.app.post(ui.loadfrag::hide)",
+        "lastSnapshotTimestamp = Time.millis()"
+      ]
+    },
+    {
+      "phase": "4_packet_serialization",
+      "label": "Packet Serialization (PacketSerializer)",
+      "steps": [
+        "READ path: byteBuffer.get() → id byte",
+        "  if id==-2: readFramework() [Ping/DiscoverHost/KeepAlive/RegisterUDP/RegisterTCP]",
+        "  else: Net.newPacket(id), validate packet.allow(isServer)",
+        "  read length (short), compression flag (byte)",
+        "  if compression==0: copy buffer, packet.read(reads)",
+        "  if compression==1: LZ4 decompress then packet.read(reads)",
+        "WRITE path: if ByteBuffer → raw put; if FrameworkMessage → writeFramework()",
+        "  else: Packet → write id byte, serialize to temp buffer",
+        "  write length (short); if length<36 or StreamChunk: write uncompressed (flag=0)",
+        "  else: LZ4 compress into output buffer (flag=1)"
+      ]
+    },
+    {
+      "phase": "5_ongoing_sync",
+      "label": "Ongoing In-Game Sync (update loop)",
+      "steps": [
+        "NetClient.update() called each frame:",
+        "  [if net.client() && state.isGame() && !connecting] → sync()",
+        "  [if !net.client() && !connecting] → net.disconnect()",
+        "  [if connecting] → timeoutTime += delta; if >dataTimeout(1800f): disconnect with '@disconnect.data'",
+        "sync() method:",
+        "  [every 66ms] Call.clientSnapshot(lastSent++, unitId, dead, x, y, aimX, aimY, rotation, baseRotation, velX, velY, mineTile, boosting, shooting, chatShown, isBuilding, selectedBlock, selectedRotation, plans, camX, camY, camW, camH)",
+        "  [every 1s] Call.ping(Time.millis())",
+        "  [every 0.5s] collect build plans via control.input.getSyncedPlans(plansOut), chunk into max 75-plan batches, Call.clientPlanSnapshot(id, plans)"
+      ]
+    },
+    {
+      "phase": "6_server_snapshots",
+      "label": "Receiving Server Snapshots",
+      "steps": [
+        "@Remote entitySnapshot(short amount, byte[] data) [UDP, low priority]:",
+        "  lastSnapshotTimestamp = Time.millis()",
+        "  loop amount times: readSyncEntity(input, reads)",
+        "  readSyncEntity: read id(int)+typeID(byte)",
+        "    if entity==null && id==player.id → entity=player, add=true",
+        "    if entity==null: EntityMapping.map(typeID).get() creates new entity",
+        "    entity.readSync(read)",
+        "    if created: entity.snapSync() [snap initial position]",
+        "    if add: entity.add(); addRemovedEntity(id)",
+        "@Remote hiddenSnapshot(IntSeq ids): entity.handleSyncHidden() for each id",
+        "@Remote blockSnapshot(short amount, byte[] data) [UDP]: read pos+blockId, tile.build.readSync(reads, version)",
+        "@Remote stateSnapshot(waveTime, wave, enemies, paused, gameOver, timeData, tps, rand0, rand1, coreData):",
+        "  update state.wave/wavetime/gameOver/enemies/serverTps/rand seeds",
+        "  read team core item data per team"
+      ]
+    },
+    {
+      "phase": "7_snapshot_timeout",
+      "label": "Snapshot Timeout Detection",
+      "steps": [
+        "In update(): if lastSnapshotTimestamp>0 AND Time.timeSinceMillis(lastSnapshotTimestamp) > 20000ms:",
+        "  Log.err('Timed out after not received UDP snapshots.')",
+        "  quiet=true",
+        "  ui.showErrorMessage('@disconnect.snapshottimeout')",
+        "  net.disconnect()",
+        "  lastSnapshotTimestamp=0"
+      ]
+    },
+    {
+      "phase": "8_disconnect_handling",
+      "label": "Disconnect & Kick Handling",
+      "steps": [
+        "ArcNetProvider.NetListener.disconnected(): if lastProtocolError!=null → netClient.setQuiet()",
+        "  → build Disconnect(reason), post net.handleClientReceived(Disconnect)",
+        "NetClient handles Disconnect.class:",
+        "  if quietReset → return [silent]",
+        "  connecting=false; logic.reset(); platform.updateRPC()",
+        "  if quiet → return [no dialog]",
+        "  else show disconnect reason dialog (closed/timeout/error)",
+        "@Remote kick(KickReason): disconnectQuietly() + logic.reset()",
+        "  if reason==serverRestarting → ui.join.reconnect() [auto-reconnect]",
+        "  else show kick dialog unless reason.quiet",
+        "disconnectQuietly(): quiet=true, connecting=false, net.disconnect()",
+        "disconnectNoReset(): quiet=quietReset=true, net.disconnect() [no state change]"
+      ]
+    }
+  ],
+
+  "conditions_and_branches": [
+    "UUID null → abort connect, show '@invalidid'",
+    "net.client() false after reset → disconnectQuietly() [connect canceled]",
+    "Data timeout (30s while connecting) → disconnect with '@disconnect.data'",
+    "Snapshot timeout (20s in-game, UDP) → disconnect with '@disconnect.snapshottimeout'",
+    "kick reason==serverRestarting → reconnect flow instead of error dialog",
+    "kick reason.quiet==true → no dialog shown",
+    "Packet length <36 bytes OR StreamChunk → skip LZ4 compression",
+    "entitySnapshot: entity exists vs new creation → snapSync only if newly created",
+    "entitySnapshot: entity not in 'removed' set → add to world",
+    "Wave number increased → fire WaveEvent",
+    "state.isMenu() → skip paused/playing state set in stateSnapshot",
+    "packetSpamLimit exceeded on server → DOS blacklist + close connection",
+    "playerLimit exceeded on server connect → close connection"
+  ],
+
+  "key_relationships": [
+    "NetClient implements ApplicationListener (update loop)",
+    "ArcNetProvider implements NetProvider",
+    "ArcNetProvider.ArcConnection extends NetConnection",
+    "ArcNetProvider owns arc.net.Client and arc.net.Server instances",
+    "NetClient depends_on NetworkIO (loadWorld)",
+    "NetClient depends_on ArcNetProvider (via Net facade) for send/disconnect",
+    "PacketSerializer uses LZ4 compression (threshold: 36 bytes)",
+    "NetClient uses Timekeeper for rate-limited sync: 66ms/500ms/1000ms intervals",
+    "WorldStream delivered via TCP streaming (StreamBegin + StreamChunk[])",
+    "entitySnapshot/blockSnapshot/stateSnapshot delivered via UDP (unreliable)"
+  ],
+
+  "key_packets": [
+    "Connect (inbound) — triggers ConnectPacket send",
+    "ConnectPacket (outbound TCP) — name, locale, mods, mobile, versionType, color, usid, uuid",
+    "WorldStream (inbound TCP stream) — compressed world data",
+    "Disconnect (inbound) — reason: closed/timeout/error",
+    "entitySnapshot (inbound UDP) — amount+binary entity data",
+    "blockSnapshot (inbound UDP) — amount+binary block state",
+    "stateSnapshot (inbound UDP) — wave/time/pause/gameOver/tps/rand/coreData",
+    "hiddenSnapshot (inbound UDP) — ids of entities to hide",
+    "clientSnapshot (outbound UDP, 66ms) — full player/unit state",
+    "clientPlanSnapshot (outbound TCP, 500ms) — build plans",
+    "ping/pingResponse (TCP, 1s) — round-trip latency"
+  ],
+
+  "important_notes": [
+    "ConnectPacket sent via reliable TCP; clientSnapshot sent via unreliable UDP",
+    "World data decompressed with InflaterInputStream before NetworkIO.loadWorld()",
+    "Entity deduplication via 'removed' IntSet — prevents re-adding disconnected entities",
+    "Snapshot timeout = 20s; data timeout = 30s (1800 game ticks at 60tps)",
+    "PacketSerializer: LZ4 compression applied when serialized size >= 36 bytes",
+    "finishConnecting() posts Call.connectConfirm via Core.app.post (deferred to next frame)",
+    "reconnect flow triggered only for KickReason.serverRestarting",
+    "worldDataBegin is a @Remote call — server triggers it before streaming world"
+  ],
+
+  "source_files_analyzed": [
+    "core/src/mindustry/core/NetClient.java",
+    "core/src/mindustry/net/ArcNetProvider.java",
+    "core/src/mindustry/net/NetworkIO.java"
+  ]
+}

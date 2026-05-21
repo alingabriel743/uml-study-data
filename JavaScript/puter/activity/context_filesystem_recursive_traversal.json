@@ -1,0 +1,165 @@
+{
+  "scope": "filesystem_recursive_traversal",
+  "title": "File System Recursive Traversal",
+  "diagram_type": "activity",
+  "key_actors": ["Caller", "FSEntryController", "PuterFSProvider", "Database (db)"],
+
+  "activities": [
+    {
+      "name": "fast_get_descendants(uuid)",
+      "owner": "FSEntryController",
+      "description": "Returns ALL descendant UUIDs (any depth) via recursive SQL CTE",
+      "steps": [
+        "Receive uuid of root node",
+        "Execute WITH RECURSIVE descendant_cte CTE: seed = fsentries WHERE parent_uid = uuid",
+        "UNION ALL: join fsentries ON f.parent_uid = d.uuid (expand level by level)",
+        "SELECT uuid FROM descendant_cte",
+        "Map rows to plain uuid array",
+        "Return uuid[]"
+      ]
+    },
+    {
+      "name": "fast_get_direct_descendants(uuid)",
+      "owner": "FSEntryController",
+      "description": "Returns only direct child UUIDs (one level deep)",
+      "steps": [
+        "Receive uuid",
+        "[Branch] If uuid === PuterPath.NULL_UUID → SELECT uuid FROM fsentries WHERE parent_uid IS NULL",
+        "[Branch] Else → SELECT uuid FROM fsentries WHERE parent_uid = ?",
+        "Map rows to uuid array",
+        "Return uuid[]"
+      ]
+    },
+    {
+      "name": "get_descendants_full(uuid, fetch_entry_options)",
+      "owner": "FSEntryController",
+      "description": "Returns full fsentry objects for direct children, with subdomain join and deduplication",
+      "steps": [
+        "Receive uuid, fetch_entry_options { thumbnail }",
+        "Build columns SQL: defaultProperties (f.col) + subdomainProperties (s.col AS subdomain_*) + optional thumbnail",
+        "[Branch] If uuid === PuterPath.NULL_UUID → SELECT columns FROM fsentries WHERE parent_uid IS NULL",
+        "[Branch] Else → SELECT columns FROM fsentries AS f LEFT JOIN subdomains AS s ON f.id=s.root_dir_id WHERE parent_uid = ? ORDER BY f.id",
+        "Deduplicate rows by entry id using Map (collapse multiple subdomain rows into entry.subdomains[])",
+        "Optionally attach thumbnail field",
+        "Return Array.from(byId.values()) — full fsentry objects"
+      ]
+    },
+    {
+      "name": "get_recursive_size(uuid)",
+      "owner": "FSEntryController",
+      "description": "Computes total size of all descendant files using recursive CTE",
+      "steps": [
+        "Receive uuid",
+        "Execute WITH RECURSIVE descendant_cte: seed = fsentries WHERE parent_uid = ? (includes size)",
+        "UNION ALL: expand all descendants with size",
+        "SELECT SUM(size) AS total_size FROM descendant_cte",
+        "Return rows[0].total_size (number)"
+      ]
+    },
+    {
+      "name": "get_recursive_size({ node })",
+      "owner": "PuterFSProvider",
+      "description": "Provider-level wrapper — duplicate CTE implementation operating on node",
+      "steps": [
+        "Receive FSNode",
+        "await node.get('uid') → uuid",
+        "Execute same recursive CTE as FSEntryController.get_recursive_size",
+        "db.read(cte_query, [uuid])",
+        "Return rows[0].total_size"
+      ]
+    },
+    {
+      "name": "find(selector, fetch_entry_options)",
+      "owner": "FSEntryController",
+      "description": "Dispatcher: resolves selector type and routes to appropriate lookup method",
+      "steps": [
+        "Receive selector (RootNodeSelector | NodePathSelector | NodeUIDSelector | NodeInternalIDSelector | NodeChildSelector)",
+        "[Branch] RootNodeSelector → return selector.entry directly (no DB call)",
+        "[Branch] NodePathSelector → call findByPath(selector.value, fetch_entry_options)",
+        "[Branch] NodeUIDSelector → call findByUID(selector.value, fetch_entry_options)",
+        "[Branch] NodeInternalIDSelector → call findByID(selector.id, fetch_entry_options)",
+        "[Branch] NodeChildSelector →",
+        "  [Sub-branch] parent is RootNodeSelector → findNameInRoot(selector.name) → id",
+        "  [Sub-branch] parent is other → find(selector.parent) → parentEntry → findNameInParent(parentEntry.uuid, name) → id",
+        "  If id undefined → return null",
+        "  Recurse: find(new NodeInternalIDSelector('mysql', id))",
+        "Return fsentry object or null"
+      ]
+    },
+    {
+      "name": "findByUID(uuid, fetch_entry_options)",
+      "owner": "FSEntryController",
+      "description": "Looks up a single fsentry by UUID using tryHardRead (retries on failure)",
+      "steps": [
+        "Receive uuid, optional { thumbnail }",
+        "Build SELECT: defaultProperties + optional thumbnail FROM fsentries WHERE uuid = ? LIMIT 1",
+        "db.tryHardRead(query, [uuid])",
+        "Return fsentry[0] (or undefined)"
+      ]
+    },
+    {
+      "name": "findByPath(path, fetch_entry_options)",
+      "owner": "FSEntryController",
+      "description": "Resolves path to fsentry — first tries direct path column, then iterative segment walk",
+      "steps": [
+        "Receive path string, options { thumbnail, tracer, trace_options }",
+        "[Branch] path === '/' → return find(new RootNodeSelector())",
+        "Split path into parts (filter empty)",
+        "[Attempt 1] SELECT * FROM fsentries WHERE path=? LIMIT 1 → if found, return result[0]",
+        "[Attempt 2 - loop] For each path segment i:",
+        "  [Branch] parent_uid === null → SELECT uuid FROM fsentries WHERE parent_uid IS NULL AND name=? LIMIT 1",
+        "  [Branch] Else → SELECT (cols or uuid) FROM fsentries WHERE parent_uid=? AND name=? LIMIT 1",
+        "  If result[0] missing → return false",
+        "  Set parent_uid = result[0].uuid",
+        "[Optional] Wrap loop in tracer span 'fs:sql:findByPath' if tracer provided",
+        "Return result[0]"
+      ]
+    },
+    {
+      "name": "readdirstat_uuid({ uuid, options })",
+      "owner": "PuterFSProvider",
+      "description": "Optimized readdir for known UUID — wraps get_descendants_full",
+      "steps": [
+        "Receive uuid and options (thumbnail, etc.)",
+        "Call fsEntryController.get_descendants_full(uuid, options) → raw entries[]",
+        "Map each raw_entry → svc_fs.node(new NodeRawEntrySelector(raw_entry, { found_thumbnail }))",
+        "Set node.found = true on each",
+        "Return Promise<FSNode[]>"
+      ]
+    }
+  ],
+
+  "key_conditions": [
+    "uuid === PuterPath.NULL_UUID → query parent_uid IS NULL (root-level entries)",
+    "selector type determines routing in find(): Root / Path / UID / InternalID / Child",
+    "NodeChildSelector.parent is RootNodeSelector → findNameInRoot, else recursive find(parent)",
+    "Direct path column hit in findByPath → skip segment loop",
+    "fetch_entry_options.thumbnail → appends thumbnail column to SELECT",
+    "fetch_entry_options.tracer → wraps path loop in OpenTelemetry span"
+  ],
+
+  "key_relationships": [
+    "PuterFSProvider depends_on FSEntryController (this.fsEntryController)",
+    "FSEntryController depends_on db (imported via extension.import('data'))",
+    "FSEntryController uses PuterPath.NULL_UUID for root detection",
+    "FSEntryController uses NodeUIDSelector, NodePathSelector, NodeInternalIDSelector, NodeChildSelector, RootNodeSelector",
+    "PuterFSProvider.readdirstat_uuid delegates to FSEntryController.get_descendants_full",
+    "PuterFSProvider.quick_check delegates to FSEntryController.findByPath / findByUID / nameExistsUnderParent",
+    "PuterFSProvider.rmdir uses fast_get_direct_descendants to check if directory is empty",
+    "FSEntryController.find recursively calls itself for NodeChildSelector parent resolution"
+  ],
+
+  "db_operations": [
+    "db.read() — standard read query",
+    "db.tryHardRead() — retrying read (used in findByUID, findByID for resilience)",
+    "db.batch_write() — batch write operations (used in exec_ for write queue)",
+    "All traversal uses SQL WITH RECURSIVE CTE (descendant_cte) pattern"
+  ],
+
+  "important_notes": "Two implementations of get_recursive_size exist: one in FSEntryController (pure, uuid param) and one in PuterFSProvider (node param, extracts uid then runs same CTE). get_descendants_full only gets DIRECT children (no recursion) — name is slightly misleading. fast_get_descendants is truly recursive (all depths, UUIDs only). findByPath has a fast-path using a denormalized 'path' column before falling back to segment-by-segment traversal.",
+
+  "source_files_analyzed": [
+    "extensions/legacyFileSystem/fsentries/FSEntryController.js",
+    "extensions/legacyFileSystem/PuterFSProvider.js"
+  ]
+}

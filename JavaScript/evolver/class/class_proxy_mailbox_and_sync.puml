@@ -1,0 +1,169 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+title Proxy Mailbox & Sync
+
+package "proxy/mailbox" {
+
+    class MailboxStore {
+        -_messagesFile: string
+        -_stateFile: string
+        -_messages: Map
+        -_outbound: string[]
+        -_inbound: string[]
+        -_state: object
+        --
+        +constructor(dataDir: string)
+        +send(opts): {message_id, status}
+        +writeInbound(opts): string
+        +writeInboundBatch(messages: object[]): string[]
+        +getById(id): message|null
+        +poll(opts): message[]
+        +pollOutbound(opts): message[]
+        +ack(messageIds): number
+        +updateStatus(id, status, opts): void
+        +updateStatusBatch(updates): void
+        +incrementRetry(id, error?): void
+        +list(opts): message[]
+        +countPending(opts): number
+        +getCursor(key): any|null
+        +setCursor(key, value): void
+        +getState(key): any|null
+        +setState(key, value): void
+        +compact(): void
+        +close(): void
+        --
+        -_loadState(): void
+        -_runMigrations(fromVersion, toVersion): void
+        -_persistState(): void
+        -_rebuildIndex(): void
+        -_appendMessage(msg): void
+        -_appendUpdate(id, fields): void
+        -_evictFromIndex(id): void
+    }
+
+    note right of MailboxStore
+        JSONL append-log + JSON state file.
+        Message statuses:
+          pending → synced | delivered
+                  | failed | rejected
+        Terminal statuses evict from index.
+        Constants:
+          DEFAULT_CHANNEL = 'evomap-hub'
+          SCHEMA_VERSION = 1
+          PROXY_PROTOCOL_VERSION = '0.1.0'
+    end note
+}
+
+package "proxy/sync" {
+
+    class SyncEngine {
+        +store: MailboxStore
+        +hubUrl: string
+        +logger: object
+        +getHeaders: Function
+        +onInboundReceived: Function|null
+        +onAuthError: Function|null
+        +outbound: OutboundSync
+        +inbound: InboundSync
+        -_outTimer: Timeout|null
+        -_inTimer: Timeout|null
+        -_running: boolean
+        -_lastActivity: number
+        --
+        +constructor(opts)
+        +start(): void
+        +stop(): void
+        +notifyNewOutbound(): void
+        --
+        -_isIdle(): boolean
+        -_handleAuthError(source: string): Promise<void>
+        -_scheduleOutbound(delayMs): void
+        -_scheduleInbound(delayMs): void
+    }
+
+    note right of SyncEngine
+        Timer logic:
+          Outbound: 1s if pending>0, else 5s
+          Inbound:  10s active, 60s idle
+        IDLE_THRESHOLD = 300 000 ms (5 min)
+    end note
+
+    class OutboundSync {
+        +store: MailboxStore
+        +hubUrl: string
+        +logger: object
+        +getHeaders: Function
+        --
+        +constructor(opts)
+        +flush(channel?): Promise<{sent, synced, responses}|{sent:0, error}>
+    }
+
+    note bottom of OutboundSync
+        POST /a2a/mailbox/outbound
+        Batch size: MAX_BATCH = 50
+        MAX_RETRIES = 10
+        On success: updateStatusBatch(),
+          writeInboundBatch(hub responses)
+        On network error: incrementRetry()
+    end note
+
+    class InboundSync {
+        +store: MailboxStore
+        +hubUrl: string
+        +logger: object
+        +getHeaders: Function
+        --
+        +constructor(opts)
+        +pull(channel?, limit?): Promise<{received, cursor}|{received:0, error}>
+        +ackDelivered(channel?): Promise<{acked}|{acked:0, error}>
+    }
+
+    note bottom of InboundSync
+        POST /a2a/mailbox/inbound
+        Cursor-based pagination.
+        POST /a2a/mailbox/ack
+        DEFAULT_POLL_INTERVAL_ACTIVE = 10s
+        DEFAULT_POLL_INTERVAL_IDLE   = 60s
+    end note
+}
+
+package "proxy/lifecycle" #EDE7F6 {
+    class AuthError {
+        +message: string
+        +statusCode: number
+        --
+        +constructor(message, statusCode)
+    }
+}
+
+' ─── Composition ───
+SyncEngine *-- OutboundSync : outbound
+SyncEngine *-- InboundSync  : inbound
+
+' ─── Dependencies on MailboxStore ───
+SyncEngine    ..> MailboxStore  : uses (countPending)
+OutboundSync  ..> MailboxStore  : uses (pollOutbound,\nupdateStatusBatch,\nwriteInboundBatch,\nsetState, incrementRetry)
+InboundSync   ..> MailboxStore  : uses (getCursor, getState,\nwriteInboundBatch,\nsetCursor, list)
+
+' ─── AuthError propagation ───
+OutboundSync ..> AuthError : throws
+InboundSync  ..> AuthError : throws
+SyncEngine   ..> AuthError : catches / handles
+
+@enduml

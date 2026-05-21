@@ -1,0 +1,155 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #F1F3F5
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #DEE2E6
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Model Failover Flow
+
+actor Caller
+participant "Agent\n(uses Promptable)" as agent #D0E8FF
+participant "Promptable\n(trait)" as promptable #D0E8FF
+participant "Provider\n(static helper)" as providerHelper
+participant "AiManager\n(Ai facade)" as aiManager
+participant "ReflectionClass" as reflection #E8F5E9
+participant "PrimaryProvider\n(TextProvider)" as primary #C8E6C9
+participant "FallbackProvider\n(TextProvider)" as fallback #FFE0B2
+participant "EventDispatcher" as events #F3E5F5
+
+== Entry Point ==
+
+Caller -> agent: prompt(\n  $prompt, $attachments,\n  $provider, $model, $timeout\n)
+activate agent
+
+agent -> promptable: withModelFailover(\n  Closure $callback,\n  $provider, $model\n)
+activate promptable
+
+== Provider List Resolution ==
+
+promptable -> promptable: getProvidersAndModels($provider, $model)
+activate promptable
+
+alt No explicit $provider passed
+    promptable -> reflection: getAttributes(ProviderAttribute)
+    reflection --> promptable: provider name (or null)
+    promptable -> reflection: getAttributes(ModelAttribute)
+    reflection --> promptable: model name (or null)
+end
+
+promptable -> providerHelper: formatProviderAndModelList(\n  $provider ?? config('ai.default'),\n  $model\n)
+activate providerHelper
+providerHelper --> promptable: array [providerName => model|null]
+deactivate providerHelper
+
+deactivate promptable
+
+note over promptable
+  Provider list built ONCE before loop.
+  Supports single string, Lab enum,
+  or array for multi-step failover.
+end note
+
+== Failover Loop — Primary Provider Attempt ==
+
+loop foreach [$providerName => $model] in providers list
+
+    promptable -> aiManager: textProviderFor($agent, $providerName)
+    activate aiManager
+    aiManager -> aiManager: textProvider($providerName)\n[validates TextProvider interface]
+    aiManager -> aiManager: hasFakeGatewayFor($agent)\n[swap in fake gateway if faked]
+    aiManager --> promptable: TextProvider instance
+    deactivate aiManager
+
+    alt model is null
+        promptable -> promptable: getDefaultModelFor(TextProvider)
+        note right of promptable
+          #[UseSmartestModel] → smartestTextModel()
+          #[UseCheapestModel] → cheapestTextModel()
+          default          → defaultTextModel()
+        end note
+    end
+
+    promptable -> primary: prompt(\n  new AgentPrompt(\n    $agent, $prompt, $attachments,\n    $providerName, $model, $timeout\n  )\n)
+    activate primary
+
+    alt Success — primary responds
+        primary --> promptable: AgentResponse
+        deactivate primary
+        promptable --> agent: AgentResponse
+        deactivate promptable
+        agent --> Caller: AgentResponse
+        deactivate agent
+    else FailoverableException thrown\n(RateLimitedException | ProviderOverloadedException | InsufficientCreditsException)
+        primary --x promptable: throws FailoverableException
+        deactivate primary
+
+        promptable -> events: event(\n  new AgentFailedOver(\n    $agent, $providerName,\n    $model, $exception\n  )\n)
+        activate events
+        events --> promptable: dispatched
+        deactivate events
+
+        note over promptable, fallback
+          Continue loop → retry with next provider
+        end note
+
+        promptable -> aiManager: textProviderFor($agent, $fallbackProviderName)
+        activate aiManager
+        aiManager --> promptable: FallbackProvider instance
+        deactivate aiManager
+
+        promptable -> fallback: prompt(\n  new AgentPrompt(...)\n)
+        activate fallback
+        fallback --> promptable: AgentResponse
+        deactivate fallback
+
+        promptable --> agent: AgentResponse
+        deactivate promptable
+        agent --> Caller: AgentResponse
+        deactivate agent
+    end
+
+end
+
+== All Providers Exhausted ==
+
+alt All providers failed (non-FailoverableException propagates immediately)
+    note over promptable
+      Non-FailoverableException:
+      propagates immediately — no failover
+    end note
+end
+
+promptable --x agent: throw $lastException\n?? RuntimeException(\n  'No AI providers were configured.'\n)
+deactivate promptable
+agent --x Caller: exception propagated
+deactivate agent
+
+@enduml

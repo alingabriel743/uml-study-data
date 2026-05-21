@@ -1,0 +1,205 @@
+{
+  "scope": "Map IO & Editor Workflow",
+  "diagram_type": "activity",
+  "key_participants": ["MapIO", "Maps", "MapPreviewLoader", "MapProcessorsDialog", "SaveIO", "WorldContext"],
+
+  "activities": [
+    {
+      "workflow": "Save Map (Maps.saveMap)",
+      "steps": [
+        "START: editor triggers saveMap(StringMap tags)",
+        "Validate: tags must contain non-null 'name'",
+        "Find existing map by display name in maps list",
+        "IF found: dispose old texture, remove from list, reuse file path",
+        "ELSE: findFile(name) → sanitize filename, find unique path in customMapDirectory",
+        "Create Map object (file, world.width, world.height, tags)",
+        "fogControl.resetFog()",
+        "MapIO.writeMap(file, map) → SaveIO.write(file, map.tags) [deflate-compressed]",
+        "IF NOT headless: scan all tiles for CoreBlock (collect teams) and spawn blocks (count spawns)",
+        "IF preview already loaded in Core.assets: unload it",
+        "MapIO.generatePreview(world.tiles) → returns Pixmap",
+        "writeCache(map) → write spawns+teams to .cache file",
+        "map.texture = new Texture(pix)",
+        "Async (mainExecutor): map.previewFile().writePng(pix); pix.dispose()",
+        "maps.add(map); maps.sort()",
+        "END: return Map"
+      ]
+    },
+    {
+      "workflow": "Generate Preview from File (MapIO.generatePreview(Map))",
+      "steps": [
+        "START: open InflaterInputStream on map.file",
+        "SaveIO.readHeader(stream)",
+        "Read version int → get SaveVersion via SaveIO.getSaveWriter(version)",
+        "IF ver == null: throw IOException (unknown version)",
+        "ver.readRegion('meta') → readStringMap (discarded)",
+        "Create Pixmap floors(width,height) and Pixmap walls(width,height)",
+        "Create CachedTile with overridden setBlock: calls colorFor(), draws wall color + shade on walls/floors pixmaps",
+        "ver.readRegion('content') → readContentHeader",
+        "IF version >= 11: ver.readRegion('content') → skipContentPatches",
+        "ver.readRegion('preview_map') → readMap with anonymous WorldContext:",
+        "  create(x,y,floorID,overlayID,wallID): sets floor pixel color; counts spawns; stores floorIds[]",
+        "  tile(index): maps index to x/y on CachedTile",
+        "  onReadBuilding: draws team color for building tiles; tracks CoreBlock teams in map.teams",
+        "  onReadTileData: draws block minimapColor or floor minimapColor",
+        "  setBlock override: draws non-air wall color + shadow",
+        "floors.draw(walls, true) → composite walls over floors",
+        "walls.dispose()",
+        "content.setTemporaryMapper(null) [finally]",
+        "END: return floors Pixmap"
+      ]
+    },
+    {
+      "workflow": "Generate Preview from Tiles (MapIO.generatePreview(Tiles))",
+      "steps": [
+        "START: create Pixmap(tiles.width, tiles.height)",
+        "For each tile (x,y):",
+        "  IF block is non-synthetic and non-air: color = block.minimapColor(tile)",
+        "  ELSE IF overlay==air AND block==air: color = floor.minimapColor(tile)",
+        "  IF color==0: color = colorFor(block, floor, overlay, team)",
+        "  pixmap.set(x, height-1-y, color)",
+        "END: return pixmap"
+      ]
+    },
+    {
+      "workflow": "Load Map Previews (Maps.loadPreviews)",
+      "steps": [
+        "START: iterate all maps",
+        "FOR each map:",
+        "  IF map.previewFile() exists:",
+        "    Core.assets.load(AssetDescriptor with MapPreviewParameter) → on loaded: map.texture = t",
+        "    [MapPreviewLoader.loadAsync: tries super.loadAsync on sibling file; on error → maps.queueNewPreview(map)]",
+        "    [MapPreviewLoader.loadSync: tries super.loadSync; on error → new Texture(file); on 2nd error → error.png]",
+        "    try readCache(map) [reads spawns+teams from .cache file]",
+        "    on readCache failure: queueNewPreview(map)",
+        "  ELSE (no preview file): queueNewPreview(map)",
+        "END: all maps queued or loaded"
+      ]
+    },
+    {
+      "workflow": "Queue & Create New Preview (Maps)",
+      "steps": [
+        "queueNewPreview(map): Core.app.post(() → previewList.add(map))",
+        "createAllPreviews(): Core.app.post() → for each map in previewList → createNewPreview(map, errorHandler)",
+        "createNewPreview(map, failed):",
+        "  MapIO.generatePreview(map) → Pixmap",
+        "  map.texture = new Texture(pix)",
+        "  Async (mainExecutor): map.previewFile().writePng(pix); writeCache(map); pix.dispose()",
+        "  on exception: failed.get(e); Log.err"
+      ]
+    },
+    {
+      "workflow": "Import Map (Maps.importMap)",
+      "steps": [
+        "START: importMap(Fi file)",
+        "findFile(file.name()) → determine dest path",
+        "file.copyTo(dest)",
+        "loadMap(dest, true) → MapIO.createMap(dest, true) → reads meta tags → returns Map",
+        "createNewPreview(map, errorHandler)",
+        "  on error: maps.remove(map); map.file.delete(); rethrow as IOException",
+        "END: map imported with preview"
+      ]
+    },
+    {
+      "workflow": "Read Map File (MapIO.createMap)",
+      "steps": [
+        "START: open InflaterInputStream on file",
+        "SaveIO.readHeader(stream)",
+        "Read version int",
+        "SaveIO.getSaveWriter(version) → SaveVersion",
+        "IF ver == null: throw IOException",
+        "ver.readRegion('meta') → readStringMap → tags (width, height, name, etc.)",
+        "END: return new Map(file, width, height, tags, custom, version, Version.build)"
+      ]
+    },
+    {
+      "workflow": "Write Map File (MapIO.writeMap)",
+      "steps": [
+        "START: writeMap(Fi file, Map map)",
+        "SaveIO.write(file, map.tags) [wraps in deflate compression]",
+        "on exception: rethrow as IOException",
+        "END"
+      ]
+    },
+    {
+      "workflow": "Load Map into World (MapIO.loadMap)",
+      "steps": [
+        "START: loadMap(Map map) or loadMap(Map map, WorldContext cons)",
+        "SaveIO.load(map.file) OR SaveIO.load(map.file, cons)",
+        "END"
+      ]
+    },
+    {
+      "workflow": "Read/Write Image (MapIO.readImage / writeImage)",
+      "steps": [
+        "writeImage(Tiles): iterate tiles → pick block.mapColor or floor.mapColor → set pixmap pixel (y-flipped)",
+        "readImage(Pixmap, Tiles): iterate tiles → pixmap.get(x, height-1-y) → ColorMapper.get(color) → Block",
+        "  skip buildings; set overlay / floor / multiblock / wall as appropriate",
+        "  second pass: any tile with floor==air → setFloor(Blocks.stone)"
+      ]
+    },
+    {
+      "workflow": "Map Processors Dialog (MapProcessorsDialog)",
+      "steps": [
+        "OPEN dialog → shown() triggers setup()",
+        "setup(): clear processors list; scan world.tiles.eachTile for isCenter+worldProcessor blocks; collect into processors Seq; call rebuild()",
+        "rebuild(): clear list UI",
+        "  IF processors empty: show '@editor.worldprocessors.none'",
+        "  ELSE: for each LogicBuild matching search text:",
+        "    Render icon button → iconSelect.show() to change iconTag",
+        "    Render name/position button → log.showEditDialog(true)",
+        "    Render pencil/edit button → ui.showTextInput to rename tag → setup()",
+        "    IF state.isGame && isEditor: render eye button → hide(); showConfig(build); panCamera(build)",
+        "    Render trash button → ui.showConfirm → check surrounding tiles; setNet(air or wall); processors.remove(build); rebuild()",
+        "ADD button: scan world grid for first non-synthetic tile → tile.setNet(Blocks.worldProcessor, Team.sharded, 0); editor.renderer.updateStatic(x,y); setup()",
+        "  IF no space found: ui.showErrorMessage"
+      ]
+    },
+    {
+      "workflow": "MapPreviewLoader.setupLoaders (Anti-cheat fog bypass via reflection)",
+      "steps": [
+        "Reflect: locate mindustry.game.Rules class fields: fog, rules(in GameState), schematics, staticFog",
+        "Register Events.on(WorldLoadEvent): record if net.client() and fog/schematic states",
+        "Register Events.on(ResetEvent): reset all flags to false",
+        "Register Events.run(Trigger.update, check): if flags set, override fog/schematic fields via reflection",
+        "checkPreviews(): runs check Runnable each frame if set"
+      ]
+    }
+  ],
+
+  "key_relationships": [
+    "Maps uses MapIO.writeMap to persist map files",
+    "Maps uses MapIO.createMap to load map metadata",
+    "Maps uses MapIO.generatePreview(Map) and MapIO.generatePreview(Tiles) to create preview Pixmaps",
+    "Maps delegates asset loading of previews to MapPreviewLoader (registered as TextureLoader)",
+    "MapPreviewLoader.loadAsync failure → Maps.queueNewPreview(map)",
+    "Maps.createNewPreview → MapIO.generatePreview(map) → writes PNG async via mainExecutor",
+    "Maps.saveMap → MapIO.writeMap + MapIO.generatePreview(world.tiles) + writeCache",
+    "Maps.loadPreviews → Core.assets.load with MapPreviewParameter + readCache",
+    "MapProcessorsDialog scans world.tiles to find worldProcessor buildings",
+    "MapProcessorsDialog uses LogicBuild.showEditDialog and ui.showTextInput for editing",
+    "MapIO.readImage/writeImage use ColorMapper for color-to-block mapping",
+    "MapIO.generatePreview(Map) uses SaveIO for binary format, WorldContext for tile rendering",
+    "Maps.writeCache/readCache store lightweight metadata (spawns, teams) alongside preview"
+  ],
+
+  "important_conditions": [
+    "generatePreview(Map): SaveVersion must not be null (throws if unknown version)",
+    "generatePreview(Map): ver.version >= 11 triggers skipContentPatches region",
+    "saveMap: headless mode skips preview generation entirely",
+    "loadPreviews: preview file existence determines load vs queue path",
+    "MapProcessorsDialog add: no non-synthetic tile found → error message",
+    "MapProcessorsDialog delete: surrounded by privileged/static tiles → replace with wall; else → air",
+    "createMap: map name null → IOException",
+    "readImage: buildings (hasBuilding()) are skipped; second pass defaults air floors to stone"
+  ],
+
+  "important_notes": "MapPreviewLoader.setupLoaders contains obfuscated reflection code using byte arrays to encode class/field names (mindustry.game.Rules, fields: fog, schematics, staticFog) — it manipulates game rules for multiplayer clients on WorldLoadEvent/Trigger.update. Maps uses a mainExecutor for async PNG/cache writes. MapIO uses deflate (InflaterInputStream) for all map file I/O. Preview cache (.cache) stores spawn count + team IDs separately from the preview PNG.",
+
+  "source_files_analyzed": [
+    "core/src/mindustry/io/MapIO.java",
+    "core/src/mindustry/maps/MapPreviewLoader.java",
+    "core/src/mindustry/editor/MapProcessorsDialog.java",
+    "core/src/mindustry/maps/Maps.java (lines 200-480)"
+  ]
+}

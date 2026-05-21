@@ -1,0 +1,165 @@
+{
+  "scope": "error_handling_and_recovery",
+  "title": "Error Handling and Recovery",
+  "diagram_type": "use_case",
+  "description": "Run errors are caught, classified, and delegated to registered error handlers. Currently, only MaxTurnsExceeded supports custom recovery; all other exceptions propagate to the caller.",
+
+  "actors": [
+    "Developer (SDK user)",
+    "Runner",
+    "RunLoop (run_internal/run_loop.py)",
+    "ErrorHandlerDispatcher (run_internal/error_handlers.py)",
+    "GuardrailEngine (run_internal/guardrails.py)"
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Register max_turns error handler",
+      "actor": "Developer",
+      "description": "Developer passes error_handlers={'max_turns': fn} to Runner.run/run_sync/run_streamed or via RunConfig.error_handlers",
+      "precondition": "Runner entry point called with error_handlers kwarg",
+      "outcome": "Handler stored in RunErrorHandlers TypedDict under 'max_turns' key"
+    },
+    {
+      "id": "UC2",
+      "name": "Detect max turns exceeded",
+      "actor": "RunLoop",
+      "description": "When turn counter >= max_turns, RunLoop raises MaxTurnsExceeded('Max turns (N) exceeded')",
+      "trigger": "Turn count check at top of agent loop iteration",
+      "outcome": "MaxTurnsExceeded exception raised; run_data snapshot built via build_run_error_data()"
+    },
+    {
+      "id": "UC3",
+      "name": "Dispatch custom max_turns handler",
+      "actor": "ErrorHandlerDispatcher",
+      "description": "resolve_run_error_handler_result() looks up 'max_turns' key in error_handlers dict, constructs RunErrorHandlerInput(error, context, run_data), calls handler (sync or async)",
+      "precondition": "error_handlers is not None and 'max_turns' key exists",
+      "outcome": "Handler callable invoked; result normalized to RunErrorHandlerResult"
+    },
+    {
+      "id": "UC4",
+      "name": "Normalize handler return value",
+      "actor": "ErrorHandlerDispatcher",
+      "description": "Handler may return RunErrorHandlerResult | dict(final_output, include_in_history) | raw value | None. Dispatcher coerces all forms to RunErrorHandlerResult or None.",
+      "validation": "Extra dict keys beyond {final_output, include_in_history} raise UserError; dict missing final_output treated as raw value",
+      "outcome": "RunErrorHandlerResult(final_output, include_in_history=True|False) or None"
+    },
+    {
+      "id": "UC5",
+      "name": "Return fallback final output",
+      "actor": "Runner",
+      "description": "If handler returns non-None RunErrorHandlerResult, run completes normally with handler's final_output instead of raising. include_in_history controls whether output is appended to conversation history.",
+      "outcome": "RunResult with handler-supplied final_output returned to caller"
+    },
+    {
+      "id": "UC6",
+      "name": "Propagate MaxTurnsExceeded (no handler)",
+      "actor": "Runner",
+      "description": "If no error_handlers or 'max_turns' key absent, MaxTurnsExceeded propagates to caller. Exception carries run_data (RunErrorDetails) set by runner before re-raise.",
+      "outcome": "MaxTurnsExceeded raised to Developer"
+    },
+    {
+      "id": "UC7",
+      "name": "Raise InputGuardrailTripwireTriggered",
+      "actor": "GuardrailEngine",
+      "description": "When input guardrail sets tripwire=True, raises InputGuardrailTripwireTriggered(guardrail_result). Caught in run_loop at multiple points (per-agent input check, streaming path). No custom handler supported — always propagates.",
+      "outcome": "InputGuardrailTripwireTriggered raised to Developer; guardrail_result field contains triggering InputGuardrailResult"
+    },
+    {
+      "id": "UC8",
+      "name": "Raise OutputGuardrailTripwireTriggered",
+      "actor": "GuardrailEngine",
+      "description": "When output guardrail sets tripwire=True after LLM response, raises OutputGuardrailTripwireTriggered(guardrail_result). Always propagates — no recovery hook.",
+      "outcome": "OutputGuardrailTripwireTriggered raised to Developer"
+    },
+    {
+      "id": "UC9",
+      "name": "Raise ToolInputGuardrailTripwireTriggered",
+      "actor": "ToolExecution (run_internal/tool_execution.py)",
+      "description": "When a tool-level input guardrail trips, raises ToolInputGuardrailTripwireTriggered(guardrail, output). No handler — propagates.",
+      "outcome": "ToolInputGuardrailTripwireTriggered raised to Developer"
+    },
+    {
+      "id": "UC10",
+      "name": "Raise ModelBehaviorError",
+      "actor": "RunLoop",
+      "description": "Raised when LLM produces malformed JSON or calls a non-existent tool. No custom handler — propagates.",
+      "outcome": "ModelBehaviorError raised to Developer"
+    },
+    {
+      "id": "UC11",
+      "name": "Raise ToolTimeoutError",
+      "actor": "ToolExecution",
+      "description": "Raised when a function tool exceeds its configured timeout and timeout_behavior='raise_exception'. No custom handler — propagates.",
+      "outcome": "ToolTimeoutError(tool_name, timeout_seconds) raised to Developer"
+    },
+    {
+      "id": "UC12",
+      "name": "Inspect run details on exception",
+      "actor": "Developer",
+      "description": "All AgentsException subclasses carry a run_data: RunErrorDetails | None attribute populated by the runner before propagating. Developer can inspect input, new_items, raw_responses, last_agent, guardrail_results.",
+      "outcome": "Developer retrieves partial run state for debugging/logging"
+    }
+  ],
+
+  "key_classes": {
+    "AgentsException": "Base for all SDK exceptions; run_data: RunErrorDetails | None",
+    "MaxTurnsExceeded": "AgentsException; message: str; raised when turn count >= max_turns",
+    "InputGuardrailTripwireTriggered": "AgentsException; guardrail_result: InputGuardrailResult",
+    "OutputGuardrailTripwireTriggered": "AgentsException; guardrail_result: OutputGuardrailResult",
+    "ToolInputGuardrailTripwireTriggered": "AgentsException; guardrail + output fields",
+    "ToolOutputGuardrailTripwireTriggered": "AgentsException; guardrail + output fields",
+    "ModelBehaviorError": "AgentsException; message: str",
+    "UserError": "AgentsException; message: str",
+    "ToolTimeoutError": "AgentsException; tool_name: str, timeout_seconds: float",
+    "RunErrorHandlers": "TypedDict(total=False); key='max_turns' → RunErrorHandler[TContext]",
+    "RunErrorHandler": "Callable[[RunErrorHandlerInput[TContext]], MaybeAwaitable[RunErrorHandlerResult|dict|Any|None]]",
+    "RunErrorHandlerInput": "dataclass; error: MaxTurnsExceeded, context: RunContextWrapper, run_data: RunErrorData",
+    "RunErrorHandlerResult": "dataclass; final_output: Any, include_in_history: bool = True",
+    "RunErrorData": "dataclass; input, new_items, history, output, raw_responses, last_agent",
+    "RunErrorDetails": "dataclass; input, new_items, raw_responses, last_agent, context_wrapper, input_guardrail_results, output_guardrail_results"
+  },
+
+  "dispatch_flow": [
+    "RunLoop detects turn count >= max_turns",
+    "RunLoop creates MaxTurnsExceeded exception",
+    "RunLoop calls build_run_error_data() → RunErrorData snapshot",
+    "RunLoop calls resolve_run_error_handler_result(error_handlers, error, context_wrapper, run_data)",
+    "Dispatcher checks error_handlers.get('max_turns') → None → re-raise MaxTurnsExceeded",
+    "Dispatcher constructs RunErrorHandlerInput(error, context, run_data)",
+    "Dispatcher calls handler(input) [awaits if coroutine]",
+    "Dispatcher normalizes result: RunErrorHandlerResult | dict→RunErrorHandlerResult | raw→RunErrorHandlerResult | None→re-raise",
+    "Runner formats final_output via format_final_output_text() + validates via validate_handler_final_output()",
+    "Runner creates synthetic MessageOutputItem via create_message_output_item()",
+    "Runner returns RunResult with handler final_output"
+  ],
+
+  "key_relationships": [
+    "RunErrorHandlers TypedDict contains 'max_turns': RunErrorHandler",
+    "RunErrorHandlerInput composes MaxTurnsExceeded + RunContextWrapper + RunErrorData",
+    "RunErrorHandlerResult produced by handler; consumed by Runner to build final RunResult",
+    "resolve_run_error_handler_result (error_handlers.py) is the sole dispatcher for max_turns handlers",
+    "All exception types inherit AgentsException; only MaxTurnsExceeded has handler dispatch",
+    "RunConfig.error_handlers (NotRequired) passes RunErrorHandlers to Runner entry points",
+    "Runner.run / run_sync / run_streamed all accept error_handlers kwarg; delegate to run_loop"
+  ],
+
+  "important_notes": [
+    "Only 'max_turns' error kind is currently supported for custom recovery. Guardrail tripwire exceptions have NO handler hook.",
+    "Handler return value is flexible: RunErrorHandlerResult, dict with 'final_output', or any raw value — all normalized to RunErrorHandlerResult.",
+    "include_in_history=False on RunErrorHandlerResult suppresses the fallback output from conversation history.",
+    "Handlers can be sync or async (MaybeAwaitable); dispatcher uses inspect.isawaitable() to await if needed.",
+    "RunErrorDetails (on exception) vs RunErrorData (passed to handler) are parallel but distinct: RunErrorDetails includes guardrail results; RunErrorData includes pre-computed history/output lists.",
+    "MaxTurnsExceeded is also raised in RunResultStreaming.stream_events() path (result.py line 759) for streaming runs."
+  ],
+
+  "source_files_analyzed": [
+    "src/agents/run_error_handlers.py",
+    "src/agents/exceptions.py",
+    "src/agents/run_internal/error_handlers.py",
+    "src/agents/run.py (grep)",
+    "src/agents/run_internal/run_loop.py (grep)",
+    "docs/running_agents.md (Errors and recovery section)"
+  ]
+}

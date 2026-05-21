@@ -1,0 +1,105 @@
+{
+  "scope": "server_file_download_flow",
+  "title": "Server File Download Flow",
+  "diagram_type": "sequence",
+  "description": "Handling an individual skill/command file download request across two runtime environments: Bun dev server and Cloudflare Workers (edge). Both expose GET /api/download/:type/:provider/:id but differ in how files are resolved.",
+
+  "key_participants": [
+    "Client",
+    "BunServer (server/index.js)",
+    "CFWorker (functions/api/download/[type]/[provider]/[id].js)",
+    "handleFileDownload (server/lib/api-handlers.js)",
+    "onRequestGet (functions handler)",
+    "validation (server/lib/validation.js)",
+    "getFilePath (server/lib/api-handlers.js)",
+    "DownloadProviders (lib/download-providers.js)",
+    "FileSystem",
+    "CF_ASSETS (context.env.ASSETS)"
+  ],
+
+  "interaction_flow_bun_server": [
+    "Client → BunServer: GET /api/download/:type/:provider/:id",
+    "BunServer → handleFileDownload(type, provider, id): route match extracts params",
+    "handleFileDownload → validation.isAllowedType(type): check 'skill'|'command'",
+    "  [FAIL] → return Response('Invalid type', 400)",
+    "handleFileDownload → validation.isAllowedFileProvider(provider): check FILE_DOWNLOAD_PROVIDERS list",
+    "  [FAIL] → return Response('Invalid provider', 400)",
+    "handleFileDownload → validation.isValidId(id): regex /^[a-zA-Z0-9_-]+$/",
+    "  [FAIL] → return Response('Invalid file ID', 400)",
+    "handleFileDownload → getFilePath(type, provider, id): resolve disk path",
+    "  getFilePath → DownloadProviders: lookup FILE_DOWNLOAD_PROVIDER_CONFIG_DIRS[provider] → configDir",
+    "  getFilePath: returns dist/{provider}/{configDir}/skills/{id}/SKILL.md (or null if unknown provider)",
+    "  [null] → return Response('Invalid provider', 400)",
+    "handleFileDownload → FileSystem.existsSync(filePath): check file exists",
+    "  [NOT FOUND] → return Response('File not found', 404)",
+    "handleFileDownload → FileSystem.readFile(filePath): read binary content",
+    "handleFileDownload → validation.sanitizeFilename(basename(filePath)): sanitize 'SKILL.md'",
+    "handleFileDownload → Client: Response(content, 200) headers: Content-Type=application/octet-stream, Content-Disposition=attachment; filename='SKILL.md'",
+    "  [ERROR] → return Response('Error downloading file', 500)"
+  ],
+
+  "interaction_flow_cf_worker": [
+    "Client → CFWorker: GET /api/download/:type/:provider/:id",
+    "CFWorker (onRequestGet) → context.params: destructure {type, provider, id}",
+    "onRequestGet: validate type !== 'skill' && type !== 'command' → Response.json({error:'Invalid type'}, 400)",
+    "onRequestGet → FILE_DOWNLOAD_PROVIDERS.includes(provider): inline check",
+    "  [FAIL] → Response.json({error:'Invalid provider'}, 400)",
+    "onRequestGet: VALID_ID.test(id) regex inline check",
+    "  [FAIL] → Response.json({error:'Invalid file ID'}, 400)",
+    "onRequestGet → DownloadProviders: lookup FILE_DOWNLOAD_PROVIDER_CONFIG_DIRS[provider] → configDir",
+    "  [null] → Response.json({error:'Invalid provider'}, 400)",
+    "onRequestGet: construct asset URL → /_data/dist/{provider}/{configDir}/skills/{id}/SKILL.md",
+    "onRequestGet → CF_ASSETS.fetch(url): fetch static asset from Cloudflare ASSETS binding",
+    "  [!response.ok] → Response.json({error:'File not found'}, 404)",
+    "onRequestGet → response.arrayBuffer(): read binary content",
+    "onRequestGet → Client: Response(content, 200) headers: Content-Type=application/octet-stream, Content-Disposition=attachment; filename='SKILL.md', Cache-Control=public s-maxage=86400 stale-while-revalidate=3600"
+  ],
+
+  "key_relationships": [
+    "BunServer depends_on handleFileDownload (api-handlers.js)",
+    "handleFileDownload depends_on validation.js (isAllowedType, isAllowedFileProvider, isValidId, sanitizeFilename)",
+    "handleFileDownload depends_on getFilePath (same module)",
+    "getFilePath depends_on DownloadProviders (FILE_DOWNLOAD_PROVIDER_CONFIG_DIRS)",
+    "handleFileDownload depends_on FileSystem (fs/promises readFile, existsSync)",
+    "CFWorker (onRequestGet) depends_on DownloadProviders (FILE_DOWNLOAD_PROVIDERS, FILE_DOWNLOAD_PROVIDER_CONFIG_DIRS)",
+    "CFWorker depends_on CF_ASSETS binding (context.env.ASSETS.fetch)",
+    "validation.js depends_on DownloadProviders (DOWNLOAD_PROVIDERS, FILE_DOWNLOAD_PROVIDERS, BUNDLE_DOWNLOAD_PROVIDERS)"
+  ],
+
+  "validation_rules": {
+    "type": "must be 'skill' or 'command'",
+    "provider": "must be in FILE_DOWNLOAD_PROVIDERS: [cursor, claude-code, gemini, codex, agents, kiro, opencode, pi]",
+    "id": "regex /^[a-zA-Z0-9_-]+$/",
+    "sanitizeFilename": "strips all chars except [a-zA-Z0-9._-] from filename for Content-Disposition header"
+  },
+
+  "path_resolution": {
+    "bun_server": "PROJECT_ROOT/dist/{provider}/{configDir}/skills/{id}/SKILL.md",
+    "cf_worker": "/_data/dist/{provider}/{configDir}/skills/{id}/SKILL.md (via ASSETS binding)",
+    "configDir_examples": {
+      "cursor": ".cursor",
+      "claude-code": ".claude",
+      "gemini": ".gemini",
+      "codex": ".codex",
+      "agents": ".agents"
+    }
+  },
+
+  "response_shape": {
+    "success": "200, Content-Type: application/octet-stream, Content-Disposition: attachment; filename='SKILL.md'",
+    "cf_adds": "Cache-Control: public, s-maxage=86400, stale-while-revalidate=3600",
+    "error_400": "Invalid type | Invalid provider | Invalid file ID",
+    "error_404": "File not found",
+    "error_500": "Error downloading file (Bun server only, on readFile exception)"
+  },
+
+  "important_notes": "Two parallel implementations exist: (1) Bun dev server reads from local disk via fs/promises, (2) Cloudflare Worker fetches from static ASSETS binding — no disk access. The CF worker uses inline validation (VALID_ID regex + FILE_DOWNLOAD_PROVIDERS array directly) while the Bun server delegates all validation to server/lib/validation.js. Both converge on the same path template: dist/{provider}/{configDir}/skills/{id}/SKILL.md. Type 'command' is accepted as alias for 'skill'.",
+
+  "source_files_analyzed": [
+    "functions/api/download/[type]/[provider]/[id].js",
+    "server/index.js",
+    "server/lib/api-handlers.js",
+    "server/lib/validation.js",
+    "lib/download-providers.js"
+  ]
+}

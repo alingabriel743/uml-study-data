@@ -1,0 +1,262 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+title LLM Core & Session Management
+
+' ─────────────────────────────────────────
+' Session Hierarchy
+' ─────────────────────────────────────────
+package "Session Hierarchy" {
+
+    abstract class BaseSession {
+        +api_key: str
+        +api_base: str
+        +model: str
+        +context_win: int
+        +history: list
+        +lock: threading.Lock
+        +system: str
+        +name: str
+        +proxies: dict|None
+        +max_retries: int
+        +connect_timeout: int
+        +read_timeout: int
+        +reasoning_effort: str|None
+        +thinking_type: str|None
+        +thinking_budget_tokens: int|None
+        +api_mode: str
+        +temperature: float
+        +max_tokens: int
+        +stream: bool
+        --
+        +__init__(cfg: dict)
+        +ask(prompt: str, stream: bool=False): str|Generator
+        +{abstract} raw_ask(messages: list): Generator
+        +{abstract} make_messages(raw_list: list): list
+        #_apply_claude_thinking(payload: dict): None
+    }
+
+    class ClaudeSession {
+        --
+        +raw_ask(messages: list): Generator
+        +make_messages(raw_list: list): list
+    }
+    note bottom of ClaudeSession
+      Calls Anthropic /messages API via SSE.
+      Applies cache_control to last 2 user
+      messages. Uses _parse_claude_sse().
+    end note
+
+    class LLMSession {
+        --
+        +raw_ask(messages: list): Generator
+        +make_messages(raw_list: list): list
+    }
+    note bottom of LLMSession
+      OpenAI-compatible backend.
+      Delegates to _openai_stream().
+      Converts messages via _msgs_claude2oai().
+    end note
+
+    class NativeClaudeSession {
+        +context_win: int
+        +fake_cc_system_prompt: bool
+        -_session_id: str
+        -_account_uuid: str
+        -_device_id: str
+        +tools: list|None
+        --
+        +__init__(cfg: dict)
+        +raw_ask(messages: list): Generator
+        +ask(msg: dict): MockResponse
+    }
+    note bottom of NativeClaudeSession
+      Poses as Claude CLI (claude-code beta
+      headers). ask() extracts tool_calls and
+      returns MockResponse. Calls
+      openai_tools_to_claude() for conversion.
+    end note
+
+    class NativeOAISession {
+        --
+        +__init__(*args, **kwargs)
+        +raw_ask(messages: list): Generator
+    }
+    note bottom of NativeOAISession
+      OpenAI-format native session.
+      Prepends system message and uses
+      _openai_stream() with tools param.
+    end note
+
+    class MixinSession {
+        -_retries: int
+        -_base_delay: float
+        -_spring_sec: int
+        -_sessions: list
+        +name: str
+        +model: str
+        -_cur_idx: int
+        -_switched_at: float
+        -_orig_raw_asks: list
+        -_BROADCAST_ATTRS: frozenset
+        --
+        +__init__(all_sessions: list, cfg: dict)
+        +__getattr__(name): Any
+        +__setattr__(name, value)
+        +primary: BaseSession
+        -_pick(): int
+        -_raw_ask(*args, **kwargs): Generator
+    }
+    note right of MixinSession
+      Multi-session failover with spring-back.
+      Patches primary session raw_ask.
+      Broadcasts system/tools/temperature/
+      max_tokens/reasoning_effort to all sessions.
+    end note
+}
+
+' ─────────────────────────────────────────
+' Response Models
+' ─────────────────────────────────────────
+package "Response Models" {
+
+    class MockFunction <<dataclass>> {
+        +name: str
+        +arguments: str
+        --
+        +__init__(name: str, arguments: str)
+    }
+
+    class MockToolCall <<dataclass>> {
+        +function: MockFunction
+        +id: str
+        --
+        +__init__(name: str, args: dict|str, id: str="")
+    }
+    note right of MockToolCall
+      args serialized to JSON string
+      inside MockFunction.arguments.
+    end note
+
+    class MockResponse <<dataclass>> {
+        +thinking: str
+        +content: str
+        +tool_calls: list
+        +raw: str
+        +stop_reason: str
+        --
+        +__init__(thinking, content, tool_calls, raw, stop_reason="end_turn")
+        +__repr__(): str
+    }
+    note right of MockResponse
+      stop_reason auto-set to "tool_use"
+      when tool_calls list is non-empty.
+    end note
+}
+
+' ─────────────────────────────────────────
+' Tool Clients
+' ─────────────────────────────────────────
+package "Tool Clients" {
+
+    class ToolClient {
+        +backend: BaseSession
+        +auto_save_tokens: bool
+        +last_tools: str
+        +name: str
+        +total_cd_tokens: int
+        --
+        +__init__(backend: BaseSession, auto_save_tokens: bool=True)
+        +chat(messages: list, tools: list=None): MockResponse
+        -_estimate_content_len(content): int
+        -_prepare_tool_instruction(tools: list): str
+        -_build_protocol_prompt(messages: list, tools: list): str
+        -_parse_mixed_response(text: str): MockResponse
+    }
+    note bottom of ToolClient
+      Text-protocol tool client for non-native
+      backends. Injects tool schema as XML/text
+      in prompt. Omits repeated tool schema when
+      last_tools unchanged & total_cd_tokens <= 9000.
+    end note
+
+    class NativeToolClient {
+        +backend: NativeClaudeSession
+        +name: str
+        -_pending_tool_ids: list
+        --
+        +{static} _thinking_prompt(): str
+        +__init__(backend)
+        +set_system(extra_system: str)
+        +chat(messages: list, tools: list=None): MockResponse
+    }
+    note bottom of NativeToolClient
+      Wraps NativeClaudeSession/NativeOAISession.
+      Injects thinking protocol into system prompt.
+      Tracks pending tool IDs across turns.
+    end note
+}
+
+' ─────────────────────────────────────────
+' Key Utility Functions (module-level)
+' ─────────────────────────────────────────
+note as UtilFunctions
+  <b>Key Module-Level Functions (llmcore.py)</b>
+  trim_messages_history(history, context_win)
+  compress_history_tags(messages, keep_recent, max_len)
+  _openai_stream(api_base, api_key, messages, model, ...)
+  _parse_claude_sse(resp_lines) -> Generator
+  _msgs_claude2oai(messages)
+  openai_tools_to_claude(tools)
+  _fix_messages(messages)
+  _parse_text_tool_calls(content)
+  tryparse(json_str)
+  auto_make_url(base, path)
+  _write_llm_log(label, content)
+end note
+
+' ─────────────────────────────────────────
+' Inheritance Relationships
+' ─────────────────────────────────────────
+ClaudeSession      --|> BaseSession
+LLMSession         --|> BaseSession
+NativeClaudeSession --|> BaseSession
+NativeOAISession   --|> NativeClaudeSession
+
+' ─────────────────────────────────────────
+' Composition / Aggregation
+' ─────────────────────────────────────────
+MockToolCall  *-- MockFunction      : contains
+MockResponse  o-- MockToolCall      : holds 0..*
+
+MixinSession  o-- BaseSession       : aggregates 1..*
+
+' ─────────────────────────────────────────
+' Dependencies
+' ─────────────────────────────────────────
+ToolClient       ..> BaseSession        : uses (backend)
+ToolClient       ..> MockResponse       : creates/returns
+ToolClient       ..> MockToolCall       : creates via _parse_mixed_response()
+
+NativeToolClient ..> NativeClaudeSession : uses (backend)
+NativeToolClient ..> MockResponse        : returns
+
+NativeClaudeSession ..> MockResponse    : creates & returns
+NativeClaudeSession ..> MockToolCall    : creates
+
+@enduml

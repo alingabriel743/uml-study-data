@@ -1,0 +1,87 @@
+{
+  "scope": "app_icon_resolution",
+  "title": "App Icon Resolution and Serving",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "HTTPClient",
+    "RouteHandler",
+    "AppIconService",
+    "FileSystem (/system/app_icons)",
+    "Database (get_app)",
+    "AppRedisCacheSpace",
+    "sharp (image lib)"
+  ],
+  "interaction_flow": [
+    "HTTPClient → RouteHandler: GET /app-icon/:app_uid OR /app-icon/:app_uid/:size",
+    "RouteHandler → RouteHandler: validate size (must be in [16,32,64,128,256,512]), default=128",
+    "RouteHandler → AppIconService.normalizeAppUid(appUid): prefix 'app-' if missing → normalizedAppUid",
+    "RouteHandler → AppIconService.#getIconStream({ appUid, size, allowRedirect })",
+    "  #getIconStream → AppIconService.normalizeAppUid(appUid)",
+    "  [IF appIcon is SVG data URL] → return { mime:'image/svg+xml', stream: buffer_to_stream(svg) }",
+    "  #getIconStream → FileSystem.getChild('{appUid}-{size}.png'): legacyNode",
+    "  [IF legacyNode.exists() AND allowRedirect] → AppIconService.getSizedIconUrl({appUid,size}) → return { redirectUrl, redirectCacheControl:'public, max-age=900' }",
+    "  [IF legacyNode.exists() AND NOT allowRedirect] → AppIconService.readIconNodeBuffer({node:legacyNode}) → LLRead → stream_to_buffer → return { mime:'image/png', stream }",
+    "  [IF legacyNode read fails AND tries<1] → recursive #getIconStream(size*2, tries+1)",
+    "  [IF no legacyNode] → AppIconService.getOriginalIconLookup({ dirAppIcons, appUid }): check '{appUid}.png'",
+    "  [IF originalNode exists] → AppIconService.queueMissingSizeFromOriginal({appUid, size}) [async background]",
+    "  [IF originalNode exists AND allowRedirect AND isFlatOriginal] → AppIconService.getOriginalIconUrl({appUid}) → return { redirectUrl, redirectCacheControl:'public, max-age=60' }",
+    "  [IF originalNode exists] → AppIconService.readIconNodeBuffer({node:originalNode}) → return { mime:'image/png', stream }",
+    "  [IF no original] → getExternalRedirect(): check shouldRedirectIconUrl(appIconOriginal|dbIcon) → return { redirectUrl } if applicable",
+    "  [FALLBACK] → getFallbackIcon(): Database.get_app({uid:appUid}), normalizeRawBase64ImageString(app.icon), pick appIcon||dbIcon||DEFAULT_APP_ICON → return { mime, stream }",
+    "  [IF dbIcon is dataUrl during fallback] → AppIconService.queueDataUrlIconWrite({appUid, dataUrl}) [async background]",
+    "RouteHandler ← AppIconService.#getIconStream: { stream, mime, redirectUrl?, redirectCacheControl? }",
+    "[IF redirectUrl] → RouteHandler: res.set('Cache-Control', redirectCacheControl), res.redirect(302, redirectUrl)",
+    "[ELSE] → RouteHandler: res.set('Content-Type', mime), res.set('Cache-Control','public, max-age=3600'), stream.pipe(res)",
+    "HTTPClient ← RouteHandler: 302 redirect OR 200 image stream"
+  ],
+  "background_flows": [
+    "queueMissingSizeFromOriginal → generateMissingSizeFromOriginal → readIconNodeBuffer(originalNode) → sharp.resize(size).png().toBuffer() → writePngToDir('{appUid}-{size}.png')",
+    "queueDataUrlIconWrite → createAppIcons({data}) → loadIconSource(dataUrl) → getSharp() → write original PNG + all ICON_SIZES PNGs → persistConvertedIconUrl(appUid, endpointUrl)",
+    "persistConvertedIconUrl → DB UPDATE apps SET icon WHERE uid AND icon LIKE 'data:%' → AppRedisCacheSpace.invalidateCachedApp(app) → svcEvent.emit('app.changed')"
+  ],
+  "key_methods": {
+    "normalizeAppUid(appUid)": "Returns appUid with 'app-' prefix; no-op if already prefixed",
+    "isDataUrl(value)": "Returns true if string starts with 'data:' and contains ','",
+    "getAppIconPath({appUid, size})": "Returns '{apiBaseUrl}/app-icon/{normalizedAppUid}/{resolvedSize}' or null",
+    "getAppIconEndpointUrl({appUid})": "Returns '{apiBaseUrl}/app-icon/{normalizedAppUid}' (no size)",
+    "shouldRedirectIconUrl({iconUrl,appUid,size})": "True if URL is puterSubdomain or appIconEndpoint BUT not the same endpoint as current request",
+    "getSizedIconUrl({appUid,size})": "Returns '{APP_ICONS_SUBDOMAIN_BASE}/{appUid}-{size}.png'",
+    "getOriginalIconUrl({appUid})": "Returns '{APP_ICONS_SUBDOMAIN_BASE}/{appUid}.png'",
+    "iconifyApps({apps,size})": "Maps app array: sets app.icon = getAppIconPath({appUid: app.uid??app.uuid, size})",
+    "#getIconStream(...)": "Private: resolves icon as stream or redirect URL using filesystem lookup with fallback chain"
+  },
+  "key_relationships": [
+    "AppIconService extends BaseService",
+    "AppIconService depends_on FileSystem service (svcFs, getChild, LLRead, HLWrite, LLMkdir)",
+    "AppIconService depends_on Database service (DB_READ/DB_WRITE for 'apps' and 'sites' tables)",
+    "AppIconService depends_on su service (svcSu.sudo, get_system_actor, get_system_user)",
+    "AppIconService depends_on event service (svcEvent.on 'app.new-icon', emit 'app.changed')",
+    "AppIconService depends_on AppRedisCacheSpace (invalidateCachedApp)",
+    "AppIconService depends_on sharp/sharp-bmp/sharp-ico (image resizing)",
+    "AppIconService uses DEFAULT_APP_ICON (inline default fallback)",
+    "AppIconService uses APP_ICONS_SUBDOMAIN = 'puter-app-icons' (consts/app-icons.js)"
+  ],
+  "constants": {
+    "ICON_SIZES": "[16, 32, 64, 128, 256, 512]",
+    "DEFAULT_ICON_SIZE": 128,
+    "LEGACY_ICON_FILENAME": "'{appUid}-{size}.png'",
+    "ORIGINAL_ICON_FILENAME": "'{appUid}.png'",
+    "REDIRECT_MAX_AGE_SIZE": "15 min (900s)",
+    "REDIRECT_MAX_AGE_ORIGINAL": "60s",
+    "APP_ICONS_SUBDOMAIN": "'puter-app-icons'"
+  },
+  "routes_registered": [
+    "GET /app-icon/:app_uid  (defaults size=128)",
+    "GET /app-icon/:app_uid/:size"
+  ],
+  "init_flow": [
+    "user.system-user-ready event → ensureAppIconsDirectory('/system/app_icons') → ensureAppIconsSubdomain() → INSERT subdomains table",
+    "app.new-icon event → createAppIcons({data})"
+  ],
+  "important_notes": "Resolution priority: (1) legacy sized PNG file, (2) original PNG file (+ queue resize), (3) external redirect (puter subdomain or endpoint URL), (4) fallback = DB app.icon or DEFAULT_APP_ICON. allowRedirect is true when config.no_subdomain is falsy. Raw base64 strings are normalized to data:image/png;base64 before processing. SVGs are returned as-is without resizing.",
+  "source_files_analyzed": [
+    "src/backend/src/modules/apps/AppIconService.js",
+    "src/backend/src/modules/apps/AppIconService.test.js",
+    "src/backend/src/consts/app-icons.js"
+  ]
+}

@@ -1,0 +1,171 @@
+{
+  "scope": "scope_management",
+  "title": "Scope & Active Span Management",
+  "diagram_type": "use_case",
+  "description": "Activating, querying, and closing scopes to track the currently active span in a request across DDTrace and OpenTracing adapters",
+
+  "actors": [
+    {
+      "name": "ApplicationDeveloper",
+      "type": "primary",
+      "description": "PHP application code that creates spans and manages their active lifecycle"
+    },
+    {
+      "name": "DDTraceTracer",
+      "type": "system",
+      "description": "Internal DDTrace Tracer that owns the ScopeManager and triggers close on request end"
+    },
+    {
+      "name": "OpenTracingClient",
+      "type": "primary",
+      "description": "Code using the OpenTracing v1 or v2 API for vendor-neutral tracing"
+    },
+    {
+      "name": "CExtension",
+      "type": "system",
+      "description": "DDTrace PHP C extension exposing root_span() and active_span() internal functions"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Activate Span",
+      "actor": "ApplicationDeveloper",
+      "description": "Make a span the current active span by wrapping it in a Scope",
+      "method": "ScopeManager::activate(SpanInterface $span, $finishSpanOnClose = true): Scope",
+      "implementations": [
+        "DDTrace\\ScopeManager::activate() — creates DDTrace\\Scope, pushes to $scopes stack, tracks hostRootScopes if span context isHostRoot()",
+        "DDTrace\\NoopScopeManager::activate() — returns NoopScope::create() (no-op)",
+        "DDTrace\\OpenTracer\\ScopeManager::activate(OTSpan) — unwraps OT span to DDTrace span, delegates to inner ScopeManager, wraps result in OT Scope",
+        "DDTrace\\OpenTracer1\\ScopeManager::activate(OTSpan, bool): OTScope — same as OpenTracer but with strict PHP 7 type hints"
+      ]
+    },
+    {
+      "id": "UC2",
+      "name": "Query Active Scope",
+      "actor": "ApplicationDeveloper",
+      "description": "Retrieve the currently active Scope (and thereby the active Span) for a request",
+      "method": "ScopeManager::getActive(): ?Scope",
+      "implementations": [
+        "DDTrace\\ScopeManager::getActive() — calls reconcileInternalAndUserland(), iterates scopes stack from top, skips finished spans, returns first active scope",
+        "DDTrace\\NoopScopeManager::getActive() — always returns NoopScope::create()",
+        "DDTrace\\OpenTracer\\ScopeManager::getActive() — delegates to inner ScopeManager, wraps result in OT Scope wrapper",
+        "DDTrace\\OpenTracer1\\ScopeManager::getActive(): ?OTScope — same with strict return type"
+      ]
+    },
+    {
+      "id": "UC3",
+      "name": "Close Scope",
+      "actor": "ApplicationDeveloper",
+      "description": "End the active period of a Scope, optionally finishing its wrapped Span",
+      "method": "Scope::close()",
+      "implementations": [
+        "DDTrace\\Scope::close() — if finishSpanOnClose=true calls span->finish(); then calls scopeManager->deactivate($this)",
+        "DDTrace\\OpenTracer\\Scope::close() — delegates to wrapped DDTrace Scope"
+      ]
+    },
+    {
+      "id": "UC4",
+      "name": "Close All Root Scopes",
+      "actor": "DDTraceTracer",
+      "description": "At end of a request, close all host-root scopes (distributed tracing entry points)",
+      "method": "ScopeManager::close()",
+      "implementations": [
+        "DDTrace\\ScopeManager::close() — iterates $hostRootScopes and calls scope->close() on each",
+        "DDTrace\\NoopScopeManager::close() — no-op"
+      ]
+    },
+    {
+      "id": "UC5",
+      "name": "Reconcile Internal and Userland Spans",
+      "actor": "CExtension",
+      "description": "Sync C-extension internal spans (root_span, active_span) with the PHP userland scope stack to ensure consistent active span view",
+      "method": "ScopeManager::reconcileInternalAndUserland() [private]",
+      "implementations": [
+        "Prunes finished scopes from the top of $scopes stack",
+        "If stack empty: calls root_span() + trace_id(), creates Scope from internal root span",
+        "Walks active_span() parent chain to create Scope wrappers for any internal spans not yet in userland stack",
+        "Returns the topmost (most recently activated) scope"
+      ]
+    },
+    {
+      "id": "UC6",
+      "name": "Deactivate Scope (Internal)",
+      "actor": "DDTraceTracer",
+      "description": "Remove a specific scope from the active scope stack",
+      "method": "ScopeManager::deactivate(Scope $scope)",
+      "implementations": [
+        "Searches $scopes array for scope, removes with array_splice",
+        "Marks span's ddtrace_scope_activated flag to false via ObjectKVStore",
+        "If span context isHostRoot(), also removes from $hostRootScopes"
+      ]
+    },
+    {
+      "id": "UC7",
+      "name": "Get Primary Root Scope",
+      "actor": "DDTraceTracer",
+      "description": "Retrieve the very first (outermost/root) scope of the request",
+      "method": "ScopeManager::getPrimaryRoot(): ?Scope",
+      "implementations": [
+        "Calls reconcileInternalAndUserland(), returns reset($scopes) or null"
+      ]
+    },
+    {
+      "id": "UC8",
+      "name": "Unwrap to Native ScopeManager",
+      "actor": "OpenTracingClient",
+      "description": "Access the underlying DDTrace ScopeManager from an OpenTracing adapter (bridge/interop)",
+      "method": "ScopeManager::unwrapped(): ScopeManagerInterface",
+      "implementations": [
+        "DDTrace\\OpenTracer\\ScopeManager::unwrapped() — returns inner $scopeManager",
+        "DDTrace\\OpenTracer1\\ScopeManager::unwrapped() — returns inner $scopeManager"
+      ]
+    }
+  ],
+
+  "key_participants": [
+    "DDTrace\\Contracts\\ScopeManager (interface)",
+    "DDTrace\\Contracts\\Scope (interface)",
+    "DDTrace\\ScopeManager (concrete, final)",
+    "DDTrace\\NoopScopeManager (concrete, final)",
+    "DDTrace\\OpenTracer\\ScopeManager (OT v2 adapter, final)",
+    "DDTrace\\OpenTracer1\\ScopeManager (OT v1 adapter, final)",
+    "DDTrace\\Scope (concrete, final)",
+    "OpenTracing\\ScopeManager (OT interface, external)"
+  ],
+
+  "key_relationships": [
+    "DDTrace\\ScopeManager implements DDTrace\\Contracts\\ScopeManager",
+    "DDTrace\\NoopScopeManager implements DDTrace\\Contracts\\ScopeManager",
+    "DDTrace\\OpenTracer\\ScopeManager implements OpenTracing\\ScopeManager (v2)",
+    "DDTrace\\OpenTracer1\\ScopeManager implements OpenTracing\\ScopeManager (v1)",
+    "DDTrace\\OpenTracer\\ScopeManager composes DDTrace\\Contracts\\ScopeManager (delegation wrapper)",
+    "DDTrace\\OpenTracer1\\ScopeManager composes DDTrace\\Contracts\\ScopeManager (delegation wrapper)",
+    "DDTrace\\Scope implements DDTrace\\Contracts\\Scope",
+    "DDTrace\\Scope composes DDTrace\\ScopeManager (back-reference for deactivation)",
+    "DDTrace\\Scope composes DDTrace\\Contracts\\Span",
+    "DDTrace\\ScopeManager aggregates DDTrace\\Scope[] (ordered stack)",
+    "DDTrace\\ScopeManager aggregates hostRootScopes: DDTrace\\Scope[] (subset for root spans)"
+  ],
+
+  "important_notes": [
+    "DEFAULT_FINISH_SPAN_ON_CLOSE = true: closing a Scope finishes its Span by default",
+    "ScopeManager.$scopes is an ordered stack; getActive() scans from the top (most recent)",
+    "reconcileInternalAndUserland() bridges C-ext DDTrace spans (root_span/active_span) into PHP userland — critical for correct parent-child relationships",
+    "hostRootScopes tracks distributed-tracing request entry points; ScopeManager::close() only closes these",
+    "NoopScopeManager is used when tracing is disabled — all operations are no-ops returning NoopScope",
+    "OpenTracer/OpenTracer1 adapters translate OT Span/Scope types ↔ DDTrace types; both support unwrapped() for interop",
+    "OpenTracer1 uses strict PHP type hints (bool, ?OTScope) for OT v1 compatibility; OpenTracer uses loose types for OT v2"
+  ],
+
+  "source_files_analyzed": [
+    "src/api/Contracts/ScopeManager.php",
+    "src/api/Contracts/Scope.php",
+    "src/DDTrace/ScopeManager.php",
+    "src/DDTrace/Scope.php",
+    "src/api/NoopScopeManager.php",
+    "src/DDTrace/OpenTracer/ScopeManager.php",
+    "src/DDTrace/OpenTracer1/ScopeManager.php"
+  ]
+}

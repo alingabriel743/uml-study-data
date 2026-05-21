@@ -1,0 +1,106 @@
+{
+  "scope": "voice_pipeline_single_vs_multi_turn",
+  "title": "Voice Pipeline Single vs Multi-Turn Execution",
+  "diagram_type": "activity",
+  "key_participants": [
+    "VoicePipeline",
+    "AudioInput",
+    "StreamedAudioInput",
+    "STTModel",
+    "TranscriptionSession",
+    "VoiceWorkflowBase",
+    "SingleAgentVoiceWorkflow",
+    "VoiceWorkflowHelper",
+    "Runner",
+    "StreamedAudioResult",
+    "TraceCtxManager"
+  ],
+  "entry_point": "VoicePipeline.run(audio_input: AudioInput | StreamedAudioInput) -> StreamedAudioResult",
+  "decision_branch": {
+    "condition": "isinstance(audio_input, AudioInput) vs StreamedAudioInput",
+    "single_turn_path": "_run_single_turn(audio_input: AudioInput)",
+    "multi_turn_path": "_run_multi_turn(audio_input: StreamedAudioInput)",
+    "else": "raise UserError(unsupported type)"
+  },
+  "single_turn_flow": [
+    "Create StreamedAudioResult(tts_model, tts_settings, config)",
+    "Create asyncio.Task: stream_events()",
+    "Enter TraceCtxManager(workflow_name, trace_id=auto, group_id, metadata)",
+    "await _process_audio_input(audio_input) -> input_text",
+    "  └─ STTModel.transcribe(audio_input, stt_settings, trace_flags) -> str",
+    "async for text_event in workflow.run(input_text): output._add_text(text_event)",
+    "await output._turn_done()",
+    "await output._done()",
+    "[on error] logger.error + output._add_error(e) + raise",
+    "Return StreamedAudioResult immediately (task runs in background)"
+  ],
+  "multi_turn_flow": [
+    "Create StreamedAudioResult(tts_model, tts_settings, config)",
+    "Create asyncio.Task: process_turns()",
+    "Enter TraceCtxManager(workflow_name, trace_id=auto, group_id, metadata)",
+    "Try: async for intro_text in workflow.on_start(): output._add_text(intro_text)",
+    "  └─ [on_start failure] logger.warning, continue",
+    "await STTModel.create_session(audio_input, stt_settings, trace_flags) -> transcription_session",
+    "LOOP: async for input_text in transcription_session.transcribe_turns():",
+    "  result = workflow.run(input_text)",
+    "  async for text_event in result: output._add_text(text_event)",
+    "  await output._turn_done()",
+    "[loop ends when transcription_session exhausted]",
+    "[on error] logger.error + output._add_error(e) + raise",
+    "finally: transcription_session.close() + output._done()",
+    "Return StreamedAudioResult immediately (task runs in background)"
+  ],
+  "single_agent_workflow_run_flow": [
+    "callbacks.on_run(self, transcription) if callbacks present",
+    "Append {role:user, content:transcription} to _input_history",
+    "result = Runner.run_streamed(_current_agent, _input_history)",
+    "async for chunk in VoiceWorkflowHelper.stream_text_from(result): yield chunk",
+    "  └─ stream_text_from: filters raw_response_event / response.output_text.delta -> yields delta",
+    "_input_history = result.to_input_list()  [update history with full conversation]",
+    "_current_agent = result.last_agent  [supports agent handoffs across turns]"
+  ],
+  "key_classes": {
+    "VoicePipeline": {
+      "constructor_args": "workflow: VoiceWorkflowBase, stt_model, tts_model, config: VoicePipelineConfig",
+      "public_methods": ["run(audio_input)"],
+      "private_methods": ["_run_single_turn(AudioInput)", "_run_multi_turn(StreamedAudioInput)", "_get_tts_model()", "_get_stt_model()", "_process_audio_input(AudioInput)"],
+      "lazy_model_init": "models resolved via config.model_provider on first use"
+    },
+    "VoiceWorkflowBase": {
+      "type": "abstract base class (abc.ABC)",
+      "abstract_methods": ["run(transcription: str) -> AsyncIterator[str]"],
+      "optional_methods": ["on_start() -> AsyncIterator[str]  (default: no-op, used for greeting in multi-turn)"]
+    },
+    "SingleAgentVoiceWorkflow": {
+      "extends": "VoiceWorkflowBase",
+      "state": ["_input_history: list[TResponseInputItem]", "_current_agent: Agent", "_callbacks: SingleAgentWorkflowCallbacks | None"],
+      "run_method": "appends to history, calls Runner.run_streamed, yields text chunks, updates history + agent"
+    },
+    "VoiceWorkflowHelper": {
+      "method": "stream_text_from(result: RunResultStreaming) -> AsyncIterator[str]",
+      "filter": "event.type=='raw_response_event' AND event.data.type=='response.output_text.delta'"
+    }
+  },
+  "key_relationships": [
+    "VoicePipeline composes VoiceWorkflowBase (injected)",
+    "VoicePipeline composes STTModel + TTSModel (lazy via VoicePipelineConfig.model_provider)",
+    "VoicePipeline creates StreamedAudioResult per run()",
+    "SingleAgentVoiceWorkflow extends VoiceWorkflowBase",
+    "SingleAgentVoiceWorkflow depends_on Runner.run_streamed",
+    "SingleAgentVoiceWorkflow depends_on VoiceWorkflowHelper.stream_text_from",
+    "Multi-turn loop driven by STTModel.create_session() -> TranscriptionSession.transcribe_turns()"
+  ],
+  "important_notes": [
+    "Both paths return StreamedAudioResult immediately; actual processing runs as background asyncio.Task",
+    "single-turn: AudioInput is a static buffer; one transcription -> one workflow run -> done",
+    "multi-turn: StreamedAudioInput is a stream; on_start() optional greeting -> loop over transcribe_turns()",
+    "multi-turn loop end condition: transcription_session.transcribe_turns() async iterator exhausted (stream closed)",
+    "SingleAgentVoiceWorkflow persists _input_history and _current_agent across turns (supports handoffs)",
+    "TraceCtxManager wraps entire session for observability; trace_id auto-generated",
+    "Error handling: errors emitted to output via _add_error(e) before re-raising"
+  ],
+  "source_files_analyzed": [
+    "src/agents/voice/pipeline.py",
+    "src/agents/voice/workflow.py"
+  ]
+}

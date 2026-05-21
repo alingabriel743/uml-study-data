@@ -1,0 +1,140 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #212529
+    EndColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+skinparam noteBorderColor #6C757D
+skinparam noteBackgroundColor #E9ECEF
+
+title Subdomain Management Flow\n<size:11><i>SubdomainES — Context provision, predicate creation, upsert, select, and max-subdomains enforcement</i></size>
+
+|SubdomainES|
+|Context / Services|
+|DatabaseService|
+|PermissionService|
+
+' ─────────────────────────────────────────────
+' 1. Context Provision
+' ─────────────────────────────────────────────
+|SubdomainES|
+start
+
+partition "**_on_context_provided()**" {
+    :Lifecycle hook triggered\nwhen context is set;
+    |Context / Services|
+    :Retrieve 'services' map\nfrom this.context;
+    :Get 'database' service;
+    |DatabaseService|
+    :Open DB_READ handle\ntagged **'subdomains'**;
+    |SubdomainES|
+    :Store handle as **this.db**;
+}
+
+' ─────────────────────────────────────────────
+' 2. create_predicate
+' ─────────────────────────────────────────────
+partition "**create_predicate(id)**" {
+    :Receive predicate **id** string;
+    if (id === **'user-can-edit'**?) then (yes)
+        |Context / Services|
+        :Resolve current user\nvia Context.get('user');
+        |SubdomainES|
+        :Return **Eq({ key: 'owner',\nvalue: user.id })**;
+    else (no)
+        :Return **undefined**\n(no predicate applied);
+    endif
+}
+
+' ─────────────────────────────────────────────
+' 3. upsert
+' ─────────────────────────────────────────────
+partition "**upsert(entity, extra)**" {
+    :Receive entity &\nextra metadata;
+    if (extra.old_entity\nexists?) then (yes — update)
+        note right
+            Updating an existing
+            subdomain; skip limit check
+        end note
+    else (no — new entity)
+        :Invoke\n**_check_max_subdomains()**;
+
+        ' ─── _check_max_subdomains inline ───
+        |Context / Services|
+        :Resolve user via\nContext.get('user');
+        |DatabaseService|
+        :Execute SQL:\n<i>SELECT COUNT(id) AS subdomain_count</i>\n<i>FROM subdomains WHERE user_id = ?</i>;
+        :Return **cnt**;
+        |SubdomainES|
+        :Resolve **max_subdomains**:\nuser.max_subdomains\n?? config.max_subdomains_per_user;
+
+        if (max_subdomains defined\nAND cnt >= max_subdomains?) then (yes — limit hit)
+            #FFD6D6:Throw **APIError**\n'subdomain_limit_reached'\n{ limit: max_subdomains };
+            stop
+        else (no — within limit)
+            :Proceed with upsert;
+        endif
+    endif
+
+    :Delegate to\n**this.upstream.upsert(entity, extra)**;
+    :Return upstream result;
+}
+
+' ─────────────────────────────────────────────
+' 4. select
+' ─────────────────────────────────────────────
+partition "**select(options)**" {
+    :Receive select **options**;
+    |Context / Services|
+    :Get actor via\nContext.get('actor');
+    :Extract user from\nactor.type.user;
+    :Get 'permission' service\nfrom this.context;
+    |PermissionService|
+    :await svc_permission.check(\nactor, **'read-all-subdomains'**);
+    :Return **has_permission**;
+    |SubdomainES|
+
+    if (has_permission\n'read-all-subdomains'?) then (yes)
+        :Use options.predicate\n**unchanged** (unrestricted listing);
+    else (no)
+        :Append\n**Eq({ key: 'owner', value: user.id })**\nto options.predicate via **.and()**;
+        note right
+            Owner filter injected —
+            user sees only their
+            own subdomains
+        end note
+    endif
+
+    :Delegate to\n**this.upstream.select(options)**;
+    :Return upstream result;
+}
+
+stop
+
+@enduml

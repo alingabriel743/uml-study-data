@@ -1,0 +1,164 @@
+@startuml activity_power_grid_management
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #212529
+    EndColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+
+title Power Grid Management
+
+|Logic / Game Loop|
+start
+:Logic.update() called each frame;
+if (state.isGame() && !state.isPaused()?) then (yes)
+    :Groups.update() — tick all entities;
+    :PowerGraphUpdater.update() triggered;
+else (no)
+    :Skip update;
+    stop
+endif
+
+|PowerGraph|
+:PowerGraph.update() begins;
+
+if (Any consumer is cheating()?) then (yes)
+    :Set all consumer power.status = 1.0f;
+    note right: Full power bypass\nfor cheat mode
+    stop
+else (no)
+endif
+
+:getPowerNeeded()\nΣ requestedPower(consumer) × delta()\nfor each shouldConsumePower consumer;
+
+:getPowerProduced()\nΣ getPowerProduction() × delta()\nfor each producer;
+
+if (All lists empty\n(no producers, consumers, batteries)?) then (yes)
+    :Skip power distribution;
+    stop
+else (no)
+endif
+
+:Record lastPowerNeeded, lastPowerProduced,\nlastPowerStored, lastCapacity,\nlastScaledPowerIn/Out;
+
+if (powerNeeded > powerProduced?) then (yes)
+    :useBatteries(deficit)\nDrain all enabled batteries proportionally\nAdd drained energy to powerProduced;
+elseif (powerProduced > powerNeeded?) then (yes)
+    :chargeBatteries(excess)\nFill all enabled batteries proportionally\ncharged = true;
+else (equal)
+    :No battery action required;
+endif
+
+:distributePower(needed, produced, charged)\ncoverage = min(1.0, produced / needed);
+
+fork
+    :For each BUFFERED consumer:\nIncrement power.status\nby coverage × requestedPower / capacity;
+fork again
+    :For each NON-BUFFERED consumer\n[shouldConsumePower == true]:\npower.status = coverage ratio;
+fork again
+    :For each NON-BUFFERED consumer\n[shouldConsumePower == false]:\npower.status = estimated coverage;
+end fork
+
+:powerBalance.add(\n(produced − needed + energyDelta) / Time.delta)\n[60-sample rolling mean];
+:energyDelta = 0;
+
+|PowerNode / Connectivity|
+split
+    :--- Node Placed Event ---;
+    :PowerNodeBuild.placed()\ngetPotentialLinks() — BFS within link radius;
+    :configureAny(other.pos())\nfor each valid nearby node;
+    if (Link already present?) then (yes)
+        :unlink(other)\nPowerGraph.reflow(this)\nPowerGraph.reflow(other)\n→ Two separate new graphs;
+    else (no)
+        :addLink(other)\npower.graph.addGraph(other.power.graph)\n→ Merge smaller graph into larger;
+    endif
+split again
+    :--- Node Removed Event ---;
+    :PowerGraph.remove(tile)\nFor each connection of removed tile:;
+    :Create new PowerGraph\nBFS from that neighbour\n(skipping removed tile);
+    :graph.update() to clear power\non isolated nodes;
+    :Remove old graph entity;
+end split
+
+:--- PowerGraph.reflow(tile) ---\nBFS from tile: queue all reachable buildings;
+:PowerGraph.add(build):\nAssign build.power.graph = this;
+fork
+    :outputsPower && consumesPower\n&& buffered → batteries[];
+fork again
+    :outputsPower && consumesPower\n&& !buffered → producers[] + consumers[];
+fork again
+    :outputsPower only → producers[];
+fork again
+    :consumesPower only → consumers[];
+end fork
+
+|NuclearReactorBuild|
+:--- NuclearReactorBuild.updateTile() (each tick) ---;
+:productionEfficiency = fuel / itemCapacity;
+
+if (fuel > 0 && enabled?) then (yes)
+    :heat += fullness × heating × min(delta, 4);
+    if (timer(timerFuel, itemDuration / timeScale)?) then (yes)
+        :consume() one fuel item;
+    endif
+else (no)
+    :heat −= Time.delta / ambientCooldownTime\n(ambient passive cooldown);
+endif
+
+if (heat > 0 && coolant liquid available?) then (yes)
+    :Drain coolant liquid\nheat −= liquidUsed × coolantPower;
+endif
+
+if (heat > smokeThreshold?) then (yes)
+    :Emit smoke particles (visual FX);
+endif
+
+:heat = clamp(heat, 0.0, 1.0);
+
+if (heat >= 0.999?) then (yes)
+    #FF6B6B:OVERLOAD CONDITION;
+    :Events.fire(Trigger.thoriumReactorOverheat);
+    :kill() → onDestroyed() → createExplosion();
+    if (shouldExplode()\n[warmup >= explosionMinWarmup\n&& (fuel >= 5 || heat >= 0.5)]?) then (yes)
+        :Damage.damage(radius=19 tiles, dmg=5000);
+        :Fx.reactorExplosion + Effect.shake;
+        :Puddles.deposit coolant liquid;
+    endif
+    stop
+else (no)
+    :Continue normal operation;
+endif
+
+|PowerGraph|
+:--- GeneratorBuild.getPowerProduction() ---\nreturns: enabled ? powerProduction × productionEfficiency : 0.0f;
+
+|Logic / Game Loop|
+:Frame complete;\nReturn to next frame;
+stop
+
+@enduml

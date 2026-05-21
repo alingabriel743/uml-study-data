@@ -1,0 +1,127 @@
+{
+  "scope": "model_run_with_offload",
+  "title": "Model Inference with Offload Strategy",
+  "diagram_type": "activity",
+  "description": "Adaptive inference strategy: running the diffusion model with memory offloading when GPU VRAM is limited",
+
+  "key_classes": [
+    "BaseWorldGenerationPipeline (ABC) — cosmos_predict1/utils/base_world_generation_pipeline.py",
+    "DiffusionText2WorldGenerationPipeline — extends BaseWorldGenerationPipeline",
+    "DiffusionVideo2WorldGenerationPipeline — extends DiffusionText2WorldGenerationPipeline"
+  ],
+
+  "offload_flags": [
+    "offload_network: bool — offload diffusion transformer (model.model) after inference",
+    "offload_tokenizer: bool — offload tokenizer (model.tokenizer) after decoding",
+    "offload_text_encoder_model: bool — offload T5 encoder after embedding",
+    "offload_guardrail_models: bool — offload safety classifiers after checks",
+    "offload_prompt_upsampler: bool — offload prompt upsampler after use"
+  ],
+
+  "initialization_flow": [
+    "START: __init__(offload_network, offload_tokenizer, offload_text_encoder_model, offload_guardrail_models, ...)",
+    "_load_model() — always called; loads model config skeleton (no weights yet)",
+    "[if NOT offload_text_encoder_model] → _load_text_encoder_model() — loads T5 to GPU",
+    "[if NOT disable_guardrail AND NOT offload_guardrail_models] → _load_text_guardrail(), _load_video_guardrail()",
+    "[if NOT offload_network] → _load_network() — loads diffusion transformer weights to GPU",
+    "[if NOT offload_tokenizer] → _load_tokenizer() — loads tokenizer weights to GPU",
+    "END INIT"
+  ],
+
+  "generate_flow_t2w": [
+    "START: generate(prompt, negative_prompt, word_limit_to_skip_upsampler)",
+    "[if NOT disable_guardrail] → _run_guardrail_on_prompt_with_offload(prompt)",
+    "  [if offload_guardrail] _load_text_guardrail() → run_text_guardrail() → _offload_guardrail_models()",
+    "  DECISION: is_safe? — if False → return None (UNSAFE EXIT)",
+    "[if enable_prompt_upsampler AND word_count <= limit] → _run_prompt_upsampler_on_prompt_with_offload(prompt)",
+    "  [if offload_prompt_upsampler] _load_prompt_upsampler_model() → run_chat_completion() → _offload_prompt_upsampler_model()",
+    "  [if NOT disable_guardrail] → re-run guardrail on upsampled prompt — if False → return None",
+    "_run_text_embedding_on_prompt_with_offload(prompts)",
+    "  [if offload_text_encoder_model] _load_text_encoder_model()",
+    "  text_encoder.encode_prompts([prompt]) → embeddings, masks",
+    "  [if offload_text_encoder_model] _offload_text_encoder_model() — del encoder, gc, cuda_empty_cache",
+    "_run_model_with_offload(prompt_embedding, negative_prompt_embedding)",
+    "[if NOT disable_guardrail] → _run_guardrail_on_video_with_offload(video)",
+    "  DECISION: video is None? → if True → return None (UNSAFE EXIT)",
+    "return (video: np.ndarray, final_prompt: str)"
+  ],
+
+  "_run_model_with_offload_t2w": [
+    "START: _run_model_with_offload(prompt_embedding, negative_prompt_embedding)",
+    "[if offload_network] → _load_network() — load_network_model(model, checkpoint_path)",
+    "[if offload_tokenizer] → _load_tokenizer() — load_tokenizer_model(model, tokenizer_path)",
+    "_run_model(prompt_embedding, negative_prompt_embedding)",
+    "  get_video_batch(model, embedding, height, width, fps, num_video_frames) → data_batch, state_shape",
+    "  generate_world_from_text(model, state_shape, data_batch, guidance, num_steps, seed) → sample (latent Tensor)",
+    "[if offload_network] → _offload_network() — del model.model, gc.collect(), cuda.empty_cache()",
+    "_run_tokenizer_decoding(sample) — model.decode(sample) → video np.ndarray [T,H,W,C]",
+    "[if offload_tokenizer] → _offload_tokenizer() — del model.tokenizer, gc.collect(), cuda.empty_cache()",
+    "return sample (np.ndarray)"
+  ],
+
+  "_run_model_with_offload_v2w": [
+    "START: _run_model_with_offload(prompt_embedding, image_or_video_path, negative_prompt_embedding)",
+    "[if offload_tokenizer] → _load_tokenizer()",
+    "_run_tokenizer_encoding(image_or_video_path)",
+    "  get_condition_latent(model, input_path, num_input_frames, state_shape) → condition_latent (Tensor)",
+    "[if offload_network] → _load_network()",
+    "_run_model(embedding, condition_latent, negative_prompt_embedding)",
+    "  get_video_batch(...) → data_batch, state_shape",
+    "  generate_world_from_video(model, state_shape, data_batch, guidance, num_steps, seed, condition_latent, num_input_frames) → sample",
+    "[if offload_network] → _offload_network() — del model.model, gc, cuda_empty_cache",
+    "_run_tokenizer_decoding(sample) → video np.ndarray",
+    "[if offload_tokenizer] → _offload_tokenizer()",
+    "return sample"
+  ],
+
+  "_offload_network_detail": [
+    "if self.model.model: del self.model.model → self.model.model = None",
+    "gc.collect()",
+    "torch.cuda.empty_cache()"
+  ],
+
+  "_load_network_detail": [
+    "load_network_model(self.model, '{checkpoint_dir}/{checkpoint_name}/model.pt')"
+  ],
+
+  "key_decisions": [
+    "offload_network flag → determines if diffusion transformer is loaded/unloaded per-inference",
+    "offload_tokenizer flag → determines if tokenizer encoder/decoder is loaded/unloaded per-inference",
+    "offload_text_encoder_model flag → T5 encoder load/unload around embedding step",
+    "offload_guardrail_models flag → safety model load/unload around each guardrail check",
+    "disable_guardrail flag → skip all safety checks entirely",
+    "enable_prompt_upsampler + word_count vs limit → conditional prompt enhancement",
+    "guardrail result (is_safe) → early exit if False at prompt or video check"
+  ],
+
+  "memory_lifecycle": [
+    "Non-offload mode: all models stay on GPU throughout pipeline lifetime",
+    "Offload mode: each model is loaded to GPU only when needed, then deleted + gc + cuda_empty_cache()",
+    "Order during offload inference: tokenizer (encode) → network (generate) → offload network → tokenizer (decode) → offload tokenizer",
+    "V2W adds tokenizer encoding step BEFORE network load (encode condition frames first)"
+  ],
+
+  "inheritance": [
+    "BaseWorldGenerationPipeline (ABC): defines interface + shared offload helpers",
+    "DiffusionText2WorldGenerationPipeline: implements T2W model loading + _run_model + _run_model_with_offload + generate",
+    "DiffusionVideo2WorldGenerationPipeline: overrides _run_model (adds condition_latent) + _run_model_with_offload (adds tokenizer encoding step) + generate"
+  ],
+
+  "external_utilities": [
+    "load_model_by_config() — builds model config skeleton",
+    "load_network_model() — loads .pt weights into model",
+    "load_tokenizer_model() — loads tokenizer weights",
+    "get_video_batch() — prepares diffusion data batch",
+    "generate_world_from_text() — runs diffusion sampling loop (T2W)",
+    "generate_world_from_video() — runs diffusion sampling loop with condition latent (V2W)",
+    "get_condition_latent() — encodes conditioning image/video to latent",
+    "guardrail_presets.run_text_guardrail() / run_video_guardrail()"
+  ],
+
+  "important_notes": "The offload pattern is consistent: check flag → load → use → offload. _offload_network deletes model.model (the DiT weights) not the full model object. T2W _run_model_with_offload has a likely bug at line 318: calls _load_tokenizer() instead of nothing (tokenizer already loaded). V2W uses tokenizer BEFORE the network (encode condition frames first, then generate). All offload methods call gc.collect() + torch.cuda.empty_cache() to reclaim VRAM.",
+
+  "source_files_analyzed": [
+    "Lyra-1/cosmos_predict1/utils/base_world_generation_pipeline.py",
+    "Lyra-1/cosmos_predict1/diffusion/inference/world_generation_pipeline.py (lines 140-691)"
+  ]
+}

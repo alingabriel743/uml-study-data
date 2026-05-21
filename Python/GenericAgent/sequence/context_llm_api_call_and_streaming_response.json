@@ -1,0 +1,71 @@
+{
+  "scope": "llm_api_call_and_streaming_response",
+  "title": "LLM API Call and Streaming Response",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Caller",
+    "BaseSession",
+    "LLMSession",
+    "trim_messages_history",
+    "compress_history_tags",
+    "_sanitize_leading_user_msg",
+    "_openai_stream",
+    "_parse_openai_sse / _parse_claude_sse",
+    "OAI-Compatible Relay (HTTP)"
+  ],
+  "interaction_flow": [
+    "Caller → BaseSession.ask(prompt, stream=False): entry point",
+    "BaseSession.ask → history.append({role:'user', content:[{type:'text',text:prompt}]})",
+    "BaseSession.ask → trim_messages_history(history, context_win)",
+    "trim_messages_history → compress_history_tags(history): runs every 5 calls; truncates <thinking>/<tool_use>/<tool_result>/<history>/<key_info> tags in older messages (_trunc / _trunc_str helpers)",
+    "trim_messages_history [if cost > context_win*3]: compress_history_tags(history, keep_recent=4, force=True) + pop oldest messages",
+    "trim_messages_history [after pop, if leading msg is user]: _sanitize_leading_user_msg(history[0]) — rewrites orphan tool_result blocks to plain text",
+    "BaseSession.ask → LLMSession.make_messages(history): calls _msgs_claude2oai() to convert Claude-format history to OAI format",
+    "BaseSession.ask → LLMSession.raw_ask(messages): generator delegation",
+    "LLMSession.raw_ask → _openai_stream(api_base, api_key, messages, model, api_mode, temperature, reasoning_effort, max_tokens, max_retries, timeouts, proxies)",
+    "_openai_stream [api_mode='responses']: url=auto_make_url(api_base,'responses'), payload={model, input:_to_responses_input(messages), stream:True, prompt_cache_key, tools?}",
+    "_openai_stream [api_mode='chat_completions']: url=auto_make_url(api_base,'chat/completions'), _stamp_oai_cache_markers(messages,model), payload={model, messages, stream:True, stream_options:{include_usage:True}, temperature?, max_tokens?, tools?}",
+    "_openai_stream → requests.post(url, headers={Authorization:Bearer, Content-Type, Accept:text/event-stream}, json=payload, stream=True, timeout=(connect_timeout,read_timeout), proxies=proxies)",
+    "_openai_stream [HTTP >=400]: if status in RETRYABLE(408,409,425,429,500-504) and not streamed → sleep+retry with exponential backoff; else raise HTTPError with err_body",
+    "_openai_stream [HTTP 200]: gen = _parse_openai_sse(r.iter_lines(), api_mode) — starts SSE parsing",
+    "_openai_stream → yield loop: while True: yield next(gen) [propagates text chunks to caller]",
+    "_openai_stream [StopIteration from gen]: return e.value (list[content_block])",
+    "_parse_openai_sse [chat_completions mode]: for each SSE line → parse JSON evt → if delta.content: yield text chunk; if delta.tool_calls: accumulate tc_buf[index]={id,name,args}",
+    "_parse_openai_sse [responses mode]: handle response.output_text.delta (yield text), response.output_item.added (new function_call → fc_buf), response.function_call_arguments.delta (accumulate args)",
+    "_parse_openai_sse [on DONE/response.completed]: assemble blocks=[{type:'text',text:content_text}] + [{type:'tool_use',id,name,input:json.loads(args)} for each tc_buf/fc_buf entry]; return blocks",
+    "BaseSession.ask [receives content_blocks via StopIteration.value]",
+    "BaseSession.ask [tool_use detection]: for block in content_blocks if block.type=='tool_use': yield '<tool_use>'+json.dumps({name,arguments})+</tool_use>",
+    "BaseSession.ask [if no error]: history.append({role:'assistant', content:[{type:'text',text:content}]})",
+    "BaseSession.ask → Caller: yields text chunks + optional <tool_use>JSON</tool_use> strings; or returns joined string if stream=False"
+  ],
+  "key_relationships": [
+    "LLMSession extends BaseSession (inherits ask, history, lock, context_win)",
+    "BaseSession.ask delegates raw_ask to LLMSession.raw_ask (generator protocol)",
+    "LLMSession.raw_ask delegates entirely to _openai_stream (yield from)",
+    "LLMSession.make_messages calls _msgs_claude2oai to convert history format",
+    "_openai_stream calls _parse_openai_sse as inner generator for SSE parsing",
+    "ClaudeSession.raw_ask uses _parse_claude_sse instead (same generator protocol)",
+    "trim_messages_history calls compress_history_tags and _sanitize_leading_user_msg",
+    "MockResponse wraps assembled content_blocks (thinking, content, tool_calls, stop_reason)"
+  ],
+  "key_data_structures": {
+    "message": "{role: 'user'|'assistant'|'tool', content: str | list[content_block]}",
+    "content_block_text": "{type:'text', text:str}",
+    "content_block_tool_use": "{type:'tool_use', id:str, name:str, input:dict}",
+    "content_block_thinking": "{type:'thinking', thinking:str}",
+    "tool_use_text_output": "<tool_use>{\"name\":\"...\",\"arguments\":{...}}</tool_use>"
+  },
+  "important_notes": [
+    "LLMSession.raw_ask is a generator function (uses 'yield from'); return value = list[content_block] passed via StopIteration.value",
+    "compress_history_tags uses a call-count modulo 5 throttle (_cd counter); force=True resets it",
+    "_trunc() strips <history>/<key_info> blocks entirely and truncates <thinking>/<tool_use>/<tool_result> to max_len=800 chars",
+    "_sanitize_leading_user_msg converts orphan tool_result blocks to plain text to avoid API validation errors",
+    "Tool-use detection has two layers: native content_block from SSE parser (primary) + _parse_text_tool_calls fallback for text-encoded <tool_use> tags",
+    "OAI-compat relay for 'responses' api_mode uses different endpoint (/responses) and input format (_to_responses_input), and flattens tool definitions",
+    "Retry logic: exponential backoff (1.5^n*2, max 30s), respects Retry-After header; only retries if streaming has NOT started",
+    "Cache markers: _stamp_oai_cache_markers adds cache_control to last 2 user messages for Claude models served via OAI relay"
+  ],
+  "source_files_analyzed": [
+    "data/83187709-02ea-456f-bd93-8dd46c9f9c58/llmcore.py"
+  ]
+}

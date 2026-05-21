@@ -1,0 +1,212 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    GroupBackgroundColor #DEE2E6
+    GroupBorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF3CD
+    BorderColor #856404
+    FontColor #212529
+}
+
+title App Icon Resolution and Serving
+
+actor "HTTP Client" as client
+participant "RouteHandler\nGET /app-icon/:app_uid[/:size]" as route
+participant "AppIconService" as svc
+participant "FileSystem\n(/system/app_icons)" as fs
+database "Database\n(apps table)" as db
+participant "AppRedisCacheSpace" as cache
+participant "sharp\n(image lib)" as sharp
+
+== Request Entry ==
+
+client -> route: GET /app-icon/:app_uid[/:size]
+activate route
+
+note right of route
+  Valid sizes: [16, 32, 64, 128, 256, 512]
+  Default size: 128
+end note
+
+route -> route: validate size param\n(default = 128 if absent/invalid)
+route -> svc: normalizeAppUid(appUid)\n→ prefix 'app-' if missing
+activate svc
+svc --> route: normalizedAppUid
+deactivate svc
+
+route -> svc: #getIconStream({ appUid, size, allowRedirect })
+activate svc
+
+svc -> svc: normalizeAppUid(appUid)
+
+== Resolution Priority 1: SVG Data URL ==
+
+alt appIcon is SVG data URL (starts with 'data:image/svg')
+    svc --> route: { mime: 'image/svg+xml', stream: buffer_to_stream(svg) }
+
+== Resolution Priority 2: Legacy Sized PNG File ==
+
+else check legacy sized PNG
+    svc -> fs: getChild('{appUid}-{size}.png')
+    activate fs
+    fs --> svc: legacyNode
+    deactivate fs
+
+    alt legacyNode.exists() AND allowRedirect
+        svc -> svc: getSizedIconUrl({ appUid, size })\n→ APP_ICONS_SUBDOMAIN_BASE/{appUid}-{size}.png
+        svc --> route: { redirectUrl, redirectCacheControl: 'public, max-age=900' }
+
+    else legacyNode.exists() AND NOT allowRedirect
+        svc -> fs: readIconNodeBuffer(legacyNode)\n[LLRead → stream_to_buffer]
+        activate fs
+        fs --> svc: buffer
+        deactivate fs
+        svc --> route: { mime: 'image/png', stream }
+
+    else legacyNode read fails AND tries < 1
+        svc -> svc: recursive #getIconStream(size*2, tries+1)
+        note right of svc: Retry at double size\nif read error
+    end
+
+== Resolution Priority 3: Original PNG File ==
+
+    alt no legacyNode — check original
+        svc -> svc: getOriginalIconLookup({ dirAppIcons, appUid })\n→ check '{appUid}.png'
+        activate svc
+        deactivate svc
+
+        alt originalNode exists
+            svc -> svc: queueMissingSizeFromOriginal({ appUid, size }) [async]
+            note right of svc: Background: resize original\nto missing size PNG
+
+            alt allowRedirect AND isFlatOriginal
+                svc -> svc: getOriginalIconUrl({ appUid })\n→ APP_ICONS_SUBDOMAIN_BASE/{appUid}.png
+                svc --> route: { redirectUrl, redirectCacheControl: 'public, max-age=60' }
+            else serve directly
+                svc -> fs: readIconNodeBuffer(originalNode)
+                activate fs
+                fs --> svc: buffer
+                deactivate fs
+                svc --> route: { mime: 'image/png', stream }
+            end
+
+== Resolution Priority 4: External Redirect ==
+
+        else no original — try external redirect
+            svc -> svc: getExternalRedirect()\nshouldRedirectIconUrl(appIconOriginal | dbIcon)
+            alt valid external redirect URL
+                svc --> route: { redirectUrl }
+
+== Fallback: Database Icon / Default ==
+
+            else FALLBACK
+                svc -> db: get_app({ uid: appUid })
+                activate db
+                db --> svc: app (with app.icon field)
+                deactivate db
+
+                svc -> svc: normalizeRawBase64ImageString(app.icon)\n→ 'data:image/png;base64,...'
+
+                alt dbIcon is data URL
+                    svc -> svc: queueDataUrlIconWrite({ appUid, dataUrl }) [async]
+                    note right of svc: Background: write icon\nfiles to filesystem
+                end
+
+                svc --> route: { mime, stream }\n(dbIcon || DEFAULT_APP_ICON)
+            end
+        end
+    end
+end
+
+deactivate svc
+
+== HTTP Response ==
+
+route <-- svc: { stream?, mime?, redirectUrl?, redirectCacheControl? }
+
+alt redirectUrl present
+    route -> route: res.set('Cache-Control', redirectCacheControl)
+    client <-- route: HTTP 302 redirect → redirectUrl
+else stream response
+    route -> route: res.set('Content-Type', mime)\nres.set('Cache-Control', 'public, max-age=3600')
+    client <-- route: HTTP 200 — stream.pipe(res)
+end
+
+deactivate route
+
+== Background: Resize Missing Size (async) ==
+
+box "Background Processing" #EEF2FF
+    participant "AppIconService\n[async]" as svcbg
+    participant "FileSystem\n(write)" as fsw
+    participant "sharp\n(resize)" as sharpbg
+end box
+
+note over svcbg, sharpbg
+  Triggered by queueMissingSizeFromOriginal
+end note
+
+svc -[#6C757D]-> svcbg: generateMissingSizeFromOriginal({ appUid, size })
+activate svcbg
+svcbg -[#6C757D]-> fs: readIconNodeBuffer(originalNode)
+fs -[#6C757D]-> svcbg: buffer
+svcbg -[#6C757D]-> sharpbg: sharp(buffer).resize(size).png().toBuffer()
+activate sharpbg
+sharpbg -[#6C757D]-> svcbg: resizedBuffer
+deactivate sharpbg
+svcbg -[#6C757D]-> fsw: writePngToDir('{appUid}-{size}.png')
+deactivate svcbg
+
+== Background: Persist Data URL Icon (async) ==
+
+note over svcbg, cache
+  Triggered by queueDataUrlIconWrite
+end note
+
+svc -[#6C757D]-> svcbg: createAppIcons({ data: dataUrl })
+activate svcbg
+svcbg -[#6C757D]-> svcbg: loadIconSource(dataUrl) → getSharp()
+svcbg -[#6C757D]-> sharpbg: write original PNG + all ICON_SIZES PNGs
+activate sharpbg
+sharpbg -[#6C757D]-> svcbg: done
+deactivate sharpbg
+svcbg -[#6C757D]-> fsw: HLWrite / LLMkdir each icon file
+svcbg -[#6C757D]-> db: UPDATE apps SET icon=endpointUrl\nWHERE uid=appUid AND icon LIKE 'data:%'
+activate db
+db -[#6C757D]-> svcbg: updated
+deactivate db
+svcbg -[#6C757D]-> cache: invalidateCachedApp(app)
+activate cache
+cache -[#6C757D]-> svcbg: done
+deactivate cache
+svcbg -[#6C757D]-> svcbg: svcEvent.emit('app.changed')
+deactivate svcbg
+
+@enduml

@@ -1,0 +1,195 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    DividerBackgroundColor #DEE2E6
+    GroupBackgroundColor #E9ECEF
+}
+
+title LLM API Call and Streaming Response
+
+actor Caller as caller
+participant "BaseSession\n(ask)" as base
+participant "trim_messages\n_history" as trim
+participant "compress_history\n_tags" as compress
+participant "_sanitize_leading\n_user_msg" as sanitize
+participant "LLMSession\n(make_messages / raw_ask)" as llm
+participant "_openai_stream" as oai_stream
+participant "_parse_openai_sse" as sse_parser
+participant "OAI-Compatible\nRelay (HTTP)" as relay
+
+== Request Entry & History Preparation ==
+
+caller -> base : ask(prompt, stream=False)
+activate base
+
+base -> base : history.append({role:'user',\ncontent:[{type:'text', text:prompt}]})
+
+base -> trim : trim_messages_history(history, context_win)
+activate trim
+
+trim -> compress : compress_history_tags(history,\nkeep_recent=10)\n[every 5 calls via _cd counter]
+activate compress
+note right of compress
+  Truncates <thinking>, <tool_use>,
+  <tool_result> to 800 chars;
+  strips <history>, <key_info> blocks
+end note
+compress --> trim : compressed history
+deactivate compress
+
+alt cost > context_win * 3  [history too large]
+    trim -> compress : compress_history_tags(history,\nkeep_recent=4, force=True)
+    activate compress
+    compress --> trim : aggressively compressed
+    deactivate compress
+    trim -> trim : pop oldest messages\nuntil cost fits context_win
+end
+
+opt leading message is a user message
+    trim -> sanitize : _sanitize_leading_user_msg(history[0])
+    activate sanitize
+    note right of sanitize
+      Rewrites orphan tool_result
+      blocks to plain text to avoid
+      API validation errors
+    end note
+    sanitize --> trim : sanitized message
+    deactivate sanitize
+end
+
+trim --> base : trimmed history
+deactivate trim
+
+== Message Formatting ==
+
+base -> llm : make_messages(history)
+activate llm
+llm -> llm : _msgs_claude2oai(history)\n[converts Claude-format to OAI format]
+llm --> base : oai_messages
+deactivate llm
+
+== Raw LLM Request (Generator Delegation) ==
+
+base -> llm : raw_ask(messages)  [generator call]
+activate llm
+
+llm -> oai_stream : yield from _openai_stream(\n  api_base, api_key, messages, model,\n  api_mode, temperature, reasoning_effort,\n  max_tokens, max_retries, timeouts, proxies)
+activate oai_stream
+
+alt api_mode == 'chat_completions'
+    oai_stream -> oai_stream : url = auto_make_url(api_base, 'chat/completions')\n_stamp_oai_cache_markers(messages, model)\npayload = {model, messages, stream:True,\n  stream_options:{include_usage:True},\n  temperature?, max_tokens?, tools?}
+else api_mode == 'responses'
+    oai_stream -> oai_stream : url = auto_make_url(api_base, 'responses')\npayload = {model, input:_to_responses_input(messages),\n  stream:True, prompt_cache_key, tools?}
+end
+
+== HTTP SSE Streaming ==
+
+oai_stream -> relay : POST url\nHeaders: {Authorization: Bearer, Content-Type,\n  Accept: text/event-stream}\nBody: json=payload\n[stream=True, timeout=(connect, read), proxies]
+activate relay
+
+alt HTTP status >= 400 and status in RETRYABLE\n[408,409,425,429,500-504] and streaming NOT started
+    relay --> oai_stream : retryable error response
+    oai_stream -> oai_stream : sleep(min(1.5^n * 2, 30))\n[respects Retry-After header]\nretry request
+    oai_stream -> relay : POST url (retry)
+end
+
+relay --> oai_stream : HTTP 200 — SSE stream begins
+note right of relay
+  Server-Sent Events:
+  data: {"choices":[{"delta":...}]}
+  data: [DONE]
+end note
+
+== SSE Chunk Parsing ==
+
+oai_stream -> sse_parser : gen = _parse_openai_sse(\n  r.iter_lines(), api_mode)
+activate sse_parser
+
+loop for each SSE line from relay
+    relay --> sse_parser : SSE data line (chunk)
+
+    alt api_mode == 'chat_completions'
+        sse_parser -> sse_parser : parse JSON event\nextract delta.content / delta.tool_calls
+        opt delta.content present
+            sse_parser --> oai_stream : yield text_chunk
+            oai_stream --> llm : yield text_chunk
+            llm --> base : yield text_chunk
+            base --> caller : yield text_chunk
+        end
+        opt delta.tool_calls present
+            sse_parser -> sse_parser : accumulate tc_buf[index]\n= {id, name, args}
+        end
+    else api_mode == 'responses'
+        alt response.output_text.delta
+            sse_parser --> oai_stream : yield text_chunk
+            oai_stream --> llm : yield text_chunk
+            llm --> base : yield text_chunk
+            base --> caller : yield text_chunk
+        else response.output_item.added
+            sse_parser -> sse_parser : new function_call → fc_buf
+        else response.function_call_arguments.delta
+            sse_parser -> sse_parser : accumulate args in fc_buf
+        end
+    end
+end
+
+== Final Assembly (on DONE / response.completed) ==
+
+relay --> sse_parser : data: [DONE]
+deactivate relay
+
+sse_parser -> sse_parser : assemble content_blocks:\n  [{type:'text', text:content_text}]\n  + [{type:'tool_use', id, name,\n     input:json.loads(args)}\n    for each tc_buf / fc_buf entry]
+
+sse_parser --> oai_stream : return content_blocks\n[via StopIteration.value]
+deactivate sse_parser
+
+oai_stream --> llm : return content_blocks\n[StopIteration propagation]
+deactivate oai_stream
+
+llm --> base : return content_blocks
+deactivate llm
+
+== Tool-Use Detection & History Update ==
+
+base -> base : detect tool_use blocks:\nfor block in content_blocks\n  if block.type == 'tool_use'
+
+opt tool_use blocks found
+    base --> caller : yield '<tool_use>'\n+ json.dumps({name, arguments})\n+ '</tool_use>'
+end
+
+base -> base : history.append({role:'assistant',\ncontent:[{type:'text', text:content}]})
+
+alt stream=False
+    base --> caller : return joined string response
+else stream=True
+    base --> caller : (text chunks already streamed above)
+end
+
+deactivate base
+
+@enduml

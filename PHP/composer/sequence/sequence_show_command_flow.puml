@@ -1,0 +1,240 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #CED4DA
+    NoteBackgroundColor #FFF9DB
+    NoteBorderColor #FAB005
+}
+
+title Show Command: Package Information Display
+
+actor "CLI / User" as User
+
+participant "ShowCommand" as Show
+participant "EventDispatcher" as Dispatcher
+participant "InstalledRepository" as InstalledRepo
+participant "CompositeRepository" as CompositeRepo
+participant "RepositorySet" as RepoSet
+participant "Pool" as Pool
+participant "DefaultPolicy" as Policy
+participant "VersionSelector" as VerSel
+participant "Package\n(CompletePackageInterface)" as Pkg
+participant "IOInterface" as IO
+
+' ─────────────────────────────────────────────
+' 1. Entry point
+' ─────────────────────────────────────────────
+User -> Show: execute(InputInterface, OutputInterface)
+activate Show
+
+Show -> Show: resolve display mode\n(--self | --platform | --available\n | --all | --locked | default)
+note right of Show
+  Mode determines which repos
+  are wrapped into InstalledRepository
+  and CompositeRepository
+end note
+
+Show -> InstalledRepo ** : new InstalledRepository\n([$localRepo, $platformRepo, ...])
+Show -> CompositeRepo ** : new CompositeRepository\n($repositoryManager->getRepositories())
+
+Show -> Dispatcher: dispatch("show", CommandEvent)
+activate Dispatcher
+Dispatcher --> Show: (event dispatched)
+deactivate Dispatcher
+
+' ─────────────────────────────────────────────
+' 2. Branch: single package display
+' ─────────────────────────────────────────────
+alt Single package requested (--package-filter provided)
+
+    Show -> Show: getPackage($installedRepo, $repos,\n$packageFilter, $version)
+    activate Show
+
+        Show -> RepoSet ** : new RepositorySet("dev")
+        Show -> RepoSet: addRepository($repos)
+        Show -> RepoSet: createPoolForPackage($name)
+        activate RepoSet
+        RepoSet --> Show: Pool
+        deactivate RepoSet
+
+        Show -> Pool: whatProvides($name, $constraint)
+        activate Pool
+        Pool --> Show: PackageInterface[]
+        deactivate Pool
+
+        Show -> InstalledRepo: hasPackage($package)
+        activate InstalledRepo
+        InstalledRepo --> Show: bool (exact match check)
+        deactivate InstalledRepo
+
+        opt No exact installed match — resolve via policy
+            Show -> Policy: selectPreferredPackages($pool, $literals)
+            activate Policy
+            Policy --> Show: preferred literal[]
+            deactivate Policy
+
+            Show -> Pool: literalToPackage($preferred[0])
+            activate Pool
+            Pool --> Show: CompletePackageInterface
+            deactivate Pool
+        end
+
+    Show --> Show: [CompletePackageInterface, versions[]]
+    deactivate Show
+
+    ' ── Optional: find latest version ──
+    opt --latest or --outdated flag set
+        Show -> Show: findLatestPackage($package, $composer,\n$platformRepo, $majorOnly, ...)
+        activate Show
+            Show -> VerSel: findBestCandidate($name,\n$targetVersion, $bestStability, ...)
+            activate VerSel
+            VerSel --> Show: PackageInterface (latestPackage)
+            deactivate VerSel
+        deactivate Show
+    end
+
+    ' ── Optional: tree display ──
+    opt --tree flag set
+        Show -> Show: generatePackageTree($package,\n$installedRepo, $repos)
+        activate Show
+        Show --> Show: arrayTree
+        deactivate Show
+
+        alt JSON output
+            Show -> IO: write(JsonFile::encode(['installed' => $arrayTree]))
+        else Text output
+            Show -> Show: displayPackageTree($arrayTree)
+            activate Show
+            Show -> IO: write(tree lines)
+            deactivate Show
+        end
+    end
+
+    ' ── Standard info display ──
+    alt JSON output format
+        Show -> Show: printPackageInfoAsJson($package,\n$versions, $installedRepo, $latestPackage)
+        activate Show
+        Show -> IO: write(JsonFile::encode($viewData))
+        deactivate Show
+
+    else Text output format
+        Show -> Show: printPackageInfo($package,\n$versions, $installedRepo, $latestPackage)
+        activate Show
+
+            Show -> Show: printMeta($package, $versions,\n$installedRepo, $latestPackage)
+            activate Show
+
+                Show -> InstalledRepo: hasPackage($package)
+                activate InstalledRepo
+                InstalledRepo --> Show: bool
+                deactivate InstalledRepo
+
+                Show -> Pkg: getPrettyName(), getDescription(),\ngetKeywords(), getType(), getHomepage(),\ngetSourceUrl(), getDistUrl(), getNames()
+                activate Pkg
+                Pkg --> Show: package metadata
+                deactivate Pkg
+
+                Show -> Show: printVersions($package, $versions, $installedRepo)
+                activate Show
+                    Show -> InstalledRepo: findPackages($package->getName())
+                    activate InstalledRepo
+                    InstalledRepo --> Show: PackageInterface[]
+                    deactivate InstalledRepo
+                    Show -> Show: Semver::rsort($versions)
+                    Show -> IO: write("<info>versions</info> : ...")
+                deactivate Show
+
+                Show -> Show: getVersionStyle($latestPackage, $package)
+                activate Show
+                Show --> Show: style string
+                deactivate Show
+
+                Show -> IO: write(name, description, keywords,\nversions, type, licenses, homepage,\nsource, dist, path, names)
+
+            deactivate Show
+
+            Show -> Show: printLinks($package, TYPE_REQUIRE)
+            activate Show
+            Show -> IO: write(require links)
+            deactivate Show
+
+            Show -> Show: printLinks($package, TYPE_DEV_REQUIRE)
+            activate Show
+            Show -> IO: write(dev-require links)
+            deactivate Show
+
+            Show -> Show: printLinks($package,\nTYPE_PROVIDE | CONFLICT | REPLACE)
+            activate Show
+            Show -> IO: write(provide/conflict/replace links)
+            deactivate Show
+
+        deactivate Show
+    end
+
+' ─────────────────────────────────────────────
+' 3. Branch: list packages display
+' ─────────────────────────────────────────────
+else List all packages (no specific package filter)
+
+    Show -> Show: RepositoryUtils::flattenRepositories($repos)
+    activate Show
+    Show --> Show: RepositoryInterface[]
+    deactivate Show
+
+    loop For each repository
+        Show -> CompositeRepo: getPackages()\nor getPackageNames($filter)
+        activate CompositeRepo
+        CompositeRepo --> Show: PackageInterface[]
+        deactivate CompositeRepo
+
+        opt --latest flag
+            Show -> Show: findLatestPackage($package, ...)
+            activate Show
+            Show --> Show: latestPackage
+            deactivate Show
+        end
+
+        Show -> Pkg: getPrettyName(),\ngetFullPrettyVersion(),\ngetDescription(), getReleaseDate()
+        activate Pkg
+        Pkg --> Show: package list metadata
+        deactivate Pkg
+    end
+
+    alt JSON output
+        Show -> IO: write(JsonFile::encode($viewData))
+    else Text output
+        Show -> Show: printPackages($io, $packages, ...)
+        activate Show
+        Show -> IO: writeError(columnar package list)
+        deactivate Show
+    end
+
+end
+
+Show --> User: exit code (0 or 1 if --strict & outdated)
+deactivate Show
+
+@enduml

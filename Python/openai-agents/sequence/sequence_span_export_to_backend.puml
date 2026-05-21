@@ -1,0 +1,250 @@
+@startuml sequence_span_export_to_backend
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F0C040
+}
+
+title Span Export to Backend
+
+actor Caller as caller
+participant "tracing/__init__.py\n(set_tracing_export_api_key\n/ flush_traces)" as tracing_init
+participant "processors.py\ndefault_exporter()" as default_exp_fn
+participant "BackendSpanExporter\n(processors.py)" as exporter
+participant "BatchTraceProcessor\n(processors.py)" as batch_proc
+participant "Background\nDaemon Thread" as bg_thread
+participant "Span / Trace\n(spans.py / traces.py)" as span_trace
+participant "httpx.Client" as http_client
+participant "OpenAI Tracing API\nPOST /v1/traces/ingest" as openai_api
+
+== API Key Setup ==
+
+caller -> tracing_init : set_tracing_export_api_key(api_key)
+activate tracing_init
+
+tracing_init -> default_exp_fn : default_exporter()
+activate default_exp_fn
+note right of default_exp_fn
+  Lazy singleton — guarded by
+  **_global_lock** (double-checked)
+end note
+
+alt _global_exporter is None
+    default_exp_fn -> exporter : BackendSpanExporter.__init__()
+    activate exporter
+    exporter -> http_client : httpx.Client(\n  timeout=60s, connect=5s)
+    note right of exporter
+      Persistent client for
+      connection pooling
+    end note
+    exporter --> default_exp_fn : instance
+    deactivate exporter
+end
+
+default_exp_fn --> tracing_init : BackendSpanExporter instance
+deactivate default_exp_fn
+
+tracing_init -> exporter : set_api_key(api_key)
+activate exporter
+note right of exporter
+  Invalidates **cached_property** 'api_key'
+  from __dict__, then stores _api_key.
+  Falls back to OPENAI_API_KEY env var
+  when not set explicitly.
+end note
+exporter --> tracing_init : (key stored)
+deactivate exporter
+
+deactivate tracing_init
+
+== Span & Trace Lifecycle (Queuing) ==
+
+participant "Agent Runtime" as agent_rt
+
+agent_rt -> batch_proc : on_trace_start(trace)
+activate batch_proc
+batch_proc -> batch_proc : _ensure_thread_started()
+activate batch_proc
+note right
+  Double-checked locking;
+  spawns daemon Thread(_run)
+  on first call only
+end note
+batch_proc -> bg_thread ** : Thread(target=_run, daemon=True).start()
+deactivate batch_proc
+batch_proc -> batch_proc : queue.put_nowait(trace)
+note right of batch_proc
+  Drops item with warning
+  if queue full (max 8,192)
+end note
+deactivate batch_proc
+
+agent_rt -> batch_proc : on_span_end(span)
+activate batch_proc
+batch_proc -> batch_proc : _ensure_thread_started()
+batch_proc -> batch_proc : queue.put_nowait(span)
+deactivate batch_proc
+
+== Background Export Loop ==
+
+activate bg_thread
+loop until shutdown_event is set
+    bg_thread -> batch_proc : _run() — check time & queue size
+    activate batch_proc
+
+    alt time >= next_export_time\nOR qsize >= 5,734 (70% of 8,192)
+        batch_proc -> batch_proc : _export_batches(force=False)
+        activate batch_proc
+
+        loop drain queue in batches of ≤128
+            batch_proc -> batch_proc : queue.get_nowait() × N items
+            batch_proc -> exporter : export(items: list[Trace | Span])
+            activate exporter
+            note right of batch_proc
+              Holds **_export_lock** for
+              thread-safe draining
+            end note
+
+            ' --- export() internals ---
+            exporter -> exporter : group items by\nitem.tracing_api_key
+            note right of exporter
+              Per-item key overrides
+              global exporter key
+            end note
+
+            loop for each item in group
+                exporter -> span_trace : item.export() → dict payload
+                activate span_trace
+                span_trace --> exporter : exported dict
+                deactivate span_trace
+
+                exporter -> exporter : _should_sanitize_for_openai_tracing_api()
+                note right of exporter
+                  True only when endpoint ==
+                  https://api.openai.com/v1/traces/ingest
+                  (custom endpoints bypass sanitization)
+                end note
+
+                alt sanitize == True
+                    exporter -> exporter : _sanitize_for_openai_tracing_api(exported)
+                    activate exporter
+
+                    loop for field in ("input", "output")
+                        exporter -> exporter : _truncate_span_field_value(field)
+                        note right
+                          If > 100 KB:
+                          1. _sanitize_json_compatible_value()
+                          2. _truncate_json_value_for_limit()
+                             → handles str / dict / list recursively
+                          Unserializable values →
+                          {truncated, original_type, preview}
+                        end note
+                    end
+
+                    alt span_data.type != "generation"
+                        exporter -> exporter : remove "usage" field
+                    else span_data.type == "generation"
+                        exporter -> exporter : _sanitize_generation_usage_for_openai_tracing_api(usage)
+                        note right
+                          Keep only: input_tokens,
+                          output_tokens, details.
+                          Extra fields moved to details{}.
+                        end note
+                    end
+                    deactivate exporter
+                end
+            end
+
+            ' --- HTTP POST ---
+            exporter -> http_client : post(url, headers={Authorization,\nContent-Type, OpenAI-Beta: traces=v1}, json=payload)
+            activate http_client
+            http_client -> openai_api : POST /v1/traces/ingest
+            activate openai_api
+            openai_api --> http_client : HTTP response
+            deactivate openai_api
+            http_client --> exporter : response
+            deactivate http_client
+
+            alt status < 300
+                exporter -> exporter : log success, break
+            else 4xx Client Error
+                exporter -> exporter : log error — no retry\n(client fault)
+            else 5xx / Network Error
+                loop attempt < max_retries (3)
+                    exporter -> exporter : sleep(delay + 10% jitter)\ndelay = min(delay×2, 30s)
+                    exporter -> http_client : retry POST
+                    activate http_client
+                    http_client -> openai_api : POST /v1/traces/ingest
+                    activate openai_api
+                    openai_api --> http_client : HTTP response
+                    deactivate openai_api
+                    http_client --> exporter : response
+                    deactivate http_client
+                end
+                exporter -> exporter : max retries reached — give up
+            end
+
+            exporter --> batch_proc : (batch exported)
+            deactivate exporter
+        end
+
+        batch_proc -> batch_proc : next_export_time = now + 5s
+        deactivate batch_proc
+    else
+        batch_proc -> bg_thread : sleep(0.2s)
+    end
+
+    deactivate batch_proc
+end
+deactivate bg_thread
+
+== Force Flush (Immediate Export) ==
+
+caller -> tracing_init : flush_traces()
+activate tracing_init
+note right of caller
+  Use after trace() context exits
+  in Celery tasks, FastAPI
+  background jobs, etc.
+end note
+
+tracing_init -> tracing_init : get_trace_provider().force_flush()
+tracing_init -> batch_proc : BatchTraceProcessor.force_flush()
+activate batch_proc
+batch_proc -> batch_proc : _export_batches(force=True)
+note right of batch_proc
+  Drains **entire** queue synchronously —
+  ignores max_batch_size limit
+end note
+batch_proc --> tracing_init : (all buffered items exported)
+deactivate batch_proc
+
+tracing_init --> caller : (flush complete)
+deactivate tracing_init
+
+@enduml

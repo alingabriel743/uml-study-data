@@ -1,0 +1,246 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #212529
+    EndColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+skinparam noteBackgroundColor #EAF4FB
+skinparam noteBorderColor #5B9BD5
+
+title Save & Load Game State\n<size:11><i>Versioned binary serialisation — SaveIO / SaveVersion / SaveFileReader (Mindustry)</i></size>
+
+|Caller|
+start
+:Invoke SaveIO operation;
+
+if (Operation?) then (SAVE)
+
+  |SaveIO|
+  :SaveIO.save(Fi file);
+  if (File already exists?) then (yes)
+    :Move current file to\nbackup sibling\n<i>(file.moveTo(backupFileFor(file)))</i>;
+  endif
+  :Open deflated OutputStream\n<i>write(file) → write(file, null)</i>;
+  :Fire **Events.SaveWriteEvent**;
+  :Retrieve latest SaveVersion\n<i>versionArray.peek() = Save11</i>;
+  :Write **"MSAV"** magic header (4 bytes)\n+ version integer to stream;
+
+  |SaveVersion|
+  :**SaveVersion.write**(DataOutputStream, extraTags);
+
+  :writeRegion(**"meta"**)\n— writeMeta(stream, tags);
+  note right
+    [isCampaign?] → include sector info,
+      saveInfo(), flush TechNode progress
+    Build StringMap: wave, playtime, build,
+      mapname, tick, wavetime, stats, rules,
+      mods, controlGroups, width, height,
+      viewpos, controlledType, nocores, playerteam
+    writeStringMap(stream, result)
+  end note
+
+  :writeRegion(**"content"**)\n— writeContentHeader(stream);
+  note right
+    Iterate content map
+    Write MappableContent type ordinals,
+    counts, and names
+  end note
+
+  :writeRegion(**"patches"**)\n— writeContentPatches(stream);
+  note right
+    [patches exist?] → write byte count
+      + each patch byte array
+    [none] → write 0
+  end note
+
+  :writeRegion(**"map"**)\n— writeMap(stream);
+  note right
+    Write world width/height (2× short)
+    ─── Floor pass (loop tiles) ───
+      write floorID, overlayID + RLE byte
+    ─── Block pass (loop tiles) ───
+      write blockID, packed flags
+      [hasData] → write 7-byte tile data
+      [hasBuild & isCenter] →
+        writeChunk: version byte +
+        tile.build.writeAll()
+      [no entity & no data] →
+        write RLE consecutive byte
+  end note
+
+  :writeRegion(**"entities"**)\n— writeEntities(stream);
+  note right
+    writeEntityMapping (custom ID→name)
+    writeTeamBlocks
+      (BlockPlan: x, y, rot, block, config)
+    writeWorldEntities:
+      write serialisable entity count
+      per entity → writeChunk(classId, id,
+        beforeWrite, entity.write())
+  end note
+
+  :writeRegion(**"markers"**)\n— state.markers.write(stream);
+
+  :writeRegion(**"custom"**)\n— writeCustomChunks(stream, net=false);
+  note right
+    Loop enabled CustomChunks:
+      write name UTF
+      writeChunk(chunk.write())
+  end note
+
+  |SaveIO|
+  if (Exception during write?) then (yes)
+    :Restore backup file\n<i>(rename '-backup' → original)</i>;
+    :Throw RuntimeException;
+    stop
+  else (no)
+    :Write succeeded — backup may be discarded;
+  endif
+
+else (LOAD)
+
+  |SaveIO|
+  :SaveIO.load(Fi file)\n<i>[or load(Fi file, WorldContext context)]</i>;
+  :Wrap file in **InflaterInputStream**\n<i>(deflate decompression)</i>;
+  :Wrap in **CounterInputStream**\n+ **DataInputStream**;
+  :logic.reset();
+
+  :Read 4-byte magic header;
+  if (Header ≠ "MSAV"?) then (yes)
+    :Throw IOException\n<i>"Not a save file"</i>;
+    stop
+  endif
+
+  :Read version integer;
+  :Lookup SaveVersion\nin versions IntMap\n<i>(Save1 … Save11 registered at init)</i>;
+  if (Version not registered?) then (yes)
+    :Throw IOException\n<i>"Unknown save version"</i>;
+    stop
+  endif
+
+  |SaveVersion|
+  :**SaveVersion.read**(DataInputStream,\nCounterInputStream, WorldContext);
+
+  :readRegion(**"meta"**)\n— readMeta(stream, context);
+  note right
+    readStringMap → restore wave, wavetime,
+      tick, stats, rules, mapLocales
+    [hasSector?] → set sector,
+      apply planet rules
+    [!headless?] → restore camera pos,
+      player pos, controlledType,
+      team, controlGroups
+    Resolve Map by name from maps registry
+  end note
+
+  :readRegion(**"content"**)\n— readContentHeader(stream);
+  note right
+    Read mapped content types
+    Build MappableContent[][] temp mapper
+    content.setTemporaryMapper(map)
+  end note
+
+  if (version < 11?) then (yes — legacy)
+    :Fire ContentPatchLoadEvent manually\n<i>(patches embedded in contentHeader)</i>\nApply patches via state.patcher;
+  else (no — v11+)
+    :readRegion(**"patches"**)\n— readContentPatches(stream);
+    note right
+      Read patch byte arrays
+      Fire ContentPatchLoadEvent
+      state.patcher.apply(patches)
+    end note
+  endif
+
+  :readRegion(**"map"**)\n— readMap(stream, context);
+  note right
+    Read width/height
+    context.begin(); context.resize(w, h)
+    ─── Floor pass (loop) ───
+      readShort floorID, overlayID + RLE
+      context.create(x, y, floor, overlay)
+    ─── Block pass (loop) ───
+      read blockID, packed flags
+      [hadData] → read data/floorData/
+        overlayData/extraData (7 bytes)
+        context.onReadTileData()
+      [hadEntity & isCenter & hasBuilding] →
+        readChunk: revision byte +
+        tile.build.readAll()
+      [hadEntity & isCenter & !hasBuilding] →
+        skipChunk (obsolete entity)
+      [no entity & no data] →
+        read RLE; setBlock for range
+    context.end()
+  end note
+
+  :readRegion(**"entities"**)\n— readEntities(stream);
+  note right
+    readEntityMapping →
+      build Prov[] (custom ID→name→Prov)
+    readTeamBlocks →
+      restore team BlockPlan queues
+    readWorldEntities:
+      Loop → readChunk → get typeid
+        create entity, entity.read(in)
+        entity.add()
+      Duplicate IDs → reassign via nextId()
+      Groups.all.each(afterReadAll)
+  end note
+
+  if (version >= 8?) then (yes)
+    :readRegion(**"markers"**)\n— state.markers.read(stream);
+  endif
+
+  :readRegion(**"custom"**)\n— readCustomChunks(stream);
+  note right
+    Loop: read name UTF
+    [known chunk?] → readChunk(chunk.read)
+    [unknown chunk?] → skipChunk
+  end note
+
+  |SaveIO|
+  :Fire **Events.SaveLoadEvent**(context.isMap());
+  :FINALLY:\nworld.setGenerating(false)\ncontent.setTemporaryMapper(null);
+
+  if (Exception from primary load?) then (yes)
+    if (Backup file exists?) then (yes)
+      :Retry full load pipeline\nusing backup file;
+    else (no)
+      :Rethrow as SaveException;
+      stop
+    endif
+  endif
+
+endif
+
+|Caller|
+:Operation complete;
+stop
+
+@enduml

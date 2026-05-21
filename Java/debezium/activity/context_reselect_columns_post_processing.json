@@ -1,0 +1,135 @@
+{
+  "scope": "reselect_columns_post_processing",
+  "title": "Reselect Columns Post-Processing",
+  "diagram_type": "activity",
+  "main_class": "ReselectColumnsPostProcessor",
+  "implements": ["PostProcessor", "BeanRegistryAware", "ServiceRegistryAware"],
+  "spi_interface": "PostProcessor (AutoCloseable) — methods: configure(Map), apply(Object key, Struct value), close()",
+
+  "lifecycle_phases": [
+    "INIT: configure(Map<String,?> properties) — parse include/exclude lists, reselectUnavailableValues, reselectNullValues, reselectUseEventKeyFields, errorHandlingMode",
+    "INIT: injectBeanRegistry(BeanRegistry) — resolve connectorConfig, valueConverterProvider, jdbcConnection, schema",
+    "INIT: injectServiceRegistry(ServiceRegistry) — resolve customConverterRegistry",
+    "RUNTIME: apply(Object messageKey, Struct value) — main processing loop per change event",
+    "SHUTDOWN: close() — no-op"
+  ],
+
+  "apply_activity_flow": [
+    "START: receive (messageKey, value)",
+    "GUARD: value == null? → log debug, RETURN",
+    "GUARD: messageKey not instanceof Struct? → log debug, RETURN",
+    "EXTRACT: after = value.getStruct('after')",
+    "GUARD: after == null? → log debug, RETURN",
+    "EXTRACT: operation = value.getString('op')",
+    "GUARD: operation == READ ('r')? → RETURN (skip snapshot reads)",
+    "EXTRACT: source = value.getStruct('source')",
+    "GUARD: source == null? → log debug, RETURN",
+    "CALL: tableId = getTableIdFromSource(source)",
+    "GUARD: tableId == null? → RETURN",
+    "GUARD: connectorConfig.isSignalDataCollection(tableId)? → log debug, RETURN",
+    "CALL: table = schema.tableFor(tableId)",
+    "GUARD: table == null? → log debug, RETURN",
+    "CALL: requiredColumns = getRequiredColumnSelections(tableId, after)",
+    "GUARD: requiredColumns.isEmpty()? → log debug, RETURN",
+    "BRANCH: reselectUseEventKeyFields == true",
+    "  TRUE: iterate key.schema().fields() → collect keyColumns + resolveKeyFieldValue(key, field)",
+    "  FALSE: iterate table.primaryKeyColumns() → collect keyColumns + resolveKeyFieldValue(after, field)",
+    "CALL: jdbcConnection.reselectColumns(table, requiredColumns, keyColumns, keyValues, source, callback)",
+    "  CALLBACK: for each columnName in requiredColumns: getConvertedValue(tableId, column, field, rs.getObject(columnName)) → after.put(field.name(), convertedValue)",
+    "BRANCH: found == false",
+    "  errorHandlingMode == FAIL → throw DebeziumException",
+    "  else → log warn, RETURN",
+    "CATCH SQLException:",
+    "  errorHandlingMode == FAIL → throw DebeziumException",
+    "  else → log warn, RETURN",
+    "END: event after-struct mutated in-place with re-selected values"
+  ],
+
+  "get_required_column_selections_flow": [
+    "Iterate all fields in after.schema().fields()",
+    "For each field, get current value = after.get(field)",
+    "BRANCH reselectUnavailableValues && isUnavailableValueHolder(field, value):",
+    "  build fullyQualifiedName = jdbcConnection.getQualifiedTableName(tableId) + ':' + field.name()",
+    "  selector.test(fullyQualifiedName) → add to list",
+    "BRANCH reselectNullValues && value == null:",
+    "  build fullyQualifiedName",
+    "  selector.test(fullyQualifiedName) → add to list",
+    "Return columnSelections list"
+  ],
+
+  "is_unavailable_value_holder_logic": [
+    "If field schema type == ARRAY: iterate collection elements with isUnavailableValueHolder(valueSchema, element); also check isUnavailableArrayValueHolder for INT32/INT64 arrays",
+    "BYTES: compare via ByteBuffers.equals or ByteBuffer.equals",
+    "MAP: compare with unavailableValuePlaceholderMap singleton",
+    "STRING: match unavailableValuePlaceholder OR JSON form for HSTORE/JSON/JSONB fields"
+  ],
+
+  "get_converted_value_flow": [
+    "customConverterRegistry.getValueConverter(tableId, column) → Optional",
+    "If empty: valueConverterProvider.converter(column, field)",
+    "If converter != null: converter.convert(value)",
+    "Else: return raw value"
+  ],
+
+  "get_table_id_from_source_flow": [
+    "source.getString(DATABASE_NAME_KEY) → null/empty → return null",
+    "source.getString(TABLE_NAME_KEY) → null/empty → return null",
+    "source.getString(SCHEMA_NAME_KEY) if field present (optional)",
+    "jdbcConnection.createTableId(database, schema, table) → TableId"
+  ],
+
+  "selector_predicate_logic": [
+    "ReselectColumnsPredicateBuilder: includeColumns(list) → Predicates.includes(CASE_INSENSITIVE)",
+    "excludeColumns(list) → Predicates.excludes(CASE_INSENSITIVE)",
+    "build(): include takes priority over exclude; if neither set → always true (x → true)"
+  ],
+
+  "key_dependencies": [
+    "JdbcConnection: reselectColumns(), getQualifiedTableName(), createTableId()",
+    "RelationalDatabaseSchema: tableFor(TableId)",
+    "RelationalDatabaseConnectorConfig: isSignalDataCollection(), getUnavailableValuePlaceholder()",
+    "ValueConverterProvider: converter(Column, Field)",
+    "CustomConverterRegistry: getValueConverter(TableId, Column)",
+    "BeanRegistry: lookupByName for CONNECTOR_CONFIG, VALUE_CONVERTER, JDBC_CONNECTION, DATABASE_SCHEMA",
+    "ServiceRegistry: tryGetService(CustomConverterRegistry)"
+  ],
+
+  "config_properties": [
+    "reselect.columns.include.list — regex of fully-qualified column names to include",
+    "reselect.columns.exclude.list — regex of fully-qualified column names to exclude",
+    "reselect.unavailable.values (default: true) — reselect unavailable-value-placeholder columns",
+    "reselect.null.values (default: true) — reselect null-valued columns",
+    "reselect.use.event.key (default: false) — use Kafka event key fields vs table PK columns",
+    "reselect.error.handling.mode (default: warn) — warn | fail on SQL error or row-not-found"
+  ],
+
+  "error_handling": [
+    "Row not found after reselect: WARN logs or throws DebeziumException(FAIL mode)",
+    "SQLException during reselect: WARN logs or throws DebeziumException(FAIL mode)",
+    "Both null + unavailable disabled: WARN logged at configure time"
+  ],
+
+  "test_class_summary": {
+    "class": "BinlogReselectColumnsProcessorIT<C extends SourceConnector>",
+    "extends": "AbstractReselectProcessorTest<C>",
+    "implements": "BinlogConnectorTest<C>",
+    "test_table": "dbz4321 (id int PK, data varchar(50), data2 int)",
+    "key_scenarios": [
+      "testNoColumnsReselectedWhenNullAndUnavailableColumnsAreDisabled — both flags false, no reselection",
+      "testNoColumnsReselectedWhenNotNullSnapshot — non-null value, no reselection needed",
+      "consumeRecordsByTopicReselectWhenNotNullSnapshot — 7 records",
+      "consumeRecordsByTopicReselectWhenNullStreaming — 8 records",
+      "consumeRecordsByTopicReselectWhenNotNullStreaming — 10 records"
+    ],
+    "config_used": "BinlogConnectorConfig.CUSTOM_POST_PROCESSORS=reselector, post.processors.reselector.type=ReselectColumnsPostProcessor"
+  },
+
+  "important_notes": "apply() mutates the Struct 'after' in-place. READ operations ('r') are always skipped. Signal tables are always skipped. Column selector uses fully-qualified names: 'schema.table:column'. Unavailable value placeholder is connector-configurable bytes; checked as String, ByteBuffer, Map, JSON, and INT32/INT64 arrays.",
+
+  "source_files_analyzed": [
+    "debezium-connector-common/src/main/java/io/debezium/processors/reselect/ReselectColumnsPostProcessor.java",
+    "debezium-connector-binlog/src/test/java/io/debezium/connector/binlog/BinlogReselectColumnsProcessorIT.java",
+    "debezium-embedded/src/test/java/io/debezium/processors/AbstractReselectProcessorTest.java",
+    "debezium-connector-common/src/main/java/io/debezium/processors/spi/PostProcessor.java"
+  ]
+}

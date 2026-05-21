@@ -1,0 +1,205 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    NoteBorderColor #CED4DA
+    NoteBackgroundColor #FFF9C4
+}
+
+title Run Error Handling Flow
+
+participant "run_loop\n(Runner)" as run_loop
+participant "error_tracing" as tracing
+participant "build_run_error_data" as build_data
+participant "ItemHelpers" as item_helpers
+participant "resolve_run_error_handler_result" as resolve_handler
+participant "RunErrorHandler\n(user callback)" as user_handler
+participant "validate_handler_final_output" as validate_output
+participant "AgentOutputSchema" as output_schema
+participant "format_final_output_text" as format_output
+participant "create_message_output_item" as create_item
+participant "Caller / run()" as caller
+
+== Turn Limit Detection ==
+
+run_loop -> run_loop : check current_turn > max_turns
+activate run_loop
+
+run_loop -> tracing : attach_error_to_span(\n  SpanError{message="Max turns exceeded",\n  data={max_turns}})
+activate tracing
+tracing --> run_loop : span annotated
+deactivate tracing
+
+run_loop -> run_loop : create MaxTurnsExceeded(message)
+note right of run_loop
+  MaxTurnsExceeded extends AgentsException.
+  AgentsException carries optional
+  run_data: RunErrorDetails | None
+end note
+
+== Build Run Error Data ==
+
+run_loop -> build_data : build_run_error_data(\n  input, new_items, raw_responses,\n  last_agent, reasoning_item_id_policy)
+activate build_data
+
+build_data -> item_helpers : input_to_new_input_list(input)
+activate item_helpers
+item_helpers --> build_data : history: list[TResponseInputItem]
+deactivate item_helpers
+
+loop for each item in new_items
+    build_data -> build_data : run_item_to_input_item(item, policy)
+end
+
+build_data --> run_loop : RunErrorData{\n  input, new_items, history,\n  output, raw_responses, last_agent}
+deactivate build_data
+
+note right of build_data
+  RunErrorData is the forward-passed
+  snapshot given to handler callbacks.
+  Separate from RunErrorDetails (which
+  is attached to re-raised exceptions).
+end note
+
+== Resolve Error Handler ==
+
+run_loop -> resolve_handler : resolve_run_error_handler_result(\n  error_handlers, MaxTurnsExceeded,\n  context_wrapper, run_data)
+activate resolve_handler
+
+resolve_handler -> resolve_handler : look up error_handlers["max_turns"]
+
+alt No handler registered (key absent or no error_handlers)
+
+    resolve_handler --> run_loop : None (no handler)
+    deactivate resolve_handler
+
+    alt Non-streamed run
+        run_loop -> caller : raise MaxTurnsExceeded
+        activate caller
+        caller -> caller : inspect exc.run_data\n(RunErrorDetails attached)
+        note right of caller
+          AgentsException.run_data is populated
+          before re-raise with RunErrorDetails{
+            input, new_items, raw_responses,
+            last_agent, context_wrapper,
+            input_guardrail_results,
+            output_guardrail_results}
+        end note
+        deactivate caller
+    else Streamed run
+        run_loop -> run_loop : enqueue QueueCompleteSentinel
+    end
+
+else Handler registered
+
+    activate resolve_handler
+    resolve_handler -> user_handler : handler(RunErrorHandlerInput{\n  error: MaxTurnsExceeded,\n  context: RunContextWrapper,\n  run_data: RunErrorData})
+    activate user_handler
+
+    note over user_handler
+      RunErrorHandler is a user-supplied
+      Callable. May be sync or async.
+      Keyed by error kind ("max_turns").
+    end note
+
+    user_handler --> resolve_handler : raw result (awaited if awaitable)
+    deactivate user_handler
+
+    alt Handler returns None
+        resolve_handler --> run_loop : None (treated as no handler)
+        deactivate resolve_handler
+        run_loop -> caller : raise MaxTurnsExceeded
+    else Handler returns RunErrorHandlerResult directly
+        resolve_handler --> run_loop : RunErrorHandlerResult{\n  final_output, include_in_history}
+        deactivate resolve_handler
+    else Handler returns dict with "final_output" key
+        resolve_handler -> resolve_handler : RunErrorHandlerResult(**result)
+        resolve_handler --> run_loop : RunErrorHandlerResult
+    else Handler returns dict without "final_output" key
+        resolve_handler -> resolve_handler : RunErrorHandlerResult(final_output=dict)
+        resolve_handler --> run_loop : RunErrorHandlerResult
+    else Handler returns other value
+        resolve_handler -> resolve_handler : RunErrorHandlerResult(final_output=value)
+        resolve_handler --> run_loop : RunErrorHandlerResult
+    end
+
+end
+
+== Validate & Synthesize Output ==
+
+run_loop -> validate_output : validate_handler_final_output(\n  current_agent, result.final_output)
+activate validate_output
+
+validate_output -> output_schema : get_output_schema(agent)
+activate output_schema
+output_schema --> validate_output : AgentOutputSchema
+deactivate output_schema
+
+alt Plain-text agent (no structured output)
+    validate_output --> run_loop : validated_output (passthrough)
+else Structured output agent
+    validate_output -> output_schema : _type_adapter.dump_json(output)\n+ validate_json(serialized)
+    activate output_schema
+    output_schema --> validate_output : validated_output
+    deactivate output_schema
+
+    opt Validation fails
+        validate_output --> run_loop : raise UserError
+    end
+end
+deactivate validate_output
+
+run_loop -> format_output : format_final_output_text(\n  agent, validated_output)
+activate format_output
+format_output --> run_loop : output_text: str
+deactivate format_output
+
+run_loop -> create_item : create_message_output_item(\n  agent, output_text)
+activate create_item
+create_item --> run_loop : MessageOutputItem\n(ResponseOutputMessage with FAKE_RESPONSES_ID)
+deactivate create_item
+
+note right of create_item
+  FAKE_RESPONSES_ID signals this item
+  is SDK-synthesized, not from a real
+  model response.
+end note
+
+== History & Final Output ==
+
+alt include_in_history = true (default)
+    run_loop -> run_loop : append synthesized_item to\ngenerated_items / new_items / session_items
+else include_in_history = false
+    run_loop -> run_loop : skip history append\n(run completes but history unchanged)
+end
+
+run_loop -> run_loop : run_final_output_hooks(\n  agent, hooks, context_wrapper, validated_output)
+run_loop -> run_loop : run_output_guardrails(...)\n→ output_guardrail_results
+
+run_loop --> caller : RunResult{final_output=validated_output, ...}
+deactivate run_loop
+
+@enduml

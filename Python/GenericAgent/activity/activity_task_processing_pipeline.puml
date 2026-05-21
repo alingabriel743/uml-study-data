@@ -1,0 +1,191 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #28A745
+    EndColor #DC3545
+    BarColor #495057
+}
+
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+
+title Task Processing Pipeline (GeneraticAgent.run)
+
+|Caller|
+start
+:Call **put_task**(query, source, images);
+:Create **display_queue** = queue.Queue();
+:Enqueue task onto **task_queue**\n{query, source, images, output: display_queue};
+:Return **display_queue** to caller;
+
+|GeneraticAgent (run loop)|
+note right
+  Runs as a daemon thread —
+  blocks indefinitely on task_queue
+end note
+:Block on **task_queue.get()**;
+:Unpack task:\nraw_query, source, images, display_queue;
+
+:Call **_handle_slash_cmd**(raw_query, display_queue);
+
+if (raw_query starts with '/'?) then (yes)
+    if (matches /session.<k>=<v>?) then (yes)
+        :Set **llmclient.backend.<k> = v**;
+        :display_queue.put({'done': ..., 'source': 'system'});
+        :Return **None**;
+    else (no)
+        if (matches /resume?) then (yes)
+            :Return injected\n**resume prompt** string;
+        else (no)
+            :Return raw_query unchanged;
+        endif
+    endif
+else (no)
+    :Return raw_query unchanged;
+endif
+
+if (result of _handle_slash_cmd is None?) then (yes)
+    :task_queue.**task_done**();
+    note right: Skip LLM call entirely
+    :← Loop back to task_queue.get();
+    detach
+else (no)
+    :Set **is_running** = True;
+    :Append '[USER]: <rquery>' to **self.history**;
+    :Build **sys_prompt**:\nget_system_prompt() + extra_sys_prompt;
+    :Construct **GenericAgentHandler**(self, history, temp_dir);
+
+    if (Previous handler has key_info?) then (yes)
+        :Carry over **key_info** into new handler;
+        :Increment **passed_sessions** counter;
+    endif
+
+    if (source == 'feishu' AND history len > 1?) then (yes)
+        :user_input = **anchor_prompt** + current message;
+    else (no)
+        :user_input = raw_query;
+    endif
+
+    :Invoke **agent_runner_loop** generator\n(llmclient, sys_prompt, user_input, handler,\n TOOLS_SCHEMA, max_turns=40);
+endif
+
+|agent_runner_loop (generator)|
+:Initialize **messages** = [system_prompt, user_input];
+repeat
+    :yield 'LLM Running (Turn N)...' → caller;
+
+    |LLMClient / Handler|
+    :LLMClient.**chat**(messages, tools)\n→ stream / collect response;
+    :Parse **tool_calls** from response;
+
+    if (No tool_calls in response?) then (yes)
+        :Inject synthetic **'no_tool'** call;
+    endif
+
+    repeat
+        :handler.**dispatch**(tool_name, args)\n→ StepOutcome;
+        if (outcome.should_exit?) then (yes)
+            :Set exit_reason = **EXITED**;
+            break
+        elseif (outcome.next_prompt empty?) then (yes)
+            :Set exit_reason = **CURRENT_TASK_DONE**;
+            break
+        else (no)
+            :Collect tool_result\nand next_prompt;
+        endif
+    repeat while (More tool_calls?) is (yes)
+    ->no;
+
+    :handler.**turn_end_callback**\n(response, tool_calls, results, turn,\n next_prompt, exit_reason);
+
+    if (No next_prompts OR exit_reason set?) then (yes)
+        if (No _done_hooks pending?) then (yes)
+            break
+        endif
+    endif
+    :messages = [next_prompt + tool_results]\nfor next turn;
+
+    |agent_runner_loop (generator)|
+repeat while (turn < max_turns?) is (yes)
+->no (MAX_TURNS_EXCEEDED);
+
+:Return exit_reason / result;
+
+|GeneraticAgent (run loop)|
+group Streaming Loop
+    repeat
+        :Receive **chunk** from generator;
+
+        :Check for **_stop file** in task_dir;
+        if (_stop file present?) then (yes)
+            :Call **self.abort**() — sets stop_sig;
+        endif
+
+        if (stop_sig == True?) then (yes)
+            break
+        endif
+
+        :Accumulate: **full_resp** += chunk;
+
+        if (Buffer grown > 50 chars\nOR chunk contains 'LLM Running'?) then (yes)
+            :display_queue.put(\n  {'next': incremental_or_full,\n   'source': source});
+            :Update **last_pos** marker;
+        endif
+    repeat while (More chunks from generator?) is (yes)
+    ->no;
+
+    if (inc_out mode AND leftover buffer?) then (yes)
+        :display_queue.put({'next': remaining,\n 'source': source});
+    endif
+end group
+
+:Post-process **full_resp**:\nfix </summary> newlines,\nreformat <file_content> blocks;
+:display_queue.put(\n  {'done': full_resp, 'source': source});
+:self.history = **handler.history_info**;
+note right
+  Normal completion path
+end note
+
+floating note left
+  **Exception path**\n[CATCH Exception]:\ndisplay_queue.put(\n  {'done': full_resp + error_block,\n   'source': source})
+end note
+
+group Finally (always runs)
+    if (stop_sig == True?) then (yes)
+        :Log **'User aborted the task.'**;
+    endif
+    :is_running = **False**;
+    :stop_sig = **False**;
+    :task_queue.**task_done**();
+    :handler.code_stop_signal.append(1)\n— signal sub-processes to stop;
+end group
+
+:← Loop back to **task_queue.get**();
+detach
+
+@enduml

@@ -1,0 +1,77 @@
+{
+  "scope": "gaussian_rendering_pipeline",
+  "title": "Gaussian Rendering Pipeline",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Caller",
+    "LatentRecon",
+    "forward_gaussians",
+    "gaussian_processing",
+    "gaussian_pruning",
+    "GaussianRendererDeferred",
+    "GaussianRenderer",
+    "DeferredBP",
+    "DeferredBPPatch",
+    "gsplat.rasterization"
+  ],
+  "interaction_flow": [
+    "Caller → LatentRecon: forward(data) — data contains rays_os, rays_ds, plucker_embedding, images_input_embed, time_embeddings, cam_view, intrinsics",
+    "LatentRecon → forward_gaussians: forward_gaussians(images, plucker_embedding, rays_os, rays_ds, time_embeddings, num_input_multi_views)",
+    "forward_gaussians → forward_gaussians: reshape_mv_temp_to_batch(images, plucker, rays_os, rays_ds)",
+    "forward_gaussians → patch_embed: forward_checkpointing(patch_embed, images_input) — patchify [B,V,C,H,W] → tokens",
+    "forward_gaussians → patch_time_embed: get_time_embedding(time_embeddings) — optional, adds input+target time tokens",
+    "forward_gaussians → patch_plucker_embed: forward_checkpointing(patch_plucker_embed, plucker_embedding) — adds Plucker ray tokens",
+    "forward_gaussians → enc_blocks: loop forward_checkpointing(blk, x) — transformer/mamba encoder blocks",
+    "forward_gaussians → enc_norm: forward_checkpointing(enc_norm, x)",
+    "forward_gaussians → block_out: forward_checkpointing(block_out, x) — optional channel reduction linear",
+    "forward_gaussians → deconv/decoder_cosmos: forward_checkpointing(deconv, x) or decoder_cosmos(x) — upsample [B,C,T,H,W]",
+    "forward_gaussians → subsample_x_and_rays_wrapper: optional Gaussian subsampling (learned mask or random)",
+    "forward_gaussians → gaussian_processing: gaussian_processing(x, rays_os, rays_ds) — convert network output to [B,N,14]",
+    "gaussian_processing → gaussian_processing: split x into [distance(1), rgb(3), scaling(3), rotation(4), opacity(1)]; apply sigmoid/exp/normalize/tanh activations; pos = rays_os + rays_ds * depth",
+    "gaussian_processing → forward_gaussians: return gaussians [B, N, 14]",
+    "forward_gaussians → gaussian_pruning: gaussian_pruning(gaussians) — prune low-opacity Gaussians by rank",
+    "forward_gaussians → LatentRecon: return gaussians [B, N, 14], gaussians_mask",
+    "LatentRecon → GaussianRendererDeferred (or GaussianRenderer): gs.render(gaussians, cam_view, bg_color, intrinsics, patch_size)",
+    "GaussianRendererDeferred → GaussianRendererDeferred: parse gaussians[...,0:3]=means3D, [3]=opacity, [4:7]=scales, [7:11]=rotations, [11:]=rgbs; build viewmat, Ks, backgrounds tensors",
+    "GaussianRendererDeferred → render_deferred (or render_standard): render_func(means3D, opacity, scales, rotations, rgbs, viewmat, Ks, backgrounds, H, W, near, far, patch_size)",
+    "render_deferred → DeferredBP: DeferredBP.apply(means3D, rgbs, scales, rotations, opacity, viewmat, Ks, W, H, near, far, backgrounds, raster_kwargs) [if patch_size is None]",
+    "render_deferred → DeferredBPPatch: DeferredBPPatch.apply(..., patch_size, ...) [if patch_size is not None]",
+    "DeferredBP → DeferredBP: forward() — loop B×V, call DeferredBP.render() per view; store results with requires_grad=True",
+    "DeferredBP → gsplat.rasterization: rasterization(means, quats, scales, opacities, colors, viewmats, Ks, W, H, near, far, backgrounds, render_mode='RGB+ED') — returns rgbd[H,W,4], alpha[H,W,1]",
+    "gsplat.rasterization → DeferredBP: image[H,W,3], alpha[H,W,1], depth[H,W,1]",
+    "DeferredBP → GaussianRendererDeferred: images[B,V,H,W,3], alphas[B,V,H,W,1], depths[B,V,H,W,1]",
+    "render_deferred → GaussianRendererDeferred: {images_pred [B,V,3,H,W], alphas_pred [B,V,1,H,W], depths_pred [B,V,1,H,W]} (permuted)",
+    "GaussianRendererDeferred → LatentRecon: out_dict {images_pred, alphas_pred, depths_pred}",
+    "LatentRecon → Caller: out {images_pred, depths_pred, opacity_pred} (training) or full results + gaussians (inference)"
+  ],
+  "key_relationships": [
+    "LatentRecon extends nn.Module",
+    "LatentRecon composes GaussianRendererDeferred (if opt.deferred_bp=True) or GaussianRenderer as self.gs",
+    "GaussianRendererDeferred dispatches to render_deferred (DeferredBP path) or render_standard (direct rasterization loop)",
+    "DeferredBP extends torch.autograd.Function — custom forward/backward for memory-efficient view-by-view rasterization",
+    "DeferredBP.backward() re-runs DeferredBP.render() per view under torch.enable_grad() to compute gradients",
+    "GaussianRenderer is a simpler chunked-view renderer (no deferred BP)",
+    "Both renderers call gsplat.rendering.rasterization as the core GPU rasterizer",
+    "DeferredBPPatch (from gs_deferred_patch) handles patch-based rendering variant",
+    "gaussian_processing converts raw network tokens → structured [B,N,14] Gaussian tensor using ray-aligned positioning"
+  ],
+  "gaussian_tensor_layout": "[pos(0:3), opacity(3:4), scale(4:7), rotation(7:11), rgb(11:14)] — 14 channels per Gaussian",
+  "activations": {
+    "opacity": "sigmoid(x - 2.0)",
+    "scale": "min(exp(x - scale_shift), scale_cap)",
+    "rotation": "F.normalize(x, dim=-1)",
+    "rgb": "0.5 * tanh(x) + 0.5"
+  },
+  "render_modes": {
+    "deferred_bp=True, patch_size=None": "DeferredBP.apply — batched view loop, deferred backward",
+    "deferred_bp=True, patch_size=N": "DeferredBPPatch.apply — patch-based variant",
+    "deferred_bp=False": "GaussianRenderer or render_standard — direct batch/view loop rasterization"
+  },
+  "oom_handling": "GaussianRendererDeferred.render() loops over downscale factors [1,2,4,8]; render_downscale() uses downscale_intrinsics() then F.interpolate back to original size",
+  "important_notes": "Gaussian position is ray-aligned: pos = rays_os + rays_ds * depth where depth is decoded from a per-Gaussian distance channel. Pruning ranks Gaussians by opacity and keeps top-K plus random fraction. DeferredBP stores tensors via ctx.save_for_backward and replays render in backward for gradient computation.",
+  "source_files_analyzed": [
+    "Lyra-1/src/rendering/gs.py",
+    "Lyra-1/src/rendering/gs_deferred.py",
+    "Lyra-1/src/models/recon/model_latent_recon.py"
+  ]
+}

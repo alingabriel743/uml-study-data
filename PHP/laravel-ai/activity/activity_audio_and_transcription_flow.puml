@@ -1,0 +1,139 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #E6A817
+}
+skinparam partition {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title Audio Generation & Transcription Flow
+
+|Caller|
+start
+
+'============================================================
+' AUDIO GENERATION FLOW
+'============================================================
+note right
+  **Audio Generation Flow**
+  AudioProvider → ElevenLabsGateway → AudioGenerated
+end note
+
+:Invoke audio(text, voice, instructions, model, timeout);
+
+|ElevenLabsProvider|
+:Generate invocationId = Str::uuid7();
+:Resolve model\n(default: **eleven_multilingual_v2**);
+:Create AudioPrompt\n(text, voice, instructions, provider, model, timeout);
+
+if (Ai::audioIsFaked()?) then (yes)
+    :Record AudioPrompt\nfor test/fake mode;
+    note right: No real HTTP call made
+    stop
+else (no)
+endif
+
+|Events Dispatcher|
+:Dispatch **GeneratingAudio**\n(invocationId, provider, model, prompt);
+
+|ElevenLabsProvider|
+:Resolve AudioGateway\n($audioGateway ?? new ElevenLabsGateway());
+
+|ElevenLabsGateway|
+:Map voice alias\n• "default-female" → XrExE9yKIg1WjnnlVkGX\n• "default-male"   → onwK4e9ZLuTAKqWW03F9\n• otherwise → pass-through;
+
+:HTTP POST /v1/text-to-speech/{voiceId}\nHeaders: xi-api-key\nBody: { model_id, text };
+
+if (HTTP call fails?) then (yes)
+    :withErrorHandling()\n(HandlesFailoverErrors trait);
+    :Throw or failover error;
+    stop
+else (no)
+endif
+
+:Build AudioResponse\n(base64(responseBody), Meta(provider, model), "audio/mpeg");
+
+|Events Dispatcher|
+:Dispatch **AudioGenerated**\n(invocationId, provider, model, prompt, response);
+
+|Caller|
+:Receive **AudioResponse**;
+
+...
+
+'============================================================
+' TRANSCRIPTION FLOW
+'============================================================
+note right
+  **Transcription Flow**
+  TranscriptionProvider → ElevenLabsGateway → TranscriptionGenerated
+end note
+
+:Invoke transcribe(audio, language, diarize, model);
+
+|ElevenLabsProvider|
+:Generate invocationId = Str::uuid7();
+:Resolve model\n(default: **scribe_v2**);
+:Create TranscriptionPrompt\n(audio, language, diarize, provider, model, timeout);
+
+if (Ai::transcriptionsAreFaked()?) then (yes)
+    :Record TranscriptionPrompt\nfor test/fake mode;
+    note right: No real HTTP call made
+    stop
+else (no)
+endif
+
+|Events Dispatcher|
+:Dispatch **GeneratingTranscription**\n(invocationId, provider, model, prompt);
+
+|ElevenLabsProvider|
+:Resolve TranscriptionGateway\n($transcriptionGateway ?? new ElevenLabsGateway());
+
+|ElevenLabsGateway|
+:Extract audioContent & mimeType\nfrom TranscribableAudio;
+
+:HTTP POST /v1/speech-to-text\nHeaders: xi-api-key\nMultipart: file attachment + { model_id, language, diarize };
+
+if (HTTP call fails?) then (yes)
+    :withErrorHandling()\n(HandlesFailoverErrors trait);
+    :Throw or failover error;
+    stop
+else (no)
+endif
+
+:Parse JSON response body;
+
+if (diarize = true?) then (yes)
+    :Filter response["words"] where type = "word";
+    :Map each word →\nTranscriptionSegment\n(text, speaker_id, startSeconds, endSeconds);
+else (no)
+    :segments = [] (empty collection);
+endif
+
+:Build TranscriptionResponse\n(text, Collection<TranscriptionSegment>, Usage, Meta);
+
+|Events Dispatcher|
+:Dispatch **TranscriptionGenerated**\n(invocationId, provider, model, prompt, response);
+
+|Caller|
+:Receive **TranscriptionResponse**;
+stop
+
+@enduml

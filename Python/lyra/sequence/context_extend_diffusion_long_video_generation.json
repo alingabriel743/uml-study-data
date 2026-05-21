@@ -1,0 +1,118 @@
+{
+  "scope": "extend_diffusion_long_video_generation",
+  "title": "Extended Diffusion Long Video Generation",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Caller",
+    "generate_video_from_batch_with_loop",
+    "get_condition_latent",
+    "ExtendDiffusionModel",
+    "create_condition_latent_from_input_frames",
+    "read_video_or_image_into_frames_BCTHW",
+    "compute_num_frames_condition",
+    "switch_config_for_inference",
+    "Sampler (self.sampler)",
+    "VAE (model.tokenizer / model.vae)"
+  ],
+  "interaction_flow": [
+    "Caller → get_condition_latent(model, video_path, num_of_latent_condition, state_shape): reads initial condition latent",
+    "  get_condition_latent → read_video_or_image_into_frames_BCTHW(path, H, W): returns input_frames BCTHW",
+    "  get_condition_latent → compute_num_frames_condition(model, num_of_latent_condition): returns num_frames_condition int",
+    "  get_condition_latent → create_condition_latent_from_input_frames(model, input_frames, num_frames_condition): returns (condition_latent BCTHW, encode_input_frames)",
+    "    create_condition_latent_from_input_frames → VAE.encode(encode_input_frames): encodes pixel frames to latent BCTHW",
+    "  get_condition_latent → returns (condition_latent bfloat16, input_frames)",
+
+    "Caller → switch_config_for_inference(model): context manager, sets condition_location='first_n', apply_corruption='noise_with_sigma_fixed'",
+
+    "Caller → generate_video_from_batch_with_loop(model, state_shape, data_batch, condition_latent, num_of_loops, num_of_latent_overlap_list, guidance, num_steps, seed, ...)",
+    "  [Loop i = 0..num_of_loops-1]",
+    "  generate_video_from_batch_with_loop: pad condition_latent to state_shape if needed",
+    "  generate_video_from_batch_with_loop: append condition_latent to condition_latent_list",
+    "  generate_video_from_batch_with_loop: select augment_sigma from augment_sigma_list[i]",
+
+    "  generate_video_from_batch_with_loop → ExtendDiffusionModel.generate_samples_from_batch(data_batch, guidance, state_shape, num_steps, seed+i, condition_latent, num_condition_t=overlap_i, condition_video_augment_sigma_in_inference)",
+    "    generate_samples_from_batch → self._normalize_video_databatch_inplace(data_batch)",
+    "    generate_samples_from_batch → self._augment_image_dim_inplace(data_batch)",
+    "    generate_samples_from_batch → self.get_x0_fn_from_batch_with_condition_latent(data_batch, guidance, condition_latent, num_condition_t, augment_sigma, seed)",
+    "      get_x0_fn_from_batch_with_condition_latent → self.conditioner.get_condition_uncondition(data_batch): returns (condition, uncondition)",
+    "      get_x0_fn_from_batch_with_condition_latent → self.add_condition_video_indicator_and_video_input_mask(condition_latent, condition, num_condition_t): sets gt_latent, condition_video_indicator [B,1,T,1,1], condition_video_input_mask [B,1,T,H,W]",
+    "      get_x0_fn_from_batch_with_condition_latent → self.add_condition_video_indicator_and_video_input_mask(condition_latent, uncondition, num_condition_t)",
+    "      get_x0_fn_from_batch_with_condition_latent → broadcast_condition(condition/uncondition, to_tp, to_cp) [tensor parallel / context parallel]",
+    "      get_x0_fn_from_batch_with_condition_latent → returns x0_fn closure",
+    "    generate_samples_from_batch → misc.arch_invariant_rand(...) * sde.sigma_max: initialise x_sigma_max noise",
+    "    generate_samples_from_batch → self.sampler(x0_fn, x_sigma_max, num_steps, sigma_max): runs diffusion sampling loop",
+    "      [Each sampler step calls x0_fn(noise_x, sigma)]",
+    "        x0_fn → self.denoise(noise_x, sigma, condition, augment_sigma, seed) → VideoDenoisePrediction.x0_pred_replaced",
+    "          denoise → (optional) normalize_condition_latent(gt_latent)",
+    "          denoise → self.augment_conditional_latent_frames(condition, cfg, gt_latent, augment_sigma, sigma, seed)",
+    "            augment_conditional_latent_frames: if sigma < augment_sigma → zero out condition_video_indicator (start joint denoising)",
+    "            augment_conditional_latent_frames → misc.arch_invariant_rand() for fixed noise",
+    "            augment_conditional_latent_frames: augment_latent = gt_latent + noise * augment_sigma",
+    "            augment_conditional_latent_frames → self.scaling(sigma=augment_sigma): get c_in_augment, c_noise_augment",
+    "            augment_conditional_latent_frames: sets condition.condition_video_augment_sigma",
+    "            augment_conditional_latent_frames: returns (condition, augment_latent_cin)",
+    "          denoise: (optional) split_inputs_cp for context parallel",
+    "          denoise: compose new_noise_xt = indicator * augment_latent + (1-indicator) * noise_x",
+    "          denoise → super().denoise(new_noise_xt, sigma, condition): base model forward pass",
+    "          denoise: x0_pred_replaced = indicator * gt_latent + (1-indicator) * denoise_pred.x0",
+    "          denoise → returns VideoDenoisePrediction(x0, eps, logvar, net_in, net_x0_pred, xt, x0_pred_replaced)",
+    "        x0_fn → self.denoise(..., uncondition, ...) → uncond_x0",
+    "        x0_fn: returns cond_x0 + guidance * (cond_x0 - uncond_x0)  [CFG]",
+    "    generate_samples_from_batch → returns samples BCTHW",
+
+    "  [After sample generated — skip_reencode=False path]",
+    "  generate_video_from_batch_with_loop → compute_num_frames_condition(model, overlap_i+1): num_cond_frames for next loop",
+    "  generate_video_from_batch_with_loop → VAE.decode(sample): decode latent to pixel frames [B,3,T,H,W] in [0,1]",
+    "  generate_video_from_batch_with_loop: slice/trim conditional frames from grid_np for output",
+    "  generate_video_from_batch_with_loop → create_condition_latent_from_input_frames(model, condition_frame_input, num_cond_frames): re-encode last frames as new condition_latent",
+
+    "  [After sample generated — skip_reencode=True path]",
+    "  generate_video_from_batch_with_loop: condition_latent = sample[:, :, -num_of_latent_overlap_i_plus_1:]  (no re-encode)",
+
+    "  [End loop — concatenate results]",
+    "  generate_video_from_batch_with_loop: video_THWC = np.concatenate(grid_list) or decode all latents together",
+    "  generate_video_from_batch_with_loop → returns (video_THWC np.array THWC [0,255], condition_latent_list, sample_latent [, noise])"
+  ],
+  "key_relationships": [
+    "ExtendDiffusionModel extends BaseModel (DiffusionModel)",
+    "FSDPExtendDiffusionModel extends ExtendDiffusionModel (via @diffusion_fsdp_class_decorator)",
+    "generate_video_from_batch_with_loop depends_on ExtendDiffusionModel.generate_samples_from_batch",
+    "generate_video_from_batch_with_loop depends_on create_condition_latent_from_input_frames (loop re-encode)",
+    "generate_video_from_batch_with_loop depends_on compute_num_frames_condition",
+    "get_condition_latent depends_on read_video_or_image_into_frames_BCTHW, compute_num_frames_condition, create_condition_latent_from_input_frames",
+    "ExtendDiffusionModel.denoise composes augment_conditional_latent_frames + base model denoise",
+    "ExtendDiffusionModel.generate_samples_from_batch composes get_x0_fn_from_batch_with_condition_latent + self.sampler",
+    "VAE (model.tokenizer / model.vae) used for encode and decode in create_condition_latent_from_input_frames and loop decode"
+  ],
+  "data_objects": {
+    "condition_latent": "torch.Tensor BCTHW (bfloat16); latent encoding of condition (seed) frames",
+    "condition_video_indicator": "torch.Tensor [B,1,T,1,1]; binary mask: 1=condition region, 0=generation region",
+    "condition_video_input_mask": "torch.Tensor [B,1,T,H,W]; concatenated to network input",
+    "condition_video_augment_sigma": "float scalar; sigma fed to network for the corrupted condition region",
+    "augment_latent": "BCTHW; condition latent corrupted with fixed/sampled noise",
+    "new_noise_xt": "BCTHW; composed model input: augment_latent in cond region, noise_x in gen region",
+    "VideoDenoisePrediction": "dataclass {x0, eps, logvar, net_in, net_x0_pred, xt, x0_pred_replaced}",
+    "x0_fn": "closure(noise_x, sigma) → CFG-guided x0 prediction; passed to sampler",
+    "video_THWC": "np.array THWC uint8 [0,255]; final long video concatenated across loops"
+  },
+  "sliding_window_logic": {
+    "num_of_loops": "Number of autoregressive generation steps",
+    "num_of_latent_overlap_list": "Per-loop count of latent frames to reuse as condition (sliding overlap)",
+    "condition_propagation": "After each loop, last num_cond_frames of decoded output are re-encoded (or last latent sliced if skip_reencode) to form the next condition_latent",
+    "augment_sigma_schedule": "augment_sigma_list[i] per loop; if current sigma < augment_sigma, condition_video_indicator zeroed so model jointly denoises all frames",
+    "first_loop_special": "First loop keeps all output frames; subsequent loops trim leading conditional (overlapped) frames before concatenation"
+  },
+  "config_flags": {
+    "condition_location": "'first_n' (inference) | 'first_random_n' (training) | 'random' (training) | 'first_and_last_1' (interpolator)",
+    "apply_corruption_to_condition_region": "'noise_with_sigma' (training) | 'noise_with_sigma_fixed' (inference) | 'gaussian_blur'→'clean' in inference",
+    "normalize_condition_latent": "bool; normalize gt_latent to zero mean / unit variance before augment",
+    "condition_on_augment_sigma": "bool; feed augment_sigma as extra conditioning signal to network",
+    "compute_loss_for_condition_region": "bool; whether loss is also computed on condition frames",
+    "add_pose_condition": "bool; adds Plucker embedding camera pose to condition (camera-control variant)"
+  },
+  "important_notes": "The core sliding-window loop lives in generate_video_from_batch_with_loop. It calls ExtendDiffusionModel.generate_samples_from_batch per window, which internally builds a CFG x0_fn via get_x0_fn_from_batch_with_condition_latent, and runs a standard diffusion sampler. The condition latent is propagated between windows either by re-encoding decoded pixel frames (default) or by directly reusing the tail of the latent (skip_reencode=True). The augment_conditional_latent_frames method is the key mechanism: it injects controlled noise into the condition frames so the model learns smooth continuation. switch_config_for_inference is a context-manager that patches model config for inference mode.",
+  "source_files_analyzed": [
+    "Lyra-1/cosmos_predict1/diffusion/training/models/extend_model.py",
+    "Lyra-1/cosmos_predict1/diffusion/training/utils/inference_long_video.py"
+  ]
+}

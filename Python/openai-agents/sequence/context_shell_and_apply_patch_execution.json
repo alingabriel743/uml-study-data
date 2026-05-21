@@ -1,0 +1,110 @@
+{
+  "scope": "shell_and_apply_patch_execution",
+  "title": "Shell & Apply-Patch Tool Execution",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "RunLoop",
+    "tool_execution (execute_shell_calls / execute_local_shell_calls / execute_apply_patch_calls)",
+    "ShellAction",
+    "LocalShellAction",
+    "ApplyPatchAction",
+    "RunHooks / AgentHooks",
+    "ShellTool (executor, needs_approval, on_approval)",
+    "LocalShellTool (executor)",
+    "ApplyPatchTool (editor, needs_approval, on_approval)",
+    "Shell (Capability) → ShellToolSet (ExecCommandTool, WriteStdinTool)",
+    "ExecCommandTool",
+    "BaseSandboxSession",
+    "Editor (create_file / update_file / delete_file)"
+  ],
+  "interaction_flow": [
+    "RunLoop → tool_execution: execute_shell_calls(public_agent, calls: list[ToolRunShellCall], context_wrapper, hooks, config)",
+    "tool_execution → ShellAction: execute(agent, call, hooks, context_wrapper, config) [serial, one call at a time]",
+    "ShellAction → coerce_shell_call(call.tool_call) → ShellCommandData",
+    "ShellAction → evaluate_needs_approval_setting(shell_tool.needs_approval, context_wrapper, shell_call.action, call_id)",
+    "ShellAction → [if needs_approval] resolve_approval_status(tool_name, call_id, raw_item, agent, context_wrapper, on_approval)",
+    "ShellAction → [if rejected] shell_rejection_item(agent, call_id) → return ToolCallOutputItem",
+    "ShellAction → [if pending] return approval_item (interruption)",
+    "ShellAction → hooks.on_tool_start(context_wrapper, agent, shell_tool) + agent_hooks.on_tool_start [parallel gather]",
+    "ShellAction → shell_tool.executor(ShellCommandRequest) → ShellResult | str",
+    "ShellAction → [ShellResult] normalize_shell_output entries → truncate_shell_outputs → render_shell_outputs → output_text",
+    "ShellAction → hooks.on_tool_end(context_wrapper, agent, shell_tool, output_text) + agent_hooks.on_tool_end [parallel gather]",
+    "ShellAction → return ToolCallOutputItem(raw_item={type: shell_call_output, call_id, output, status})",
+
+    "RunLoop → tool_execution: execute_local_shell_calls(public_agent, calls: list[ToolRunLocalShellCall], ...)",
+    "tool_execution → LocalShellAction: execute(agent, call, hooks, context_wrapper, config) [serial]",
+    "LocalShellAction → hooks.on_tool_start [parallel gather]",
+    "LocalShellAction → call.local_shell_tool.executor(LocalShellCommandRequest) → result (sync or async)",
+    "LocalShellAction → hooks.on_tool_end [parallel gather]",
+    "LocalShellAction → return ToolCallOutputItem(raw_item={type: local_shell_call_output, call_id, output})",
+
+    "RunLoop → tool_execution: execute_apply_patch_calls(public_agent, calls: list[ToolRunApplyPatchCall], ...)",
+    "tool_execution → ApplyPatchAction: execute(agent, call, hooks, context_wrapper, config) [serial]",
+    "ApplyPatchAction → coerce_apply_patch_operations(call.tool_call, context_wrapper) → list[ApplyPatchOperation]",
+    "ApplyPatchAction → extract_apply_patch_call_id(call.tool_call) → call_id",
+    "ApplyPatchAction → [per operation] evaluate_needs_approval_setting(apply_patch_tool.needs_approval, ...) → bool",
+    "ApplyPatchAction → [if any needs_approval] resolve_approval_status(...) → approval_status",
+    "ApplyPatchAction → [if rejected] apply_patch_rejection_item(agent, call_id, type=apply_patch_call_output) → return",
+    "ApplyPatchAction → hooks.on_tool_start(context_wrapper, agent, apply_patch_tool) [parallel gather]",
+    "ApplyPatchAction → [per operation type] editor.create_file(op) | editor.update_file(op) | editor.delete_file(op)",
+    "ApplyPatchAction → normalize_apply_patch_result(awaited) → ApplyPatchResult (status, output)",
+    "ApplyPatchAction → hooks.on_tool_end(context_wrapper, agent, apply_patch_tool, output_text) [parallel gather]",
+    "ApplyPatchAction → return ToolCallOutputItem(raw_item={type: apply_patch_call_output, call_id, status, output})",
+
+    "--- Sandbox Shell Path (ExecCommandTool via Shell Capability) ---",
+    "Shell(Capability).tools() → ShellToolSet(ExecCommandTool(session, user), WriteStdinTool(session) if pty)",
+    "ExecCommandTool._invoke(ctx, raw_input) → args_model.model_validate_json(raw_input) → run(ExecCommandArgs)",
+    "ExecCommandTool.run → _resolve_workdir_command(session, cmd, workdir) → wrapped_command",
+    "ExecCommandTool.run → _resolve_shell(args.shell, args.login) → shell spec",
+    "ExecCommandTool.run → [if session.supports_pty()] session.pty_exec_start(cmd, shell, tty, user, yield_time_s, max_output_tokens)",
+    "ExecCommandTool.run → [PTY ExecTransportError fallback] _run_one_shot_exec(session, command, timeout_s, shell, max_output_tokens, user)",
+    "ExecCommandTool.run → [no PTY] _run_one_shot_exec(session, command, timeout_s, shell, max_output_tokens, user)",
+    "_run_one_shot_exec → session.exec(command, timeout, shell, user) → ExecResult(stdout, stderr, exit_code)",
+    "_run_one_shot_exec → _normalize_output(stdout, stderr) → _truncate_output(output, max_output_tokens)",
+    "ExecCommandTool.run → _format_response(output, wall_time, exit_code, process_id, original_token_count) → str",
+
+    "WriteStdinTool._invoke → run(WriteStdinArgs) → session.pty_write_stdin(session_id, chars, yield_time_s, max_output_tokens) → _format_response"
+  ],
+  "key_relationships": [
+    "execute_shell_calls depends_on ShellAction",
+    "execute_local_shell_calls depends_on LocalShellAction",
+    "execute_apply_patch_calls depends_on ApplyPatchAction",
+    "ShellAction uses ShellTool (executor: ShellExecutor | None, needs_approval, on_approval)",
+    "LocalShellAction uses LocalShellTool (executor: LocalShellExecutor, no approval)",
+    "ApplyPatchAction uses ApplyPatchTool (editor: Editor, needs_approval, on_approval)",
+    "Shell(Capability) composes ShellToolSet(ExecCommandTool, WriteStdinTool) from BaseSandboxSession",
+    "ExecCommandTool extends FunctionTool; tool_name=exec_command",
+    "WriteStdinTool extends FunctionTool; tool_name=write_stdin; requires pty support",
+    "All action classes fire RunHooks + AgentHooks on_tool_start/on_tool_end in parallel (asyncio.gather)",
+    "All action classes return ToolCallOutputItem as RunItem"
+  ],
+  "approval_flow": {
+    "shell": "evaluate_needs_approval_setting → resolve_approval_status → approval_status: True|False|None(pending) → rejection or interruption item",
+    "apply_patch": "per-operation loop checking needs_approval; first truthy breaks and triggers approval flow",
+    "local_shell": "no approval plumbing — executor is called directly"
+  },
+  "data_models": {
+    "ExecCommandArgs": "cmd, workdir, shell, login(bool), tty(bool), yield_time_ms(default 10000), max_output_tokens",
+    "WriteStdinArgs": "session_id(int), chars(str), yield_time_ms(default 250), max_output_tokens",
+    "ShellResult": "output: list[ShellOutput], max_output_length: int|None, provider_data: dict|None",
+    "ApplyPatchOperation": "type: create_file|update_file|delete_file, path, diff",
+    "ToolCallOutputItem": "agent, output: str, raw_item: dict"
+  },
+  "error_handling": [
+    "ExecCommandTool: ExecTimeoutError/TimeoutError → output = 'Command timed out after N seconds'",
+    "ExecCommandTool: ExecTransportError (retry_safe) → fallback to _run_one_shot_exec with fallback_notice",
+    "WriteStdinTool: PtySessionNotFoundError → _format_response with error message",
+    "WriteStdinTool: non-PTY session → RuntimeError",
+    "ShellAction: executor exception → status='failed', format_shell_error(exc), span.set_error",
+    "ApplyPatchAction: editor exception → status='failed', format_shell_error(exc), span.set_error",
+    "ShellTool hosted env: needs_approval/on_approval must be False/None; executor must be None"
+  ],
+  "important_notes": "Shell calls (sandbox) use ExecCommandTool via Shell(Capability) bound to BaseSandboxSession; supports PTY (interactive) and one-shot modes with fallback. Local shell calls use LocalShellTool.executor directly (no sandbox). ApplyPatchTool.editor dispatches file operations (create/update/delete). All three action types run serially per batch. Tracing includes sensitive data only if config.trace_include_sensitive_data=True.",
+  "source_files_analyzed": [
+    "src/agents/run_internal/tool_execution.py",
+    "src/agents/run_internal/tool_actions.py",
+    "src/agents/sandbox/capabilities/tools/shell_tool.py",
+    "src/agents/sandbox/capabilities/shell.py",
+    "src/agents/tool.py"
+  ]
+}

@@ -1,0 +1,109 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 2
+skinparam sequenceParticipantBorderColor #495057
+skinparam sequenceParticipantBackgroundColor #F8F9FA
+skinparam sequenceParticipantFontColor #212529
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceBoxBorderColor #6C757D
+skinparam sequenceBoxBackgroundColor #E9ECEF
+skinparam noteBackgroundColor #FFF9C4
+skinparam noteBorderColor #F9A825
+skinparam activationBorderColor #495057
+skinparam activationBackgroundColor #DEE2E6
+
+title DogStatsD Metrics Emission Flow
+
+actor "PHP Application" as app
+participant "DDTrace\\nPHP Extension\n(ddtrace.c)" as ext
+participant "Sidecar Layer\n(sidecar.c)" as sidecar
+participant "ddog FFI\n(Rust Sidecar)" as ffi
+participant "Datadog Agent\n(DogStatsD)" as agent
+
+note over ext, ffi
+  <b>Initialization (once per process)</b>
+  ddtrace_set_non_resettable_sidecar_globals() resolves dogstatsd_endpoint
+  from DD_DOGSTATSD_URL or DD_API_KEY (agentless mode).
+  dd_sidecar_post_connect() passes endpoint to Rust sidecar via
+  ddog_sidecar_session_set_config(). Instance identity is established
+  via ddog_sidecar_instanceId_build(session_id + runtime_id).
+end note
+
+== Custom Metric Emission (DDTrace Namespace) ==
+
+group alt Metric Type
+  app -> ext : DDTrace\\dogstatsd_count(\n  string $metric, int $value, array $tags = [])
+  note right : StatsD type: <b>c</b>
+  app -> ext : DDTrace\\dogstatsd_gauge(\n  string $metric, float $value, array $tags = [])
+  note right : StatsD type: <b>g</b>
+  app -> ext : DDTrace\\dogstatsd_histogram(\n  string $metric, float $value, array $tags = [])
+  note right : StatsD type: <b>h</b>
+  app -> ext : DDTrace\\dogstatsd_distribution(\n  string $metric, float $value, array $tags = [])
+  note right : StatsD type: <b>d</b>
+  app -> ext : DDTrace\\dogstatsd_set(\n  string $metric, int $value, array $tags = [])
+  note right : StatsD type: <b>s</b>
+end
+
+activate ext
+
+ext -> sidecar : ddtrace_sidecar_dogstatsd_*(\n  zend_string *metric, value, zval *tags)
+activate sidecar
+
+== Guard Checks ==
+
+sidecar -> sidecar : check ddtrace_sidecar != NULL
+sidecar -> sidecar : check DD_INTEGRATION_METRICS_ENABLED == true
+
+alt Guard check fails
+    sidecar --> ext : return (silent, no error)
+    note right of sidecar : Metric dropped silently.\nNo error is raised.
+else Guards pass
+    == Tag Vector Assembly ==
+
+    sidecar -> sidecar : ddog_Vec_Tag_new()\ncreate empty tag vector
+    sidecar -> sidecar : ddtrace_sidecar_push_tags(&vec, tags)\niterate PHP array,\nconvert key/value to ddog_CharSlice
+
+    == FFI Forwarding to Rust Sidecar ==
+
+    sidecar -> ffi : ddog_sidecar_dogstatsd_count(\n  &ddtrace_sidecar,\n  ddtrace_sidecar_instance_id,\n  metric_slice, value, &vec)
+    note right : OR gauge / histogram /\ndistribution / set variant.\ninstance_id binds metric\nto PHP runtime session.
+    activate ffi
+
+    ffi -> agent : UDP / UDS datagram\nformat: metric:value|type[|@sample_rate][|#tag1,tag2,...,const_tags]
+    note right of agent : Sent via sendto() on\nSOCK_DGRAM (UDP) or\nPF_UNIX socket (UDS).\nconst_tags from\nDD_DOGSTATSD_URL config.
+
+    ffi --> sidecar : (fire-and-forget, no return value)
+    deactivate ffi
+
+    == Cleanup ==
+
+    sidecar -> sidecar : ddog_Vec_Tag_drop(vec)\nfree tag vector
+end
+
+sidecar --> ext : return
+deactivate sidecar
+
+ext --> app : void
+deactivate ext
+
+== Optional: Global Tag Registration ==
+
+app -> ext : DDTrace\\add_global_tag(\n  string $key, string $value)
+note right of ext : Adds a global tag applied\nto every APM span.\nTracer.php invokes this\nfor config['global_tags'].\n<i>Note: does NOT affect\nDogStatsD per-call tags.</i>
+
+@enduml

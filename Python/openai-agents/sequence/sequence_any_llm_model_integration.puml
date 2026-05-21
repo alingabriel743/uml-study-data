@@ -1,0 +1,317 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    GroupBorderColor #ADB5BD
+    GroupBodyBackgroundColor #F1F3F5
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #6C757D
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title AnyLLM Model Integration\nRouting model calls to non-OpenAI LLMs via Responses API or Chat Completions API
+
+actor "Runner / Agent" as Caller
+participant "AnyLLMProvider" as Provider
+participant "AnyLLMModel" as Model
+participant "AnyLLM SDK\n(any-llm factory)" as AnyLLMSDK
+participant "AnyLLMProvider\nInstance" as ProviderInst
+participant "OpenAIResponses\nConverter" as RespConv
+participant "Converter\n(chatcmpl_converter)" as ChatConv
+participant "ChatCmpl\nStreamHandler" as StreamHandler
+participant "TracingSpan\n(response/generation)" as Tracing
+
+== Provider Setup ==
+
+Caller -> Provider: get_model("provider/model")
+activate Provider
+Provider -> Model: new AnyLLMModel(model="provider/model", api_key, base_url, api)
+note right of Model
+  Model name split on first '/':
+  "openrouter/openai/gpt-4" →
+  provider="openrouter",
+  model="openai/gpt-4"
+  No '/' → defaults to "openai"
+end note
+Provider --> Caller: AnyLLMModel instance
+deactivate Provider
+
+== Provider Lazy Init (first call) ==
+
+Caller -> Model: get_response(...) or stream_response(...)
+activate Model
+
+Model -> Model: _get_provider()
+activate Model
+Model -> AnyLLMSDK: AnyLLM.create(provider_name, api_key, api_base)
+activate AnyLLMSDK
+AnyLLMSDK --> Model: provider instance
+deactivate AnyLLMSDK
+note right of Model
+  Provider cached by retry-flag (bool).
+  If should_disable_provider_managed_retries():
+    clone provider with max_retries=0
+end note
+Model -> Model: _selected_api()\nchecks SUPPORTS_RESPONSES flag\nor user-forced api= override
+deactivate Model
+
+== get_response() — Responses API Path ==
+
+alt api == 'responses' (provider.SUPPORTS_RESPONSES = True)
+
+    Model -> Tracing: open response_span(model, input)
+    activate Tracing
+
+    Model -> Model: _get_response_via_responses(...)
+    activate Model
+
+    Model -> Model: _fetch_responses_response(..., stream=False)
+    activate Model
+
+    note over Model
+      Validates: prompt == None (else UserError)
+      Validates: _supports_responses() (else UserError)
+    end note
+
+    Model -> RespConv: convert_tool_choice(tool_choice)
+    activate RespConv
+    RespConv --> Model: tool_choice param
+    deactivate RespConv
+
+    Model -> RespConv: convert_tools(tools, handoffs)
+    activate RespConv
+    RespConv --> Model: tools param
+    deactivate RespConv
+
+    Model -> RespConv: get_response_format(output_schema)
+    activate RespConv
+    RespConv --> Model: response_format param
+    deactivate RespConv
+
+    Model -> Model: _sanitize_any_llm_responses_input(input_list)
+    note right of Model
+      Strips: null/None fields,
+      provider_data fields,
+      FAKE_RESPONSES_IDs,
+      cross-adapter reasoning items
+    end note
+
+    Model -> Model: _call_any_llm_responses(request_kwargs, transport_kwargs)
+    activate Model
+
+    alt no transport_kwargs (no extra headers/query/body)
+        Model -> ProviderInst: aresponses(model, input, tools, ...)
+        activate ProviderInst
+        ProviderInst --> Model: Response (raw)
+        deactivate ProviderInst
+    else transport_kwargs present
+        Model -> ProviderInst: _aresponses(ResponsesParams, **transport_kwargs)
+        activate ProviderInst
+        ProviderInst --> Model: Response (raw)
+        deactivate ProviderInst
+    end
+
+    deactivate Model
+
+    Model -> Model: _normalize_response(raw) → Response
+    deactivate Model
+    deactivate Model
+
+    Model -> Tracing: finish response_span(usage, response_id)
+    deactivate Tracing
+
+    Model --> Caller: ModelResponse(output, usage, response_id=response.id)
+    note right
+      Stateful: preserves
+      previous_response_id
+      and conversation_id
+    end note
+
+== get_response() — Chat Completions API Path ==
+
+else api == 'chat_completions' (SUPPORTS_RESPONSES = False or forced)
+
+    Model -> Tracing: open generation_span(model, messages)
+    activate Tracing
+
+    Model -> Model: _get_response_via_chat(...)
+    activate Model
+
+    Model -> Model: _fetch_chat_response(..., stream=False)
+    activate Model
+
+    note over Model
+      Validates: prompt == None (else UserError)
+    end note
+
+    Model -> ChatConv: items_to_messages(input, preserve_thinking_blocks, model)
+    activate ChatConv
+    ChatConv --> Model: messages list
+    deactivate ChatConv
+
+    note right of Model
+      Inserts system message if
+      system_instructions present.
+      Anthropic/Claude/Gemini get
+      fix_tool_message_ordering()
+    end note
+
+    Model -> ChatConv: convert_tool_choice()\nconvert_response_format()\ntool_to_openai() per tool\nconvert_handoff_tool() per handoff
+    activate ChatConv
+    ChatConv --> Model: tool params
+    deactivate ChatConv
+
+    Model -> ProviderInst: acompletion(model, messages, tools,\ntemperature, top_p, ..., stream=False)
+    activate ProviderInst
+    ProviderInst --> Model: ChatCompletion (raw)
+    deactivate ProviderInst
+
+    Model -> Model: _normalize_chat_completion_response(ret)
+    note right of Model
+      Normalizes non-OpenAI payloads
+      (dict or generic BaseModel)
+      via model_validate
+    end note
+
+    Model -> Model: _normalize_any_llm_message(message)
+    note right of Model
+      Extracts reasoning_content
+      from reasoning_content,
+      reasoning.content, or
+      thinking attributes
+    end note
+    deactivate Model
+
+    Model -> ChatConv: message_to_output_items(normalized_message, provider_data)
+    activate ChatConv
+    ChatConv --> Model: output items
+    deactivate ChatConv
+
+    deactivate Model
+
+    Model -> Tracing: finish generation_span(usage)
+    deactivate Tracing
+
+    Model --> Caller: ModelResponse(output=items, usage, response_id=None)
+    note right
+      Stateless: no
+      response_id returned
+    end note
+
+end
+
+== stream_response() — Responses API Path ==
+
+group Streaming (Responses API)
+    Caller -> Model: stream_response(...)\n[same params as get_response]
+    activate Model
+    Model -> Model: _selected_api() → 'responses'
+    Model -> Tracing: open response_span(model, input)
+    activate Tracing
+    Model -> Model: _stream_response_via_responses(...)
+    Model -> Model: _fetch_responses_response(..., stream=True)
+    Model -> ProviderInst: aresponses(..., stream=True)
+    activate ProviderInst
+
+    loop each ResponseStreamEvent chunk
+        ProviderInst --> Model: ResponseStreamEvent chunk
+        Model -> Caller: yield ResponseStreamEvent
+        note right
+          Detects ResponseCompletedEvent
+          to capture final_response
+          and record usage/tracing
+        end note
+    end
+
+    deactivate ProviderInst
+    Model -> Tracing: finish response_span(usage)
+    deactivate Tracing
+    deactivate Model
+end
+
+== stream_response() — Chat Completions API Path ==
+
+group Streaming (Chat Completions)
+    Caller -> Model: stream_response(...)\n[same params as get_response]
+    activate Model
+    Model -> Model: _selected_api() → 'chat_completions'
+    Model -> Tracing: open generation_span(model, messages)
+    activate Tracing
+    Model -> Model: _stream_response_via_chat(...)
+    Model -> Model: _fetch_chat_response(..., stream=True)
+    Model -> ProviderInst: acompletion(..., stream=True)
+    activate ProviderInst
+    ProviderInst --> Model: (Response shell, AsyncIterator[ChatCompletionChunk])
+    note right of Model
+      Response shell uses
+      FAKE_RESPONSES_ID as id
+    end note
+    deactivate ProviderInst
+
+    Model -> Model: _normalize_chat_stream(stream)
+    note right: Normalizes each chunk;\nextracts reasoning text
+
+    Model -> StreamHandler: handle_stream(response_shell, normalized_stream, model)
+    activate StreamHandler
+
+    loop each TResponseStreamEvent
+        StreamHandler --> Model: TResponseStreamEvent
+        Model -> Caller: yield TResponseStreamEvent
+    end
+
+    deactivate StreamHandler
+    Model -> Tracing: finish generation_span(usage)
+    deactivate Tracing
+    deactivate Model
+end
+
+== Retry Advice ==
+
+Caller -> Model: get_retry_advice(request: ModelRetryAdviceRequest)
+activate Model
+Model -> Model: get_openai_retry_advice(request)
+note right of Model
+  Maps HTTP error codes to
+  ModelRetryAdvice (retry delay,
+  should_retry flags).
+  Provider-managed retries disabled
+  when should_disable_provider_managed_retries()
+end note
+Model --> Caller: ModelRetryAdvice | None
+deactivate Model
+
+== Cleanup ==
+
+Caller -> Model: close()
+activate Model
+Model -> ProviderInst: aclose()
+activate ProviderInst
+ProviderInst --> Model: closed
+deactivate ProviderInst
+deactivate Model
+
+@enduml

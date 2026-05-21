@@ -1,0 +1,101 @@
+{
+  "scope": "agent_runner_loop",
+  "title": "Agent Runner Loop (Core Turn Cycle)",
+  "diagram_type": "activity",
+  "source_files_analyzed": ["agent_loop.py"],
+
+  "key_participants": [
+    "agent_runner_loop (function)",
+    "client (LLM client)",
+    "handler (BaseHandler subclass)",
+    "BaseHandler.dispatch",
+    "StepOutcome",
+    "turn_end_callback"
+  ],
+
+  "activity_flow": [
+    "START: agent_runner_loop(client, system_prompt, user_input, handler, tools_schema, max_turns=40)",
+    "BUILD initial messages: [{role:system, content:system_prompt}, {role:user, content:initial_user_content or user_input}]",
+    "INIT: turn=0, handler._done_hooks=[], handler.max_turns=max_turns",
+
+    "LOOP_START: while turn < handler.max_turns",
+    "  INCREMENT turn += 1",
+    "  YIELD status: 'LLM Running (Turn N)...'",
+    "  CONDITION: if turn % 10 == 0 → reset client.last_tools = '' (avoid context bloat)",
+    "  CALL client.chat(messages=messages, tools=tools_schema) → response_gen (generator)",
+    "  BRANCH verbose:",
+    "    [verbose=True]  → yield from response_gen → response; yield newline",
+    "    [verbose=False] → exhaust(response_gen) → response; clean + yield summary",
+
+    "  PARSE tool_calls from response:",
+    "    CONDITION: if response.tool_calls is None → tool_calls = [{'tool_name':'no_tool','args':{}}]",
+    "    ELSE → parse each tc: {tool_name, args (JSON-parsed), id}",
+
+    "  INIT: tool_results=[], next_prompts=set(), exit_reason=None",
+
+    "  FOR each tool_call (ii, tc) in tool_calls:",
+    "    EXTRACT: tool_name, args, tid",
+    "    CONDITION: tool_name == 'no_tool' → skip display",
+    "    ELSE → yield tool name + args display (verbose or compact)",
+    "    SET handler.current_turn = turn",
+    "    CALL handler.dispatch(tool_name, args, response, index=ii) → generator gen",
+    "    DRIVE generator via proxy() → outcome (StepOutcome)",
+    "    CONDITION: outcome.should_exit == True → exit_reason = {result:'EXITED', data:outcome.data}; BREAK loop",
+    "    CONDITION: outcome.next_prompt is falsy → exit_reason = {result:'CURRENT_TASK_DONE', data:outcome.data}; BREAK loop",
+    "    CONDITION: outcome.next_prompt starts with '未知工具' → reset client.last_tools = ''",
+    "    CONDITION: outcome.data is not None AND tool_name != 'no_tool' → append to tool_results",
+    "    ADD outcome.next_prompt to next_prompts set",
+    "  END FOR",
+
+    "  POST-LOOP CHECK:",
+    "    CONDITION: next_prompts is empty OR exit_reason:",
+    "      IF handler._done_hooks is empty → BREAK main while loop (natural exit)",
+    "      ELSE → pop handler._done_hooks[0] into next_prompts (continue via hook)",
+
+    "  CALL handler.turn_end_callback(response, tool_calls, tool_results, turn, joined_next_prompts, exit_reason) → next_prompt",
+    "  REBUILD messages = [{role:user, content:next_prompt, tool_results:tool_results}]",
+    "LOOP_END",
+
+    "POST-LOOP:",
+    "  CONDITION: exit_reason is set → call handler.turn_end_callback(..., '', exit_reason) (final notification)",
+    "RETURN: exit_reason OR {'result': 'MAX_TURNS_EXCEEDED'}"
+  ],
+
+  "dispatch_sub_flow": [
+    "BaseHandler.dispatch(tool_name, args, response, index=0)",
+    "  LOOK UP method: 'do_' + tool_name on handler",
+    "  FOUND → args['_index'] = index",
+    "    CALL tool_before_callback(tool_name, args, response)",
+    "    CALL handler.do_<tool_name>(args, response) → ret (StepOutcome)",
+    "    CALL tool_after_callback(tool_name, args, response, ret)",
+    "    RETURN ret",
+    "  NOT FOUND + tool_name == 'bad_json' → return StepOutcome(None, next_prompt=args.get('msg','bad_json'), should_exit=False)",
+    "  NOT FOUND (other) → yield '未知工具: <name>'; return StepOutcome(None, next_prompt='未知工具 <name>', should_exit=False)"
+  ],
+
+  "exit_conditions": [
+    "outcome.should_exit == True → exit_reason = {result:'EXITED', data:...}",
+    "outcome.next_prompt is falsy (None/'') → exit_reason = {result:'CURRENT_TASK_DONE', data:...}",
+    "next_prompts empty + _done_hooks empty → natural completion (BREAK)",
+    "turn >= handler.max_turns (loop exhausted) → return {result:'MAX_TURNS_EXCEEDED'}"
+  ],
+
+  "key_data_structures": {
+    "StepOutcome": {"fields": ["data: Any", "next_prompt: Optional[str]", "should_exit: bool (default False)"]},
+    "messages": "List of {role, content, tool_results} — rebuilt each turn (history kept in Session object elsewhere",
+    "tool_calls": "List of {tool_name, args (dict), id (str)}",
+    "tool_results": "List of {tool_use_id, content (JSON string)} — passed back to LLM next turn",
+    "next_prompts": "set() — deduplicated prompts collected across tool calls; joined with \\n for turn_end_callback"
+  },
+
+  "important_notes": [
+    "agent_runner_loop is itself a generator — yields streaming text/status to caller",
+    "client.chat() is also a generator (streaming LLM output); exhaust() drains it non-verbosely",
+    "try_call_generator() in dispatch handles both regular functions and generators transparently",
+    "Every 10 turns, client.last_tools is reset to prevent context degradation",
+    "messages list is REPLACED each turn (not appended) — history managed externally by Session",
+    "handler._done_hooks allows deferred follow-up prompts after a natural exit",
+    "turn_end_callback can modify next_prompt (return value used, not the input)",
+    "verbose mode yields raw LLM stream + tool details; non-verbose mode yields compact summaries"
+  ]
+}

@@ -1,0 +1,262 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #F9A825
+}
+
+title Legacy Filesystem Extension
+
+' ─────────────────────────────────────────
+'  External / Shared Dependencies
+' ─────────────────────────────────────────
+package "External Dependencies" {
+    class BaseService <<service>> {
+    }
+
+    class EWMA <<utility>> {
+        +update(value): void
+        +get(): number
+    }
+
+    class db <<database>> {
+        +read(sql, params): Promise<Row[]>
+        +batch_write(ops): Promise<void>
+    }
+}
+
+' ─────────────────────────────────────────
+'  extensions/legacyFileSystem
+' ─────────────────────────────────────────
+package "extensions/legacyFileSystem" {
+
+    class FSEntryController {
+        {static} +CONCERN: string = 'filesystem'
+        {static} +STATUS_READY: Object
+        {static} +STATUS_RUNNING_JOB: Object
+        --
+        -status: Object
+        -currentState: {queue, updating_uuids}
+        -deferredState: {queue, updating_uuids}
+        -entryListeners_: Object
+        -queueSizePromise: Promise
+        -max_queue: number
+        +defaultProperties: string[]
+        +subdomainProperties: string[]
+        --
+        +init(): void
+        +insert(entry): Promise<Insert>
+        +update(uuid, entry): Promise<Update>
+        +delete(uuid): Promise<Delete>
+        +fast_get_descendants(uuid): Promise<string[]>
+        +fast_get_direct_descendants(uuid): Promise<string[]>
+        +get(uuid, fetch_entry_options): Promise<Object>
+        +get_descendants(uuid): Promise<Object[]>
+        +get_descendants_full(uuid, fetch_entry_options): Promise<Object[]>
+        +get_recursive_size(uuid): Promise<number>
+        +find(selector, fetch_entry_options): Promise<Object|null>
+        +findByUID(uuid, fetch_entry_options?): Promise<Object>
+        +findByID(id, fetch_entry_options?): Promise<Object>
+        +findByPath(path, fetch_entry_options?): Promise<Object|false>
+        +findNameInRoot(name): Promise<number|undefined>
+        +findNameInParent(parent_uid, name): Promise<number|undefined>
+        +nameExistsUnderParent(parent_uid, name): Promise<boolean>
+        +nameExistsUnderParentID(parent_id, name): Promise<boolean>
+        +waitForEntry(node, callback): Detachable|undefined
+        -enqueue_(op): Promise<void>
+        -checkShouldExec_(): void
+        -exec_(): Promise<void>
+        -flipState_(): void
+        -mkPromiseForQueueSize_(): void
+    }
+
+    note right of FSEntryController
+        Dual-queue pattern: currentState/deferredState
+        flip atomically to batch DB writes.
+        All writes go via enqueue_(); reads go direct to db.
+    end note
+
+    class S3StorageController {
+        +forceDefault: boolean = true
+        -clients_: Object
+        -config: Object
+        -global_average_S3_part_time: EWMA
+        --
+        +init(): Promise<void>
+        +upload({uid, file, storage_meta, storage_api}): Promise<void>
+        +copy({src_node, dst_storage, storage_api}): Promise<Object>
+        +delete({node}): Promise<Object>
+        +read({location, range, version_id}): Promise<Readable>
+        #get_client(region): S3Client
+        #upload_stream({bucket_region, bucket, key, stream, on_progress}): Promise<Object>
+        #copy_simple({dst_bucket_region, dst_bucket, src_bucket, src_key, dst_key}): Promise<Object>
+        #copy_multipart({dst_bucket_region, dst_bucket, src_bucket, src_key, dst_key, on_progress, size}): Promise<Object>
+    }
+
+    note right of S3StorageController
+        upload(): PutObject for buffers,
+        multipart (5 MB parts, max 4 concurrent) for streams.
+        copy(): simple CopyObject < 4 GB, multipart >= 4 GiB.
+    end note
+
+    class PuterFSProvider {
+        +name: string = 'puterfs'
+        -fsEntryController: FSEntryController
+        -storageController: S3StorageController
+        --
+        +get_capabilities(): Set
+        +stat({selector, options, controls, node}): Promise<Object|null>
+        +read({context, node, version_id, range}): Promise<Stream>
+        +readdir({node}): Promise<string[]>
+        +readdirstat_uuid({uuid, options}): Promise<FSNode[]>
+        +write_new({context, parent, name, file}): Promise<FSNode>
+        +write_overwrite({context, node, file}): Promise<FSNode>
+        +mkdir({context, parent, name, immutable}): Promise<FSNode>
+        +copy_tree({context, source, parent, target_name}): Promise<FSNode>
+        +move({context, node, new_parent, new_name, metadata}): Promise<FSNode>
+        +unlink({context, node, options}): Promise<void>
+        +rmdir({context, node, options}): Promise<void>
+        +update_thumbnail({context, node, thumbnail}): Promise<FSNode>
+        +puter_shortcut({parent, name, user, target}): Promise<FSNode>
+        +quick_check({selector}): Promise<boolean>
+        +directory_has_name({parent, name}): Promise<boolean>
+        +get_recursive_size({node}): Promise<number>
+        #pathDepth(path): number
+        #getSourceTreeMaxRelativeDepth(node): Promise<number>
+        #assertDepthLimitForTreeOp(destinationPathDepth, sourceNode): Promise<void>
+        #storage_upload({uuid, bucket, bucket_region, file, tmp}): Promise<Object>
+        #rmnode({node, options}): Promise<void>
+    }
+
+    note bottom of PuterFSProvider
+        Strategy (provider interface) for PuterFS operations.
+        MAX_DIRECTORY_DEPTH = 35 enforced on mkdir / copy_tree / move.
+        #storage_upload delegates to storageController.upload().
+    end note
+}
+
+' ─────────────────────────────────────────
+'  src/backend/src/deprecated/filesystem
+' ─────────────────────────────────────────
+package "deprecated/filesystem" {
+
+    class PuterS3Service <<deprecated>> {
+        -clients_: Object
+        -config: Object
+        -global_average_S3_part_time: EWMA
+        --
+        #_init(): Promise<void>
+        +"__on_install.context-initializers"(): Promise<void>
+        -_get_client(region): S3Client
+        +create_read_stream({bucket_region, bucket, key, version_id, range}): Promise<Readable>
+        +upload_buffer({bucket_region, bucket, key, buffer}): Promise<Object>
+        +put_stream({size, bucket_region, bucket, key, stream, on_progress}): Promise<Object>
+        +upload_stream({bucket_region, bucket, key, stream, on_progress}): Promise<Object>
+        +copy_simple({dst_bucket_region, dst_bucket, src_bucket, src_key, dst_key}): Promise<Object>
+        +copy_multipart({dst_bucket_region, dst_bucket, src_bucket, src_key, dst_key, on_progress, size}): Promise<Object>
+        +delete({bucket_region, bucket, key}): Promise<Object>
+    }
+
+    note right of PuterS3Service
+        DEPRECATED. On install, creates PuterS3StorageStrategy
+        and registers it with the mountpoint service under
+        key 'PuterFSProvider'. Parallel to S3StorageController.
+    end note
+
+    class FSNodeContext <<deprecated>> {
+        {static} +CONCERN: string = 'filesystem'
+        {static} +TYPE_FILE: Symbol
+        {static} +TYPE_DIRECTORY: Symbol
+        {static} +TYPE_SYMLINK: Symbol
+        {static} +TYPE_SHORTCUT: Symbol
+        {static} +TYPE_UNDETERMINED: Symbol
+        {static} +SELECTOR_PRIORITY_ORDER: Class[]
+        --
+        -fetching: TeePromise|null
+        -log: Logger
+        -selector_: NodeSelector
+        -selectors_: NodeSelector[]
+        +provider: PuterFSProvider
+        +entry: Object
+        +found: boolean|undefined
+        +found_thumbnail: Object
+        +services: Object
+        +fileContentsFetcher: Function
+        +fs: Object
+        #writable: boolean
+        --
+        +set selector(new_selector): void
+        +get selector(): NodeSelector
+        +get_selector_of_type(cls): NodeSelector|null
+        +get_optimal_selector(): NodeSelector
+        +get isRoot(): boolean
+        +exists(opts?): Promise<boolean>
+        +fetchPath(): Promise<void>
+        +fetchEntry(fetch_entry_options?): Promise<void>
+        +awaitStableEntry(): Promise<void>
+        +fetchSubdomains(user, force?): Promise<void>
+        +fetchOwner(force?): Promise<void>
+        +fetchShares(force?): Promise<void>
+        +fetchVersions(force?): Promise<void>
+        +fetchSize(): Promise<number>
+        +fetchSuggestedApps(user, force?): Promise<void>
+        +fetchIsEmpty(): Promise<void>
+        +fetchAll(_, user, _): Promise<void>
+        +get(key, force?): Promise<any>
+        +getParent(): Promise<FSNodeContext>
+        +getChild(name): Promise<FSNodeContext>
+        +hasChild(name): Promise<boolean>
+        +getTarget(): Promise<FSNodeContext>
+        +is_above(child_fsNode): Promise<boolean>
+        +is(fsNode): Promise<boolean>
+        +getSafeEntry(fetch_options?): Promise<Object>
+        {static} +sanitize_pending_entry_info(res): Object
+    }
+
+    note right of FSNodeContext
+        DEPRECATED. Facade pattern: lazy-loads all
+        fsentry data (entry, path, owner, shares, etc.)
+        with OTel-traced fetch* methods.
+        Cached via ECMAP (entity-context map).
+    end note
+}
+
+' ─────────────────────────────────────────
+'  Relationships
+' ─────────────────────────────────────────
+
+' Inheritance
+PuterS3Service --|> BaseService : extends
+
+' Composition (PuterFSProvider owns its controllers)
+PuterFSProvider *--> FSEntryController : fsEntryController
+PuterFSProvider *--> S3StorageController : storageController
+
+' PuterFSProvider ↔ FSNodeContext (bidirectional dependency)
+PuterFSProvider ..> FSNodeContext : uses node param\n& calls sanitize_pending_entry_info()
+FSNodeContext --> PuterFSProvider : provider\n(stat / get_recursive_size\n/ directory_has_name)
+
+' Storage controllers share EWMA utility
+S3StorageController o-- EWMA : global_average_S3_part_time
+PuterS3Service o-- EWMA : global_average_S3_part_time
+
+' DB access
+FSEntryController --> db : reads & batch-writes
+PuterFSProvider ..> db : direct reads
+
+@enduml

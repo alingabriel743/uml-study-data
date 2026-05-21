@@ -1,0 +1,191 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #E9ECEF
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #6C757D
+    GroupBorderColor #495057
+    GroupHeaderFontColor #212529
+}
+skinparam note {
+    BackgroundColor #FFF3CD
+    BorderColor #856404
+}
+
+title GEP Genetic Evolution Loop
+
+actor "Daemon\n(index.js)" as daemon
+participant "evolve\n(evolve.js)" as evolve
+participant "AssetStore\n(assetStore.js)" as assets
+participant "Selector\n(selector.js)" as selector
+participant "Mutation\n(mutation.js)" as mutation
+participant "Prompt\n(prompt.js)" as prompt
+participant "LLM Agent" as llm
+participant "PolicyCheck\n(policyCheck.js)" as policy
+participant "Solidify\n(solidify.js)" as solidify
+
+== Daemon Startup Guard ==
+
+daemon -> daemon: acquireLock()\n<i>write evolver.pid; abort if already running</i>
+activate daemon
+
+daemon -> daemon: isPendingSolidify(state)
+note right: Skip new cycle if\nevolution_solidify_state.json\nshows unprocessed run
+
+== Phase 1 — Evolution Cycle ==
+
+daemon -> evolve: evolve.run()
+activate evolve
+
+evolve -> assets: loadGenes()
+activate assets
+assets --> evolve: Gene[]\n<i>genes.json + genes.jsonl, deduplicated by id</i>
+deactivate assets
+
+evolve -> assets: loadCapsules()
+activate assets
+assets --> evolve: Capsule[]\n<i>capsules.json + capsules.jsonl</i>
+deactivate assets
+
+evolve -> assets: readAllEvents()
+activate assets
+assets --> evolve: EvolutionEvent[]\n<i>recent history for context</i>
+deactivate assets
+
+evolve -> evolve: extractSignals()\n<i>from context / env</i>
+
+evolve -> selector: selectGeneAndCapsule(\n  {genes, capsules, signals,\n   memoryAdvice, driftEnabled})
+activate selector
+
+selector -> selector: selectGene(genes, signals, opts)\n<i>score by signals_match overlap;\napply preferredGeneId multiplier;\ndownweight hard-fail anti_patterns</i>
+selector -> selector: selectCapsule(capsules, signals)\n<i>trigger field overlap scoring</i>
+selector -> selector: computeDriftIntensity(\n  {driftEnabled, genePoolSize, memoryEvidence})\n<i>float[0,1]; decays as memory matures</i>
+
+selector --> evolve: {selectedGene, selector,\n selectionPath, memoryUsed,\n memoryEvidence, driftIntensity}
+deactivate selector
+
+evolve -> evolve: computeAdaptiveStrategyPolicy(\n  {signals, selectedGene, recentEvents})\n→ {forceInnovate, blastRadiusMaxFiles,\n   highRiskGene, cautiousExecution}
+
+evolve -> mutation: buildMutation(\n  {signals, selectedGene, driftEnabled,\n   allowHighRisk, personalityState})
+activate mutation
+mutation --> evolve: Mutation{\n  id: 'mut_*', type, category,\n  trigger_signals, target,\n  expected_effect,\n  risk_level: low|medium|high,\n  rationale}
+deactivate mutation
+
+evolve -> prompt: buildGepPrompt(\n  {nowIso, context, signals, selector,\n   selectedGene, capsuleCandidates,\n   genesPreview, strategyPolicy, mutation})
+activate prompt
+prompt --> evolve: string (rendered GEP prompt)
+deactivate prompt
+
+evolve -> llm: emit prompt
+activate llm
+note right: Agent performs\ncode edits in workspace
+llm --> evolve: (edits applied)
+deactivate llm
+
+evolve -> assets: save run state →\n  evolution_solidify_state.json\n  {run_id, signals, selected_gene_id,\n   mutation, blast_radius_estimate}
+activate assets
+assets --> evolve: ok
+deactivate assets
+
+evolve --> daemon: return\n<i>(phase 1 complete; awaiting solidify)</i>
+deactivate evolve
+
+== Phase 2 — Solidify ==
+
+daemon -> solidify: solidify(\n  {intent, summary, dryRun,\n   rollbackOnFailure})
+activate solidify
+
+solidify -> solidify: readStateForSolidify()\n<i>reads evolution_solidify_state.json</i>
+
+solidify -> policy: checkConstraints(\n  {gene, blast, blastRadiusEstimate,\n   repoRoot})
+activate policy
+
+policy -> policy: isForbiddenPath(path,\n  gene.constraints.forbidden_paths)
+policy -> policy: classifyBlastSeverity({blast, maxFiles})\n→ within_limit | approaching_limit\n  | exceeded | critical_overrun\n  | hard_cap_breach
+policy -> policy: compareBlastEstimate(\n  estimate, actual) → {drifted}
+policy -> policy: isValidationCommandAllowed(cmd)\n<i>blocks shell injection, eval, rm -rf</i>
+
+policy --> solidify: {ok, violations[]}
+deactivate policy
+
+solidify -> solidify: run validation commands\n<i>gene.validation steps</i>
+
+solidify -> policy: classifyFailureMode(\n  {constraintViolations,\n   protocolViolations,\n   validation, canary})\n→ {mode: hard|soft, reasonClass, retryable}
+activate policy
+policy --> solidify: FailureMode
+deactivate policy
+
+solidify -> solidify: computeProcessScores(\n  {constraintCheck, validation,\n   protocolViolations, canary,\n   blast, geneUsed, signals, mutation})\n→ {validation_pass_rate, blast_control, ...}
+
+alt outcome == success
+
+    solidify -> assets: appendEventJsonl(EvolutionEvent)\n<i>persists to events.jsonl</i>
+    activate assets
+    assets --> solidify: ok
+    deactivate assets
+
+    solidify -> assets: upsertGene(updatedGene)\n<i>writes genes.json</i>
+    activate assets
+    assets --> solidify: ok
+    deactivate assets
+
+    solidify -> assets: upsertCapsule(newCapsule)\n<i>writes capsules.json</i>
+    activate assets
+    assets --> solidify: ok
+    deactivate assets
+
+    solidify -> solidify: adaptGeneFromLearning(\n  {gene, outcomeStatus: 'success',\n   learningSignals, failureMode})\n<i>broadens gene.signals_match\nwith problem/area tags</i>
+
+else outcome == failed
+
+    solidify -> assets: appendFailedCapsule(failedCapsule)\n<i>capped at 200, trimmed to 100</i>
+    activate assets
+    assets --> solidify: ok
+    deactivate assets
+
+    solidify -> solidify: adaptGeneFromLearning(\n  {gene, outcomeStatus: 'failed',\n   learningSignals, failureMode})\n<i>appends anti_patterns;\npreserves signals_match</i>
+
+    opt rollbackOnFailure && mode == hard
+        solidify -> solidify: git checkout -- .\ngit clean -fd
+        note right: Hard rollback:\nrevert all workspace changes
+    end
+
+end
+
+solidify --> daemon: SolidifyResult{\n  ok, gene, event, capsule,\n  blast, validation,\n  constraintCheck, failureReason,\n  failureMode}
+deactivate solidify
+
+== Adaptive Sleep ==
+
+daemon -> daemon: adaptiveSleep()\n<i>min 2s, max 300s;\n4× on saturation signals</i>
+
+note over daemon: Loop back to next\nevolution cycle
+
+deactivate daemon
+
+@enduml

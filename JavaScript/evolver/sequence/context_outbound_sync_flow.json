@@ -1,0 +1,85 @@
+{
+  "scope": "outbound_sync_flow",
+  "title": "Outbound Message Sync Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Caller",
+    "SyncEngine",
+    "OutboundSync",
+    "MailboxStore",
+    "Hub (HTTP)"
+  ],
+  "interaction_flow": [
+    "Caller → SyncEngine: start()  [or notifyNewOutbound()]",
+    "SyncEngine → SyncEngine: _scheduleOutbound(delayMs)  [setTimeout, 500ms on start / 100ms on notify]",
+    "SyncEngine → OutboundSync: flush(channel='evomap-hub')",
+    "OutboundSync → MailboxStore: pollOutbound({ channel, limit: MAX_BATCH=50 })  → returns pending[]",
+    "alt pending.length === 0: OutboundSync → SyncEngine: return { sent: 0 }",
+    "OutboundSync → MailboxStore: getState('node_id')  → senderId",
+    "OutboundSync → Hub: POST /a2a/mailbox/outbound  { sender_id, proxy_protocol_version, messages[] }  [30s timeout]",
+    "Hub → OutboundSync: 200 { results: [{ id, status, response?, error? }] }",
+    "loop for each result in results:",
+    "  alt status === 'accepted'|'ok': OutboundSync → updates[]: push { id, status:'synced' }",
+    "  alt status === 'failed'|'rejected': OutboundSync → MailboxStore: incrementRetry(id, error)  [if retry_count < MAX_RETRIES=10] OR push { id, status:'failed' }",
+    "  alt result.response present: OutboundSync → inboundMessages[]: push { type, payload, refId, channel }",
+    "OutboundSync → MailboxStore: updateStatusBatch(updates)  [marks synced/failed, evicts from index]",
+    "OutboundSync → MailboxStore: writeInboundBatch(inboundMessages)  [if any hub responses]",
+    "OutboundSync → MailboxStore: setState('last_sync_at', ISO-timestamp)",
+    "OutboundSync → SyncEngine: return { sent, synced, responses }",
+    "SyncEngine: if result.sent > 0 → _lastActivity = Date.now()",
+    "SyncEngine → MailboxStore: countPending({ direction:'outbound' })  → decide next delay",
+    "alt pending > 0: SyncEngine → SyncEngine: _scheduleOutbound(1_000)",
+    "alt pending === 0: SyncEngine → SyncEngine: _scheduleOutbound(5_000)  [DEFAULT_OUTBOUND_INTERVAL]",
+    "alt AuthError thrown: SyncEngine → SyncEngine: _handleAuthError('outbound')  → calls onAuthError()"
+  ],
+  "trigger_paths": [
+    "Normal timer path: start() → _scheduleOutbound(500) → recurring loop (1s if pending, else 5s)",
+    "Fast-path: notifyNewOutbound() → clears existing timer → _scheduleOutbound(100)  [only if !_outPending]"
+  ],
+  "key_relationships": [
+    "SyncEngine composes OutboundSync (instantiated in constructor)",
+    "SyncEngine composes InboundSync (parallel, separate timer)",
+    "SyncEngine depends_on MailboxStore (shared with OutboundSync via constructor injection)",
+    "OutboundSync depends_on MailboxStore: pollOutbound, getState, updateStatusBatch, writeInboundBatch, incrementRetry, setState",
+    "OutboundSync depends_on lifecycle/manager: AuthError (thrown on HTTP 401/403)"
+  ],
+  "method_signatures": {
+    "SyncEngine": {
+      "constructor": "({ store, hubUrl, getHeaders, logger, onInboundReceived, onAuthError })",
+      "start": "() → void  [sets _running=true, schedules outbound 500ms, inbound 1000ms]",
+      "stop": "() → void  [clears timers]",
+      "notifyNewOutbound": "() → void  [bumps _lastActivity, re-arms outbound timer at 100ms]",
+      "_scheduleOutbound": "(delayMs: number) → void  [recursive setTimeout loop]",
+      "_isIdle": "() → bool  [Date.now() - _lastActivity > IDLE_THRESHOLD(5min)]",
+      "_handleAuthError": "async (source: string) → void  [calls onAuthError callback]"
+    },
+    "OutboundSync": {
+      "constructor": "({ store, hubUrl, getHeaders, logger })",
+      "flush": "async (channel='evomap-hub') → { sent, synced, responses } | { sent:0, error }"
+    },
+    "MailboxStore": {
+      "pollOutbound": "({ channel, limit }) → Message[]  [sorted by priority then created_at, status==='pending' only]",
+      "updateStatusBatch": "(updates: [{id, status, error?}]) → void",
+      "writeInboundBatch": "(messages: [{type, payload, refId, channel}]) → string[]",
+      "incrementRetry": "(id, error) → void",
+      "countPending": "({ direction, channel? }) → number",
+      "getState": "(key) → string|null",
+      "setState": "(key, value) → void  [persists to state.json]"
+    }
+  },
+  "important_notes": [
+    "MAX_BATCH=50 messages per flush; MAX_RETRIES=10 before marking failed",
+    "Hub endpoint: POST {hubUrl}/a2a/mailbox/outbound with 30s AbortSignal timeout",
+    "Payload includes: sender_id, proxy_protocol_version='0.1.0', messages[]",
+    "Hub can return inline responses (result.response) that are written back as inbound messages",
+    "MailboxStore is JSONL-backed with in-memory index; messages persisted to messages.jsonl",
+    "_outPending flag prevents re-entrant outbound flushes during notifyNewOutbound()",
+    "Timer is unref()'d (won't block Node.js process exit)",
+    "SyncEngine also runs inbound polling concurrently on its own timer (separate flow)"
+  ],
+  "source_files_analyzed": [
+    "src/proxy/sync/engine.js",
+    "src/proxy/sync/outbound.js",
+    "src/proxy/mailbox/store.js"
+  ]
+}

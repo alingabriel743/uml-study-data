@@ -1,0 +1,236 @@
+{
+  "scope": "messaging_frontend_interactions",
+  "title": "Messaging Frontend Interactions",
+  "diagram_type": "use_case",
+  "system_boundary": "Messaging Platform Frontend Layer",
+
+  "actors": [
+    {"name": "TelegramUser", "label": "Telegram User", "platform": "tgapp.py"},
+    {"name": "QQUser", "label": "QQ User", "platform": "qqapp.py"},
+    {"name": "DingTalkUser", "label": "DingTalk User", "platform": "dingtalkapp.py"},
+    {"name": "WeComUser", "label": "WeCom User", "platform": "wecomapp.py"},
+    {"name": "WeChatUser", "label": "WeChat User", "platform": "wechatapp.py"},
+    {"name": "FeishuUser", "label": "Feishu/Lark User", "platform": "fsapp.py"},
+    {"name": "GeneraticAgent", "label": "GeneraticAgent (Backend)", "role": "system_actor", "note": "Shared across all frontends; agent.put_task() / agent.abort() / agent.history"}
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Send Text Message",
+      "description": "User sends a plain text message to the bot; platform receives and dispatches to agent",
+      "actors": ["TelegramUser", "QQUser", "DingTalkUser", "WeComUser", "WeChatUser", "FeishuUser"],
+      "trigger_methods": {
+        "TgApp": "handle_msg(update, ctx) → agent.put_task(prompt, source='telegram')",
+        "QQApp": "on_message(data, is_group) → run_agent(chat_id, content)",
+        "DingTalkApp": "on_message(content, sender_id, ...) → run_agent(chat_id, content)",
+        "WeComApp": "on_text(frame) → run_agent(chat_id, content)",
+        "WeChatApp": "on_message(bot, msg) → _handle() → agent.put_task(prompt, source='wechat')",
+        "FsApp": "handle_message(data) → run_agent() → agent.put_task(user_input, source='feishu')"
+      }
+    },
+    {
+      "id": "UC2",
+      "name": "Receive Agent Response",
+      "description": "User receives the agent reply sent back by the frontend (text, streaming, or chunked)",
+      "actors": ["TelegramUser", "QQUser", "DingTalkUser", "WeComUser", "WeChatUser", "FeishuUser"],
+      "delivery_patterns": {
+        "TgApp": "Streaming: _stream(dq, msg) → msg.edit_text() every 3s; final clean + HTML",
+        "QQApp": "AgentChatMixin.run_agent → send_done → send_text via post_c2c_message / post_group_message",
+        "DingTalkApp": "AgentChatMixin.run_agent → send_done → send_text → _send_batch_message (sampleMarkdown)",
+        "WeComApp": "AgentChatMixin.run_agent → send_done → send_text → client.reply_stream(frame, finish=True)",
+        "WeChatApp": "on_message._handle() polls dq.get(timeout=300), chunked bot.send_text() up to 6 msgs",
+        "FsApp": "run_agent() polls dq.get_nowait(), update_message(msg_id, display) streaming via card; final send_message"
+      }
+    },
+    {
+      "id": "UC3",
+      "name": "Stop Running Task",
+      "description": "User sends /stop command to abort the active agent task",
+      "actors": ["TelegramUser", "QQUser", "DingTalkUser", "WeComUser", "WeChatUser", "FeishuUser"],
+      "command": "/stop or /abort",
+      "impl": {
+        "shared_mixin": "AgentChatMixin.handle_command('/stop') → state['running']=False; agent.abort(); send_text('⏹️ 正在停止...')",
+        "TgApp": "cmd_abort() → agent.abort(); task.cancel()",
+        "WeChatApp": "on_message checks text in ('/stop', '/abort') → agent.abort(); bot.send_text('已停止')",
+        "FsApp": "handle_command('/stop') → user_tasks[open_id]['running']=False; agent.abort()"
+      }
+    },
+    {
+      "id": "UC4",
+      "name": "Switch LLM Model",
+      "description": "User sends /llm [n] to list or switch the active language model",
+      "actors": ["TelegramUser", "QQUser", "DingTalkUser", "WeComUser", "WeChatUser", "FeishuUser"],
+      "command": "/llm [n]",
+      "impl": {
+        "shared_mixin": "AgentChatMixin.handle_command('/llm') → agent.next_llm(n) or agent.list_llms()",
+        "TgApp": "cmd_llm(update, ctx) → agent.next_llm(n) or agent.list_llms()",
+        "WeChatApp": "on_message checks text.startswith('/llm') → agent.next_llm(n) or agent.list_llms()"
+      }
+    },
+    {
+      "id": "UC5",
+      "name": "Clear Conversation Context",
+      "description": "User sends /new to clear shared agent history and start fresh",
+      "actors": ["TelegramUser", "QQUser", "DingTalkUser", "WeComUser", "WeChatUser", "FeishuUser"],
+      "command": "/new",
+      "impl": "AgentChatMixin.handle_command('/new') / FsApp.handle_command('/new') → agent.abort(); agent.history = []"
+    },
+    {
+      "id": "UC6",
+      "name": "Restore Conversation History",
+      "description": "User sends /restore to reload last conversation from log files",
+      "actors": ["TelegramUser", "QQUser", "DingTalkUser", "WeComUser", "FeishuUser"],
+      "command": "/restore",
+      "impl": "AgentChatMixin.handle_command('/restore') / FsApp.handle_command('/restore') → format_restore() → agent.history.extend(restored)",
+      "note": "WeChatApp does not implement /restore"
+    },
+    {
+      "id": "UC7",
+      "name": "View Agent Status",
+      "description": "User sends /status to check if agent is running and which LLM is active",
+      "actors": ["TelegramUser", "QQUser", "DingTalkUser", "WeComUser", "FeishuUser"],
+      "command": "/status",
+      "impl": "AgentChatMixin.handle_command('/status') / FsApp.handle_command('/status') → reports agent.is_running and agent.get_llm_name()"
+    },
+    {
+      "id": "UC8",
+      "name": "View Help",
+      "description": "User sends /help to see available commands",
+      "actors": ["TelegramUser", "QQUser", "DingTalkUser", "WeComUser", "FeishuUser"],
+      "command": "/help",
+      "impl": "AgentChatMixin.handle_command (default) sends HELP_TEXT / FsApp.handle_command('/help')"
+    },
+    {
+      "id": "UC9",
+      "name": "Send/Receive Files",
+      "description": "User sends a file or receives generated file attachments from agent",
+      "actors": ["WeChatUser", "FeishuUser"],
+      "impl": {
+        "WeChatApp_receive": "WxBotClient.send_file(to_user_id, file_path) → CDN encrypt + upload + sendmessage",
+        "WeChatApp_send": "_dl_media(items) → AES decrypt + save to temp dir",
+        "FsApp_receive": "_send_local_file → _upload_image_sync/_upload_file_sync → send_message(image/file/media)",
+        "FsApp_send": "_download_and_save_media → _download_image_sync/_download_file_sync"
+      },
+      "extend": "UC2 (agent response may include [FILE:path] references)"
+    },
+    {
+      "id": "UC10",
+      "name": "Send Media Messages",
+      "description": "User sends images, audio, or video to the bot for processing",
+      "actors": ["WeChatUser", "FeishuUser"],
+      "impl": {
+        "WeChatApp": "_dl_media() AES-128-ECB decrypt from CDN; appended to prompt as '[用户发送文件: path]'",
+        "FsApp": "_build_user_message() handles msg_type in (image, audio, file, media, post); _download_and_save_media()"
+      }
+    },
+    {
+      "id": "UC11",
+      "name": "Access Control / Authorization",
+      "description": "Each frontend checks if sender is in the allowed users list before processing messages",
+      "actors": ["TelegramUser", "QQUser", "DingTalkUser", "WeComUser", "WeChatUser", "FeishuUser"],
+      "impl": {
+        "TgApp": "ALLOWED set from tg_allowed_users; uid not in ALLOWED → reply 'no'",
+        "QQApp": "public_access(ALLOWED) or user_id in ALLOWED",
+        "DingTalkApp": "public_access(ALLOWED) or sender_id in ALLOWED",
+        "WeComApp": "public_access(ALLOWED) or sender_id in ALLOWED",
+        "WeChatApp": "no ALLOWED check (open access)",
+        "FsApp": "PUBLIC_ACCESS or open_id in ALLOWED_USERS"
+      }
+    },
+    {
+      "id": "UC12",
+      "name": "QR Code Login",
+      "description": "WeChat bot authenticates via QR code scan on first launch",
+      "actors": ["WeChatUser"],
+      "impl": "WxBotClient.login_qr() → GET /ilink/bot/get_bot_qrcode → poll /ilink/bot/get_qrcode_status → save token",
+      "note": "WeChat only; triggered if no stored token"
+    },
+    {
+      "id": "UC13",
+      "name": "Receive Welcome Message",
+      "description": "User entering a WeCom chat receives a configured welcome message",
+      "actors": ["WeComUser"],
+      "impl": "WeComApp.on_enter_chat(frame) → client.reply_welcome(frame, {text: WELCOME}) if WELCOME configured"
+    },
+    {
+      "id": "UC14",
+      "name": "Send Group Message",
+      "description": "Bot sends replies to group chats (where applicable)",
+      "actors": ["QQUser", "DingTalkUser"],
+      "impl": {
+        "QQApp": "send_text(chat_id, is_group=True) → client.api.post_group_message(group_openid=chat_id)",
+        "DingTalkApp": "chat_id.startswith('group:') → POST groupMessages/send with openConversationId"
+      }
+    }
+  ],
+
+  "key_classes_and_relationships": [
+    "AgentChatMixin (chatapp_common.py): abstract base — methods: send_text (abstract), send_done, handle_command, run_agent",
+    "QQApp extends AgentChatMixin — overrides send_text; adds on_message, start",
+    "DingTalkApp extends AgentChatMixin — overrides send_text; adds _get_access_token, _send_batch_message, on_message, start",
+    "WeComApp extends AgentChatMixin — overrides send_text; adds on_text, on_enter_chat, on_connected/authenticated/disconnected/error, start",
+    "TgApp: standalone (no mixin), uses handle_msg, _stream, cmd_abort, cmd_llm",
+    "WeChatApp: standalone (no mixin), uses WxBotClient + on_message function",
+    "FsApp: standalone (no mixin), uses handle_message, handle_command, send_message, update_message",
+    "WxBotClient (wechatapp.py inline): send_text, send_file, send_typing, get_updates, run_loop, login_qr",
+    "All apps depend on: GeneraticAgent (agentmain.py) — agent.put_task(), agent.abort(), agent.history, agent.is_running, agent.next_llm(), agent.list_llms()"
+  ],
+
+  "shared_utilities_from_chatapp_common": [
+    "split_text(text, limit) — splits long messages at newlines",
+    "clean_reply(text) — strips XML tags (thinking/summary/tool_use/file_content)",
+    "build_done_text(raw_text) — combines cleaned reply + file paths",
+    "format_restore() — loads latest log file, reconstructs history pairs",
+    "ensure_single_instance(port, label) — socket lock per app",
+    "require_runtime(agent, label, **required) — checks env/key config",
+    "redirect_log(script_file, log_name, label, allowed) — redirects stdout/stderr to log",
+    "public_access(allowed) — True if empty or contains '*'"
+  ],
+
+  "platform_sdk_dependencies": {
+    "TgApp": "python-telegram-bot (telegram, telegram.ext, HTTPXRequest)",
+    "QQApp": "qq-botpy (botpy, botpy.message.C2CMessage/GroupMessage)",
+    "DingTalkApp": "dingtalk-stream (dingtalk_stream, AckMessage, CallbackHandler, DingTalkStreamClient)",
+    "WeComApp": "wecom_aibot_sdk (WSClient, generate_req_id)",
+    "WeChatApp": "requests + qrcode + pycryptodome (inline WxBotClient, REST polling API)",
+    "FsApp": "lark-oapi (lark_oapi, lark.ws.Client, lark.EventDispatcherHandler, lark.api.im.v1)"
+  },
+
+  "lock_ports": {
+    "TgApp": 19527,
+    "QQApp": 19528,
+    "WeChatApp": 19528,
+    "WeComApp": 19529,
+    "DingTalkApp": 19530
+  },
+
+  "source_labels": {
+    "TgApp": "telegram",
+    "QQApp": "qq",
+    "DingTalkApp": "dingtalk",
+    "WeComApp": "wecom",
+    "WeChatApp": "wechat",
+    "FsApp": "feishu"
+  },
+
+  "important_notes": [
+    "All frontends share one GeneraticAgent instance (global 'agent') — shared context/history across users within each platform process",
+    "TgApp uses streaming edit (edit_text every 3s); FsApp uses update_message card streaming; others are fire-and-wait",
+    "WeChatApp and QQApp share the same lock port 19528 — cannot run simultaneously on same host",
+    "WeChatApp handles media download with AES-128-ECB decryption from CDN (pycryptodome required)",
+    "FsApp supports richest message types: text, post, image, audio, file, media, share_chat, share_user, interactive, share_calendar_event, system, merge_forward",
+    "Command routing: mixin-based apps (QQ, DingTalk, WeCom) use AgentChatMixin.handle_command; others implement their own",
+    "Ping interval: AgentChatMixin sends '⏳ 还在处理中' every 20s during long tasks"
+  ],
+
+  "source_files_analyzed": [
+    "frontends/chatapp_common.py",
+    "frontends/tgapp.py",
+    "frontends/qqapp.py",
+    "frontends/dingtalkapp.py",
+    "frontends/wecomapp.py",
+    "frontends/wechatapp.py",
+    "frontends/fsapp.py"
+  ]
+}

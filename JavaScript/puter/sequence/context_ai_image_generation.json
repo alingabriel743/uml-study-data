@@ -1,0 +1,89 @@
+{
+  "scope": "ai_image_generation",
+  "title": "AI Image Generation Request Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Client",
+    "DriverService",
+    "AIImageGenerationService",
+    "PermissionService",
+    "IImageProvider (OpenAi/Gemini/Together/Cloudflare/Replicate/XAI)",
+    "MeteringService",
+    "EventService",
+    "ExternalImageAPI (e.g. OpenAI)"
+  ],
+  "interaction_flow": [
+    "Client → DriverService: call({ iface: 'puter-image-generation', driver: 'openai-image-generation', method: 'generate', args: { prompt, model?, provider?, ratio?, quality? } })",
+    "DriverService → DriverService: _call() — _process_args(iface, method, args) [validates & consolidates arg types from registry]",
+    "DriverService → DriverService: resolve driver name (iface_to_driver map: 'puter-image-generation' → 'openai-image-generation' by default)",
+    "DriverService → DriverService: resolve service aliases (interface_service_aliases / service_aliases lookup)",
+    "DriverService → DriverService: get_service_or_throw_(driverName, iface) → returns AIImageGenerationService",
+    "DriverService → EventService: emit('driver.create-call-context', event) [sets up client_driver_call context with intended_service, test_mode, response_metadata]",
+    "DriverService → PermissionService: scan(actor, 'service:<driver>:ii:<iface>') [checks permission options]",
+    "PermissionService → DriverService: returns reading/options",
+    "DriverService → DriverService: select_best_option_(options) → get_policies_for_option_(option) [resolves effective policy, rate-limit]",
+    "DriverService → DriverService: Invoker.create with decorators: [enforce-rate-limit → svc_rateLimit.check_and_increment(), add-metadata, result-coercion via svc_coercion.coerce()]",
+    "DriverService → AIImageGenerationService: service.as('puter-image-generation').generate({ prompt, model, provider, ratio, quality, test_mode })",
+    "AIImageGenerationService → AIImageGenerationService: Context.get('client_driver_call') — extract test_mode, intended_service (legacyProviderName)",
+    "AIImageGenerationService → AIImageGenerationService: resolve intendedProvider (parameters.provider || legacyProviderName fallback → DEFAULT_PROVIDER 'openai-image-generation' || configuredProviders[0])",
+    "AIImageGenerationService → AIImageGenerationService: if no model → provider.getDefaultModel()",
+    "AIImageGenerationService → AIImageGenerationService: getModel({ modelId: parameters.model, provider: intendedProvider }) → looks up #modelIdMap, prefers exact puterId match",
+    "AIImageGenerationService → AIImageGenerationService: validate/clamp ratio against model.allowedRatios (default 1024x1024), validate quality against model.allowedQualityLevels",
+    "AIImageGenerationService → IImageProvider: provider.generate({ prompt, model: model.id, provider: model.provider, ratio, quality, test_mode })",
+    "IImageProvider (OpenAI) → IImageProvider: if test_mode → return 'https://puter-sample-data.puter.site/image_example.png'",
+    "IImageProvider (OpenAI) → IImageProvider: #estimatePromptTokenCount(prompt) + #buildPriceKey(model, quality, size)",
+    "IImageProvider (OpenAI) → MeteringService: hasEnoughCredits(actor, estimatedTotalCostInMicroCents)",
+    "MeteringService → IImageProvider: returns boolean (throws APIError 'insufficient_funds' if false)",
+    "IImageProvider (OpenAI) → ExternalImageAPI: openai.images.generate({ model, prompt, size, quality, user })",
+    "ExternalImageAPI → IImageProvider: returns ImagesResponse { data[0].url | data[0].b64_json, usage? }",
+    "IImageProvider (OpenAI) → IImageProvider: #extractUsage(result) → compute input/output costs in cents",
+    "IImageProvider (OpenAI) → MeteringService: batchIncrementUsages(actor, [{ usageType, usageAmount, costOverride }])",
+    "IImageProvider (OpenAI) → IImageProvider: #setResponseCostMetadata → writes to Context client_driver_call.response_metadata",
+    "IImageProvider → AIImageGenerationService: returns url (string: 'https://...' or 'data:image/...')",
+    "AIImageGenerationService → AIImageGenerationService: wrap url in TypedValue({ $: 'string:url:web'|'string:url:data', content_type: 'image' }, url)",
+    "AIImageGenerationService → DriverService: returns TypedValue",
+    "DriverService (result-coercion) → DriverService: svc_coercion.coerce(desired_type, TypedValue) → coerced value",
+    "DriverService (add-metadata) → DriverService: wraps result as { success: true, service: { name, version }, result, metadata: response_metadata }",
+    "DriverService → Client: returns { success: true, service, result: <image url>, metadata: { cost, cost_components } }"
+  ],
+  "key_relationships": [
+    "AIImageGenerationService extends BaseService",
+    "AIImageGenerationService IMPLEMENTS 'puter-image-generation' driver interface (generate method) and 'driver-capabilities' (supports_test_mode)",
+    "AIImageGenerationService depends_on DriverService (registers service aliases per provider at boot)",
+    "AIImageGenerationService depends_on MeteringService (via this.services.get('meteringService').meteringService)",
+    "AIImageGenerationService depends_on EventService (emit 'ai.image.registerProviders' for extension providers)",
+    "AIImageGenerationService composes IImageProvider[] (OpenAi, Gemini, Together, Cloudflare, Replicate, XAI) — registered in #providers map",
+    "DriverService orchestrates call() → _call() → call_new_() pipeline with permission check, rate-limiting, coercion",
+    "IImageProvider (all) depends_on MeteringService (credits check + usage recording)",
+    "IImageProvider (OpenAiImageGenerationProvider) depends_on openai SDK (openai.images.generate)",
+    "Model resolution: #modelIdMap[modelId] → IImageModel[] sorted by cost; supports aliases and puterId"
+  ],
+  "boot_time_registration": [
+    "AIImageGenerationService.__on_boot.consolidation(): registerProviders() (reads config for openai/gemini/together/xai/cloudflare/replicate API keys)",
+    "For each provider: driverService.register_service_alias('ai-image', providerName, { iface: 'puter-image-generation' }) — all legacy provider names route to AIImageGenerationService",
+    "For each provider: provider.models() → build #modelIdMap (id + puterId aliases), sort by cost"
+  ],
+  "provider_list": [
+    "openai-image-generation → OpenAiImageGenerationProvider (DALL-E 2, DALL-E 3, gpt-image-1)",
+    "gemini-image-generation → GeminiImageGenerationProvider",
+    "together-image-generation → TogetherImageGenerationProvider",
+    "xai-image-generation → XAIImageGenerationProvider",
+    "cloudflare-image-generation → CloudflareImageGenerationProvider",
+    "replicate-image-generation → ReplicateImageGenerationProvider"
+  ],
+  "error_cases": [
+    "No providers configured → throws Error('no image generation providers configured')",
+    "Model not found → APIError 'field_invalid' with available models URL",
+    "Insufficient credits → APIError 'insufficient_funds' (thrown inside provider before API call)",
+    "No permission option → APIError 'forbidden'",
+    "Rate limit exceeded → thrown by svc_rateLimit.check_and_increment() inside Invoker decorator"
+  ],
+  "important_notes": "DEFAULT_PROVIDER = 'openai-image-generation'. Default model = 'dall-e-2'. Ratio default = 1024x1024. test_mode short-circuits to static sample image URL. Cost metadata is written to Context (client_driver_call.response_metadata) and returned in response.metadata. Metering uses microCents (cents * 1_000_000). Provider resolution: parameters.provider → legacyProviderName (intended_service from DriverService context) → DEFAULT_PROVIDER → configuredProviders[0].",
+  "source_files_analyzed": [
+    "src/backend/src/services/ai/image/AIImageGenerationService.ts",
+    "src/backend/src/services/drivers/DriverService.js",
+    "src/backend/src/services/ai/image/providers/types.ts",
+    "src/backend/src/services/ai/image/providers/OpenAiImageGenerationProvider/OpenAiImageGenerationProvider.ts",
+    "src/backend/src/services/MeteringService/utils.ts"
+  ]
+}

@@ -1,0 +1,199 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+}
+skinparam NoteBackgroundColor #FFF9C4
+skinparam NoteBorderColor #F0C040
+
+title Lifecycle Authentication and Heartbeat Loop
+
+participant "EvoMapProxy" as proxy
+participant "LifecycleManager" as lm
+participant "envFingerprint" as ef
+participant "MailboxStore" as store
+participant "Hub\n/a2a/hello\n/a2a/heartbeat" as hub
+
+== Startup: Initial Registration ==
+
+proxy -> lm : new LifecycleManager({ hubUrl, store, logger, getTaskMeta })
+proxy -> lm : hello()
+activate lm
+
+lm -> ef : captureEnvFingerprint()
+activate ef
+ef --> lm : envFingerprint
+deactivate ef
+
+lm -> store : getState('node_id')
+activate store
+store --> lm : nodeId (generate UUID if missing)
+deactivate store
+
+lm -> lm : _buildHeaders()\n[Bearer node_secret + x-correlation-id]
+
+lm -> hub : POST /a2a/hello\n{ protocol, protocol_version,\n  message_type: 'hello',\n  sender_id, payload,\n  env_fingerprint }\n[timeout: 15s]
+activate hub
+hub --> lm : { payload: { status, node_secret?, reason? } }
+deactivate hub
+
+alt response.payload.status === 'rejected'
+    lm --> proxy : return { ok: false, error: reason }
+else status ok
+    lm -> store : setState('node_secret', secret)\n[if new 64-hex secret returned]
+    activate store
+    store --> lm : ok
+    deactivate store
+    lm -> store : setState('node_id', nodeId)
+    activate store
+    store --> lm : ok
+    deactivate store
+    lm --> proxy : return { ok: true, nodeId, response }
+end
+
+deactivate lm
+
+== Heartbeat Loop ==
+
+proxy -> lm : startHeartbeatLoop(intervalMs?)\n[min: 30s, default: 360s]
+activate lm
+note right of lm : _running = true\ntick() called immediately
+
+loop every interval (exponential backoff on failures)
+
+    lm -> lm : heartbeat()
+    activate lm
+
+    lm -> store : getState('node_id')
+    activate store
+    store --> lm : nodeId
+    deactivate store
+
+    alt nodeId missing
+        lm -> lm : hello() [auto-register]
+    end
+
+    lm -> store : countPending({ direction: 'outbound' })
+    activate store
+    store --> lm : outbound_pending
+    deactivate store
+
+    lm -> store : countPending({ direction: 'inbound' })
+    activate store
+    store --> lm : inbound_pending
+    deactivate store
+
+    lm -> hub : POST /a2a/heartbeat\n{ node_id, evolver_version,\n  env_fingerprint,\n  meta: { proxy_version,\n  outbound_pending,\n  inbound_pending, ...taskMeta } }\n[timeout: 10s]
+    activate hub
+
+    alt res.status 401 or 403
+        hub --> lm : 401 / 403 AuthError
+        deactivate hub
+
+        lm -> lm : reAuthenticate()
+        activate lm
+        note right of lm : _reauthInProgress guard\nprevents concurrent re-auth
+
+        loop up to MAX_REAUTH_ATTEMPTS (2)
+            lm -> lm : hello({ rotateSecret: true })
+            activate lm
+            note right of lm : Hub issues new 64-hex\nnode_secret (secret rotation)
+            lm -> hub : POST /a2a/hello\n{ rotateSecret: true }
+            activate hub
+            hub --> lm : { payload: { node_secret } }
+            deactivate hub
+            lm -> store : setState('node_secret', newSecret)
+            deactivate lm
+
+            lm -> lm : heartbeat({ _skipReauth: true })\n[verify new secret works]
+            activate lm
+            lm -> hub : POST /a2a/heartbeat [_skipReauth]
+            activate hub
+
+            alt heartbeat ok
+                hub --> lm : 200 OK
+                deactivate hub
+                lm --> lm : return true [auth restored]
+                deactivate lm
+            else still failing
+                hub --> lm : 401 / 403
+                deactivate hub
+                deactivate lm
+                note right of lm : continue next attempt
+            end
+        end
+
+        lm --> lm : return false [reauth exhausted]
+        deactivate lm
+
+    else res.status other error
+        hub --> lm : 5xx / network error
+        deactivate hub
+        lm -> lm : _consecutiveFailures++
+        lm --> lm : return { ok: false }
+
+    else res.status 200 OK
+        hub --> lm : 200 OK\n{ status, events[], min_proxy_version }
+        deactivate hub
+
+        lm -> store : setState('last_heartbeat_at', ISO timestamp)
+        activate store
+        store --> lm : ok
+        deactivate store
+
+        alt data.status === 'unknown_node'
+            lm -> lm : hello() [re-register with hub]
+        end
+
+        alt data.events array non-empty
+            lm -> store : writeInboundBatch(events)\n[mapped to { type, payload, channel: 'evomap-hub' }]
+            activate store
+            store --> lm : ok
+            deactivate store
+        end
+
+        alt data.min_proxy_version requires upgrade
+            lm -> lm : _shouldUpgrade(minVersion)\n[semver comparison]
+            lm -> store : writeInbound({ type: 'system',\n  payload: { action: 'proxy_upgrade_required', ... },\n  priority: 'high' })
+            activate store
+            store --> lm : ok
+            deactivate store
+        end
+
+        lm -> lm : _consecutiveFailures = 0
+        lm --> lm : return { ok: true, response }
+
+    end
+
+    deactivate lm
+
+    lm -> lm : setTimeout(tick, backoff)\n[backoff = interval × 2^failures, max 30min]
+
+end
+
+deactivate lm
+
+@enduml

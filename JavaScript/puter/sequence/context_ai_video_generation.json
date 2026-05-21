@@ -1,0 +1,105 @@
+{
+  "scope": "ai_video_generation",
+  "title": "AI Video Generation Request Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Client",
+    "DriverService",
+    "AIVideoGenerationService",
+    "IVideoProvider (OpenAI/Together/Gemini)",
+    "MeteringService",
+    "EventService",
+    "PermissionService",
+    "RegistryService"
+  ],
+  "boot_flow": [
+    "AIVideoGenerationService.__on_boot.consolidation() → registerProviders()",
+    "registerProviders() → creates OpenAIVideoGenerationProvider, TogetherVideoGenerationProvider, GeminiVideoGenerationProvider (if API keys configured)",
+    "eventService.emit('ai.video.registerProviders', extensionProviders) → allows external provider injection",
+    "for each provider: driverService.register_service_alias('ai-video', providerName, { iface: 'puter-video-generation' })",
+    "for each provider: provider.models() → builds #modelIdMap with id/puterId/alias resolution + cost-based sorting"
+  ],
+  "generate_flow": [
+    "Client → DriverService.call({ iface: 'puter-video-generation', method: 'generate', args })",
+    "DriverService._call() → _process_args('puter-video-generation', 'generate', args) [validates via registry interface definition]",
+    "DriverService resolves driver: iface_to_driver['puter-video-generation'] = 'ai-video'",
+    "DriverService resolves provider alias: interface_service_aliases['puter-video-generation'][providerName] → 'ai-video'",
+    "DriverService.get_service_or_throw_('ai-video', 'puter-video-generation') → returns AIVideoGenerationService instance",
+    "DriverService emits 'driver.create-call-context' with Context sub { client_driver_call, call_details }",
+    "DriverService.call_new_({ actor, service: AIVideoGenerationService, iface, method, args })",
+    "call_new_ → svc_permission.scan(actor, 'service:ai-video:ii:puter-video-generation') → checks options/policy",
+    "call_new_ → Invoker decorator: rate-limit check (svc_rateLimit.check_and_increment) under policy_holder",
+    "call_new_ → service.as('puter-video-generation').generate(args) → AIVideoGenerationService.generate(parameters)",
+    "AIVideoGenerationService.generate() → Context.get('client_driver_call') → extracts test_mode, intended_service",
+    "AIVideoGenerationService.generate() → resolves intendedProvider from params.provider or legacyProviderName or DEFAULT_PROVIDER ('openai-video-generation')",
+    "AIVideoGenerationService.generate() → getModel({ modelId: parameters.model, provider: intendedProvider }) → looks up #modelIdMap",
+    "AIVideoGenerationService.generate() → validates/normalizes duration (durationSeconds) and dimensions (size/resolution)",
+    "AIVideoGenerationService.generate() → provider.generate({ ...parameters, model: model.id, provider: model.provider, test_mode })",
+    "[Gemini path] GeminiVideoGenerationProvider.generate() → meteringService.hasEnoughCredits(actor, costInMicroCents)",
+    "[Gemini path] GoogleGenAI.models.generateVideos(generateParams) → returns GenerateVideosOperation",
+    "[Gemini path] #pollUntilComplete(operation) → polls client.operations.getVideosOperation() every 10s (max 10min)",
+    "[Gemini path] meteringService.incrementUsage(actor, usageKey, durationSeconds, costInMicroCents)",
+    "[Gemini path] returns TypedValue({ $: 'string:url:web', content_type: 'video' }, proxyUrl)",
+    "call_new_ → Invoker decorator: result coercion (TypedValue → desired interface result type via svc_coercion)",
+    "call_new_ → returns { success: true, service: { name: 'ai-video' }, result }",
+    "DriverService._call() → attaches response_metadata → returns to Client"
+  ],
+  "list_flow": [
+    "Client → DriverService.call({ iface: 'puter-video-generation', method: 'list', args })",
+    "Same DriverService routing as generate → AIVideoGenerationService.list()",
+    "AIVideoGenerationService.list() → models() → iterates #modelIdMap, deduplicates by provider:puterId/id, sorts by provider+id",
+    "Returns sorted array of model puterId or id strings"
+  ],
+  "key_relationships": [
+    "AIVideoGenerationService extends BaseService",
+    "AIVideoGenerationService IMPLEMENTS 'puter-video-generation' (generate) and 'driver-capabilities' (supports_test_mode)",
+    "AIVideoGenerationService depends_on DriverService (register_service_alias)",
+    "AIVideoGenerationService depends_on MeteringService (via lazy getter → services.get('meteringService').meteringService)",
+    "AIVideoGenerationService depends_on EventService (emit 'ai.video.registerProviders')",
+    "AIVideoGenerationService composes IVideoProvider instances: OpenAIVideoGenerationProvider, TogetherVideoGenerationProvider, GeminiVideoGenerationProvider",
+    "DriverService routes 'puter-video-generation' → 'ai-video' via hardcoded iface_to_driver map",
+    "DriverService routes provider-specific alias → 'ai-video' via interface_service_aliases['puter-video-generation'][providerName]",
+    "GeminiVideoGenerationProvider implements IVideoProvider",
+    "GeminiVideoGenerationProvider depends_on MeteringService (hasEnoughCredits, incrementUsage)",
+    "GeminiVideoGenerationProvider depends_on GoogleGenAI client (models.generateVideos, operations.getVideosOperation)"
+  ],
+  "key_methods": {
+    "AIVideoGenerationService": {
+      "generate(parameters: IGenerateVideoParams)": "Main entry; resolves provider+model, validates params, delegates to provider.generate()",
+      "list()": "Returns sorted array of model IDs from #modelIdMap",
+      "models()": "Returns deduplicated, sorted IVideoModel[] from all providers",
+      "getModel({ modelId, provider? })": "Looks up IVideoModel from #modelIdMap; prefers exact id > puterId > first",
+      "getProvider(name: string)": "Returns IVideoProvider from #providers map",
+      "registerProviders()": "Instantiates providers from config; emits extension hook event",
+      "__on_boot.consolidation()": "Calls registerProviders(), builds model id map, registers service aliases"
+    },
+    "DriverService": {
+      "call(o)": "Public entry; delegates to _call, wraps errors",
+      "_call({ driver, iface, method, args })": "Resolves driver alias, builds context, delegates to call_new_",
+      "call_new_({ actor, service, iface, method, args })": "Permission check, rate-limit via Invoker, calls service.as(iface)[method](args)",
+      "_process_args(iface, method, args)": "Validates and coerces args against interface registry definition",
+      "register_service_alias(service_name, alias, options)": "Registers provider→service name mapping under optional iface scope",
+      "get_service_or_throw_(name, iface)": "Resolves service by name+trait; falls back to driver registry"
+    },
+    "GeminiVideoGenerationProvider": {
+      "generate(params: IGenerateVideoParams)": "Validates prompt, checks credits, calls Gemini API, polls, increments usage, returns TypedValue URL",
+      "models()": "Returns GEMINI_VIDEO_GENERATION_MODELS with aliases",
+      "getDefaultModel()": "Returns first model id from GEMINI_VIDEO_GENERATION_MODELS",
+      "#pollUntilComplete(operation)": "Polls Gemini operation every 10s until done or 10min timeout"
+    }
+  },
+  "important_notes": [
+    "SERVICE_NAME='ai-video', DEFAULT_PROVIDER='openai-video-generation'",
+    "test_mode: skips real API call, returns DEFAULT_TEST_VIDEO_URL; also skips usage metering (skip_usage=true)",
+    "Provider selection priority: params.provider > legacy intended_service > DEFAULT_PROVIDER > first configured",
+    "Model alias resolution: exact id > puterId > short-name (org/model → model) > first; sorted by cost ascending",
+    "Gemini polling: 10s interval, 10min timeout, proxied URLs with HMAC signature (48h expiry)",
+    "DriverService Invoker applies two decorators: rate-limit enforcement + result metadata wrapping",
+    "Extension providers registered via EventService 'ai.video.registerProviders' event at boot"
+  ],
+  "source_files_analyzed": [
+    "src/backend/src/services/ai/video/AIVideoGenerationService.ts",
+    "src/backend/src/services/drivers/DriverService.js",
+    "src/backend/src/services/ai/video/providers/GeminiVideoGenerationProvider/GeminiVideoGenerationProvider.ts"
+  ]
+}

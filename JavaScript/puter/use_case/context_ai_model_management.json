@@ -1,0 +1,209 @@
+{
+  "scope": "ai_model_management",
+  "title": "AI Model Management",
+  "diagram_type": "use_case",
+  "description": "Listing available AI models, selecting default models, and routing completions to providers",
+
+  "actors": [
+    {
+      "name": "Client (API User)",
+      "type": "primary",
+      "description": "External caller making unauthenticated HTTP GET requests to /puterai endpoints"
+    },
+    {
+      "name": "ChatAPIService",
+      "type": "system",
+      "description": "Express service (extends BaseService) that exposes public REST endpoints for AI model discovery and routes completions; mounts under /puterai"
+    },
+    {
+      "name": "AIChatService",
+      "type": "system",
+      "description": "Core AI orchestration service (SERVICE_NAME='ai-chat'). Owns the provider registry (#providers map) and #modelIdMap. Implements 'puter-chat-completion' driver interface."
+    },
+    {
+      "name": "OpenRouterProvider",
+      "type": "system",
+      "description": "Implements IChatProvider. Wraps OpenAI SDK pointed at openrouter.ai/api/v1. Caches model list in kv store. Handles cost metering via MeteringService."
+    },
+    {
+      "name": "MeteringService",
+      "type": "supporting",
+      "description": "Records token usage and cost overrides per actor/model via utilRecordUsageObject()"
+    },
+    {
+      "name": "APICallLogger",
+      "type": "supporting",
+      "description": "Client-side (puter-js SDK) logger. Logs: service - operation - params - result. Enabled/disabled at runtime."
+    },
+    {
+      "name": "SUService",
+      "type": "supporting",
+      "description": "Elevates execution context to system user for internal service calls (sudo())"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC-1",
+      "name": "List Available Chat Models",
+      "endpoint": "GET /puterai/chat/models",
+      "actors": ["Client (API User)", "ChatAPIService", "AIChatService", "OpenRouterProvider"],
+      "flow": [
+        "Client sends GET /puterai/chat/models",
+        "ChatAPIService uses SUService.sudo() to call AIChatService.list()",
+        "AIChatService.list() aggregates list() from each registered provider",
+        "OpenRouterProvider.list() calls this.models(), extracts model.id strings",
+        "OpenRouterProvider.models() checks kv cache; if miss, GET axios {apiBaseUrl}/models",
+        "Model IDs prefixed as 'openrouter:{model.id}' and aliases added",
+        "ChatAPIService filters out ['costly','fake','abuse','model-fallback-test-1']",
+        "Returns { models: string[] }"
+      ]
+    },
+    {
+      "id": "UC-2",
+      "name": "Get Detailed Chat Model Info",
+      "endpoint": "GET /puterai/chat/models/details",
+      "actors": ["Client (API User)", "ChatAPIService", "AIChatService", "OpenRouterProvider"],
+      "flow": [
+        "Client sends GET /puterai/chat/models/details",
+        "ChatAPIService uses SUService.sudo() to call AIChatService.models()",
+        "AIChatService.models() calls models() on each registered provider",
+        "OpenRouterProvider.models() returns IChatModel[] with id, name, aliases, context, max_tokens, costs (microcents), costs_currency, modalities",
+        "Filters out 'openrouter/auto' models",
+        "Applies OPEN_ROUTER_MODEL_OVERRIDES for specific model config overrides",
+        "ChatAPIService filters by model.id, returns { models: IChatModel[] }"
+      ]
+    },
+    {
+      "id": "UC-3",
+      "name": "List Available Image Models",
+      "endpoint": "GET /puterai/image/models",
+      "actors": ["Client (API User)", "ChatAPIService", "AIImageGenerationService"],
+      "flow": [
+        "Client sends GET /puterai/image/models",
+        "ChatAPIService uses SUService.sudo() to call AIImageGenerationService.list()",
+        "Returns { models: string[] }"
+      ]
+    },
+    {
+      "id": "UC-4",
+      "name": "Get Default Model",
+      "actors": ["AIChatService", "OpenRouterProvider"],
+      "flow": [
+        "AIChatService calls provider.getDefaultModel() during routing when no model specified",
+        "OpenRouterProvider.getDefaultModel() returns 'openrouter:openai/gpt-5-nano'"
+      ]
+    },
+    {
+      "id": "UC-5",
+      "name": "Route Chat Completion to Provider",
+      "actors": ["Client (API User)", "AIChatService", "OpenRouterProvider", "MeteringService"],
+      "flow": [
+        "Client sends chat completion request with { messages, model, stream, tools, max_tokens, temperature }",
+        "AIChatService.complete() resolves provider from #providers map using model prefix",
+        "Applies concurrentRequestLimiter (default: 3 concurrent, lease 2min)",
+        "Calls OpenRouterProvider.complete({ messages, stream, model, tools, max_tokens, temperature })",
+        "Provider resolves modelUsed by matching model id/alias in this.models()",
+        "Strips 'openrouter:' prefix for OpenAI SDK params",
+        "Calls OpenAI.chat.completions.create(completionParams) via OpenAI SDK → openrouter.ai",
+        "On max_context error: retries without max_tokens",
+        "Passes usage to MeteringService.utilRecordUsageObject() with cost overrides",
+        "Returns stream or { message, usage, finish_reason }"
+      ]
+    },
+    {
+      "id": "UC-6",
+      "name": "Register AI Providers",
+      "actors": ["AIChatService", "OpenRouterProvider"],
+      "flow": [
+        "AIChatService.registerProviders() reads config.providers or global_config.services",
+        "For each configured provider with apiKey: instantiates provider class",
+        "OpenRouterProvider instantiated with { apiBaseUrl, apiKey } + meteringService",
+        "Also auto-discovers Ollama via localhost:11434/api/tags",
+        "Emits 'ai.chat.registerProviders' event for extension providers",
+        "Populates #providers map and #modelIdMap after all providers registered"
+      ]
+    },
+    {
+      "id": "UC-7",
+      "name": "Log API Calls (Client-Side)",
+      "actors": ["Client (API User)", "APICallLogger"],
+      "flow": [
+        "puter-js SDK instantiates APICallLogger({ enabled: false }) by default",
+        "Developer calls apiCallLogger.enable() to activate",
+        "SDK calls apiCallLogger.logRequest({ service, operation, params, result, error })",
+        "Logger formats: '{service} - {operation} - {params}' and outputs to console.log/error",
+        "Developer can call apiCallLogger.disable() or updateConfig() at runtime",
+        "apiCallLogger.getStats() returns { enabled, config }"
+      ]
+    }
+  ],
+
+  "key_interfaces": [
+    {
+      "name": "IChatProvider",
+      "methods": [
+        "models(extra_params?): IChatModel[] | Promise<IChatModel[]>",
+        "list(): string[] | Promise<string[]>",
+        "getDefaultModel(): string",
+        "complete(arg: ICompleteArguments): Promise<StreamResult | MessageResult>",
+        "checkModeration(text: string): Promise<{ flagged: boolean, results: ... }>"
+      ]
+    },
+    {
+      "name": "IChatModel",
+      "fields": ["id: string", "aliases?: string[]", "costs: ModelCost", "costs_currency: string", "context?: number", "max_tokens: number", "subscriberOnly?: boolean", "tool_call?: boolean"]
+    },
+    {
+      "name": "ICompleteArguments",
+      "key_fields": ["messages", "model", "stream?", "tools?", "max_tokens?", "temperature?", "provider?", "moderation?"]
+    }
+  ],
+
+  "key_relationships": [
+    "ChatAPIService depends_on AIChatService (via services.get('ai-chat'))",
+    "ChatAPIService depends_on SUService (elevation for internal calls)",
+    "AIChatService owns OpenRouterProvider (and 9 other providers) in #providers registry",
+    "OpenRouterProvider implements IChatProvider",
+    "OpenRouterProvider depends_on MeteringService (cost tracking per completion)",
+    "OpenRouterProvider depends_on OpenAI SDK (wraps openrouter.ai endpoint)",
+    "OpenRouterProvider depends_on kv (singleton cache for model list)",
+    "AIChatService implements 'puter-chat-completion' driver interface",
+    "APICallLogger used by puter-js SDK (client-side, independent of backend)"
+  ],
+
+  "registered_providers": [
+    "claude (ClaudeProvider)",
+    "openai-completion (OpenAiChatProvider)",
+    "openai-responses (OpenAiResponsesChatProvider)",
+    "gemini (GeminiChatProvider)",
+    "groq (GroqAIProvider)",
+    "deepseek (DeepSeekProvider)",
+    "mistral (MistralAIProvider)",
+    "xai (XAIProvider)",
+    "openrouter (OpenRouterProvider)",
+    "together-ai (TogetherAIProvider)",
+    "ollama (OllamaChatProvider, auto-discovered)",
+    "fake-chat (FakeChatProvider, always registered)"
+  ],
+
+  "important_notes": [
+    "ChatAPIService is PUBLIC (unauthenticated) — model listing endpoints require no auth",
+    "OpenRouterProvider default model: 'openrouter:openai/gpt-5-nano'",
+    "Model IDs are prefixed 'openrouter:{upstream_id}'; aliases include bare upstream ID",
+    "Costs converted to microcents (USD): value * 1_000_000 * 100",
+    "OpenRouter custom billing: if usage.cost present, overrides per-token pricing entirely",
+    "MAX_FALLBACKS = 4 (3 retries) in AIChatService for failed completions",
+    "Concurrent request limits: default=3, temp_free=3, user_free=5 (configurable)",
+    "APICallLogger is a puter-js client-side utility, disabled by default",
+    "Video model endpoints (GET /puterai/video/models, /video/models/details) also exposed by ChatAPIService"
+  ],
+
+  "source_files_analyzed": [
+    "src/backend/src/services/ai/chat/providers/OpenRouterProvider/OpenRouterProvider.ts",
+    "src/backend/src/services/ChatAPIService.js",
+    "src/puter-js/src/lib/APICallLogger.js",
+    "src/backend/src/services/ai/chat/providers/types.ts",
+    "src/backend/src/services/ai/chat/AIChatService.ts (lines 1-239)"
+  ]
+}

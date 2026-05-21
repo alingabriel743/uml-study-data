@@ -1,0 +1,188 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam sequence {
+    ArrowColor #495057
+    ArrowFontColor #212529
+    ArrowFontSize 11
+    ActorBorderColor #495057
+    ActorBackgroundColor #F8F9FA
+    ActorFontColor #212529
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    ParticipantFontSize 12
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Autoregressive World Generation Pipeline
+
+actor Caller as caller
+
+participant "ARVideo2World\nGenerationPipeline" as pipeline
+participant "Guardrail" as guardrail
+participant "TextEncoder\n(T5)" as textenc
+participant "Tokenizer\n(DiscreteVideo)" as tokenizer
+participant "AutoRegressive\nModel" as armodel
+participant "VideoTokenizer\n(AR Decode)" as vidtok
+participant "ARBase\nGenerationPipeline" as base
+participant "diffusion_decoder\n_process_tokens" as ddpt
+participant "LatentDiffusion\nDecoderModel" as lddm
+
+== Initialization ==
+caller -> pipeline : generate(inp_prompt, inp_vid,\nnum_input_frames=9, seed=0,\nsampling_config)
+activate pipeline
+
+== Guardrail: Prompt Safety Check ==
+opt guardrail enabled
+    pipeline -> guardrail : _run_guardrail_on_prompt_with_offload(inp_prompt)
+    activate guardrail
+    guardrail --> pipeline : is_safe (None if unsafe → early return)
+    deactivate guardrail
+end
+
+== Text Encoding ==
+pipeline -> textenc : _run_text_embedding_on_prompt_with_offload([inp_prompt])
+activate textenc
+note right of textenc
+  str → T5 embeddings
+  Tensor B×512×1024
+end note
+textenc --> pipeline : (prompt_embeddings, prompt_masks)
+deactivate textenc
+
+== AR Model Inference ==
+pipeline -> pipeline : _run_model_with_offload(\nprompt_embedding, prompt_mask,\ninp_vid, num_input_frames,\nseed, sampling_config)
+activate pipeline
+
+pipeline -> pipeline : _run_model(...)
+activate pipeline
+
+pipeline -> pipeline : generate_partial_tokens_from_data_batch(\ndata_batch={video, context, context_mask},\nnum_tokens_to_generate,\ntask_condition='text_and_video')
+activate pipeline
+
+== Video Tokenization ==
+pipeline -> tokenizer : tokenize(data_batch)
+activate tokenizer
+note right of tokenizer
+  inp_vid (B×T×3×H×W) →
+  data_tokens (discrete ints)
+  + token_boundaries
+end note
+tokenizer --> pipeline : (data_tokens, token_boundaries)
+deactivate tokenizer
+
+== Autoregressive Token Generation ==
+pipeline -> pipeline : generate_video_from_tokens(\nprompt_tokens, latent_shape,\nvideo_start_boundary, max_gen_len,\nsampling_config, logit_clipping_range,\ncontext, context_mask)
+activate pipeline
+
+pipeline -> armodel : model.generate(prompt_tokens,\ntemperature, top_p, echo, seed,\ncontext, context_mask, max_gen_len,\ncompile_sampling, compile_prefill,\nstop_tokens)
+activate armodel
+note right of armodel
+  Autoregressive sampling
+  with causal attention mask
+  Tensor Parallelism (TP)
+end note
+armodel --> pipeline : (generation_tokens, _)\nTensor B×(T×H×W)
+deactivate armodel
+
+note over pipeline : Reshape B(THW) → B×T×H×W\nApply logit offset to token indices
+
+== AR Lightweight Decode (Preview) ==
+pipeline -> vidtok : model.tokenizer.video_tokenizer\n.decode(indices_tensor.cuda())
+activate vidtok
+vidtok --> pipeline : video_decoded (Tensor, [0,1])
+deactivate vidtok
+
+deactivate pipeline
+deactivate pipeline
+deactivate pipeline
+deactivate pipeline
+
+== Diffusion Decoder (High-Quality Upscale) ==
+pipeline -> base : _run_diffusion_decoder_with_offload(\nout_videos_cur_batch,\nindices_tensor_cur_batch,\n[prompt_embedding])
+activate base
+
+opt offload_diffusion_decoder=True
+    base -> base : _load_diffusion_decoder()\n→ LatentDiffusionDecoderModel
+end
+
+base -> base : _run_diffusion_decoder(\nout_videos_cur_batch,\nindices_tensor_cur_batch,\nt5_emb_batch)
+activate base
+
+note over base : Enable Context Parallelism (CP)\nif cp_size > 1
+
+base -> ddpt : diffusion_decoder_process_tokens(\nmodel=diffusion_decoder_model,\nindices_tensor,\ndd_sampling_config,\noriginal_video_example,\nt5_emb_batch)
+activate ddpt
+
+ddpt -> ddpt : split_with_overlap(\ntoken_BCTHW,\nnum_frames_per_chunk, overlap)
+note right of ddpt
+  Splits long video into
+  overlapping temporal chunks
+  for memory efficiency
+end note
+
+loop for each temporal chunk
+    ddpt -> lddm : model.generate_samples_from_batch(\ndata_batch, guidance,\nstate_shape,\napply_corruptor=False,\npreencode_condition=True,\nnum_steps)
+    activate lddm
+    lddm --> ddpt : samples_latent
+    deactivate lddm
+
+    ddpt -> lddm : model.decode(samples_latent)\n.clamp(-1, 1)
+    activate lddm
+    note right of lddm
+      Decoder:
+      Cosmos-Predict1-7B-Decoder
+      DV8x16x16ToCV8x8x8-720p
+    end note
+    lddm --> ddpt : pixel_frames (Tensor, [-1,1])
+    deactivate lddm
+end
+
+opt multiple chunks
+    ddpt -> ddpt : linear_blend_video_list(\nfull_length_sample_pixs, overlap)
+    note right of ddpt
+      Smooth temporal blending
+      at chunk boundaries
+    end note
+end
+
+ddpt --> base : out_videos_batch\n(List[Tensor], normalized [0,1])
+deactivate ddpt
+
+deactivate base
+deactivate base
+
+== Guardrail: Output Video Safety Check ==
+opt guardrail enabled
+    pipeline -> guardrail : _run_guardrail_on_video_with_offload(output_video)
+    activate guardrail
+    guardrail --> pipeline : output_video (None if unsafe)
+    deactivate guardrail
+end
+
+== Return Result ==
+pipeline --> caller : output_video\nnp.ndarray (T×H×W×C, [0,1])\nor None if safety check failed
+deactivate pipeline
+
+@enduml

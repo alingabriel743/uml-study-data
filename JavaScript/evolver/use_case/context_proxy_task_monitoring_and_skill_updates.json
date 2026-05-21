@@ -1,0 +1,160 @@
+{
+  "scope": "proxy_task_monitoring_and_skill_updates",
+  "title": "Proxy Task Monitoring & Skill Updates",
+  "diagram_type": "use_case",
+  "system_boundary": "Proxy Task & Skill Modules",
+
+  "actors": [
+    {
+      "name": "ProxyAgent",
+      "type": "primary",
+      "description": "The loop orchestrator / proxy process that drives task claiming and evolution cycles"
+    },
+    {
+      "name": "Hub",
+      "type": "external",
+      "description": "Remote message hub that delivers inbound tasks and skill_update messages"
+    },
+    {
+      "name": "Administrator",
+      "type": "primary",
+      "description": "Configures skill path and capability filters; enables/disables the loop bridge"
+    },
+    {
+      "name": "Store",
+      "type": "supporting",
+      "description": "Persistent state layer – getState/setState, send, poll, ack, countPending"
+    },
+    {
+      "name": "Filesystem",
+      "type": "supporting",
+      "description": "Local FS used by SkillUpdater (skill.md write/backup) and rejectPendingRun (atomic JSON write)"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Subscribe to Task Queue",
+      "actor": "ProxyAgent",
+      "class": "TaskMonitor",
+      "method": "subscribe(filters[])",
+      "description": "Persists subscription state and sends task_subscribe message with capability_filter to Hub via Store"
+    },
+    {
+      "id": "UC2",
+      "name": "Unsubscribe from Task Queue",
+      "actor": "ProxyAgent",
+      "class": "TaskMonitor",
+      "method": "unsubscribe()",
+      "description": "Clears subscription state and sends task_unsubscribe message to Hub via Store"
+    },
+    {
+      "id": "UC3",
+      "name": "Record Task Claimed",
+      "actor": "ProxyAgent",
+      "class": "TaskMonitor",
+      "method": "recordClaim(taskId)",
+      "description": "Increments claimed counter, timestamps, persists metrics to Store"
+    },
+    {
+      "id": "UC4",
+      "name": "Record Task Completed",
+      "actor": "ProxyAgent",
+      "class": "TaskMonitor",
+      "method": "recordComplete(taskId, startedAt)",
+      "description": "Increments completed counter, computes rolling avg_completion_ms (last 100 samples), persists to Store"
+    },
+    {
+      "id": "UC5",
+      "name": "Record Task Failed",
+      "actor": "ProxyAgent",
+      "class": "TaskMonitor",
+      "method": "recordFailed(taskId)",
+      "description": "Increments failed counter, persists metrics snapshot to Store"
+    },
+    {
+      "id": "UC6",
+      "name": "View Task Metrics",
+      "actor": "ProxyAgent",
+      "class": "TaskMonitor",
+      "method": "getMetrics()",
+      "description": "Returns subscribed status, received/claimed/completed/failed counts, pending inbound count, timing stats"
+    },
+    {
+      "id": "UC7",
+      "name": "Report Heartbeat Metadata",
+      "actor": "ProxyAgent",
+      "class": "TaskMonitor",
+      "method": "getHeartbeatMeta()",
+      "description": "Returns compact task metrics subset for inclusion in periodic heartbeat messages"
+    },
+    {
+      "id": "UC8",
+      "name": "Poll & Apply Skill Updates",
+      "actor": "ProxyAgent",
+      "class": "SkillUpdater",
+      "method": "pollAndApply()",
+      "description": "Polls Store for skill_update messages; for each: calls processSkillUpdate, then acks if successful. Returns count applied."
+    },
+    {
+      "id": "UC9",
+      "name": "Process Single Skill Update",
+      "actor": "ProxyAgent",
+      "class": "SkillUpdater",
+      "method": "processSkillUpdate(message)",
+      "description": "Validates content, backs up existing skill.md, writes new content to skillPath, records last_skill_update and skill_version in Store"
+    },
+    {
+      "id": "UC10",
+      "name": "Configure Skill Path",
+      "actor": "Administrator",
+      "class": "SkillUpdater",
+      "method": "setSkillPath(filePath)",
+      "description": "Sets the filesystem path where skill.md updates will be written"
+    },
+    {
+      "id": "UC11",
+      "name": "Check Pending Solidify",
+      "actor": "ProxyAgent",
+      "class": "index.js (utility)",
+      "method": "isPendingSolidify(state)",
+      "description": "Returns true if last_run.run_id exists and differs from last_solidify.run_id, gate that blocks new evolution cycles"
+    },
+    {
+      "id": "UC12",
+      "name": "Reject Pending Run",
+      "actor": "ProxyAgent",
+      "class": "index.js (utility)",
+      "method": "rejectPendingRun(statePath)",
+      "description": "Reads evolution_solidify_state.json, writes last_solidify = {run_id, rejected:true, reason:'loop_bridge_disabled_autoreject_no_rollback'} atomically via tmp+rename"
+    }
+  ],
+
+  "relationships": [
+    "UC8 includes UC9 (pollAndApply iterates and delegates to processSkillUpdate)",
+    "UC11 extends UC1/UC3 (isPendingSolidify gates loop before each cycle start)",
+    "UC12 extends UC8 (rejectPendingRun fires after evolve.run() when EVOLVE_BRIDGE=false and pending solidify detected)",
+    "TaskMonitor depends_on Store (getState, setState, send, countPending)",
+    "SkillUpdater depends_on Store (poll, ack, setState)",
+    "SkillUpdater depends_on Filesystem (writeFileSync, copyFileSync, mkdirSync)",
+    "rejectPendingRun depends_on Filesystem (readJsonSafe → writeFileSync tmp → renameSync)",
+    "ProxyAgent uses TaskMonitor (subscription + metrics lifecycle)",
+    "ProxyAgent uses SkillUpdater (periodic skill update polling)",
+    "Hub delivers task messages → Store → TaskMonitor subscription",
+    "Hub delivers skill_update messages → Store → SkillUpdater.pollAndApply"
+  ],
+
+  "key_logic": {
+    "isPendingSolidify": "Compares last_run.run_id vs last_solidify.run_id; true if run is unsolidified — blocks loop from starting new cycle",
+    "rejectPendingRun": "Auto-rejects (state-only, no git rollback) when bridge is disabled; marks rejected=true with reason tag; atomic write via .tmp file",
+    "TaskMonitor_stats": "Rolling 100-sample window for avg_completion_ms; stats persist across restarts via Store (task_monitor_stats key)",
+    "SkillUpdater_backup": "Always creates skill.md.bak before overwriting; stores skill_version and last_skill_update in Store state"
+  },
+
+  "source_files_analyzed": [
+    "src/proxy/task/monitor.js",
+    "src/proxy/extensions/skillUpdater.js",
+    "index.js (rejectPendingRun, isPendingSolidify)"
+  ]
+}

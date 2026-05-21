@@ -1,0 +1,218 @@
+{
+  "scope": "service_lifecycle_management",
+  "title": "Service Lifecycle Management",
+  "diagram_type": "use_case",
+  "description": "Registering, initializing, and retrieving services via the ServiceManager IoC container",
+
+  "actors": [
+    {
+      "name": "Caller / Boot System",
+      "type": "primary",
+      "note": "External code (e.g. Kernel, Module) that registers services and retrieves them"
+    },
+    {
+      "name": "Service Instance",
+      "type": "secondary",
+      "note": "A concrete class extending Service (e.g. LaunchOnInitService, BaseService) that implements _construct/_init lifecycle hooks"
+    }
+  ],
+
+  "system_boundary": "ServiceManager (IoC Container)",
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Register Service",
+      "actor": "Caller / Boot System",
+      "description": "Caller calls register(name, factory, options). Factory.create() instantiates the service with parameters and context. Entry is added to services_l_ and services_m_ with status=Registering.",
+      "triggers": "ServiceManager.register(name, factory, options)",
+      "key_steps": [
+        "factory.create({ parameters, context }) → new ServiceInstance()",
+        "Service.create() calls ins.as(TService).construct(parameters) → _construct()",
+        "Entry pushed to services_l_[] and services_m_[name]",
+        "maybe_init_(name) called automatically"
+      ]
+    },
+    {
+      "id": "UC2",
+      "name": "Resolve Dependencies & Initialize Service",
+      "actor": "ServiceManager (internal)",
+      "description": "maybe_init_ checks if all declared DEPENDS are Running. If yes, calls init_service_. If not, marks service as Pending and registers it in waiting_[dependency] map.",
+      "triggers": "Automatically after register(); also re-triggered when a dependency transitions to Running",
+      "key_steps": [
+        "entry.instance.as(TService).get_depends() → reads static DEPENDS + instance get_depends()",
+        "get_waiting_for_(depends) → filters deps not yet Running",
+        "If all deps ready → init_service_(name): status=Initializing → service_impl.init() → _init() → status=Running",
+        "If deps missing → status=Pending; name stored in waiting_[dependency]",
+        "After a service goes Running, cascade: for each waiting dependent, call maybe_init_ again"
+      ]
+    },
+    {
+      "id": "UC3",
+      "name": "Retrieve Running Service (Sync)",
+      "actor": "Caller / Boot System",
+      "description": "Synchronous lookup. Returns instance only if status=Running; returns undefined if Pending/Initializing; throws if not registered.",
+      "triggers": "ServiceManager.get(name)",
+      "key_steps": [
+        "Lookup services_m_[name]",
+        "Throw Error if not found",
+        "Return undefined if status !== Running",
+        "Return info.instance if Running"
+      ]
+    },
+    {
+      "id": "UC4",
+      "name": "Async-Retrieve Service (Wait for Init)",
+      "actor": "Caller / Boot System",
+      "description": "Awaits until the named service is Running, then returns it. Internally delegates to wait_for_init([name]).",
+      "triggers": "ServiceManager.aget(name)",
+      "key_steps": [
+        "await wait_for_init([name])",
+        "wait_for_init installs a listener in init_listeners_[] if service not yet Running",
+        "Listener is checked after every init_service_ completion",
+        "Once Running, listener removes itself and resolves the promise",
+        "Return get(name)"
+      ]
+    },
+    {
+      "id": "UC5",
+      "name": "Wait for Multiple Services",
+      "actor": "Caller / Boot System",
+      "description": "Blocks until all listed services are Running.",
+      "triggers": "ServiceManager.wait_for_init(depends[])",
+      "key_steps": [
+        "get_waiting_for_(depends) checks statuses",
+        "If nothing waiting, resolves immediately",
+        "Else adds check function to init_listeners_[]",
+        "Re-evaluated after each service's init_service_ completes"
+      ]
+    },
+    {
+      "id": "UC6",
+      "name": "Subscribe to Service Events via HOOKS",
+      "actor": "Service Instance",
+      "description": "ServiceFeature installs HOOKS during service init. Each hook subscribes the service instance to a named event on another service's topic bus.",
+      "triggers": "Automatically during TService.init() via ServiceFeature.install_in_instance()",
+      "key_steps": [
+        "ServiceFeature reads instance._get_merged_static_array('HOOKS')",
+        "For each hook spec: get dependency service via context.services.info(spec.service)",
+        "service_instance.as(TTopics).sub(spec.event, spec.do.bind(instance))",
+        "Hooks are deferred until service init so dependency services are already Running"
+      ]
+    },
+    {
+      "id": "UC7",
+      "name": "Execute Launch Commands on Init",
+      "actor": "Service Instance",
+      "description": "LaunchOnInitService reads GUI launch_options.on_initialized at _init time and dispatches named commands (e.g. window-call).",
+      "triggers": "LaunchOnInitService._init() during boot",
+      "key_steps": [
+        "_construct() → registers command handlers map (e.g. 'window-call')",
+        "_init() → reads this.$puter.gui_params.launch_options.on_initialized",
+        "Iterates commands and calls run_(command)",
+        "run_() dispatches to this.commands[command.$](args)"
+      ]
+    },
+    {
+      "id": "UC8",
+      "name": "Query Service Info / Status",
+      "actor": "Caller / Boot System",
+      "description": "Retrieve the raw service entry (name, instance, status, statusStartTS, statusWaitingFor) without triggering wait.",
+      "triggers": "ServiceManager.info(name)",
+      "key_steps": [
+        "Returns services_m_[name] entry object directly"
+      ]
+    }
+  ],
+
+  "key_classes": [
+    {
+      "name": "AdvancedBase",
+      "file": "src/putility/src/AdvancedBase.js",
+      "extends": "FeatureBase",
+      "features": ["NodeModuleDIFeature", "PropertiesFeature", "TraitsFeature", "TopicsFeature"],
+      "note": "Root base class; provides trait system (.as()), property merging, and topic pub/sub"
+    },
+    {
+      "name": "Service",
+      "file": "src/putility/src/concepts/Service.js",
+      "extends": "AdvancedBase",
+      "features": ["ServiceFeature"],
+      "implements_trait": "TService",
+      "static_methods": ["create({parameters, context})"],
+      "trait_methods": ["init(...a)", "construct(o)", "get_depends()"],
+      "instance_methods": ["__on(id, args)", "__get_event_handler(id)"],
+      "override_hooks": ["_init()", "_construct()", "get_depends()"],
+      "static_fields": ["DEPENDS[]", "HOOKS[]", "IMPLEMENTS"]
+    },
+    {
+      "name": "ServiceManager",
+      "file": "src/putility/src/system/ServiceManager.js",
+      "extends": "AdvancedBase",
+      "public_methods": ["register(name, factory, options)", "get(name)", "aget(name)", "info(name)", "wait_for_init(depends)"],
+      "private_methods": ["maybe_init_(name)", "init_service_(name, modifiers)", "get_waiting_for_(depends)"],
+      "state": {
+        "services_l_": "Array — ordered list of service entries",
+        "services_m_": "Map<name, entry> — lookup by name",
+        "waiting_": "Map<dependency, Set<dependent>> — pending dependency graph",
+        "init_listeners_": "Array<fn> — callbacks fired on each service init"
+      },
+      "status_enum": ["Registering", "Pending", "Initializing", "Running"]
+    },
+    {
+      "name": "LaunchOnInitService",
+      "file": "src/gui/src/services/LaunchOnInitService.js",
+      "extends": "Service",
+      "methods": ["_construct()", "_init()", "run_(command)"],
+      "commands": ["window-call"],
+      "note": "GUI frontend service; executes parameterized window function calls during boot init"
+    },
+    {
+      "name": "BaseService",
+      "file": "src/backend/src/services/BaseService.js",
+      "extends": "concepts.Service",
+      "note": "Backend base; adds logging, config access, error handling, run_as_early_as_possible()"
+    }
+  ],
+
+  "key_relationships": [
+    "Service extends AdvancedBase",
+    "ServiceManager extends AdvancedBase",
+    "LaunchOnInitService extends Service",
+    "BaseService extends Service",
+    "ServiceManager creates Service instances via factory.create()",
+    "ServiceManager calls TService.init() on each service at initialization",
+    "Service implements TService trait (init, construct, get_depends)",
+    "ServiceFeature installs HOOKS into Service instance at init time",
+    "ServiceFeature uses TTopics trait on dependency services to subscribe events",
+    "ServiceManager tracks dependency graph in waiting_[] map"
+  ],
+
+  "lifecycle_state_machine": [
+    "register() → status: Registering",
+    "Registering + deps unmet → status: Pending (stored in waiting_[dep])",
+    "Registering + deps met OR dependency goes Running → status: Initializing",
+    "Initializing: TService.init() → init_hooks → _init() called",
+    "init() complete → status: Running, statusStartTS set",
+    "Running → cascades: check waiting_[name] and re-attempt maybe_init_ for dependents"
+  ],
+
+  "important_notes": [
+    "register() uses setTimeout(0) delay to allow async/await caller stacks to settle before init",
+    "get(name) returns undefined (not throws) if service exists but not yet Running",
+    "aget(name) is the safe async accessor — waits for Running then returns",
+    "TService is a Symbol trait, not a class — accessed via .as(TService)",
+    "DEPENDS is a static class array; get_depends() merges static + dynamic deps",
+    "ServiceFeature HOOKS provide declarative cross-service event wiring without imperative coupling",
+    "LaunchOnInitService is a GUI-layer service — uses ES module imports, not CommonJS"
+  ],
+
+  "source_files_analyzed": [
+    "src/putility/src/system/ServiceManager.js",
+    "src/putility/src/concepts/Service.js",
+    "src/putility/src/AdvancedBase.js",
+    "src/putility/src/features/ServiceFeature.js",
+    "src/gui/src/services/LaunchOnInitService.js",
+    "src/backend/src/services/BaseService.js (first 80 lines)"
+  ]
+}

@@ -1,0 +1,176 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #DEE2E6
+    DiamondBorderColor #495057
+    DiamondFontColor #212529
+}
+skinparam swimlane {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam note {
+    BackgroundColor #FFF3CD
+    BorderColor #FFCA28
+    FontColor #212529
+}
+skinparam arrow {
+    Color #495057
+    FontColor #495057
+}
+
+title Node Lifecycle — Hello & Authentication
+
+' ═══════════════════════════════════════════════════════════════
+'  FLOW 1 — hello() : Node Registration
+' ═══════════════════════════════════════════════════════════════
+
+|LifecycleManager|
+start
+:hello(rotateSecret = false);
+
+if (hubUrl configured?) then (no)
+  :Return {ok:false,\nerror:'no_hub_url'};
+  stop
+else (yes)
+endif
+
+|Store|
+:getState('node_id');
+
+|LifecycleManager|
+if (Existing node_id found?) then (yes)
+  :Use existing nodeId;
+else (no)
+  :Generate new nodeId\n'node_' + 6 random bytes hex\n(crypto.randomBytes);
+endif
+
+:Build payload\n{ capabilities: {} };
+
+if (rotateSecret = true?) then (yes)
+  :Add rotate_secret: true\nto payload;
+else (no)
+endif
+
+:_getEnvFingerprint()\n(captureEnvFingerprint lazy-loaded\nor fallback: {platform, arch, node_version});
+
+:Build request body\n{ protocol, protocol_version:'1.0.0',\n  message_type:'hello', message_id,\n  sender_id:nodeId, timestamp,\n  payload, env_fingerprint };
+
+:_buildHeaders();
+note right
+  Content-Type: application/json
+  Authorization: Bearer <secret>
+    (if store or env A2A_NODE_SECRET present)
+  x-correlation-id: crypto.randomUUID()
+end note
+
+|Hub|
+:POST ${hubUrl}/a2a/hello\n(AbortSignal.timeout: 15 000 ms);
+
+|LifecycleManager|
+if (Network error\nor timeout?) then (yes)
+  :Log error;
+  :Return {ok:false,\nerror:err.message};
+  stop
+else (no)
+endif
+
+:Parse response.json() → data;
+
+if (data.payload.status\n=== 'rejected'?) then (yes)
+  :Log rejection reason;
+  :Return {ok:false,\nerror:reason};
+  stop
+else (no)
+endif
+
+:Extract secret from\ndata.payload.node_secret\nOR data.node_secret;
+
+if (Secret matches\n/^[a-f0-9]{64}$/i ?) then (yes)
+  |Store|
+  :setState('node_secret', secret);
+  |LifecycleManager|
+else (no — absent or invalid)
+  note right: Secret not stored;\nnode continues without updated secret
+endif
+
+|Store|
+:setState('node_id', nodeId);
+
+|LifecycleManager|
+:Return {ok:true,\nnodeId, response:data};
+stop
+
+' ═══════════════════════════════════════════════════════════════
+'  FLOW 2 — reAuthenticate() : Re-Authentication Loop
+' ═══════════════════════════════════════════════════════════════
+
+|LifecycleManager|
+start
+note left
+  Entry point: triggered by
+  heartbeat() receiving
+  HTTP 401 or 403 (and !_skipReauth)
+end note
+
+:reAuthenticate();
+
+if (_reauthInProgress\nalready set?) then (yes)
+  :Return false immediately\n(guard against concurrent re-auth);
+  stop
+else (no)
+endif
+
+:_reauthInProgress = true;
+:attempt = 1;
+
+while (attempt <=\nMAX_REAUTH_ATTEMPTS (2)?) is (yes)
+
+  :Log warn:\n"re-auth attempt N/2:\nrotating secret via hello...";
+
+  :Call hello({ rotateSecret:true });
+
+  if (hello() succeeded?) then (no)
+    :Log error:\nhello failed on attempt N;
+  else (yes)
+    if (New node_secret present\nin hello response?) then (no)
+      :Log error:\nno new secret returned\non attempt N;
+    else (yes)
+      :Call heartbeat({ _skipReauth:true });
+      note right
+        _skipReauth:true prevents
+        infinite heartbeat ↔ reAuthenticate
+        recursion during verification
+      end note
+      if (heartbeat ok?) then (yes)
+        :Log success:\n"re-auth restored";
+        :_reauthInProgress = false;
+        :Return true;
+        stop
+      else (no)
+        :Log warn:\nheartbeat failed after\nsecret rotate on attempt N;
+      endif
+    endif
+  endif
+
+  :attempt++;
+
+endwhile (no — all attempts exhausted)
+
+:Log error:\n"re-auth exhausted all attempts";
+:_reauthInProgress = false;
+:Return false;
+stop
+
+@enduml

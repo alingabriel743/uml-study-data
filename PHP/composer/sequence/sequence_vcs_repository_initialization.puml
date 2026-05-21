@@ -1,0 +1,259 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+}
+
+title VCS Repository Initialization
+
+actor Caller as caller
+participant "ArrayRepository" as arrayRepo
+participant "VcsRepository" as vcsRepo
+participant "VcsDriver\n(e.g. GitHubDriver)" as driver
+participant "VersionParser" as versionParser
+participant "VersionCacheInterface" as versionCache
+participant "ArrayLoader" as loader
+
+== Construction ==
+
+caller -> vcsRepo : __construct(repoConfig, io, config,\nhttpDownloader, dispatcher?, process?,\ndrivers?, versionCache?)
+activate vcsRepo
+note right of vcsRepo
+  Registers driver map:
+  github → GitHubDriver
+  gitlab → GitLabDriver
+  bitbucket → GitBitbucketDriver
+  git → GitDriver, hg → HgDriver, …
+  Stores url, io, type, config,
+  repoConfig, versionCache
+end note
+vcsRepo --> caller : VcsRepository instance
+deactivate vcsRepo
+
+== Lazy Initialization (triggered by ArrayRepository) ==
+
+caller -> arrayRepo : getPackages() [or similar access]
+activate arrayRepo
+arrayRepo -> vcsRepo : initialize()
+activate vcsRepo
+
+== Driver Detection — getDriver() ==
+
+vcsRepo -> vcsRepo : getDriver()
+activate vcsRepo
+
+alt type key directly matches drivers map
+    note right of vcsRepo : Instantiate specific driver class directly\n(e.g. type="github" → new GitHubDriver)
+else type does not match — supports() detection
+    loop each registered driver class (shallow pass)
+        vcsRepo -> driver : supports(io, config, url, deep=false)
+        activate driver
+        driver --> vcsRepo : true / false
+        deactivate driver
+    end
+    opt no driver matched shallow pass
+        loop each registered driver class (deep pass)
+            vcsRepo -> driver : supports(io, config, url, deep=true)
+            activate driver
+            note right of driver
+              May perform network calls
+              to confirm support
+            end note
+            driver --> vcsRepo : true / false
+            deactivate driver
+        end
+    end
+end
+
+vcsRepo -> driver : new DriverClass(repoConfig, io, config,\nhttpDownloader, processExecutor)
+activate driver
+
+== Driver Initialization ==
+
+vcsRepo -> driver : initialize()
+
+alt GitHubDriver
+    note right of driver
+      Parse URL → owner, repo, originUrl
+      Create Cache instance
+      if use-github-api=false or no-api=true:
+        → setupGitDriver(url) [fallback to GitDriver]
+      else:
+        → fetchRootIdentifier()
+        → HTTP GET api.github.com/repos/{owner}/{repo}
+        → sets repoData, rootIdentifier
+    end note
+else GitBitbucketDriver
+    note right of driver
+      Parse HTTPS URL → owner, repo
+      Set originUrl = 'bitbucket.org'
+      Create Cache instance
+      NOTE: API data NOT fetched yet —
+      deferred to getRootIdentifier() /
+      getTags() / getBranches() via getRepoData()
+    end note
+end
+
+driver --> vcsRepo : (initialized)
+deactivate driver
+
+deactivate vcsRepo
+
+== Read Root Package Name ==
+
+vcsRepo -> driver : getRootIdentifier()
+activate driver
+driver --> vcsRepo : rootIdentifier
+deactivate driver
+
+vcsRepo -> driver : hasComposerFile(rootIdentifier)
+activate driver
+driver --> vcsRepo : true / false
+deactivate driver
+
+vcsRepo -> driver : getComposerInformation(rootIdentifier)
+activate driver
+driver --> vcsRepo : composerData (incl. packageName)
+deactivate driver
+
+== Pre-process Tags ==
+
+vcsRepo -> driver : getTags()
+activate driver
+driver --> vcsRepo : map[tagName => identifier]
+deactivate driver
+
+loop for each tag
+    vcsRepo -> versionParser : normalize(tag)
+    activate versionParser
+    versionParser --> vcsRepo : normalizedVersion / null (invalid)
+    deactivate versionParser
+
+    alt valid tag version
+        vcsRepo -> versionCache : getVersionPackage(tag, identifier)
+        activate versionCache
+        versionCache --> vcsRepo : cachedPackage / null / false
+        deactivate versionCache
+
+        alt cachedPackage found
+            vcsRepo -> vcsRepo : addPackage(cachedPackage)
+        else cachedPackage === false (known empty)
+            vcsRepo -> vcsRepo : add to emptyReferences, skip
+        else no cache
+            vcsRepo -> driver : getComposerInformation(identifier)
+            activate driver
+            driver --> vcsRepo : composerData
+            deactivate driver
+
+            vcsRepo -> driver : getDist(identifier)
+            activate driver
+            driver --> vcsRepo : distInfo
+            deactivate driver
+
+            vcsRepo -> driver : getSource(identifier)
+            activate driver
+            driver --> vcsRepo : sourceInfo
+            deactivate driver
+
+            vcsRepo -> loader : load(packageData)
+            activate loader
+            loader --> vcsRepo : Package instance
+            deactivate loader
+
+            vcsRepo -> vcsRepo : addPackage(package)
+        end
+    end
+end
+
+== Pre-process Branches ==
+
+vcsRepo -> driver : getBranches()
+activate driver
+driver --> vcsRepo : map[branchName => identifier]
+deactivate driver
+
+note right of vcsRepo : rootIdentifier branch is moved to front
+
+loop for each branch
+    vcsRepo -> versionParser : normalizeBranch(branch)
+    activate versionParser
+    versionParser --> vcsRepo : branchVersion (dev-{branch} or x.y.z-dev)
+    deactivate versionParser
+
+    alt valid branch version
+        vcsRepo -> versionCache : getVersionPackage(branchVersion, identifier)
+        activate versionCache
+        versionCache --> vcsRepo : cachedPackage / null / false
+        deactivate versionCache
+
+        alt cachedPackage found
+            vcsRepo -> vcsRepo : addPackage(cachedPackage)
+        else cachedPackage === false
+            vcsRepo -> vcsRepo : add to emptyReferences, skip
+        else no cache
+            vcsRepo -> driver : getComposerInformation(identifier)
+            activate driver
+            driver --> vcsRepo : composerData
+            deactivate driver
+
+            vcsRepo -> driver : getDist(identifier)
+            activate driver
+            driver --> vcsRepo : distInfo
+            deactivate driver
+
+            vcsRepo -> driver : getSource(identifier)
+            activate driver
+            driver --> vcsRepo : sourceInfo
+            deactivate driver
+
+            vcsRepo -> loader : load(packageData)
+            activate loader
+            loader --> vcsRepo : Package instance
+            deactivate loader
+
+            vcsRepo -> vcsRepo : addPackage(package)
+        end
+    end
+end
+
+== Post-initialization ==
+
+vcsRepo -> driver : cleanup()
+activate driver
+driver --> vcsRepo
+deactivate driver
+
+alt no packages found after all tags + branches
+    vcsRepo -> vcsRepo : throw InvalidRepositoryException
+end
+
+vcsRepo --> arrayRepo : (initialization complete)
+deactivate vcsRepo
+
+arrayRepo --> caller : packages
+deactivate arrayRepo
+
+@enduml

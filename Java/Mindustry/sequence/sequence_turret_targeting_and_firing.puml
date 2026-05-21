@@ -1,0 +1,273 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #E9ECEF
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #6C757D
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #E9ECEF
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Turret Targeting and Firing Sequence
+
+participant "GameLoop" as GL
+participant "TurretBuild" as TB
+participant "Units (static)" as U
+participant "Predict (static)" as PR
+participant "ShootPattern" as SP
+participant "BulletType" as BT
+participant "Bullet" as B
+participant "Healthc / Unit" as HC
+participant "Events (static)" as EV
+participant "Effect / Sound" as FX
+
+== Per-Tick Update ==
+
+GL -> TB : updateTile() [each tick]
+activate TB
+
+TB -> TB : validateTarget()
+note right: Checks Units.invalidateTarget()\nor player/logic control override
+
+alt target invalid
+    TB -> TB : target = null
+end
+
+TB -> TB : shouldConsume()\nnote: isShooting() || reloadCounter < reload
+note right #FFF9C4: Gates power/liquid consumption
+
+== Target Acquisition (timer-gated) ==
+
+TB -> TB : timer(timerTarget, targetInterval)
+
+alt timer fires
+    TB -> TB : findTarget()
+    activate TB
+
+    alt targetAir && targetGround
+        TB -> U : bestTarget(team, x, y, range,\n  unitFilter, buildingFilter, unitSort)
+    else air-only
+        TB -> U : bestEnemy(team, x, y, range, filter, unitSort)
+    else canHeal
+        TB -> U : findAllyTile(team, x, y, range, b->b.damaged())
+    end
+
+    U --> TB : target : Posc (Unit or Building)
+    deactivate TB
+end
+
+== Aiming ==
+
+alt target valid
+    TB -> TB : validateTarget() → true
+
+    alt AI mode (default)
+        TB -> TB : targetPosition(target)
+        activate TB
+
+        alt predictTarget == true
+            TB -> PR : intercept(this, targetPos,\n  offset.x, offset.y, bullet.speed)
+            PR --> TB : predictedPos : Vec2
+        end
+
+        TB -> TB : targetRot = angleTo(targetPos)
+        deactivate TB
+    else player-controlled
+        TB -> TB : targetPos from unit.aimX / unit.aimY
+    else logic-controlled
+        TB -> TB : targetPos from LAccess.shoot\n(logicShooting flag)
+    end
+
+    TB -> TB : turnToTarget(targetRot)\nnote: rotation += rotateSpeed (clamped)
+end
+
+== Shooting Gate ==
+
+alt angleDist(rotation, targetRot) < shootCone\n&& canShoot && hasAmmo() && canConsume()
+
+    TB -> TB : updateShooting()
+    activate TB
+
+    note right: Guard: reloadCounter >= reload\n&& !charging() && shootWarmup >= minWarmup
+
+    TB -> TB : peekAmmo() → BulletType
+    TB -> TB : shoot(BulletType type)
+    activate TB
+
+    opt firstShotDelay > 0 (charging)
+        TB -> FX : chargeEffect.at(bulletX, bulletY, rotation)
+    end
+
+    TB -> SP : shoot(barrelCounter, callback, incrementBarrel)
+    activate SP
+
+    loop for each bullet in pattern
+        SP -> TB : callback(xOffset, yOffset, angle, delay, mover)
+        activate TB
+
+        alt delay > 0
+            TB -> TB : Time.run(delay, () -> bullet(type, ...))
+        else delay == 0
+            TB -> TB : bullet(type, xOffset, yOffset, angleOffset, mover)
+            activate TB
+
+            TB -> BT : create(owner=this, team, bulletX, bulletY,\n  shootAngle, velocityScl, lifeScl,\n  mover, targetPos.x, targetPos.y)
+            activate BT
+
+            BT -> B : Bullet.create() [from pool]
+            activate B
+            BT -> B : set(type, owner, team, vel,\n  lifetime, damage, hitSize, ...)
+            BT -> B : bullet.add() [register with entity system]
+            BT -> BT : init(bullet)\nnote: killShooter, instantDisappear, spawnBullets
+            BT --> TB : bullet : Bullet
+            deactivate B
+            deactivate BT
+
+            TB -> TB : handleBullet(bullet, xOffset, yOffset, angleOffset)
+            TB -> FX : shootEffect.at(bulletX, bulletY, rotation, hitColor)
+            TB -> FX : smokeEffect.at(bulletX, bulletY, rotation, hitColor)
+            TB -> FX : shootSound.at(bulletX, bulletY, pitch, volume)
+            TB -> FX : ammoUseEffect.at(ejectX, ejectY, rotation)
+            TB -> TB : curRecoil=1f, heat=1f, totalShots++
+            deactivate TB
+        end
+
+        deactivate TB
+    end
+
+    deactivate SP
+
+    opt consumeAmmoOnce == true
+        TB -> TB : useAmmo()\nnote: ammo.peek().amount -= ammoPerShot\n(pop entry if depleted)
+    end
+
+    TB -> TB : reloadCounter %= reload
+    deactivate TB
+    deactivate TB
+
+end
+
+deactivate TB
+
+== Bullet Travel (per-tick) ==
+
+GL -> B : update() [each tick]
+activate B
+B -> BT : update(bullet)\nnote: trail, homing, weaving,\ninterval sub-bullets
+deactivate B
+
+== Collision: Entity ==
+
+B -> BT : hitEntity(bullet, entity, entityHealth)
+activate BT
+
+alt standard damage
+    BT -> HC : h.damage(damage)
+else piercing
+    BT -> HC : h.damagePierce(damage)
+else armor-scaled
+    BT -> HC : h.damageArmorMult(damage, armorMultiplier)
+end
+
+BT -> HC : unit.impulse(knockbackVec)
+BT -> HC : unit.apply(status, statusDuration)
+BT -> EV : fire(UnitDamageEvent(unit, bullet))
+
+opt unit dies
+    BT -> EV : fire(UnitBulletDestroyEvent(unit, bullet))
+end
+
+BT -> BT : handlePierce(bullet, health, x, y)\nnote: may remove bullet if not piercing
+
+opt not piercing past
+    BT -> BT : hit(bullet, x, y, createFrags=true)
+end
+
+deactivate BT
+
+== Collision: Tile / Building ==
+
+B -> BT : hitTile(bullet, building, x, y, initialHealth, direct)
+activate BT
+
+alt heal scenario
+    BT -> HC : build.heal(healPercent/100 * maxHealth + healAmount)
+else enemy + direct hit
+    BT -> BT : hit(bullet)
+end
+
+BT -> BT : handlePierce(bullet, initialHealth, x, y)
+deactivate BT
+
+== Hit() Cascade ==
+
+BT -> FX : hitEffect.at(x, y, rotation, hitColor)
+BT -> FX : hitSound.at(x, y, pitch, volume)
+
+opt fragBullets > 0
+    BT -> BT : createFrags(bullet, x, y)\nnote: fragBullet.create(...) × fragBullets
+end
+
+opt splashDamage > 0
+    BT -> BT : createSplashDamage(bullet, x, y)\nnote: Damage.damage(team, x, y, radius, splashDmg)
+end
+
+opt incendAmount > 0
+    BT -> BT : createIncend(bullet, x, y)\nnote: Damage.createIncend(x, y, spread, amount)
+end
+
+opt lightning > 0
+    BT -> FX : Lightning.create(bullet, color,\n  damage, x, y, angle, length)
+end
+
+== Bullet Despawn ==
+
+GL -> B : update() → time >= lifetime → remove()
+activate B
+B -> BT : despawned(bullet)
+activate BT
+
+opt despawnHit == true
+    BT -> BT : hit(bullet, x, y, createFrags=false)
+end
+
+BT -> FX : despawnEffect.at(x, y, rotation)
+BT -> FX : despawnSound.at(x, y, pitch, volume)
+deactivate BT
+
+B -> BT : removed(bullet)
+activate BT
+
+opt fragOnDespawn == true
+    BT -> BT : createFrags(bullet, x, y)
+end
+
+deactivate BT
+deactivate B
+
+@enduml

@@ -1,0 +1,178 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam actor {
+    BackgroundColor #D0E8FF
+    BorderColor #2C6FAC
+    FontColor #1A1A2E
+    FontSize 12
+}
+skinparam usecase {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+    FontSize 11
+}
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #F0C040
+    FontColor #333333
+    FontSize 10
+}
+
+title Error Handling and Recovery\n<size:11>//Run errors are caught, classified, and delegated to registered error handlers//</size>
+
+left to right direction
+
+' ─────────────────────────────────────────
+'  Primary Actor
+' ─────────────────────────────────────────
+actor "Developer\n(SDK User)" as Developer
+
+' ─────────────────────────────────────────
+'  System Boundary
+' ─────────────────────────────────────────
+rectangle "Agents SDK — Error Handling and Recovery" {
+
+    ' ── Max Turns Recovery ──
+    package "Max Turns Recovery" {
+        usecase "Register max_turns\nError Handler" as UC1
+        usecase "Detect Max Turns\nExceeded" as UC2
+        usecase "Dispatch Custom\nmax_turns Handler" as UC3
+        usecase "Normalize Handler\nReturn Value" as UC4
+        usecase "Return Fallback\nFinal Output" as UC5
+        usecase "Propagate\nMaxTurnsExceeded\n(no handler)" as UC6
+    }
+
+    ' ── Guardrail Exceptions ──
+    package "Guardrail Exceptions (Always Propagate)" {
+        usecase "Raise InputGuardrail\nTripwireTriggered" as UC7
+        usecase "Raise OutputGuardrail\nTripwireTriggered" as UC8
+        usecase "Raise ToolInputGuardrail\nTripwireTriggered" as UC9
+    }
+
+    ' ── Other SDK Exceptions ──
+    package "Other SDK Exceptions (Always Propagate)" {
+        usecase "Raise\nModelBehaviorError" as UC10
+        usecase "Raise\nToolTimeoutError" as UC11
+    }
+
+    ' ── Post-Exception Inspection ──
+    package "Diagnostics" {
+        usecase "Inspect Run Details\non Exception" as UC12
+    }
+
+}
+
+' ─────────────────────────────────────────
+'  Internal System Actors (right side)
+' ─────────────────────────────────────────
+actor "Runner" as Runner
+actor "RunLoop" as RunLoop
+actor "ErrorHandler\nDispatcher" as Dispatcher
+actor "Guardrail\nEngine" as GuardrailEngine
+actor "Tool\nExecution" as ToolExecution
+
+' ─────────────────────────────────────────
+'  Developer relationships
+' ─────────────────────────────────────────
+Developer --> UC1 : passes error_handlers=\n{"max_turns": fn}\nto Runner.run / run_sync\n/ run_streamed or RunConfig
+Developer --> UC12 : inspects AgentsException\n.run_data (RunErrorDetails)
+Developer <-- UC5 : receives RunResult with\nhandler final_output
+Developer <-- UC6 : MaxTurnsExceeded raised\n(with run_data snapshot)
+Developer <-- UC7 : InputGuardrailTripwireTriggered\nraised (guardrail_result attached)
+Developer <-- UC8 : OutputGuardrailTripwireTriggered\nraised (guardrail_result attached)
+Developer <-- UC9 : ToolInputGuardrailTripwireTriggered\nraised
+Developer <-- UC10 : ModelBehaviorError raised\n(malformed JSON / unknown tool)
+Developer <-- UC11 : ToolTimeoutError raised\n(tool_name, timeout_seconds)
+
+' ─────────────────────────────────────────
+'  Runner relationships
+' ─────────────────────────────────────────
+Runner --> UC1 : stores handler in\nRunErrorHandlers TypedDict
+Runner --> UC5 : formats final_output via\nformat_final_output_text();\ncreates synthetic MessageOutputItem
+
+' ─────────────────────────────────────────
+'  RunLoop relationships
+' ─────────────────────────────────────────
+RunLoop --> UC2 : checks turn counter\n>= max_turns each iteration
+RunLoop --> UC10 : detects malformed LLM JSON\nor call to unknown tool
+
+' ─────────────────────────────────────────
+'  ErrorHandlerDispatcher relationships
+' ─────────────────────────────────────────
+Dispatcher --> UC3 : looks up "max_turns" key;\nbuilds RunErrorHandlerInput;\ncalls handler (sync or async)
+Dispatcher --> UC4 : coerces result to\nRunErrorHandlerResult or None
+
+' ─────────────────────────────────────────
+'  GuardrailEngine relationships
+' ─────────────────────────────────────────
+GuardrailEngine --> UC7 : tripwire=True on input check
+GuardrailEngine --> UC8 : tripwire=True after LLM response
+
+' ─────────────────────────────────────────
+'  ToolExecution relationships
+' ─────────────────────────────────────────
+ToolExecution --> UC9 : tool-level input guardrail trips
+ToolExecution --> UC11 : function tool exceeds timeout\n(timeout_behavior="raise_exception")
+
+' ─────────────────────────────────────────
+'  Include / extend relationships
+' ─────────────────────────────────────────
+UC2 ..> UC3 : <<include>>\n(when handler registered)
+UC2 ..> UC6 : <<extend>>\n(when no handler)
+UC3 ..> UC4 : <<include>>
+UC4 ..> UC5 : <<extend>>\n(result is non-None)
+UC4 ..> UC6 : <<extend>>\n(result is None)
+
+' ─────────────────────────────────────────
+'  Notes
+' ─────────────────────────────────────────
+note bottom of UC1
+  Handler signature:
+  Callable[[RunErrorHandlerInput[TContext]],
+    MaybeAwaitable[RunErrorHandlerResult | dict | Any | None]]
+  Registered under key "max_turns" in RunErrorHandlers TypedDict.
+  Handlers can be sync or async; dispatcher awaits if coroutine.
+end note
+
+note right of UC4
+  Flexible return value coercion:
+  • RunErrorHandlerResult → used as-is
+  • dict {"final_output", "include_in_history"} → coerced
+  • raw value → wrapped as RunErrorHandlerResult
+  • None → re-raise MaxTurnsExceeded
+  Extra dict keys beyond allowed set raise UserError.
+end note
+
+note bottom of UC12
+  All AgentsException subclasses carry:
+  run_data: RunErrorDetails | None
+  (input, new_items, raw_responses, last_agent,
+   context_wrapper, input_guardrail_results,
+   output_guardrail_results)
+  Set by Runner before propagating.
+end note
+
+note top of UC7
+  No custom handler hook.
+  Guardrail tripwire exceptions
+  ALWAYS propagate to Developer.
+end note
+
+@enduml

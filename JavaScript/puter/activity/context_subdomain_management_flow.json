@@ -1,0 +1,94 @@
+{
+  "scope": "subdomain_management_flow",
+  "title": "Subdomain Management Flow",
+  "diagram_type": "activity",
+  "description": "Context provision, predicate creation, upsert, select, and max-subdomains enforcement in SubdomainES",
+  "key_participants": [
+    "SubdomainES",
+    "BaseES (upstream)",
+    "Context",
+    "DatabaseService (DB_READ)",
+    "PermissionService",
+    "APIError"
+  ],
+  "activities": [
+    {
+      "method": "_on_context_provided()",
+      "steps": [
+        "Retrieve 'services' from this.context",
+        "Get 'database' service, open DB_READ handle tagged 'subdomains'",
+        "Store handle as this.db"
+      ]
+    },
+    {
+      "method": "create_predicate(id)",
+      "steps": [
+        "Receive predicate id string",
+        "[Decision] id === 'user-can-edit'?",
+        "  YES → return new Eq({ key: 'owner', value: Context.get('user').id })",
+        "  NO  → return undefined (no predicate)"
+      ]
+    },
+    {
+      "method": "upsert(entity, extra)",
+      "steps": [
+        "[Decision] extra.old_entity exists?",
+        "  NO (new entity) → call _check_max_subdomains()",
+        "    → _check_max_subdomains throws APIError 'subdomain_limit_reached' if limit hit",
+        "  YES (update) → skip check",
+        "Delegate to this.upstream.upsert(entity, extra)",
+        "Return upstream result"
+      ]
+    },
+    {
+      "method": "select(options)",
+      "steps": [
+        "Get actor from Context.get('actor')",
+        "Extract user from actor.type.user",
+        "Get 'permission' service from this.context",
+        "await svc_permission.check(actor, 'read-all-subdomains')",
+        "[Decision] has_permission_to_read_all?",
+        "  NO  → append Eq({ key: 'owner', value: user.id }) to options.predicate via .and()",
+        "  YES → use options.predicate unchanged",
+        "Delegate to this.upstream.select(options)",
+        "Return upstream result"
+      ]
+    },
+    {
+      "method": "_check_max_subdomains()",
+      "steps": [
+        "Get user from Context.get('user')",
+        "Execute SQL: SELECT COUNT(id) AS subdomain_count FROM subdomains WHERE user_id = ?",
+        "Resolve max_subdomains: user.max_subdomains ?? config.max_subdomains_per_user",
+        "[Decision] max_subdomains defined AND cnt >= max_subdomains?",
+        "  YES → throw APIError.create('subdomain_limit_reached', null, { limit: max_subdomains })",
+        "  NO  → return (allow upsert to proceed)"
+      ]
+    }
+  ],
+  "flow_logic": [
+    "upsert → [new entity?] → YES: _check_max_subdomains → [limit reached?] → YES: throw APIError | NO: upstream.upsert",
+    "upsert → [new entity?] → NO (update): upstream.upsert directly",
+    "select → [read-all permission?] → NO: filter by owner → upstream.select | YES: upstream.select unfiltered",
+    "create_predicate → [id=user-can-edit?] → return Eq(owner=currentUser) | else: undefined"
+  ],
+  "key_relationships": [
+    "SubdomainES extends BaseES",
+    "SubdomainES delegates upsert/select to this.upstream (BaseES chain)",
+    "SubdomainES reads DB via DatabaseService (DB_READ mode)",
+    "SubdomainES checks permissions via PermissionService",
+    "SubdomainES uses Context for user/actor resolution",
+    "SubdomainES throws APIError on subdomain limit violation"
+  ],
+  "constants": {
+    "PERM_READ_ALL_SUBDOMAINS": "read-all-subdomains",
+    "max_subdomains_fallback": "config.max_subdomains_per_user",
+    "db_tag": "subdomains",
+    "db_mode": "DB_READ",
+    "error_code": "subdomain_limit_reached"
+  },
+  "important_notes": "Enforcement only applies to INSERT (no old_entity). Updates bypass the limit check. Permission 'read-all-subdomains' grants unrestricted listing; otherwise results are owner-filtered. max_subdomains is user-level override, falling back to global config.",
+  "source_files_analyzed": [
+    "src/backend/src/om/entitystorage/SubdomainES.js"
+  ]
+}

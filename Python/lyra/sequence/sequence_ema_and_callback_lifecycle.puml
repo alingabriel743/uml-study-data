@@ -1,0 +1,243 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequence {
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ArrowColor #495057
+    ActorBackgroundColor #F8F9FA
+    ActorBorderColor #495057
+    LifeLineBorderColor #ADB5BD
+    LifeLineBackgroundColor #DEE2E6
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    GroupBackgroundColor #F1F3F5
+    GroupBorderColor #868E96
+    NoteBackgroundColor #FFF9DB
+    NoteBorderColor #F59F00
+}
+skinparam defaultFontColor #212529
+
+title EMA and Callback Lifecycle
+
+participant "Trainer" as trainer
+participant "CallBackGroup" as cbg
+participant "EMAModelCallback" as ema_cb
+participant "IterationLoggerCallback" as logger_cb
+participant "GradClipCallback" as gc_cb
+participant "FastEmaModelUpdater\n/ EMAModelTracker" as ema_updater
+participant "Model / model_ddp" as model
+participant "GradScaler" as scaler
+participant "Optimizer" as opt
+participant "Scheduler" as sched
+
+== Training Start ==
+
+trainer -> cbg : on_train_start(model, iteration)
+activate cbg
+
+cbg -> ema_cb : on_train_start(model, iteration)
+activate ema_cb
+note right of ema_cb
+  if ema.enabled:
+    cast model.ema → float32
+    assert model.ema exists
+end note
+ema_cb --> cbg
+deactivate ema_cb
+
+cbg -> logger_cb : on_train_start(model, iteration)
+activate logger_cb
+note right of logger_cb
+  @rank0_only
+  record start_iteration_time
+  elapsed_iteration_time = 0
+end note
+logger_cb --> cbg
+deactivate logger_cb
+
+cbg --> trainer
+deactivate cbg
+
+== Per-Iteration Loop ==
+
+loop each training iteration
+
+    trainer -> cbg : on_training_step_start(model, data_batch, iteration)
+    activate cbg
+    cbg -> logger_cb : on_training_step_start(...)
+    activate logger_cb
+    note right of logger_cb
+      @rank0_only
+      start_iteration_time = time.time()
+    end note
+    logger_cb --> cbg
+    deactivate logger_cb
+    cbg --> trainer
+    deactivate cbg
+
+    trainer -> model : training_step(data, iteration)
+    activate model
+    model --> trainer : (output_batch, loss)
+    deactivate model
+
+    trainer -> cbg : on_before_backward(model_ddp, loss, iteration)
+    activate cbg
+    cbg --> trainer
+    deactivate cbg
+
+    trainer -> scaler : scale(loss).backward()
+    activate scaler
+    scaler --> trainer
+    deactivate scaler
+
+    trainer -> cbg : on_after_backward(model_ddp, iteration)
+    activate cbg
+    cbg --> trainer
+    deactivate cbg
+
+    alt every grad_accum_iter steps — Optimizer Step
+
+        trainer -> cbg : on_before_optimizer_step(model_ddp, optimizer, scheduler, grad_scaler, iteration)
+        activate cbg
+
+        cbg -> gc_cb : on_before_optimizer_step(...)
+        activate gc_cb
+        gc_cb -> scaler : unscale_(optimizer)
+        activate scaler
+        scaler --> gc_cb
+        deactivate scaler
+        gc_cb -> model : clip_grad_norm_(module.parameters(), max_norm)
+        activate model
+        model --> gc_cb
+        deactivate model
+        gc_cb --> cbg
+        deactivate gc_cb
+
+        cbg --> trainer
+        deactivate cbg
+
+        trainer -> scaler : step(optimizer)
+        activate scaler
+        scaler -> opt : step()
+        activate opt
+        opt --> scaler
+        deactivate opt
+        scaler --> trainer
+        deactivate scaler
+
+        trainer -> scaler : update()
+        activate scaler
+        scaler --> trainer
+        deactivate scaler
+
+        trainer -> sched : step()
+        activate sched
+        note right of sched : LR schedule advance
+        sched --> trainer
+        deactivate sched
+
+        trainer -> cbg : on_before_zero_grad(model_ddp, optimizer, scheduler, iteration)
+        activate cbg
+        cbg --> trainer
+        deactivate cbg
+
+        trainer -> opt : zero_grad(set_to_none=True)
+        activate opt
+        opt --> trainer
+        deactivate opt
+
+    end
+
+    trainer -> cbg : on_training_step_end(model, data_batch, output_batch, loss, iteration)
+    activate cbg
+
+    cbg -> ema_cb : on_training_step_end(...)
+    activate ema_cb
+    note right of ema_cb : if ema.enabled
+    ema_cb -> ema_updater : update_average(src=model, tgt=model.ema, beta=0.9999)
+    activate ema_updater
+    note right of ema_updater
+      _foreach_mul_(tgt_params, beta)
+      _foreach_add_(tgt_params, src_params,
+                    alpha = 1 - beta)
+    end note
+    ema_updater --> ema_cb
+    deactivate ema_updater
+    ema_cb --> cbg
+    deactivate ema_cb
+
+    cbg -> logger_cb : on_training_step_end(...)
+    activate logger_cb
+    note right of logger_cb
+      @rank0_only
+      accumulate elapsed_iteration_time
+      if iteration % logging_iter == 0:
+        log(iteration, avg_iter_time,
+            total_loss)
+    end note
+    logger_cb --> cbg
+    deactivate logger_cb
+
+    cbg --> trainer
+    deactivate cbg
+
+end
+
+== Periodic Validation (ema_scope) ==
+
+trainer -> ema_updater : cache(model.parameters(), is_cpu)
+activate ema_updater
+note right of ema_updater : clone params; is_cached = True
+ema_updater --> trainer
+deactivate ema_updater
+
+trainer -> ema_updater : copy_to(src=model.ema, tgt=model)
+activate ema_updater
+note right of ema_updater : swap in EMA weights for inference
+ema_updater --> trainer
+deactivate ema_updater
+
+loop validation steps
+    trainer -> cbg : on_validation_step_start(model, data, iteration)
+    activate cbg
+    cbg --> trainer
+    deactivate cbg
+
+    trainer -> model : validation_step(data, iteration)
+    activate model
+    model --> trainer : val_output
+    deactivate model
+
+    trainer -> cbg : on_validation_step_end(model, data, output, iteration)
+    activate cbg
+    cbg --> trainer
+    deactivate cbg
+end
+
+trainer -> ema_updater : restore(model.parameters())
+activate ema_updater
+note right of ema_updater
+  copy collected_params back
+  clear cache; is_cached = False
+end note
+ema_updater --> trainer
+deactivate ema_updater
+
+== Training End ==
+
+trainer -> cbg : on_train_end(model, iteration)
+activate cbg
+cbg --> trainer
+deactivate cbg
+
+trainer -> cbg : on_app_end()
+activate cbg
+cbg --> trainer
+deactivate cbg
+
+@enduml

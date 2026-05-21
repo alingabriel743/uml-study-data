@@ -1,0 +1,124 @@
+{
+  "scope": "world_interpolation_pipeline",
+  "title": "World Interpolation Generation Pipeline",
+  "diagram_type": "activity",
+  "main_class": "DiffusionWorldInterpolatorGenerationPipeline",
+  "inheritance": "DiffusionWorldInterpolatorGenerationPipeline extends DiffusionVideo2WorldGenerationPipeline",
+  "source_files_analyzed": [
+    "Lyra-1/cosmos_predict1/diffusion/inference/world_generation_pipeline.py",
+    "Lyra-1/cosmos_predict1/diffusion/inference/world_interpolator.py"
+  ],
+
+  "init_params": [
+    "inference_type: str",
+    "checkpoint_dir: str",
+    "checkpoint_name: str",
+    "prompt_upsampler_dir: str (default: 'Pixtral-12B')",
+    "enable_prompt_upsampler: bool = True",
+    "offload_network/tokenizer/text_encoder/prompt_upsampler/guardrail: bool flags",
+    "disable_guardrail: bool = False",
+    "guidance: float = -1.0",
+    "num_steps: int = 35",
+    "height/width/fps/num_video_frames: int",
+    "num_input_frames: int = 1",
+    "num_frame_pairs: int = 1",
+    "frame_index_start: int = 0",
+    "frame_stride: int = 1"
+  ],
+
+  "activity_flow": [
+    {
+      "step": "START",
+      "action": "generate(prompt, image_or_video_path, negative_prompt) called"
+    },
+    {
+      "step": "BRANCH: enable_prompt_upsampler?",
+      "if_true": [
+        "_run_prompt_upsampler_on_prompt_with_offload(image_or_video_path)",
+        "  └─ [if offload] _load_prompt_upsampler_model() → create_vlm_prompt_upsampler(checkpoint_dir)",
+        "  └─ _run_prompt_upsampler_on_prompt(image_or_video_path)",
+        "       └─ prepare_dialog(image_or_video_path) → dialog",
+        "       └─ run_chat_completion_vlm(self.prompt_upsampler, dialog) → upsampled_prompt",
+        "  └─ [if offload] offload prompt_upsampler",
+        "  └─ BRANCH: disable_guardrail?",
+        "       if_false: _run_guardrail_on_prompt_with_offload(upsampled_prompt) → is_safe",
+        "       if not safe: RETURN None (blocked)"
+      ],
+      "if_false": [
+        "BRANCH: disable_guardrail?",
+        "  if_false: _run_guardrail_on_prompt_with_offload(prompt) → is_safe",
+        "  if not safe: RETURN None (blocked)"
+      ]
+    },
+    {
+      "step": "TEXT EMBEDDING",
+      "action": "_run_text_embedding_on_prompt_with_offload([prompt, negative_prompt?])",
+      "output": "prompt_embedding, negative_prompt_embedding"
+    },
+    {
+      "step": "GENERATION WITH OFFLOAD",
+      "action": "_run_model_with_offload(prompt_embedding, image_or_video_path, negative_prompt_embedding, frame_index_start, num_frame_pairs)",
+      "sub_steps": [
+        "BRANCH: offload_tokenizer? → _load_tokenizer()",
+        "get_video_batch(model, prompt_embedding, height, width, fps, num_video_frames) → raw_data_batch, state_shape",
+        "Compute H, W from state_shape × spatial_compression_factor",
+        "read_video_or_image_into_frames_BCTHW(image_or_video_path, H, W) → input_frames",
+        "Compute num_frame_pairs from input (default: num_frames // frame_stride)",
+        "LOOP: for frame_index in range(frame_index_start, num_frame_pairs):",
+        "  ├─ _run_tokenizer_encoding(image_or_video_path, frame_index, frame_stride)",
+        "  │    └─ get_condition_latent(model, image_or_video_path, num_input_frames, state_shape, frame_index, frame_stride) → condition_latent",
+        "  ├─ _run_model(condition_latent, negative_prompt_embedding, raw_data_batch, state_shape)",
+        "  │    └─ generate_video_from_batch_with_loop(model, data_batch, condition_latent, num_of_loops, guidance, state_shape, num_steps, seed, ...) → video_np_THWC",
+        "  └─ Accumulate segment: skip first frame if not first iteration (avoid duplication)",
+        "END LOOP",
+        "torch.cat(video_output, dim=1) → video_tensor (C, total_T, H, W)",
+        "Permute + normalize → video_np (T, H, W, C) uint8",
+        "BRANCH: offload_network? → _offload_network()",
+        "BRANCH: offload_tokenizer? → _offload_tokenizer()"
+      ],
+      "output": "video_np: np.ndarray [T, H, W, C]"
+    },
+    {
+      "step": "VIDEO GUARDRAIL",
+      "action": "BRANCH: disable_guardrail?",
+      "if_false": [
+        "_run_guardrail_on_video_with_offload(video)",
+        "if video is None: RETURN None (blocked)"
+      ]
+    },
+    {
+      "step": "END",
+      "action": "RETURN (video, prompt)"
+    }
+  ],
+
+  "key_methods": {
+    "_load_prompt_upsampler_model": "Loads VLM (Pixtral-12B) via create_vlm_prompt_upsampler(); stores as self.prompt_upsampler",
+    "_run_prompt_upsampler_on_prompt(image_or_video_path)": "Uses VLM to generate enhanced prompt from visual input: prepare_dialog() + run_chat_completion_vlm(max_gen_len=400)",
+    "_run_tokenizer_encoding(image_or_video_path, frame_index, frame_stride)": "Calls get_condition_latent() with frame_index and frame_stride for interpolation pair selection",
+    "_run_model(condition_latent, negative_prompt_embedding, raw_data_batch, state_shape)": "Calls generate_video_from_batch_with_loop() for diffusion sampling; returns video_np_THWC",
+    "_run_model_with_offload(prompt_embedding, image_or_video_path, ...)": "Orchestrates per-frame-pair tokenizer encoding + diffusion inference loop; concatenates output segments",
+    "generate(prompt, image_or_video_path, negative_prompt)": "Top-level pipeline: upsampler → guardrail → text embedding → model → guardrail → return"
+  },
+
+  "key_differences_from_parent": [
+    "Prompt upsampler is VLM-based (visual input), not text-only (uses prepare_dialog + run_chat_completion_vlm)",
+    "_run_model_with_offload loops over frame pairs (frame_index_start to num_frame_pairs) for multi-segment interpolation",
+    "_run_tokenizer_encoding accepts frame_index and frame_stride for interpolation pair targeting",
+    "_run_model uses generate_video_from_batch_with_loop instead of generate_world_from_video",
+    "Output concatenation handles overlap: first frame of subsequent segments is skipped",
+    "generate() checks if prompt is None and upsampler disabled → accepts visual-only input"
+  ],
+
+  "external_dependencies": [
+    "get_condition_latent (inference_utils) — tokenizer encoding per frame pair",
+    "get_video_batch (inference_utils) — build model input batch",
+    "read_video_or_image_into_frames_BCTHW (inference_utils) — frame loading",
+    "generate_video_from_batch_with_loop — core diffusion sampling loop",
+    "create_vlm_prompt_upsampler — VLM model loader",
+    "prepare_dialog / run_chat_completion_vlm — VLM prompt upsampling",
+    "DiffusionWorldInterpolatorWModel — model class used in _load_model()"
+  ],
+
+  "important_notes": "Interpolator pipeline processes multiple frame pairs sequentially in a loop. Each pair: encode boundary frames → diffusion sample → append segment. Offloading flags control GPU memory management by loading/unloading components between steps. Guardrail runs twice: once on (upsampled) prompt, once on generated video. VLM upsampler takes visual input (not text), making prompt optional when upsampler is enabled."
+}

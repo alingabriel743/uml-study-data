@@ -1,0 +1,181 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #212529
+    EndColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam arrow {
+    Color #495057
+    FontColor #495057
+    FontSize 11
+}
+skinparam note {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+title Package Installation Flow\n<size:11>(InstallationManager — batch download scheduling, installer dispatch, binary linking, post-install notifications)</size>
+
+|InstallationManager|
+start
+:Receive **execute**(repo, operations[], devMode, runScripts, downloadOnly);
+
+:Register **SignalHandler** for SIGINT / SIGTERM / SIGHUP\n→ triggers runCleanup() on signal;
+
+note right
+  Ensures partial downloads\n  are aborted on interruption
+end note
+
+:Split operations into **download batches**\n(isolate composer-plugin with\nextra[plugin-modifies-downloads]=true\ninto its own batch);
+
+|InstallationManager|
+repeat
+  :Process next **download batch**\n→ **downloadAndExecuteBatch**();
+
+  |DownloadManager|
+  :Iterate batch operations;
+  repeat
+    if (opType is **alias**?) then (yes)
+      :Skip — no download needed;
+    else (no)
+      if (opType is **uninstall**?) then (yes)
+        :Skip download phase;
+      else (no)
+        :Resolve **InstallerInterface**\nvia getInstaller(package.type);
+        :Register **cleanupPromise**[i]\n= installer->cleanup(opType, pkg);
+        :Call **installer->download**(package)\n→ collect PromiseInterface;
+      endif
+    endif
+  repeat while (more operations in batch?) is (yes)
+  -> no;
+
+  :**waitOnPromises**(promises)\n[All downloads run concurrently;\nshow ProgressBar if >1 promise\nand non-CI / non-debug mode];
+
+  |InstallationManager|
+  if (**downloadOnly** == true?) then (yes)
+    :runCleanup(cleanupPromises);
+    :Return early — skip execution;
+    note right: No installation performed;\npackages downloaded to cache only
+  else (no)
+
+    :Re-split batch into **execution sub-batches**\n(isolate composer-plugin / composer-installer\ntypes for correct activation order);
+
+    repeat
+      :Process next **execution sub-batch**\n→ **executeBatch**();
+
+      |InstallerInterface|
+      :Iterate sub-batch operations;
+      repeat
+        if (opType is **alias**?) then (yes)
+          :Call markAliasInstalled()\nor markAliasUninstalled() directly;
+        else (no)
+          :Resolve **InstallerInterface**\nvia getInstaller(package.type);
+
+          |EventDispatcher|
+          if (runScripts &&\neventDispatcher != null?) then (yes)
+            :Dispatch **PRE_PACKAGE_INSTALL**\n/ PRE_PACKAGE_UPDATE\n/ PRE_PACKAGE_UNINSTALL;
+          else (no)
+          endif
+
+          |InstallerInterface|
+          :Build async promise chain:\n**installer->prepare**(opType, pkg);
+          if (opType?) then (install)
+            :installer->**install**(repo, package);
+            :markForNotification(package);
+          elseif (opType?) then (update)
+            if (initialType == targetType?) then (yes)
+              :installer->**update**(repo, initial, target);
+              :markForNotification(package);
+            else (no — type changed)
+              :installer->**uninstall**(repo, initial);
+              :installer->**install**(repo, target);
+              :markForNotification(package);
+            endif
+          else (uninstall)
+            :installer->**uninstall**(repo, package);
+          endif
+          :cleanupPromises[i]();
+          :repo->**write**(devMode, this);
+
+          :Queue **postExecCallback**\n(dispatches POST_* event after batch);
+        endif
+      repeat while (more ops in sub-batch?) is (yes)
+      -> no;
+
+      |InstallerInterface|
+      :**waitOnPromises**(promises)\n[prepare→install→cleanup→write\nchains run concurrently];
+
+      :Platform::**workaroundFilesystemIssues**();
+
+      |EventDispatcher|
+      :Execute queued **postExecCallbacks** sequentially\n→ dispatch POST_PACKAGE_INSTALL\n/ POST_PACKAGE_UPDATE\n/ POST_PACKAGE_UNINSTALL;
+
+    repeat while (more execution sub-batches?) is (yes)
+    -> no;
+
+  endif
+
+|InstallationManager|
+repeat while (more download batches?) is (yes)
+-> no;
+
+:Final **repo->write**(devMode, this)\n[flush repository state];
+
+:Call **notifyInstalls**(io);
+
+|InstallationManager|
+:Group notifiable packages by **repoUrl**;
+repeat
+  if (repoUrl contains '%package%'\n(legacy Packagist API)?) then (yes)
+    :Build per-package HTTP POST URL\n→ collect promise;
+  else (no)
+    :Build batch JSON HTTP POST\n(packages + download metadata)\n→ collect promise;
+  endif
+repeat while (more repo URLs?) is (yes)
+-> no;
+
+:loop->**wait**(promises)\n[fire-and-forget — exceptions swallowed];
+
+:reset() — clear notifiablePackages\n& FileDownloader::$downloadMetadata;
+
+:SignalHandler->**unregister**();
+
+note
+  **Error path (any phase):**
+  catch(Exception) →
+  runCleanup(cleanupPromises) →
+  rethrow exception
+  ----
+  **finally:** signalHandler->unregister()
+end note
+
+stop
+
+@enduml

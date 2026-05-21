@@ -1,0 +1,182 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+title GEP Analysis & Review
+
+package "GEP Analysis & Review (src/gep)" {
+
+  class FailureAnalyzer <<module>> {
+    + analyzeFailures() : FailureAnalysis
+    --
+    ' Reads MEMORY.md, parses failure table rows
+    ' Returns top 3 { summary, detail } failures
+    ' Returns { status:"skipped", reason:"no_memory" } if file missing
+  }
+
+  class LlmReviewer <<module>> {
+    - REVIEW_ENABLED_KEY : string
+    - REVIEW_TIMEOUT_MS : number
+    --
+    + isLlmReviewEnabled() : boolean
+    + buildReviewPrompt(diff, gene, signals, mutation) : string
+    + runLlmReview(diff, gene, signals, mutation) : LlmReviewResult
+    --
+    ' Checks EVOLVER_LLM_REVIEW env var
+    ' Writes prompt to temp file, runs subprocess
+    ' Falls back to auto-approved stub on timeout/error
+  }
+
+  class HubReviewer <<module>> {
+    --
+    + submitForReview(arg1, arg2, arg3) : HubReviewDecision
+    - getHubUrl() : string
+    - postToHub() : Promise
+    - checkHubConfig(key) : boolean
+    - initHubConfig() : object
+    --
+    ' Source is obfuscated (~43K tokens)
+    ' Reads A2A_HUB_URL env; POSTs mutation to hub
+  }
+
+  class HubVerifier <<module>> {
+    --
+    + isSolidifyVerifyEnabled() : boolean
+    + requestSolidifyPermitSync(geneId, signals, mutation) : HubPermit
+    + consumeOfflinePermit() : HubPermit
+    --
+    ' Source is obfuscated (~55K tokens)
+    ' Requires A2A_HUB_URL to be set for verification
+    ' Returns { ok:false, offline:true } when hub unreachable
+  }
+
+  class ReflectionLogger <<module>> {
+    --
+    + appendReflection(entry) : void
+    + getReflectionLogPath() : string
+    - writeReflection(entry) : void
+    --
+    ' Source is obfuscated (~44K tokens)
+    ' Writes JSONL entries per evolution cycle outcome
+    ' Log path: getEvolutionDir()/reflection_log.jsonl
+  }
+
+  class ValidationReportBuilder <<module>> {
+    --
+    + buildValidationReport(geneId, commands, results, envFp, startedAt, finishedAt) : ValidationReport
+    + isValidValidationReport(obj) : boolean
+    --
+    ' Creates machine-readable ValidationReport objects
+    ' Validates: type, id, commands array, overall_ok flag
+  }
+
+}
+
+class Solidify <<orchestrator>> {
+  --
+  + solidify(gene, diff, signals, mutation) : void
+  --
+  ' Calls llmReview → hubVerify → reflection → validationReport
+}
+
+' --- Data / Value Types ---
+
+class ValidationReport <<data>> {
+  + type : string
+  + id : string
+  + schema_version : string
+  + gene_id : string
+  + env_fingerprint : object
+  + env_fingerprint_key : string
+  + commands : CommandResult[]
+  + overall_ok : boolean
+  + duration_ms : number
+  + created_at : string
+  + asset_id : string
+}
+
+class LlmReviewResult <<data>> {
+  + approved : boolean
+  + confidence : number
+  + concerns : string[]
+  + summary : string
+}
+
+class FailureAnalysis <<data>> {
+  + status : string
+  + count : number
+  + failures : Failure[]
+}
+
+class HubPermit <<data>> {
+  + ok : boolean
+  + offline : boolean
+}
+
+' --- External / Shared Dependencies ---
+
+package "Shared Utilities (src/gep)" {
+  class PathsModule <<utility>> {
+    + getRepoRoot() : string
+    + getReflectionLogPath() : string
+    + getEvolutionDir() : string
+  }
+  class ContentHashModule <<utility>> {
+    + SCHEMA_VERSION : string
+    + computeAssetId(report) : string
+  }
+  class EnvFingerprintModule <<utility>> {
+    + captureEnvFingerprint() : object
+    + envFingerprintKey(fp) : string
+  }
+}
+
+package "External Systems" {
+  class A2AHub <<external>> {
+    + POST /mutation-review
+    + POST /solidify-permit
+  }
+  class MemoryMd <<file>> {
+    + failure_table : FailureRow[]
+  }
+  class ReflectionLog <<file>> {
+    + reflection_log.jsonl : ReflectionEntry[]
+  }
+}
+
+' --- Relationships: Orchestrator ---
+Solidify ..> LlmReviewer       : calls runLlmReview()
+Solidify ..> HubVerifier       : calls isSolidifyVerifyEnabled()\nrequestSolidifyPermitSync()
+Solidify ..> ReflectionLogger  : calls appendReflection()
+Solidify ..> ValidationReportBuilder : calls buildValidationReport()
+
+' --- Relationships: Module → Return Types ---
+FailureAnalyzer    ..> FailureAnalysis    : returns
+LlmReviewer        ..> LlmReviewResult    : returns
+HubVerifier        ..> HubPermit          : returns
+ValidationReportBuilder ..> ValidationReport : creates
+
+' --- Relationships: Module → External/Shared ---
+FailureAnalyzer    ..> MemoryMd           : reads via fs
+LlmReviewer        ..> PathsModule        : uses getRepoRoot()
+HubReviewer        ..> A2AHub             : HTTP POST
+HubVerifier        ..> A2AHub             : HTTP sync POST
+ReflectionLogger   ..> PathsModule        : uses getReflectionLogPath()
+ReflectionLogger   ..> ReflectionLog      : writes JSONL
+ValidationReportBuilder ..> ContentHashModule   : uses computeAssetId()
+ValidationReportBuilder ..> EnvFingerprintModule : uses captureEnvFingerprint()
+
+@enduml

@@ -1,0 +1,89 @@
+{
+  "scope": "video_to_world_generation",
+  "title": "Video-to-World Diffusion Generation",
+  "diagram_type": "activity",
+  "key_participants": [
+    "DiffusionVideo2WorldGenerationPipeline",
+    "DiffusionText2WorldGenerationPipeline (parent)",
+    "BaseWorldGenerationPipeline (abstract base)",
+    "VLM PromptUpsampler (Pixtral-12B)",
+    "GuardrailModel",
+    "T5 TextEncoder",
+    "DiffusionV2WModel",
+    "Tokenizer (CV8x8x8)"
+  ],
+  "class_hierarchy": [
+    "BaseWorldGenerationPipeline (ABC) -> DiffusionText2WorldGenerationPipeline -> DiffusionVideo2WorldGenerationPipeline"
+  ],
+  "entry_point": "generate(prompt, image_or_video_path, negative_prompt=None) -> tuple[np.ndarray, str] | None",
+  "activity_flow": [
+    "START: generate() called with (prompt, image_or_video_path, negative_prompt)",
+    "BRANCH: enable_prompt_upsampler?",
+    "  YES -> _run_prompt_upsampler_on_prompt_with_offload(image_or_video_path)",
+    "    BRANCH: offload_prompt_upsampler? -> _load_prompt_upsampler_model() [conditional]",
+    "    ACTION: prepare_dialog(image_or_video_path) -> dialog",
+    "    ACTION: run_chat_completion_vlm(prompt_upsampler, dialog) -> upsampled_prompt",
+    "    BRANCH: offload_prompt_upsampler? -> _offload_prompt_upsampler_model() [conditional]",
+    "  NO  -> use original prompt as-is",
+    "BRANCH: disable_guardrail?",
+    "  NO  -> _run_guardrail_on_prompt_with_offload(prompt)",
+    "    BRANCH: is_safe==False -> return None [GUARDRAIL BLOCKED]",
+    "  YES -> skip guardrail",
+    "ACTION: build prompts list [prompt] or [prompt, negative_prompt]",
+    "ACTION: _run_text_embedding_on_prompt_with_offload(prompts) -> prompt_embeddings",
+    "  BRANCH: offload_text_encoder? -> load/offload T5 encoder [conditional]",
+    "ACTION: extract prompt_embedding[0], negative_prompt_embedding[1 if exists]",
+    "ACTION: _run_model_with_offload(prompt_embedding, image_or_video_path, negative_prompt_embedding)",
+    "  BRANCH: offload_tokenizer? -> _load_tokenizer() [conditional]",
+    "  ACTION: _run_tokenizer_encoding(image_or_video_path) -> condition_latent",
+    "    ACTION: get_condition_latent(model, image_or_video_path, num_input_frames, state_shape) -> condition_latent",
+    "  BRANCH: offload_network? -> _load_network() [conditional]",
+    "  ACTION: _run_model(prompt_embedding, condition_latent, negative_prompt_embedding) -> sample (latent Tensor)",
+    "    ACTION: get_video_batch(model, embedding, height, width, fps, num_video_frames) -> data_batch, state_shape",
+    "    ACTION: generate_world_from_video(model, state_shape, data_batch, guidance, num_steps, seed, condition_latent, num_input_frames) -> video_latent",
+    "  BRANCH: offload_network? -> _offload_network() [conditional]",
+    "  ACTION: _run_tokenizer_decoding(sample) -> np.ndarray (uint8 [T,H,W,C])",
+    "    ACTION: model.decode(sample) -> raw frames, clamp & convert to uint8",
+    "  BRANCH: offload_tokenizer? -> _offload_tokenizer() [conditional]",
+    "BRANCH: disable_guardrail?",
+    "  NO  -> _run_guardrail_on_video_with_offload(video)",
+    "    BRANCH: video is None -> return None [VIDEO GUARDRAIL BLOCKED]",
+    "  YES -> skip video guardrail",
+    "END: return (video_frames_ndarray, final_prompt)"
+  ],
+  "key_methods": {
+    "generate": "Orchestrator; runs prompt upsampler, guardrail checks, text embedding, model inference, video guardrail",
+    "_run_prompt_upsampler_on_prompt": "V2W override: uses VLM (Pixtral-12B) with prepare_dialog(image_path) + run_chat_completion_vlm()",
+    "_run_prompt_upsampler_on_prompt_with_offload": "Wraps _run_prompt_upsampler_on_prompt with optional model load/unload",
+    "_run_tokenizer_encoding": "Calls get_condition_latent(model, path, num_input_frames, state_shape) -> condition_latent Tensor",
+    "_run_model": "V2W override: calls get_video_batch() then generate_world_from_video() with condition_latent and num_input_frames",
+    "_run_model_with_offload": "V2W override: orchestrates tokenizer load -> tokenizer encode -> network load -> diffusion -> network offload -> tokenizer decode -> tokenizer offload",
+    "_run_tokenizer_decoding": "Decodes latent via model.decode(), clamps [0,2]/2, returns uint8 numpy [T,H,W,C]",
+    "_load_model": "V2W override: uses DiffusionV2WModel class with load_model_by_config()",
+    "_load_prompt_upsampler_model": "V2W override: calls create_vlm_prompt_upsampler() (not text-only create_prompt_upsampler)"
+  },
+  "offload_branches": [
+    "offload_prompt_upsampler: load VLM before / del+gc after prompt upsample",
+    "offload_text_encoder_model: load T5 before / offload after text embedding",
+    "offload_tokenizer: load tokenizer before encoding & before decoding / offload after decoding",
+    "offload_network: load DiT network after tokenizer encode / offload after diffusion sampling"
+  ],
+  "guardrail_exit_points": [
+    "After prompt guardrail: return None if prompt is unsafe",
+    "After video guardrail: return None if generated video is unsafe"
+  ],
+  "key_relationships": [
+    "DiffusionVideo2WorldGenerationPipeline extends DiffusionText2WorldGenerationPipeline",
+    "DiffusionText2WorldGenerationPipeline extends BaseWorldGenerationPipeline (ABC)",
+    "Pipeline composes DiffusionV2WModel (loaded via load_model_by_config)",
+    "Pipeline composes VLM prompt upsampler (Pixtral-12B, create_vlm_prompt_upsampler)",
+    "Pipeline composes T5 text encoder (in BaseWorldGenerationPipeline)",
+    "Pipeline composes Guardrail model (in BaseWorldGenerationPipeline)",
+    "Pipeline uses inference_utils: generate_world_from_video, get_condition_latent, get_video_batch"
+  ],
+  "important_notes": "V2W differs from T2W: (1) prompt upsampler is VLM-based (visual), not text-only; (2) _run_tokenizer_encoding is new step unique to V2W; (3) _run_model passes condition_latent + num_input_frames; (4) offload order in _run_model_with_offload is tokenizer-first (encode) → network (diffusion) → network offload → tokenizer (decode) → tokenizer offload. num_input_frames ∈ {1, 9}. Default model: Cosmos-Predict1-7B-Video2World.",
+  "source_files_analyzed": [
+    "Lyra-1/cosmos_predict1/diffusion/inference/world_generation_pipeline.py",
+    "Lyra-1/cosmos_predict1/diffusion/inference/video2world.py"
+  ]
+}

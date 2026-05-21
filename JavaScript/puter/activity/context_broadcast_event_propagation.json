@@ -1,0 +1,173 @@
+{
+  "scope": "broadcast_event_propagation",
+  "title": "Broadcast and Event Propagation",
+  "diagram_type": "activity",
+  "key_participants": [
+    "BroadcastService",
+    "EventService (svc_event)",
+    "Redis (PubSub channel: broadcast.webhook.events)",
+    "WebhookPeers (HTTP endpoints)",
+    "IncomingWebhookRequest (POST /broadcast/webhook)"
+  ],
+  "activities": [
+    {
+      "name": "_init",
+      "steps": [
+        "Load config: peers[], webhook_replay_window_seconds, outbound_flush_ms",
+        "For each peer_config: resolvePeerId → if duplicate warn → store in #peersByKey",
+        "If peer has webhook=true → push to #webhookPeers; else warn (websocket disabled)",
+        "Set #webhookReplayWindowSeconds, #outboundFlushMs (default 5000ms)",
+        "Set #webhookHostHeader = global_config.domain, #webhookProtocol (http|https)",
+        "Set #redisSourceId = server_id + ':' + randomUUID()",
+        "Await #initRedisPubSub()",
+        "Subscribe svc_event.on('outer.*') → outBroadcastEventHandler"
+      ]
+    },
+    {
+      "name": "#initRedisPubSub",
+      "steps": [
+        "Check redisClient.duplicate is available; if not → warn and return",
+        "Create #redisSubscriber = redisClient.duplicate()",
+        "Register 'error' and 'message' listeners on subscriber",
+        "Subscribe to channel 'broadcast.webhook.events'"
+      ]
+    },
+    {
+      "name": "outBroadcastEventHandler (triggered by outer.* event)",
+      "steps": [
+        "[Guard] if meta.from_outside → return (prevent re-broadcast loop)",
+        "Normalize meta → safeMeta via #normalizeMeta",
+        "Build outboundEvent = { key, data, meta: safeMeta }",
+        "Call #publishWebhookEventsToRedis([outboundEvent]) (async, fire-and-forget with warning on error)",
+        "Call #enqueueOutboundEvent(outboundEvent)"
+      ]
+    },
+    {
+      "name": "#enqueueOutboundEvent",
+      "steps": [
+        "Create dedupKey = JSON.stringify(event) OR fallback counter string",
+        "Store in #outboundEventsByDedupKey Map (dedup by key)",
+        "Call #scheduleOutboundFlush()"
+      ]
+    },
+    {
+      "name": "#scheduleOutboundFlush",
+      "steps": [
+        "[Guard] if #outboundFlushTimer already set → return (no double-schedule)",
+        "Set #outboundFlushTimer = setTimeout(#flushOutboundEvents, #outboundFlushMs)"
+      ]
+    },
+    {
+      "name": "#flushOutboundEvents",
+      "steps": [
+        "Clear #outboundFlushTimer = null",
+        "[Guard] if #outboundIsFlushing OR no queued events → return",
+        "Set #outboundIsFlushing = true",
+        "Drain: collect all events from #outboundEventsByDedupKey, clear map",
+        "For each peer in #webhookPeers → await #sendWebhookToPeer(peer, events) [catch per-peer errors]",
+        "Finally: set #outboundIsFlushing = false",
+        "[Condition] if #outboundEventsByDedupKey still has events → re-schedule flush"
+      ]
+    },
+    {
+      "name": "#sendWebhookToPeer",
+      "steps": [
+        "Resolve peerId and webhook_url; if missing → return",
+        "Get mySecretKey from config.webhook.secret; if missing → return",
+        "Increment nonce (per-peer counter in #outgoingNonceByPeer)",
+        "Capture timestamp = floor(Date.now()/1000)",
+        "Build rawBody = JSON.stringify({ events })",
+        "Compute HMAC-SHA256 signature over '{timestamp}.{nonce}.{rawBody}'",
+        "Build headers: Content-Type, Content-Length, X-Broadcast-Peer-Id, X-Broadcast-Timestamp, X-Broadcast-Nonce, X-Broadcast-Signature, [Host]",
+        "POST to normalizedWebhookUrl via axios (timeout 15s)",
+        "[Condition] if response.status not 2xx → throw Error (logged as warning by caller)"
+      ]
+    },
+    {
+      "name": "#publishWebhookEventsToRedis",
+      "steps": [
+        "[Guard] if events empty → return",
+        "Filter events: only outer.pub or outer.pub.* keys",
+        "[Guard] if filtered list empty → return",
+        "Build JSON payload: { sourceId: #redisSourceId, events: filteredEvents }",
+        "Await redisClient.publish('broadcast.webhook.events', payload)"
+      ]
+    },
+    {
+      "name": "#handleRedisPubSubMessage (incoming from Redis)",
+      "steps": [
+        "[Guard] ignore messages not on #redisPubSubChannel",
+        "Parse JSON message; invalid → warn and return",
+        "[Guard] if payload.sourceId === #redisSourceId → return (ignore own messages)",
+        "Normalize incoming payload → #normalizeIncomingPayload",
+        "Filter for outer.pub events",
+        "Call #emitIncomingEventsSequentially(eventsToEmit)"
+      ]
+    },
+    {
+      "name": "#handleWebhookRequest (POST /broadcast/webhook)",
+      "steps": [
+        "[Validate] rawBody present → else 400",
+        "[Validate] body is object → else 400",
+        "[Validate] normalizeIncomingPayload(body) → else 400",
+        "[Validate] X-Broadcast-Peer-Id header present → else 403",
+        "[Guard] if peerId === localPeerId → 200 ignored:self-peer",
+        "[Validate] peer exists in #peersByKey with webhook_secret → else 403",
+        "[Validate] X-Broadcast-Timestamp present and numeric → else 400",
+        "[Validate] timestamp within replay window (now - window to now + 60s) → else 400",
+        "[Validate] X-Broadcast-Nonce present and numeric → else 400",
+        "[Validate] #isNonceReplayForPeer({timestamp, nonce, peerId}) → if replay → 403",
+        "[Validate] X-Broadcast-Signature present → else 403",
+        "Compute expected HMAC-SHA256 over '{timestamp}.{nonce}.{rawBody}'",
+        "timingSafeEqual(incoming, expected) → else 403",
+        "Update #incomingLastNonceByPeer for peerId",
+        "Await #publishWebhookEventsToRedis(incomingEvents)",
+        "Await #emitIncomingEventsSequentially(incomingEvents)",
+        "Return 200 { ok: true }"
+      ]
+    },
+    {
+      "name": "#emitIncomingEventsSequentially",
+      "steps": [
+        "Get svcEvent = services.get('event')",
+        "Get ambient context (allow_fallback=true)",
+        "For each event: [Guard] if event.meta.from_outside → warn + skip",
+        "Build metaOut = { ...event.meta, from_outside: true }",
+        "context.arun(() => svcEvent.emit(event.key, event.data, metaOut))"
+      ]
+    }
+  ],
+  "key_relationships": [
+    "BroadcastService extends BaseService",
+    "BroadcastModule registers BroadcastService as 'broadcast' service",
+    "BroadcastService subscribes to EventService 'outer.*' events",
+    "BroadcastService publishes to Redis PubSub channel (broadcast.webhook.events)",
+    "BroadcastService subscribes to Redis PubSub via duplicate client",
+    "BroadcastService emits back into EventService with from_outside=true flag",
+    "BroadcastService POSTs to configured peer webhook URLs via axios"
+  ],
+  "flow_decision_points": [
+    "meta.from_outside → skip outbound (loop prevention)",
+    "peer.webhook === true → include in webhookPeers, else skip (websocket disabled)",
+    "Redis available → use PubSub; else skip Redis path",
+    "payload.sourceId === #redisSourceId → skip (own message)",
+    "Dedup key collision → overwrite (deduplicate duplicate events)",
+    "#outboundIsFlushing → skip flush (prevent concurrent flushes), re-schedule if needed",
+    "timestamp out of window → reject webhook",
+    "nonce replay detected → reject webhook",
+    "HMAC mismatch → reject webhook",
+    "peerId === localPeerId → ignore self-ping"
+  ],
+  "important_notes": [
+    "Outbound events are batched: deduped by JSON.stringify key, flushed after #outboundFlushMs (default 5s)",
+    "Redis PubSub used for same-cluster instance fan-out (outer.pub events only)",
+    "Webhook transport uses HMAC-SHA256 with per-peer monotonic nonces + timestamp for anti-replay",
+    "from_outside flag on meta prevents re-emission loops across cluster nodes",
+    "Route: POST /broadcast/webhook registered via eggspress on app",
+    "BroadcastModule.install() → services.registerService('broadcast', BroadcastService)"
+  ],
+  "source_files_analyzed": [
+    "src/backend/src/modules/broadcast/BroadcastService.js",
+    "src/backend/src/modules/broadcast/BroadcastModule.js"
+  ]
+}

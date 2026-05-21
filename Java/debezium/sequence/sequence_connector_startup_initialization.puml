@@ -1,0 +1,179 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam sequence {
+    ArrowColor #495057
+    ArrowFontColor #212529
+    ArrowFontSize 11
+    ActorBorderColor #495057
+    ActorBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontSize 12
+    ParticipantFontColor #212529
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    DividerBackgroundColor #DEE2E6
+    GroupBackgroundColor #F1F3F5
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Connector Startup and Initialization Flow
+
+actor "Kafka Connect\nWorker" as KCW
+
+participant "BinlogConnector\n(MySql/MariaDb)" as BC
+participant "BinlogConnector\nConfig" as BCC
+participant "BinlogConnector\nConnection" as BCCON
+participant "BinlogSource\nTask" as BST
+participant "BinlogOffset\nContext.Loader" as BOCL
+participant "BinlogOffset\nContext" as BOC
+participant "BinlogDatabase\nSchema" as BDS
+participant "BinlogTask\nContext" as BTC
+database "Database\n(MySQL/MariaDB)" as DB
+
+== Phase 1: Connector Validation ==
+
+KCW -> BC : start(Map<String,String> props)
+activate BC
+BC -> BC : store @Immutable\nproperties map
+BC --> KCW : connector started
+deactivate BC
+
+KCW -> BC : validate(config)
+activate BC
+BC -> BCC : createConnectorConfig(config)
+activate BCC
+BCC -> BCC : super(config) — resolve maxQueueSize=8192,\nmaxBatchSize=2048, pollInterval,\nheartbeatInterval, snapshotMode, logicalName
+BCC --> BC : connectorConfig
+deactivate BCC
+
+BC -> BCCON : createConnection(config, connectorConfig)
+activate BCCON
+BCCON --> BC : connection
+deactivate BCCON
+
+BC -> BC : validateConnection(configValues, config)
+activate BC
+BCCON -> DB : SHOW VARIABLES
+activate DB
+DB --> BCCON : system variables
+deactivate DB
+BCCON -> DB : SHOW MASTER STATUS
+activate DB
+DB --> BCCON : binlog status
+deactivate DB
+BC --> BC : connection validated
+deactivate BC
+BC --> KCW : validation result
+deactivate BC
+
+== Phase 2: Task Configuration ==
+
+KCW -> BC : taskConfigs(maxTasks)
+activate BC
+BC --> KCW : List<Map<String,String>>\n(one config map per task)
+deactivate BC
+
+== Phase 3: Task Initialization (BinlogSourceTask.start()) ==
+
+KCW -> BST : instantiate + start(props)
+activate BST
+
+BST -> BCC : createConnectorConfig(config)\n— parse hostName, port, snapshotMode,\nconnectionTimeout, GTID settings
+activate BCC
+BCC --> BST : connectorConfig
+deactivate BCC
+
+BST -> BCCON : createConnection(config, connectorConfig)
+activate BCCON
+
+BCCON -> DB : readSystemVariables()\n— SHOW VARIABLES
+activate DB
+DB --> BCCON : system variables
+deactivate DB
+
+BCCON -> DB : readCharsetSystemVariables()
+activate DB
+DB --> BCCON : charset variables
+deactivate DB
+
+BCCON -> DB : isBinlogFormatRow()\n— verify ROW format
+activate DB
+DB --> BCCON : format result
+deactivate DB
+
+BCCON -> DB : isBinlogRowImageFull()\n— verify FULL image
+activate DB
+DB --> BCCON : image result
+deactivate DB
+
+BCCON --> BST : connection ready
+deactivate BCCON
+
+== Phase 4: Offset Loading ==
+
+BST -> BOCL : load(storedOffsets)\n— read from Kafka Connect offset storage
+activate BOCL
+BOCL -> BOC : reconstruct(restartBinlogFilename,\nrestartBinlogPosition, restartGtidSet,\neventsToSkip, rowsToSkip)
+activate BOC
+BOC --> BOCL : offsetContext
+deactivate BOC
+BOCL --> BST : offsetContext
+deactivate BOCL
+
+== Phase 5: Binlog Position Validation ==
+
+BST -> BCCON : validateLogPosition(partition,\noffsetContext, config)
+activate BCCON
+BCCON -> DB : isBinlogPositionAvailable(config,\ngtid, binlogFileName)\n— check offset still valid
+activate DB
+DB --> BCCON : availability result
+deactivate DB
+BCCON --> BST : position valid / invalid
+deactivate BCCON
+
+BST -> BST : validateSnapshotFeasibility\n(snapshotter, offsetContext, connection)
+activate BST
+BST --> BST : feasibility checked
+deactivate BST
+
+BST -> BST : validateBinlogConfiguration\n(snapshotter, connection)
+activate BST
+BST --> BST : binlog config validated
+deactivate BST
+
+== Phase 6: Schema & Context Setup ==
+
+BST -> BDS : initialize schema registry
+activate BDS
+BDS --> BST : schema ready
+deactivate BDS
+
+BST -> BTC : create(connectorConfig, connection,\nschema, metrics)
+activate BTC
+BTC --> BST : taskContext
+deactivate BTC
+
+BST --> KCW : task ready —\nbegins snapshot or streaming
+deactivate BST
+
+@enduml

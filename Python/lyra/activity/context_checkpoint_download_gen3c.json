@@ -1,0 +1,117 @@
+{
+  "scope": "checkpoint_download_gen3c",
+  "title": "Gen3C Checkpoint Download & Conversion",
+  "diagram_type": "activity",
+  "source_files_analyzed": ["Lyra-1/scripts/download_gen3c_checkpoints.py"],
+
+  "entry_point": "__main__ → parse_args() → main(args)",
+
+  "activities": [
+    {
+      "id": "parse_args",
+      "label": "parse_args()",
+      "description": "Parse CLI args: --checkpoint_dir (default='checkpoints'). Returns args namespace."
+    },
+    {
+      "id": "main_init",
+      "label": "main(): Initialize",
+      "description": "Set ORG_NAME='nvidia', extra_models list, create checkpoints_dir (Path), define download_kwargs with allowed file patterns."
+    },
+    {
+      "id": "check_gen3c",
+      "label": "get_md5_checksum(checkpoints_dir, 'Gen3C-Cosmos-7B')",
+      "description": "Verify MD5 for Gen3C-Cosmos-7B/model.pt against lookup table. Returns True if valid, False if missing/mismatch."
+    },
+    {
+      "id": "download_gen3c",
+      "label": "snapshot_download('nvidia/Gen3C-Cosmos-7B', ...)",
+      "description": "Download Gen3C-Cosmos-7B from HuggingFace to local_dir with allowed patterns: README.md, model.pt, mean_std.pt, image_mean_std.pt, config.json, *.jit, guardrail/*."
+    },
+    {
+      "id": "loop_extra_models",
+      "label": "For each model in extra_models",
+      "description": "Iterate over ['Cosmos-Tokenize1-CV8x8x8-720p', 'google-t5/t5-11b']."
+    },
+    {
+      "id": "check_extra",
+      "label": "get_md5_checksum(checkpoints_dir, model_name)",
+      "description": "Verify MD5 for extra model files. google-t5/t5-11b checks pytorch_model.bin and tf_model.h5."
+    },
+    {
+      "id": "download_extra",
+      "label": "snapshot_download(repo_id, local_dir, ...)",
+      "description": "Download all files for the extra model (no allow_patterns filter — full repo download)."
+    }
+  ],
+
+  "convert_pixtral_checkpoint_flow": [
+    "Check if save_path (checkpoint_dir/checkpoint_name/model.pt) already exists and non-empty → if so, return early",
+    "Create pixtral_ckpt_dir = checkpoint_dir/Pixtral-12B-2409",
+    "snapshot_download('mistralai/Pixtral-12B-2409', allow_patterns=['params.json','consolidated.safetensors'])",
+    "Set torch dtype to bfloat16",
+    "load_file(*.safetensors) → ckpt (assert exactly 1 file)",
+    "Split ckpt keys into: vit_ckpt (prefix 'vision_encoder.'), projector_ckpt (prefix 'vision_language_adapter.'), llm_ckpt (remainder)",
+    "Remap projector keys: w_in. → projector.0., w_out. → projector.2.",
+    "Assemble vlm_ckpt: model.* (llm), mm_projector.* (projector), vision_encoder.* (vit)",
+    "Load params.json, extract vision_encoder_config dict (dim, num_channels, image_size, patch_size, etc.)",
+    "Assert vision_encoder_config matches expected 400M ViT config (dim=1024, patch_size=16, n_layers=24, n_heads=16, etc.)",
+    "Build llm_config from pixtral_config keys; map hidden_dim → ffn_hidden_size; embed vision_encoder type string",
+    "torch.save({'model': vlm_ckpt, 'mm_projector': projector_ckpt, 'vision_encoder': vit_ckpt}, save_path)",
+    "json.dump(llm_config) → config.json",
+    "Reset torch default dtype",
+    "shutil.rmtree(pixtral_ckpt_dir) — remove original Pixtral download"
+  ],
+
+  "get_md5_checksum_flow": [
+    "Filter MD5_CHECKSUM_LOOKUP keys by prefix model_name + '/'",
+    "If no expected files: check if model_dir exists and is non-empty → return True/False",
+    "For each matching key: verify file exists on disk; compute hashlib.md5; compare to lookup value",
+    "Return False on first mismatch or missing file; return True if all pass"
+  ],
+
+  "decision_points": [
+    {
+      "condition": "save_path exists and size > 0",
+      "true_branch": "Return early from convert_pixtral_checkpoint (skip re-conversion)",
+      "false_branch": "Proceed with download and conversion"
+    },
+    {
+      "condition": "get_md5_checksum returns True for Gen3C-Cosmos-7B",
+      "true_branch": "Skip download of Gen3C-Cosmos-7B",
+      "false_branch": "mkdir + snapshot_download Gen3C-Cosmos-7B"
+    },
+    {
+      "condition": "get_md5_checksum returns True for extra model",
+      "true_branch": "Skip download of extra model",
+      "false_branch": "mkdir + snapshot_download extra model"
+    },
+    {
+      "condition": "model_name == 'google-t5/t5-11b'",
+      "true_branch": "repo_id = model_name (no org prefix)",
+      "false_branch": "repo_id = 'nvidia/' + model_name"
+    },
+    {
+      "condition": "No expected files in MD5_CHECKSUM_LOOKUP for model",
+      "true_branch": "Check directory exists and non-empty",
+      "false_branch": "Iterate and verify MD5 for each expected file"
+    }
+  ],
+
+  "key_data": {
+    "models_downloaded": ["Gen3C-Cosmos-7B", "Cosmos-Tokenize1-CV8x8x8-720p", "google-t5/t5-11b"],
+    "pixtral_repo": "mistralai/Pixtral-12B-2409",
+    "md5_lookup_models": ["Cosmos-Predict1-14B-Text2World", "Cosmos-Predict1-14B-Video2World", "Cosmos-Predict1-7B-WorldInterpolator", "Cosmos-Predict1-7B-Text2World", "Cosmos-Predict1-7B-Video2World", "Cosmos-Tokenize1-CV8x8x8-720p", "Cosmos-UpsamplePrompt1-12B-Text2World", "Gen3C-Cosmos-7B", "google-t5/t5-11b"],
+    "checkpoint_format": "torch .pt with keys: model, mm_projector, vision_encoder",
+    "pixtral_ckpt_cleaned_after_conversion": true
+  },
+
+  "external_dependencies": [
+    "huggingface_hub.snapshot_download — download model repos from HF Hub",
+    "safetensors.torch.load_file — load .safetensors weight files",
+    "torch.save / torch.set_default_dtype — save converted checkpoint, manage dtype",
+    "hashlib.md5 — compute file checksums",
+    "scripts.download_guardrail_checkpoints.download_guardrail_checkpoints — imported but NOT called in main()"
+  ],
+
+  "important_notes": "convert_pixtral_checkpoint() is defined but never called inside main() — it is a standalone utility. The main() workflow only downloads Gen3C-Cosmos-7B + 2 extra models with MD5 gating. download_guardrail_checkpoints is imported but unused in this script."
+}

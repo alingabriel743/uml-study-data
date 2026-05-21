@@ -1,0 +1,267 @@
+@startuml class_models_interface_and_providers
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam enum {
+    BackgroundColor #FFF3CD
+    BorderColor #856404
+}
+skinparam note {
+    BackgroundColor #D1ECF1
+    BorderColor #0C5460
+}
+
+title Models – Interface & Providers
+
+' ─────────────────────────────────────────────
+' Package: agents.models.interface
+' ─────────────────────────────────────────────
+package "agents.models.interface" {
+
+    abstract class Model {
+        {abstract} +get_response(system_instructions, input,\n  model_settings: ModelSettings, tools,\n  output_schema, handoffs,\n  tracing: ModelTracing, *,\n  previous_response_id, conversation_id,\n  prompt) : ModelResponse <<async>>
+        {abstract} +stream_response(system_instructions, input,\n  model_settings: ModelSettings, tools,\n  output_schema, handoffs,\n  tracing: ModelTracing, *,\n  previous_response_id, conversation_id,\n  prompt) : AsyncIterator[TResponseStreamEvent]
+        +close() : None <<async>>
+        +get_retry_advice(request: ModelRetryAdviceRequest) : ModelRetryAdvice | None
+    }
+
+    abstract class ModelProvider {
+        {abstract} +get_model(model_name: str | None) : Model
+        +aclose() : None <<async>>
+    }
+
+    enum ModelTracing {
+        DISABLED = 0
+        ENABLED = 1
+        ENABLED_WITHOUT_DATA = 2
+        --
+        +is_disabled() : bool
+        +include_data() : bool
+    }
+
+}
+
+' ─────────────────────────────────────────────
+' Package: agents.model_settings
+' ─────────────────────────────────────────────
+package "agents.model_settings" {
+
+    class ModelSettings <<pydantic dataclass>> {
+        +temperature : float | None
+        +top_p : float | None
+        +frequency_penalty : float | None
+        +presence_penalty : float | None
+        +tool_choice : ToolChoice | None
+        +parallel_tool_calls : bool | None
+        +truncation : Literal["auto","disabled"] | None
+        +max_tokens : int | None
+        +reasoning : Reasoning | None
+        +verbosity : Literal["low","medium","high"] | None
+        +metadata : dict[str, str] | None
+        +store : bool | None
+        +prompt_cache_retention : Literal["in_memory","24h"] | None
+        +include_usage : bool | None
+        +response_include : list[ResponseIncludable | str] | None
+        +top_logprobs : int | None
+        +extra_query : Query | None
+        +extra_body : Body | None
+        +extra_headers : Headers | None
+        +extra_args : dict[str, Any] | None
+        +retry : ModelRetrySettings | None
+        --
+        +resolve(override: ModelSettings | None) : ModelSettings
+        +to_json_dict() : dict[str, Any]
+    }
+
+    class MCPToolChoice <<dataclass>> {
+        +server_label : str
+        +name : str
+    }
+
+    note bottom of ModelSettings
+        resolve() merges non-None values from override.
+        extra_args dicts are merged (not replaced).
+        retry settings are deep-merged via
+        _merge_retry_settings().
+    end note
+
+    note right of MCPToolChoice
+        ToolChoice = Literal["auto","required","none"]
+                   | str | MCPToolChoice | None
+    end note
+
+}
+
+' ─────────────────────────────────────────────
+' Package: agents.models.openai_provider
+' ─────────────────────────────────────────────
+package "agents.models.openai_provider" {
+
+    class OpenAIProvider {
+        -_client : AsyncOpenAI | None
+        -_stored_api_key : str | None
+        -_stored_base_url : str | None
+        -_stored_websocket_base_url : str | None
+        -_stored_organization : str | None
+        -_stored_project : str | None
+        -_use_responses : bool
+        -_responses_transport : "http" | "websocket"
+        -_use_responses_websocket : bool
+        -_ws_model_cache_by_loop : WeakKeyDictionary[EventLoop, dict]
+        -_agent_registration : ResolvedOpenAIAgentRegistrationConfig | None
+        --
+        +get_model(model_name: str | None) : Model
+        +aclose() : None <<async>>
+        +agent_registration : ResolvedOpenAIAgentRegistrationConfig | None <<property>>
+        -_get_client() : AsyncOpenAI
+        -_get_running_loop() : AbstractEventLoop | None
+        -_prune_closed_ws_loop_caches() : None
+        -_collect_unique_cached_models(loop_cache, seen) : list[Model]
+        -_close_models(models) : None <<async>>
+        -_close_ws_models_for_loop(loop, models, current_loop) : None <<async>>
+        -_clear_ws_loop_cache_entry(loop, loop_cache) : None
+    }
+
+    note right of OpenAIProvider
+        DEFAULT_MODEL = "gpt-4o" (backward compat)
+        get_model() dispatch:
+          · !use_responses  → OpenAIChatCompletionsModel
+          · websocket transport → OpenAIResponsesWSModel
+          · otherwise        → OpenAIResponsesModel
+        WS models are cached per event loop
+        via WeakKeyDictionary.
+    end note
+
+}
+
+' ─────────────────────────────────────────────
+' Package: agents.models.multi_provider
+' ─────────────────────────────────────────────
+package "agents.models.multi_provider" {
+
+    class MultiProviderMap {
+        -_mapping : dict[str, ModelProvider]
+        --
+        +has_prefix(prefix: str) : bool
+        +get_mapping() : dict[str, ModelProvider]
+        +set_mapping(mapping: dict[str, ModelProvider])
+        +get_provider(prefix: str) : ModelProvider | None
+        +add_provider(prefix: str, provider: ModelProvider)
+        +remove_provider(prefix: str)
+    }
+
+    class MultiProvider {
+        +provider_map : MultiProviderMap | None
+        +openai_provider : OpenAIProvider
+        -_openai_prefix_mode : "alias" | "model_id"
+        -_unknown_prefix_mode : "error" | "model_id"
+        -_fallback_providers : dict[str, ModelProvider]
+        --
+        +get_model(model_name: str | None) : Model
+        +aclose() : None <<async>>
+        -_get_prefix_and_model_name(model_name) : tuple[str|None, str|None]
+        -_resolve_prefixed_model(original, prefix, stripped) : tuple[ModelProvider, str|None]
+        -_get_fallback_provider(prefix) : ModelProvider
+        -_create_fallback_provider(prefix) : ModelProvider
+        -_validate_openai_prefix_mode(mode) : MultiProviderOpenAIPrefixMode <<static>>
+        -_validate_unknown_prefix_mode(mode) : MultiProviderUnknownPrefixMode <<static>>
+    }
+
+    note bottom of MultiProvider
+        Routing rules:
+          · None / no prefix    → openai_provider
+          · "openai/" + alias   → openai_provider (stripped)
+          · "openai/" + model_id → openai_provider (original)
+          · "litellm/"          → LitellmProvider (lazy)
+          · "any-llm/"          → AnyLLMProvider (lazy)
+          · provider_map entry  → mapped provider
+          · unknown + error     → raises UserError
+          · unknown + model_id  → openai_provider (original)
+    end note
+
+}
+
+' ─────────────────────────────────────────────
+' Package: agents.models.default_models
+' ─────────────────────────────────────────────
+package "agents.models.default_models" {
+
+    class DefaultModels <<utility>> {
+        {static} OPENAI_DEFAULT_MODEL_ENV_VARIABLE_NAME : str = "OPENAI_DEFAULT_MODEL"
+        {static} _GPT_5_LOW_DEFAULT_MODEL_SETTINGS : ModelSettings
+        {static} _GPT_5_NONE_DEFAULT_MODEL_SETTINGS : ModelSettings
+        {static} _GPT_5_MEDIUM_DEFAULT_MODEL_SETTINGS : ModelSettings
+        {static} _GPT_5_TEXT_ONLY_DEFAULT_MODEL_SETTINGS : ModelSettings
+        --
+        {static} +get_default_model() : str
+        {static} +get_default_model_settings(model: str | None) : ModelSettings
+        {static} +gpt_5_reasoning_settings_required(model_name: str) : bool
+        {static} +is_gpt_5_default() : bool
+        {static} -_get_default_reasoning_effort(model_name) : GPT5DefaultReasoningEffort | None
+    }
+
+    note right of DefaultModels
+        Default model resolved from env var
+        OPENAI_DEFAULT_MODEL (fallback: "gpt-4.1").
+        GPT-5 variant patterns matched via regex
+        (gpt-5, gpt-5.1–5.4, -pro/-mini/-nano/-codex,
+        dated variants). chat-latest aliases skip
+        reasoning effort injection.
+    end note
+
+}
+
+' ─────────────────────────────────────────────
+' Concrete model implementations (referenced)
+' ─────────────────────────────────────────────
+package "agents.models (concrete)" {
+    class OpenAIChatCompletionsModel
+    class OpenAIResponsesModel
+    class OpenAIResponsesWSModel
+}
+
+' ─────────────────────────────────────────────
+' Inheritance
+' ─────────────────────────────────────────────
+OpenAIProvider    --|>  ModelProvider
+MultiProvider     --|>  ModelProvider
+
+OpenAIChatCompletionsModel  --|>  Model
+OpenAIResponsesModel        --|>  Model
+OpenAIResponsesWSModel      --|>  Model
+
+' ─────────────────────────────────────────────
+' Composition / Aggregation
+' ─────────────────────────────────────────────
+MultiProvider  *--  OpenAIProvider       : owns >
+MultiProvider  o--  MultiProviderMap     : optionally composes >
+
+' ─────────────────────────────────────────────
+' Dependencies / usage
+' ─────────────────────────────────────────────
+Model          ..>  ModelSettings        : uses >
+Model          ..>  ModelTracing         : uses >
+ModelSettings  ..>  MCPToolChoice        : ToolChoice includes >
+
+OpenAIProvider ..>  OpenAIChatCompletionsModel  : creates >
+OpenAIProvider ..>  OpenAIResponsesModel        : creates >
+OpenAIProvider ..>  OpenAIResponsesWSModel      : creates >
+
+MultiProviderMap  o--  ModelProvider  : maps prefix → >
+
+DefaultModels  ..>  ModelSettings  : produces >
+
+@enduml

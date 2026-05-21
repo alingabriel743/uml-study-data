@@ -1,0 +1,130 @@
+{
+  "scope": "scope_and_stack_management",
+  "title": "Scope and Span Stack Management",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Caller",
+    "ScopeManager",
+    "Scope",
+    "Span",
+    "SpanStack (C ext)",
+    "ObjectKVStore",
+    "SpanContext",
+    "C Extension (active_span / root_span / active_stack / create_stack / switch_stack)"
+  ],
+  "two_layer_architecture": "PHP userland (ScopeManager + Scope) wraps C-extension span stack (SpanStack, active_span, root_span, etc.). reconcileInternalAndUserland() is the bridge.",
+
+  "interaction_flow": {
+    "activate_span": [
+      "Caller → ScopeManager.activate(span, finishSpanOnClose=true)",
+      "ScopeManager → new Scope(this, span, finishSpanOnClose)",
+      "ScopeManager → ObjectKVStore.get(span.internalSpan, 'ddtrace_scope_activated') [check if already marked]",
+      "ScopeManager → ObjectKVStore.put(span.internalSpan, 'ddtrace_scope_activated', true) [if applicable]",
+      "ScopeManager: scopes[count] = scope  [push onto scopes array]",
+      "ScopeManager → span.getContext().isHostRoot() [check distributed tracing root]",
+      "if isHostRoot → ScopeManager: hostRootScopes[] = scope",
+      "ScopeManager → Caller: return Scope"
+    ],
+    "get_active_scope": [
+      "Caller → ScopeManager.getActive()",
+      "ScopeManager → reconcileInternalAndUserland()  [sync C spans with PHP userland]",
+      "  reconcile: iterate scopes from end, unset finished spans",
+      "  reconcile: if scopes empty → call C root_span() → wrap in Span+SpanContext → create Scope → scopes[0] = scope",
+      "  reconcile: call C active_span() → walk span.parent chain until currentSpanId found",
+      "  reconcile: for each untracked C span → new Scope(this, new Span(cSpan, SpanContext)) → push to newScopes[]",
+      "  reconcile: link parentContext chain for new scopes → push all to scopes[]",
+      "  reconcile: return top new scope or existing topScope",
+      "ScopeManager: iterate scopes[] from end",
+      "  for each scope: ObjectKVStore.get(span.internalSpan, 'ddtrace_scope_activated', default=true)",
+      "  return first scope where flag is truthy (not explicitly deactivated)",
+      "ScopeManager → Caller: return Scope|null"
+    ],
+    "close_scope": [
+      "Caller → Scope.close()",
+      "Scope: if finishSpanOnClose → span.finish()",
+      "Scope → ScopeManager.deactivate(this)",
+      "ScopeManager: array_search(scope, scopes) → get index i",
+      "ScopeManager: array_splice(scopes, i, 1)  [remove from stack]",
+      "ScopeManager → ObjectKVStore.get(span.internalSpan, 'ddtrace_scope_activated') [check if tracked]",
+      "ScopeManager → ObjectKVStore.put(span.internalSpan, 'ddtrace_scope_activated', false) [mark deactivated]",
+      "ScopeManager → span.getContext().isHostRoot() [check]",
+      "if isHostRoot → ScopeManager.deactivateHostRoot(scope) → array_splice(hostRootScopes, i, 1)"
+    ],
+    "get_primary_root": [
+      "Caller → ScopeManager.getPrimaryRoot()",
+      "ScopeManager → reconcileInternalAndUserland()",
+      "ScopeManager: reset(scopes) → return first scope (root) or null"
+    ],
+    "close_all_host_roots": [
+      "Caller → ScopeManager.close()",
+      "ScopeManager: foreach hostRootScopes as scope → scope.close()  [triggers deactivate chain per scope]"
+    ],
+    "stack_management_c_extension": [
+      "Caller → active_stack(): SpanStack|null  [returns copy of current active SpanStack]",
+      "Caller → create_stack(): SpanStack  [creates new SpanStack; parent = currently active stack; inherits spanCreationObservers by ref]",
+      "Caller → switch_stack(SpanData|SpanStack|null): SpanStack|null|false  [switches active context to given stack/span, or to parent stack if null]",
+      "Caller → active_span(): SpanData|null  [returns SpanStack.active of current stack]",
+      "Caller → root_span(): RootSpanData|null  [returns root span of the active stack]"
+    ]
+  },
+
+  "key_relationships": [
+    "ScopeManager composes Scope[] (scopes array, ordered stack)",
+    "ScopeManager composes hostRootScopes[] (subset tracking distributed-tracing root spans)",
+    "ScopeManager owns rootContext: SpanContext (injected on construct for distributed tracing)",
+    "Scope holds ref to ScopeManager (calls deactivate on close)",
+    "Scope holds ref to Span (finishes on close if finishSpanOnClose=true)",
+    "Span wraps internalSpan (C-level SpanData); tracked via ObjectKVStore flags",
+    "SpanContext.isHostRoot() = parentContext is null OR parentContext.isDistributedTracingActivationContext()",
+    "SpanStack.parent links stacks hierarchically (created via create_stack)",
+    "SpanStack.active = current active SpanData on that stack",
+    "reconcileInternalAndUserland bridges C-extension SpanStack with PHP ScopeManager.scopes[]"
+  ],
+
+  "class_summaries": {
+    "Scope": {
+      "namespace": "DDTrace",
+      "implements": "Contracts\\Scope",
+      "final": true,
+      "properties": ["$span: SpanInterface", "$scopeManager: ScopeManager", "$finishSpanOnClose: bool"],
+      "methods": ["__construct(ScopeManager, SpanInterface, bool)", "close(): void", "getSpan(): SpanInterface"]
+    },
+    "ScopeManager": {
+      "namespace": "DDTrace",
+      "implements": "Contracts\\ScopeManager",
+      "final": true,
+      "properties": ["$scopes: ScopeInterface[]", "$hostRootScopes: ScopeInterface[]", "$rootContext: SpanContext|null"],
+      "methods": [
+        "activate(SpanInterface, bool): Scope",
+        "getActive(): Scope|null",
+        "deactivate(Scope): void",
+        "deactivateHostRoot(Scope): void  [private]",
+        "getPrimaryRoot(): Scope|null",
+        "getTopScope(): Scope|null",
+        "reconcileInternalAndUserland(): Scope|null  [private]",
+        "close(): void"
+      ]
+    },
+    "SpanStack": {
+      "namespace": "DDTrace (C extension)",
+      "properties": ["$parent: SpanStack|null (readonly)", "$active: SpanData|null", "$spanCreationObservers: Closure[]"],
+      "note": "Internal C class, not instantiated in PHP userland directly"
+    }
+  },
+
+  "important_notes": [
+    "scopes[] is a flat ordered array acting as a stack; getActive() iterates from end (LIFO)",
+    "reconcileInternalAndUserland() auto-wraps C-level spans (e.g., created by DDTrace hooks) into PHP Scope objects so OpenTracing API stays consistent",
+    "ObjectKVStore flag 'ddtrace_scope_activated': null=not tracked, true=active, false=deactivated — used to skip non-activated spans in getActive()",
+    "finishSpanOnClose=false is used for root spans when DD_TRACE_GENERATE_ROOT_SPAN is set (Tracer.php:239-241)",
+    "hostRootScopes tracks request-level root spans; in distributed tracing these represent the entry point of the service",
+    "create_stack() inherits spanCreationObservers by reference so observer removal propagates to parent stacks",
+    "switch_stack(null) switches to parent of active stack; switch_stack(SpanData) switches to that span's stack"
+  ],
+
+  "source_files_analyzed": [
+    "src/DDTrace/Scope.php",
+    "src/DDTrace/ScopeManager.php",
+    "ext/ddtrace.stub.php (SpanStack class + active_span/root_span/active_stack/create_stack/switch_stack functions)"
+  ]
+}

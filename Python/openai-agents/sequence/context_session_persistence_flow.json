@@ -1,0 +1,114 @@
+{
+  "scope": "session_persistence_flow",
+  "title": "Session Persistence Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "AgentRunner",
+    "agent_runner_helpers",
+    "session_persistence",
+    "Session",
+    "RunState",
+    "SingleStepResult"
+  ],
+  "interaction_flow": [
+    "=== INITIAL TURN SETUP ===",
+    "AgentRunner → agent_runner_helpers: validate_session_conversation_settings(session, conversation_id, previous_response_id, auto_previous_response_id)",
+    "  [guard] raises UserError if session combined with conversation_id / previous_response_id / auto_previous_response_id",
+    "AgentRunner → session_persistence: prepare_input_with_session(raw_input, session, session_input_callback, session_settings)",
+    "  session_persistence → Session: get_items(limit?) → history: list[TResponseInputItem]",
+    "  session_persistence: normalize + deduplicate history + new_input → (prepared_input, items_to_persist)",
+    "  [if session_input_callback] session_persistence → session_input_callback(history_copy, new_items_copy) → combined",
+    "  session_persistence: classify combined items into appended (new) vs history sets",
+    "  returns (prepared_input: str|list, session_input_items_for_persistence: list[TResponseInputItem])",
+    "AgentRunner → session_persistence: save_result_to_session(session, session_input_items_for_persistence, [], run_state)",
+    "  [persist user input items for this turn before model call]",
+
+    "=== PER-TURN EXECUTION ===",
+    "AgentRunner: execute_turn → turn_result: SingleStepResult",
+
+    "=== PATH A: NextStepRunAgain (tool calls, more turns needed) ===",
+    "AgentRunner → agent_runner_helpers: save_turn_items_if_needed(session, run_state, session_persistence_enabled, input_guardrail_results, items, response_id)",
+    "  [skip if not session_persistence_enabled]",
+    "  [skip if input_guardrails_triggered(input_guardrail_results)]",
+    "  [skip if run_state._current_turn_persisted_item_count > 0]",
+    "  agent_runner_helpers → session_persistence: save_result_to_session(session, [], items, run_state, response_id)",
+
+    "=== PATH B: NextStepFinalOutput ===",
+    "AgentRunner → agent_runner_helpers: save_turn_items_if_needed(session, run_state, session_persistence_enabled, input_guardrail_results, items, response_id)",
+    "  [same guards as PATH A]",
+    "  agent_runner_helpers → session_persistence: save_result_to_session(session, [], items, run_state, response_id)",
+
+    "=== PATH C: NextStepInterruption (human-in-the-loop) ===",
+    "AgentRunner → session_persistence: save_result_to_session(session, input_items_for_save, session_items_for_turn(turn_result), run_state)",
+    "AgentRunner → agent_runner_helpers: update_run_state_for_interruption(run_state, model_responses, processed_response, generated_items, session_items, current_turn, next_step)",
+
+    "=== SAVE_RESULT_TO_SESSION INTERNALS ===",
+    "session_persistence.save_result_to_session: compute already_persisted = run_state._current_turn_persisted_item_count",
+    "session_persistence: slice new_run_items = new_items[already_persisted:] (dedup retry protection)",
+    "session_persistence: convert RunItems → TResponseInputItem via run_item_to_input_item()",
+    "session_persistence: deduplicate_input_items_preferring_latest(input_list + new_items_as_input)",
+    "session_persistence → Session: add_items(items_to_save)",
+    "session_persistence: update run_state._current_turn_persisted_item_count",
+    "[if response_id + compaction_aware_session]",
+    "  [if local tool outputs] → session._defer_compaction(response_id) [skip compaction]",
+    "  [else] session_persistence → Session: run_compaction({response_id, force?, store?})",
+
+    "=== RESUME PATH (multi-turn continuation) ===",
+    "AgentRunner: is_resumed_state=True, turn_result received",
+    "AgentRunner → session_persistence: resumed_turn_items(turn_result)",
+    "  returns (generated_items = pre_step_items + new_step_items, turn_session_items = session_items_for_turn(turn_result))",
+    "AgentRunner: session_items.extend(turn_session_items)",
+    "AgentRunner → agent_runner_helpers: update_run_state_after_resume(run_state, turn_result, generated_items, session_items)",
+    "  run_state._original_input = copy_input_items(turn_result.original_input)",
+    "  run_state._generated_items = generated_items",
+    "  run_state._session_items = session_items",
+    "  run_state._current_step = turn_result.next_step",
+    "AgentRunner → session_persistence: save_resumed_turn_items(session, turn_session_items, persisted_count, response_id, reasoning_item_id_policy)",
+    "  session_persistence → session_persistence: save_result_to_session(session, [], items, None, response_id)",
+    "  returns updated persisted_count",
+
+    "=== STREAMED RESUME PATH ===",
+    "run_loop → session_persistence: save_resumed_turn_items(session, items, persisted_count, response_id)",
+    "run_loop → agent_runner_helpers: update_run_state_after_resume(run_state, turn_result, generated_items, streamed_result.new_items)",
+
+    "=== GUARDRAIL TRIP PATH ===",
+    "AgentRunner → session_persistence: persist_session_items_for_guardrail_trip(session, server_conversation_tracker, session_input_items_for_persistence, original_user_input, run_state)",
+    "  [skip if server_conversation_tracker is set]",
+    "  session_persistence → session_persistence: save_result_to_session(session, input_items, [], run_state)"
+  ],
+  "key_relationships": [
+    "AgentRunner orchestrates all session persistence calls",
+    "agent_runner_helpers.save_turn_items_if_needed delegates to session_persistence.save_result_to_session",
+    "session_persistence.save_resumed_turn_items wraps save_result_to_session with persisted_count tracking",
+    "session_persistence.resumed_turn_items reads from SingleStepResult (pre_step_items, new_step_items, session_step_items)",
+    "session_persistence.save_result_to_session reads/writes Session and updates RunState._current_turn_persisted_item_count",
+    "Session interface: get_items(limit?) → list, add_items(items), run_compaction(args), pop_item() [optional]",
+    "OpenAIConversationsSession: special handling — strips id/provider_data fields, ignores ids for fingerprinting",
+    "OpenAIResponsesCompactionAwareSession: triggers run_compaction or _defer_compaction after add_items"
+  ],
+  "key_data_types": {
+    "TResponseInputItem": "dict-like input item for model API",
+    "RunItem": "SDK wrapper for model output (tool_call_output_item, HandoffOutputItem, etc.)",
+    "SingleStepResult": "fields: pre_step_items, new_step_items, session_step_items, original_input, next_step",
+    "RunState": "fields: _current_turn_persisted_item_count, _session_items, _generated_items, _original_input, _current_step",
+    "Session": "abstract: get_items, add_items, run_compaction, pop_item (optional)",
+    "SessionSettings": "fields: limit (optional item count cap)",
+    "ReasoningItemIdPolicy": "controls ID handling for reasoning items during serialization"
+  },
+  "business_rules": [
+    "Session cannot be combined with conversation_id, previous_response_id, or auto_previous_response_id — mutual exclusion enforced at run start",
+    "Already-persisted items are tracked via run_state._current_turn_persisted_item_count to prevent duplicates on streaming retries",
+    "Input items (user turn) are persisted BEFORE model call; output items AFTER turn completes",
+    "session_input_callback allows custom history merging; output is classified as new vs history to avoid re-persisting old history",
+    "Compaction is deferred when local tool outputs are present (to avoid losing tool context); forced once tool outputs are resolved",
+    "rewind_session_items provides best-effort rollback via pop_item() on conversation lock retry errors",
+    "session_items_for_turn prefers session_step_items over new_step_items when set (allows override of what gets persisted)"
+  ],
+  "important_notes": "Two session modes: (1) local Session store — full persistence logic in session_persistence.py; (2) server-managed conversation (OpenAI Responses API) — prepare_input_with_session called with include_history=False, server handles history. save_result_to_session is the central persistence function called from multiple paths (normal turn, resume, guardrail trip, interruption). All functions are async.",
+  "source_files_analyzed": [
+    "src/agents/run_internal/session_persistence.py",
+    "src/agents/run_internal/agent_runner_helpers.py",
+    "src/agents/run.py (grep excerpts)",
+    "src/agents/run_internal/run_loop.py (grep excerpts)"
+  ]
+}

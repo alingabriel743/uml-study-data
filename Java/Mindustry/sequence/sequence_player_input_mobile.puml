@@ -1,0 +1,225 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #E9ECEF
+    NoteBackgroundColor #FFF3CD
+    NoteBorderColor #856404
+}
+
+title Mobile Player Input Handling
+
+actor "Player\n(Touch)" as Player
+participant "MobileInput" as MI
+participant "InputHandler\n(super)" as IH
+participant "PlayerComp\n/ Unit" as Unit
+participant "Tile / Building" as Tile
+participant "Units (static)" as Units
+participant "Call (Remote)" as Call
+participant "BlockInventoryFragment\n/ BlockConfigFragment" as Frag
+participant "Events" as Events
+
+== Touch Down ==
+
+Player -> MI : touchDown(screenX, screenY, pointer, button)
+activate MI
+MI -> MI : tileAt(screenX, screenY) : cursor
+MI -> MI : hasPlan(cursor) → selecting = true/false
+alt schematicMode active
+    MI -> MI : mode = schematicSelect / rebuildSelect\nrecord lineStartX/Y
+else normal mode
+    MI -> Unit : tryTapPlayer(worldX, worldY)
+    note right : sets droppingItem=true\nor player.shooting=true
+end
+deactivate MI
+
+== Gesture: Tap ==
+
+Player -> MI : tap(x, y, count, button)
+activate MI
+MI -> MI : tileAt(x, y) : cursor
+MI -> Call : tileTap(player, cursor) [remote broadcast]
+MI -> Units : closestEnemy(team, x, y, 20f) : unit
+MI -> Tile : buildWorld(x, y) : building
+note right of MI : target = unit OR building
+
+alt hasPlan(cursor)
+    MI -> MI : removePlan(getPlan(cursor))\nselectPlans.remove(plan)
+else mode == placing && validPlace() && !checkOverlapPlacement()
+    MI -> MI : checkOverlapPlacement(x, y, block)\n[checks selectPlans + unit.plans()]
+    MI -> MI : selectPlans.add(new BuildPlan(x, y, rotation, block))
+else mode == breaking && validBreak()
+    MI -> MI : selectPlans.add(new BuildPlan(x, y))
+end
+
+alt double-tap && unitTapped != null
+    MI -> Call : unitControl(player, unitTapped) [remote]
+else double-tap && buildingTapped != null
+    MI -> Call : buildingControlSelect(player, buildingTapped) [remote]
+else double-tap (else)
+    MI -> IH : checkConfigTap() OR tryBeginMine(cursor) OR tileTapped(build)
+else single-tap
+    MI -> Unit : tryRepairDerelict(cursor) → unit.addBuild(BuildPlan)
+    MI -> Unit : tryStopMine() → unit.mineTile = null
+    MI -> IH : checkConfigTap()
+    activate IH
+    IH -> Frag : config.getSelected().onConfigureTapped()
+    deactivate IH
+    MI -> IH : tileTapped(linked.build)
+    activate IH
+    IH -> Frag : planConfig.hide()
+    alt build.configurable
+        IH -> Frag : config.showConfig(build) OR config.hideConfig()
+    end
+    alt block.hasItems && items.total() > 0
+        IH -> Frag : inv.showFor(build)
+    else
+        IH -> Frag : inv.hide()
+    end
+    deactivate IH
+    MI -> Unit : tryBeginMine(cursor) → unit.mineTile = tile
+end
+deactivate MI
+
+== Gesture: Long Press ==
+
+Player -> MI : longPress(x, y)
+activate MI
+alt commandMode
+    MI -> MI : commandRect = true\nrecord commandRectX/Y
+else Payload unit with target found
+    MI -> MI : payloadTarget = unit OR building OR Vec2
+else mode == none
+    MI -> MI : manualShooting = true, target = null
+else mode == placing / breaking
+    MI -> MI : lineMode = true\nlineStartX/Y = cursor.x/y
+    alt mode == placing && block != null
+        MI -> IH : updateLine(lineStartX, lineStartY, cursor.x, cursor.y)
+        activate IH
+        IH -> IH : iterateLine(x1,y1,x2,y2)\n→ linePlans populated with BuildPlan[]
+        deactivate IH
+    end
+end
+deactivate MI
+
+== Gesture: Pan ==
+
+Player -> MI : pan(x, y, deltaX, deltaY)
+activate MI
+alt selecting == true
+    MI -> MI : shift selectPlans x/y\nby tile-snapped delta
+else
+    MI -> MI : camera.position -= delta\n(pan world view)
+end
+deactivate MI
+
+== Touch Up ==
+
+Player -> MI : touchUp(screenX, screenY, pointer, button)
+activate MI
+alt lineMode && mode == placing
+    MI -> IH : flushSelectPlans(linePlans)
+    activate IH
+    IH -> IH : validPlace() check
+    IH -> Tile : block.onNewPlan(copy)
+    IH -> Unit : unit.addBuild(copy)
+    deactivate IH
+    MI -> Events : fire(LineConfirmEvent)
+else lineMode && mode == breaking
+    MI -> IH : removeSelection(lineStartX, lineStartY, tileX, tileY, true)
+else mode == schematicSelect
+    MI -> MI : schematics.create(x1,y1,x2,y2)\n→ useSchematic(lastSchematic)
+    MI -> MI : mode = none
+else mode == rebuildSelect
+    MI -> IH : rebuildArea(lineStartX, lineStartY, lastLineX, lastLineY)
+    MI -> MI : mode = none
+else (normal touchUp)
+    MI -> IH : tryDropItems(tile.build, worldX, worldY)
+    activate IH
+    alt build accepts items && allowDeposit
+        IH -> Call : transferInventory(player, build) [remote]
+        activate Call
+        Call -> Tile : build.handleStack(item, amount, unit)
+        deactivate Call
+    else
+        IH -> Call : dropItem(player.angleTo(x, y)) [remote]
+    end
+    deactivate IH
+end
+alt commandMode rect selection active
+    MI -> Units : selectUnitsRect()
+end
+deactivate MI
+
+== Update Loop ==
+
+[-> MI : update()
+activate MI
+MI -> IH : super.update()
+MI -> MI : mode state machine\n(block!=null→placing; block==null+placing→none)
+alt lineMode active
+    MI -> MI : autoPan()
+    MI -> IH : updateLine(lineStartX, lineStartY, lx, ly)
+end
+alt !player.dead()
+    MI -> Units : invalidateTarget(target, unit, range)
+    note right : clears stale target if out of range
+    alt payloadTarget set && within 3f
+        MI -> Call : tryDropPayload() OR requestBuildPayload()\nOR requestUnitPayload() [remote]
+    end
+    alt manualShooting
+        MI -> Unit : unit.aim(mouseWorldX, mouseWorldY)
+        MI -> Unit : player.shooting = true
+    else autotarget
+        MI -> Units : closestTarget(team, x, y, range) : target
+        alt target set
+            MI -> MI : Predict.intercept() → intercept point
+            MI -> Unit : unit.aim(intercept)
+            MI -> Unit : player.shooting = true
+        end
+    end
+    MI -> Unit : unit.movePref(movement)
+    MI -> Unit : unit.controlWeapons(player.shooting)
+end
+deactivate MI
+
+== Confirm Button (UI) ==
+
+Player -> MI : tap confirm button (buildPlacementUI)
+activate MI
+alt !plan.breaking
+    MI -> MI : validPlace() → getPlan()
+    MI -> Tile : block.onNewPlan(copy)
+    MI -> Unit : unit.addBuild(copy)
+else plan.breaking
+    MI -> IH : tryBreakBlock(tile.x, tile.y)
+    activate IH
+    IH -> IH : breakBlock(x, y)
+    deactivate IH
+end
+MI -> MI : removals.addAll(selectPlans)\nselectPlans.clear()
+deactivate MI
+
+@enduml

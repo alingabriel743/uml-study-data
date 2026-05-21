@@ -1,0 +1,76 @@
+{
+  "scope": "token_pruning_selection",
+  "title": "Token Pruning and Selection Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "LatentRecon",
+    "subsample_x_and_rays",
+    "process_tensors",
+    "global_selection",
+    "structured_selection",
+    "select_topk",
+    "sample_gumbel",
+    "apply_mask_and_select"
+  ],
+  "interaction_flow": [
+    "LatentRecon.forward(data) → forward_gaussians(images, plucker, rays_os, rays_ds, time_embeddings)",
+    "forward_gaussians → patch_embed(images_input) → enc_blocks (transformer) → enc_norm → block_out",
+    "forward_gaussians → deconv(x) or decoder_cosmos(x) [upsample latent features]",
+    "forward_gaussians: if sub_sample_gaussians_type=='learned' → split x into (x[:, :-1], x_mask=x[:, [-1]])",
+    "forward_gaussians → subsample_x_and_rays_wrapper(x, rays_os, rays_ds, x_mask)",
+    "subsample_x_and_rays_wrapper → subsample_x_and_rays(x, rays_os, rays_ds, x_mask, factor, type, type_tokens, temperature, training)",
+    "subsample_x_and_rays: compute t_g_out, h_g_out, w_g_out = (x.shape[-3:] / sub_sample_gaussians_factor).int()",
+    "[branch: sub_sample_gaussians_type=='random'] subsample_x_and_rays → subsample_pixels_spatio_temporal() → query_z_with_indices(bthw_g, x/rays)",
+    "[branch: sub_sample_gaussians_type=='learned' & type_tokens=='local'] subsample_x_and_rays → process_tensors(tokens=x, mask_logits=x_mask, other_tensors=[rays_os, rays_ds], k_t=t_g_out, k_hw=h_g_out*w_g_out, temperature, training)",
+    "[branch: sub_sample_gaussians_type=='learned' & type_tokens=='global'] subsample_x_and_rays → process_tensors(tokens=x, mask_logits=x_mask, other_tensors=[rays_os, rays_ds], total_k=t_g_out*h_g_out*w_g_out, temperature, training)",
+    "process_tensors: squeeze mask_logits (B,1,T,H,W) → (B,T,H,W); if training or soft_inference → method='softmax', hard=True; else → method='topk', hard=False",
+    "[branch: total_k is not None] process_tensors → global_selection(mask_logits, total_k, method, temperature, hard, eps)",
+    "global_selection: flatten (B,T,H,W) → (B, N=T*H*W) → select_topk(logits_flat, total_k, method, temperature, hard, eps) → reshape back to (B,T,H,W)",
+    "[branch: k_t and k_hw are not None] process_tensors → structured_selection(mask_logits, k_t, k_hw, method, temperature, hard, eps)",
+    "structured_selection: temporal logits_t = mask_logits.mean(dim=[2,3]) → (B,T) → select_topk(logits_t, k_t, ...)",
+    "structured_selection: for each (b,t): logits_hw = mask_logits[b,t].reshape(-1) → select_topk(logits_hw.unsqueeze(0), k_hw, ...) → reshape (H,W)",
+    "structured_selection: mask = mask_spatial * mask_t.unsqueeze(-1).unsqueeze(-1) → (B,T,H,W)",
+    "select_topk [method='topk']: torch.topk(logits, k) → scatter to binary mask (B,N)",
+    "select_topk [method='softmax']: sample_gumbel(shape, eps, device, dtype) → y = (logits + gumbel_noise) / temperature → softmax(y); if hard=True → straight-through: hard_mask - y_soft.detach() + y_soft",
+    "process_tensors → apply_mask_and_select(tokens, other_tensors=[rays_os, rays_ds], mask)",
+    "apply_mask_and_select: flatten tokens (B,C,T,H,W)→(B,C,N), mask→(B,N); per batch: idx=mask_flat[b].nonzero(); gather tokens[:,idx] and other_tensors at idx → stack → (B,C,k)",
+    "process_tensors returns (tokens_out, others_out, mask) → back to subsample_x_and_rays → returns to forward_gaussians",
+    "forward_gaussians → gaussian_processing(x, rays_os, rays_ds) → split into distance/rgb/scaling/rotation/opacity → activations → cat gaussians (B,N,14)",
+    "forward_gaussians → gaussian_pruning(gaussians): opacity-based top-k + optional random keep",
+    "LatentRecon.forward → gs.render(gaussians, cam_view, bg_color, intrinsics) → returns images_pred, depths_pred"
+  ],
+  "key_relationships": [
+    "LatentRecon depends_on subsample_x_and_rays (via subsample_x_and_rays_wrapper)",
+    "subsample_x_and_rays depends_on process_tensors (token_pruning.py)",
+    "process_tensors delegates_to global_selection OR structured_selection (mutually exclusive, based on total_k vs k_t/k_hw)",
+    "global_selection delegates_to select_topk (flat N-dim selection)",
+    "structured_selection delegates_to select_topk (twice: temporal then spatial per-frame)",
+    "select_topk delegates_to sample_gumbel (only in softmax/Gumbel path)",
+    "process_tensors delegates_to apply_mask_and_select (gather selected tokens)",
+    "LatentRecon composes GaussianRenderer (or GaussianRendererDeferred)",
+    "LatentRecon.forward_gaussians produces mask_logit as extra output channel (output_dims += 1 when sub_sample_gaussians_type=='learned')"
+  ],
+  "method_signatures": {
+    "process_tensors": "process_tensors(tokens:(B,C,T,H,W), mask_logits:(B,1,T,H,W), other_tensors:List[Tensor], total_k:Optional[int], k_t:Optional[int], k_hw:Optional[int], temperature:float=1.0, eps:float=1e-6, training:bool=True, soft_inference:bool=True) -> (tokens_out, others_out, mask)",
+    "global_selection": "global_selection(mask_logits:(B,T,H,W), total_k:int, method:str, temperature:float, hard:bool, eps:float) -> mask:(B,T,H,W)",
+    "structured_selection": "structured_selection(mask_logits:(B,T,H,W), k_t:int, k_hw:int, method:str, temperature:float, hard:bool, eps:float) -> mask:(B,T,H,W)",
+    "select_topk": "select_topk(logits:(B,N), k:int, method:str, temperature:float, hard:bool, eps:float) -> mask:(B,N)",
+    "sample_gumbel": "sample_gumbel(shape:Size, eps:float=1e-6, device, dtype) -> Tensor",
+    "apply_mask_and_select": "apply_mask_and_select(tokens:(B,C,T,H,W), other_tensors:List[Tensor], mask:(B,T,H,W)) -> (tokens_out:(B,C,k), others_out:List[(B,C_other,k)])",
+    "subsample_x_and_rays": "subsample_x_and_rays(x, rays_os, rays_ds, x_mask, sub_sample_gaussians_factor, sub_sample_gaussians_type, sub_sample_gaussians_type_tokens, temperature, training)",
+    "LatentRecon.forward_gaussians": "forward_gaussians(images_input, plucker_embedding, rays_os, rays_ds, time_embeddings, num_input_multi_views) -> (gaussians:(B,N,14), x_mask)",
+    "LatentRecon.gaussian_pruning": "gaussian_pruning(gaussians:(B,N,14)) -> gaussians pruned by opacity top-k + random"
+  },
+  "branching_logic": {
+    "training_vs_inference": "training=True or soft_inference=True → method='softmax', hard=True (Gumbel-Softmax, differentiable); else → method='topk', hard=False (non-differentiable)",
+    "selection_mode": "total_k provided → global_selection (joint T×H×W); k_t+k_hw provided → structured_selection (temporal then spatial independently); neither → ValueError",
+    "subsampling_type": "sub_sample_gaussians_type='random' → random pixel sampling; 'learned' + type_tokens='local' → structured_selection; 'learned' + type_tokens='global' → global_selection",
+    "mask_logit_extraction": "sub_sample_gaussians_type='learned' → output_dims += 1 (mask logit channel); x_mask = x[:, [-1]]; x = x[:, :-1]"
+  },
+  "important_notes": "Token pruning selects a subset of spatio-temporal Gaussian tokens for efficient rendering. Two modes: (1) structured/local selects k_t temporal frames then k_hw spatial tokens per frame independently (outer product mask); (2) global selects total_k tokens jointly across T×H×W. Gumbel-Softmax straight-through estimator enables differentiable selection during training. gaussian_pruning is a separate opacity-based post-process (Long LRM style). process_tensors is the central entry point imported from token_pruning.py into render.py.",
+  "source_files_analyzed": [
+    "Lyra-1/src/models/utils/token_pruning.py",
+    "Lyra-1/src/models/recon/model_latent_recon.py",
+    "Lyra-1/src/models/utils/render.py"
+  ]
+}

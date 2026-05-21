@@ -1,0 +1,181 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequence {
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    ActorBackgroundColor #F8F9FA
+    ActorBorderColor #495057
+    DividerBackgroundColor #DEE2E6
+    GroupBackgroundColor #F1F3F5
+    GroupBorderColor #6C757D
+}
+skinparam NoteBackgroundColor #FFF9C4
+skinparam NoteBorderColor #F9A825
+
+title Binlog Change Record Emission\nConverting raw binlog events to Debezium change records
+
+participant "BinlogEventHandler" as handler
+participant "BinlogChangeRecordEmitter" as emitter
+participant "RelationalChangeRecordEmitter" as relEmitter
+participant "BinlogOffsetContext" as offsetCtx
+participant "BinlogSourceInfoStructMaker" as structMaker
+participant "BinlogSourceInfo" as sourceInfo
+participant "TableSchema" as tableSchema
+participant "EnvelopeSchema" as envelope
+participant "BinlogUnsignedIntegerConverter" as uintConv
+participant "Receiver" as receiver
+
+' ──────────────────────────────────────────────
+' 1. Construction
+' ──────────────────────────────────────────────
+handler -> emitter : new BinlogChangeRecordEmitter(\n  partition, offsetContext, clock,\n  operation, before[], after[], connectorConfig)
+activate emitter
+note right of emitter
+  Stores: operation, offsetContext,
+  before[], after[] (per-row Serializable[])
+end note
+
+' ──────────────────────────────────────────────
+' 2. Dispatch
+' ──────────────────────────────────────────────
+handler -> emitter : emitChangeRecords(tableSchema, receiver)
+emitter -> relEmitter : [super] emitChangeRecords(schema, receiver)
+activate relEmitter
+
+relEmitter -> emitter : getOperation()
+emitter --> relEmitter : Operation (CREATE / READ / UPDATE / DELETE / TRUNCATE)
+
+' ──────────────────────────────────────────────
+' 3. Source info struct (shared by all paths)
+' ──────────────────────────────────────────────
+relEmitter -> offsetCtx : getSourceInfo() / getOffset()
+activate offsetCtx
+offsetCtx -> structMaker : struct(sourceInfo)
+activate structMaker
+structMaker -> sourceInfo : getServerId()
+structMaker -> sourceInfo : getCurrentGtid()
+structMaker -> sourceInfo : getCurrentBinlogFilename()
+structMaker -> sourceInfo : getCurrentBinlogPosition()
+structMaker -> sourceInfo : getCurrentRowNumber()
+structMaker -> sourceInfo : getThreadId()
+structMaker -> sourceInfo : table()
+structMaker -> sourceInfo : getQuery()
+structMaker -> structMaker : commonStruct(sourceInfo)\n[version, connector, name, ts_ms, snapshot, db]
+structMaker -> structMaker : put(server_id, gtid, file,\n  pos, row, thread, table, query)
+structMaker --> offsetCtx : Struct sourceInfoStruct
+deactivate structMaker
+offsetCtx --> relEmitter : Struct sourceInfoStruct
+deactivate offsetCtx
+
+' ──────────────────────────────────────────────
+' 4. Operation-specific paths
+' ──────────────────────────────────────────────
+
+alt CREATE or READ
+
+  relEmitter -> emitter : getNewColumnValues()
+  emitter --> relEmitter : after[]
+
+  relEmitter -> tableSchema : keyFromColumnData(newColumnValues)
+  note right of tableSchema
+    ValueConverter calls
+    BinlogUnsignedIntegerConverter
+    for unsigned numeric columns
+  end note
+  tableSchema -> uintConv : convertUnsignedTinyint(short)\n| convertUnsignedSmallint(int)\n| convertUnsignedMediumint(int)\n| convertUnsignedInteger(long)\n| convertUnsignedBigint(BigDecimal)
+  uintConv --> tableSchema : corrected unsigned value
+  tableSchema --> relEmitter : Struct newKey
+
+  relEmitter -> tableSchema : valueFromColumnData(newColumnValues)
+  tableSchema --> relEmitter : Struct newValue
+
+  relEmitter -> envelope : create(newValue, sourceInfoStruct, clock.currentTimeAsInstant())
+  envelope --> relEmitter : Struct envelope
+
+  relEmitter -> receiver : changeRecord(partition, tableSchema,\n  CREATE, newKey, envelope, offset, null)
+
+else UPDATE — same primary key
+
+  relEmitter -> emitter : getOldColumnValues()
+  emitter --> relEmitter : before[]
+  relEmitter -> emitter : getNewColumnValues()
+  emitter --> relEmitter : after[]
+
+  relEmitter -> tableSchema : keyFromColumnData(oldColumnValues)
+  tableSchema --> relEmitter : Struct oldKey
+  relEmitter -> tableSchema : keyFromColumnData(newColumnValues)
+  tableSchema --> relEmitter : Struct newKey
+  relEmitter -> tableSchema : valueFromColumnData(oldColumnValues)
+  tableSchema --> relEmitter : Struct oldValue
+  relEmitter -> tableSchema : valueFromColumnData(newColumnValues)
+  tableSchema --> relEmitter : Struct newValue
+
+  relEmitter -> envelope : update(oldValue, newValue, sourceInfoStruct, ts)
+  envelope --> relEmitter : Struct envelope
+
+  relEmitter -> receiver : changeRecord(partition, tableSchema,\n  UPDATE, newKey, envelope, offset, null)
+
+else UPDATE — primary key change
+
+  note over relEmitter
+    emitUpdateAsPrimaryKeyChangeRecord()
+    emits two records to preserve PK semantics
+  end note
+
+  relEmitter -> envelope : delete(oldValue, sourceInfoStruct, ts)
+  envelope --> relEmitter : Struct envelope1
+  relEmitter -> receiver : changeRecord(partition, tableSchema,\n  DELETE, oldKey, envelope1, offset,\n  headers[__debezium.newkey])
+
+  relEmitter -> envelope : create(newValue, sourceInfoStruct, ts)
+  envelope --> relEmitter : Struct envelope2
+  relEmitter -> receiver : changeRecord(partition, tableSchema,\n  CREATE, newKey, envelope2, offset,\n  headers[__debezium.oldkey])
+
+else DELETE
+
+  relEmitter -> emitter : getOldColumnValues()
+  emitter --> relEmitter : before[]
+
+  relEmitter -> tableSchema : keyFromColumnData(oldColumnValues)
+  tableSchema --> relEmitter : Struct oldKey
+  relEmitter -> tableSchema : valueFromColumnData(oldColumnValues)
+  tableSchema --> relEmitter : Struct oldValue
+
+  relEmitter -> envelope : delete(oldValue, sourceInfoStruct, ts)
+  envelope --> relEmitter : Struct envelope
+
+  relEmitter -> receiver : changeRecord(partition, tableSchema,\n  DELETE, oldKey, envelope, offset, null)
+
+else TRUNCATE (overridden in BinlogChangeRecordEmitter)
+
+  note over relEmitter, emitter
+    Base class throws UnsupportedOperationException for TRUNCATE;
+    BinlogChangeRecordEmitter overrides emitTruncateRecord()
+  end note
+
+  relEmitter -> emitter : emitTruncateRecord(receiver, schema)
+  activate emitter
+  emitter -> offsetCtx : getOffset().getSourceInfo()
+  offsetCtx --> emitter : Struct sourceInfoStruct
+
+  emitter -> envelope : schema.getEnvelopeSchema()\n  .truncate(sourceInfoStruct, clock.currentTimeAsInstant())
+  envelope --> emitter : Struct envelope
+
+  emitter -> receiver : changeRecord(partition, schema,\n  TRUNCATE, null, envelope, offset, null)
+  deactivate emitter
+
+end
+
+deactivate relEmitter
+deactivate emitter
+
+@enduml

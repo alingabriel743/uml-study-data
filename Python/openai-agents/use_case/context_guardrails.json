@@ -1,0 +1,180 @@
+{
+  "scope": "guardrails",
+  "title": "Guardrails — Input and Output Filtering",
+  "diagram_type": "use_case",
+  "description": "Input and output guardrails validate agent I/O, triggering tripwires when violated. Includes agent-level and tool-level guardrails.",
+
+  "actors": [
+    "Developer (configures guardrails via decorators or manual construction)",
+    "Runner (executes guardrail pipeline during agent run)",
+    "Agent (carries input_guardrails / output_guardrails lists)",
+    "FunctionTool (carries tool_input_guardrails / tool_output_guardrails lists)"
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Define Input Guardrail",
+      "actor": "Developer",
+      "description": "Decorate a sync/async function with @input_guardrail (or @input_guardrail(name=..., run_in_parallel=...)) to produce an InputGuardrail instance. Attach to Agent.input_guardrails list.",
+      "key_api": "@input_guardrail / InputGuardrail(guardrail_function, name, run_in_parallel)"
+    },
+    {
+      "id": "UC2",
+      "name": "Define Output Guardrail",
+      "actor": "Developer",
+      "description": "Decorate a function with @output_guardrail (or @output_guardrail(name=...)) to produce an OutputGuardrail instance. Attach to Agent.output_guardrails list.",
+      "key_api": "@output_guardrail / OutputGuardrail(guardrail_function, name)"
+    },
+    {
+      "id": "UC3",
+      "name": "Define Tool Input Guardrail",
+      "actor": "Developer",
+      "description": "Decorate a function with @tool_input_guardrail and pass to function_tool(tool_input_guardrails=[...]). Runs before tool executes.",
+      "key_api": "@tool_input_guardrail / ToolInputGuardrail(guardrail_function, name)"
+    },
+    {
+      "id": "UC4",
+      "name": "Define Tool Output Guardrail",
+      "actor": "Developer",
+      "description": "Decorate a function with @tool_output_guardrail and pass to function_tool(tool_output_guardrails=[...]). Runs after tool executes.",
+      "key_api": "@tool_output_guardrail / ToolOutputGuardrail(guardrail_function, name)"
+    },
+    {
+      "id": "UC5",
+      "name": "Run Input Guardrails (Blocking mode)",
+      "actor": "Runner",
+      "description": "run_in_parallel=False: Runner runs all input guardrails sequentially BEFORE the agent starts. If any tripwire triggers, InputGuardrailTripwireTriggered is raised; agent never executes.",
+      "flow": "Runner → run_input_guardrails() → [run_single_input_guardrail() per guardrail] → InputGuardrail.run() → guardrail_function(context, agent, input) → InputGuardrailResult → check tripwire_triggered → raise InputGuardrailTripwireTriggered"
+    },
+    {
+      "id": "UC6",
+      "name": "Run Input Guardrails (Parallel mode)",
+      "actor": "Runner",
+      "description": "run_in_parallel=True (default): guardrails run concurrently WITH the agent via asyncio.create_task. If tripwire fires, remaining guardrail tasks are cancelled and InputGuardrailTripwireTriggered is raised.",
+      "flow": "Runner → run_input_guardrails_with_queue() → asyncio tasks for each guardrail → as_completed() → tripwire check → cancel remaining tasks → put result in queue → raise via streamed_result._triggered_input_guardrail_result"
+    },
+    {
+      "id": "UC7",
+      "name": "Run Output Guardrails",
+      "actor": "Runner",
+      "description": "After agent produces final output, Runner runs all output guardrails concurrently. Always blocking (no parallel mode). If tripwire fires → OutputGuardrailTripwireTriggered raised.",
+      "flow": "Runner → run_output_guardrails() → [asyncio tasks] → run_single_output_guardrail() → OutputGuardrail.run() → guardrail_function(context, agent, agent_output) → OutputGuardrailResult → check tripwire_triggered → raise OutputGuardrailTripwireTriggered"
+    },
+    {
+      "id": "UC8",
+      "name": "Handle Tripwire (Input)",
+      "actor": "Developer",
+      "description": "Caller catches InputGuardrailTripwireTriggered exception. Access guardrail_result.guardrail and guardrail_result.output for details. Run data stored in exception.run_data (RunErrorDetails).",
+      "exception": "InputGuardrailTripwireTriggered(guardrail_result: InputGuardrailResult)"
+    },
+    {
+      "id": "UC9",
+      "name": "Handle Tripwire (Output)",
+      "actor": "Developer",
+      "description": "Caller catches OutputGuardrailTripwireTriggered exception. Access guardrail_result for details.",
+      "exception": "OutputGuardrailTripwireTriggered(guardrail_result: OutputGuardrailResult)"
+    },
+    {
+      "id": "UC10",
+      "name": "Handle Tool Guardrail Response",
+      "actor": "Runner / FunctionTool",
+      "description": "Tool guardrails return ToolGuardrailFunctionOutput with one of three behaviors: allow (continue), reject_content (skip call, send message to model), raise_exception (halt via ToolInputGuardrailTripwireTriggered / ToolOutputGuardrailTripwireTriggered).",
+      "behaviors": ["allow", "reject_content", "raise_exception"]
+    },
+    {
+      "id": "UC11",
+      "name": "Trace Guardrail Execution",
+      "actor": "Runner",
+      "description": "Each guardrail wrapped in guardrail_span(name). span_data.triggered set to tripwire_triggered value. SpanError attached to current span on tripwire.",
+      "key_api": "guardrail_span(guardrail.get_name()) → span_guardrail.span_data.triggered"
+    }
+  ],
+
+  "key_classes": {
+    "InputGuardrail": {
+      "file": "src/agents/guardrail.py",
+      "fields": ["guardrail_function: Callable[RunContextWrapper, Agent, str|list] → MaybeAwaitable[GuardrailFunctionOutput]", "name: str|None", "run_in_parallel: bool=True"],
+      "methods": ["get_name() -> str", "async run(agent, input, context) -> InputGuardrailResult"]
+    },
+    "OutputGuardrail": {
+      "file": "src/agents/guardrail.py",
+      "fields": ["guardrail_function: Callable[RunContextWrapper, Agent, Any] → MaybeAwaitable[GuardrailFunctionOutput]", "name: str|None"],
+      "methods": ["get_name() -> str", "async run(context, agent, agent_output) -> OutputGuardrailResult"]
+    },
+    "GuardrailFunctionOutput": {
+      "file": "src/agents/guardrail.py",
+      "fields": ["output_info: Any", "tripwire_triggered: bool"]
+    },
+    "InputGuardrailResult": {
+      "file": "src/agents/guardrail.py",
+      "fields": ["guardrail: InputGuardrail", "output: GuardrailFunctionOutput"]
+    },
+    "OutputGuardrailResult": {
+      "file": "src/agents/guardrail.py",
+      "fields": ["guardrail: OutputGuardrail", "agent_output: Any", "agent: Agent", "output: GuardrailFunctionOutput"]
+    },
+    "ToolInputGuardrail": {
+      "file": "src/agents/tool_guardrails.py",
+      "fields": ["guardrail_function: Callable[ToolInputGuardrailData] → MaybeAwaitable[ToolGuardrailFunctionOutput]", "name: str|None"],
+      "methods": ["get_name() -> str", "async run(data: ToolInputGuardrailData) -> ToolGuardrailFunctionOutput"]
+    },
+    "ToolOutputGuardrail": {
+      "file": "src/agents/tool_guardrails.py",
+      "fields": ["guardrail_function: Callable[ToolOutputGuardrailData] → MaybeAwaitable[ToolGuardrailFunctionOutput]", "name: str|None"],
+      "methods": ["get_name() -> str", "async run(data: ToolOutputGuardrailData) -> ToolGuardrailFunctionOutput"]
+    },
+    "ToolGuardrailFunctionOutput": {
+      "file": "src/agents/tool_guardrails.py",
+      "fields": ["output_info: Any", "behavior: AllowBehavior | RejectContentBehavior | RaiseExceptionBehavior"],
+      "factory_methods": ["allow(output_info)", "reject_content(message, output_info)", "raise_exception(output_info)"]
+    }
+  },
+
+  "exceptions": [
+    "InputGuardrailTripwireTriggered(AgentsException) — carries InputGuardrailResult",
+    "OutputGuardrailTripwireTriggered(AgentsException) — carries OutputGuardrailResult",
+    "ToolInputGuardrailTripwireTriggered(AgentsException) — carries ToolInputGuardrail + ToolGuardrailFunctionOutput",
+    "ToolOutputGuardrailTripwireTriggered(AgentsException) — carries ToolOutputGuardrail + ToolGuardrailFunctionOutput"
+  ],
+
+  "key_relationships": [
+    "Agent has-list InputGuardrail (input_guardrails)",
+    "Agent has-list OutputGuardrail (output_guardrails)",
+    "FunctionTool has-list ToolInputGuardrail (tool_input_guardrails)",
+    "FunctionTool has-list ToolOutputGuardrail (tool_output_guardrails)",
+    "InputGuardrail produces InputGuardrailResult",
+    "OutputGuardrail produces OutputGuardrailResult",
+    "GuardrailFunctionOutput contained-in InputGuardrailResult / OutputGuardrailResult",
+    "InputGuardrailTripwireTriggered references InputGuardrailResult",
+    "OutputGuardrailTripwireTriggered references OutputGuardrailResult",
+    "run_internal/guardrails.py orchestrates all guardrail execution with tracing spans"
+  ],
+
+  "business_rules": [
+    "Input guardrails only run for the FIRST agent in a chain",
+    "Output guardrails only run for the LAST agent (final output producer)",
+    "Tool guardrails run on every custom function-tool invocation",
+    "Tool guardrails do NOT apply to handoffs, hosted tools, or built-in execution tools",
+    "run_in_parallel=True (default): guardrail runs concurrently with agent — may consume tokens before cancellation",
+    "run_in_parallel=False (blocking): guardrail completes before agent starts — prevents token waste",
+    "Output guardrails do NOT support run_in_parallel — always sequential after agent completion",
+    "All guardrail tasks run via asyncio; first tripwire cancels remaining tasks",
+    "Guardrail names default to the decorated function's __name__ if not explicitly set"
+  ],
+
+  "decorators": [
+    "@input_guardrail — wraps sync/async fn → InputGuardrail; supports (name, run_in_parallel) kwargs",
+    "@output_guardrail — wraps sync/async fn → OutputGuardrail; supports (name) kwarg",
+    "@tool_input_guardrail — wraps fn → ToolInputGuardrail; supports (name) kwarg",
+    "@tool_output_guardrail — wraps fn → ToolOutputGuardrail; supports (name) kwarg"
+  ],
+
+  "source_files_analyzed": [
+    "src/agents/guardrail.py",
+    "src/agents/tool_guardrails.py",
+    "src/agents/run_internal/guardrails.py",
+    "src/agents/exceptions.py",
+    "docs/guardrails.md"
+  ]
+}

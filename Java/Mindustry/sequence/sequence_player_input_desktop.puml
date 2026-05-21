@@ -1,0 +1,258 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #E9ECEF
+    NoteBackgroundColor #FFF3CD
+    NoteBorderColor #856404
+}
+
+title Desktop Player Input Handling
+
+actor "Player\n(keyboard/mouse)" as Player
+
+participant "DesktopInput" as DI
+participant "InputHandler\n(base)" as IH
+participant "PlayerComp" as PC
+participant "Unit" as Unit
+participant "Tile / Building" as Tile
+participant "Call\n(RPC layer)" as Call
+
+== Frame Update ==
+
+Player -> DI: [game loop] update()
+activate DI
+
+DI -> IH: super.update()
+activate IH
+IH --> DI: (base update done)
+deactivate IH
+
+DI -> DI: locked()?\ncheck keyboard/scene locks
+
+alt player alive && not locked
+    DI -> DI: updateCommandMode()\n(keyDown/keyTap commandMode)
+    DI -> PC: player.unit()
+    PC --> DI: unit
+
+    DI -> DI: updateMovement(unit)
+    activate DI
+
+    DI -> DI: read Binding.moveX/moveY\n→ movement Vec2
+
+    DI -> Unit: lookAt(mouseAngle / prefRotation)
+    DI -> Unit: movePref(movement)
+    DI -> Unit: aim(mouseWorld)
+    DI -> Unit: controlWeapons(true, player.shooting)
+    DI -> PC: boosting = boostKey held\nmouseX/mouseY = mouseWorld
+
+    opt unit instanceof Payloadc
+        alt keyTap(pickupCargo)
+            DI -> IH: tryPickupPayload()
+            activate IH
+            IH -> IH: Units.closest(...)\n→ nearest Unit or Building
+            alt target is Unit
+                IH -> Call: requestUnitPayload(player, target)
+            else target is Building
+                IH -> Call: requestBuildPayload(player, build)
+            end
+            deactivate IH
+        else keyTap(dropCargo)
+            DI -> IH: tryDropPayload()
+            activate IH
+            IH -> Call: requestDropPayload(player, x, y)
+            deactivate IH
+        end
+    end
+
+    deactivate DI
+
+else player dead / paused
+    DI -> DI: pan camera\n(lerpDelta toward mouseWorld)
+end
+
+deactivate DI
+
+== Left-Click: Select Tap (Binding.select) ==
+
+Player -> DI: keyTap(Binding.select)\n[mouse not over scene]
+activate DI
+
+DI -> DI: cursorX/Y = world tile coords
+
+alt selectPlans not empty
+    DI -> IH: flushPlans(selectPlans)
+    activate IH
+    loop for each BuildPlan
+        IH -> IH: validPlace(x, y, block, rot)
+        IH -> IH: block.onNewPlan(copy)
+        IH -> PC: player.unit().addBuild(copy)
+        IH -> IH: playerPlanTree.insert(copy)
+    end
+    deactivate IH
+
+else isPlacing() — block selected
+    DI -> DI: mode = placing\nselectX/Y = cursor\nupdateLine(selectX, selectY)
+
+else plan exists at cursor (not breaking, not started)
+    DI -> DI: splan = plan\n(begin drag-move)
+
+else plan.breaking
+    DI -> DI: deleting = true
+
+else commandMode active
+    DI -> DI: commandRect = true
+
+else normal tile tap
+    DI -> IH: checkConfigTap()\n→ tryRepairDerelict(selected)
+    DI -> IH: tryTapPlayer(x, y)
+    activate IH
+    IH -> IH: droppingItem = true\n(player tapped self)
+    deactivate IH
+
+    DI -> IH: tileTapped(selected.build)
+    activate IH
+    alt build == null
+        IH -> IH: inv.hide()\nconfig.hideConfig()
+        IH --> DI: false
+    else commandable && commandMode
+        IH --> DI: consumed = true
+    else block.configurable && interactable
+        IH -> IH: config.showConfig(build)
+    else !consumed && interactable
+        IH -> Tile: build.tapped()
+    end
+    opt block.hasItems && items.total() > 0
+        IH -> IH: inv.showFor(build)
+    end
+    deactivate IH
+
+    DI -> IH: tryStopMine(selected)\nOR tryBeginMine(selected)
+    activate IH
+    alt canMine(tile)
+        IH -> IH: !dead && unit.validMine(tile)\n&& unit.acceptsItem(...)
+        IH -> Unit: mineTile = tile
+    else stop mining
+        IH -> Unit: mineTile = null
+    end
+    deactivate IH
+
+    DI -> PC: shooting = shouldShoot
+end
+
+deactivate DI
+
+== Key Release: Select → Item Drop ==
+
+Player -> DI: keyRelease(Binding.select)
+activate DI
+
+DI -> IH: tryDropItems(selected.build, mouseWorld.x, mouseWorld.y)
+activate IH
+
+alt build accepts items && allowDeposit
+    IH -> Call: transferInventory(player, build)
+    activate Call
+    Call -> Tile: build.acceptStack()\nbuild.handleStack(item, amount, unit)
+    Call -> Call: fire DepositEvent
+    deactivate Call
+else drop to ground
+    IH -> Call: dropItem(player.angleTo(x, y))
+end
+
+deactivate IH
+deactivate DI
+
+== Break Block (Binding.breakBlock) ==
+
+Player -> DI: keyTap(Binding.breakBlock)
+activate DI
+DI -> DI: mode = breaking\nselectX/Y = cursor tile
+deactivate DI
+
+Player -> DI: keyRelease(breakBlock)
+activate DI
+DI -> IH: removeSelection(x1, y1, x2, y2, maxLength)
+activate IH
+IH -> Tile: world.tileBuilding(x, y)
+Tile --> IH: building reference
+IH -> PC: player.unit().addBuild(breakPlan)
+deactivate IH
+deactivate DI
+
+== Schematic Select ==
+
+Player -> DI: keyRelease(Binding.schematicSelect)
+activate DI
+DI -> DI: schematics.create(x1, y1, x2, y2)\n→ lastSchematic
+DI -> DI: useSchematic(lastSchematic)
+DI -> DI: schematics.toPlans(schem, x, y)\n→ selectPlans.addAll(plans)\nmode = none
+deactivate DI
+
+opt keyTap(schematicFlipX) or keyTap(schematicFlipY)
+    Player -> IH: flipPlans(selectPlans, axis)
+end
+
+== Rotate Placed Block ==
+
+Player -> DI: axisTap(Binding.rotate)\n[cursor.build present & rotatePlaced held]
+activate DI
+DI -> Call: rotateBlock(player, cursor.build, dir)
+deactivate DI
+
+== Unit / Building Control ==
+
+Player -> DI: keyDown(control) + keyTap(select)
+activate DI
+alt unit under cursor
+    DI -> DI: selectedUnit()
+    DI -> Call: unitControl(player, unit)
+else building under cursor
+    DI -> DI: selectedControlBuild()
+    DI -> Call: buildingControlSelect(player, build)
+end
+deactivate DI
+
+== Item Transfer (RPC Detail) ==
+
+note over Call
+  Call.requestItem(player, build, item, amount)
+    → Call.takeItems(build, item, amount, unit)
+       → build.removeStack(item, amount)
+       + unit.addItem(item, removed)
+       + transferItemEffect()
+end note
+
+== Respawn ==
+
+Player -> DI: keyTap(Binding.respawn)
+activate DI
+DI -> Call: unitClear(player)
+activate Call
+Call -> PC: clearUnit() → unit(null)
+PC -> PC: fire UnitChangeEvent
+deactivate Call
+deactivate DI
+
+@enduml

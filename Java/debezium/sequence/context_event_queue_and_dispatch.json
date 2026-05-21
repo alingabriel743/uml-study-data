@@ -1,0 +1,91 @@
+{
+  "scope": "event_queue_and_dispatch",
+  "title": "Change Event Queue and Dispatch Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "ProducerThread",
+    "ChangeEventQueue",
+    "QueueProvider",
+    "ConsumerThread (Kafka Connect poll loop)",
+    "EventDispatcher",
+    "StreamingChangeRecordReceiver",
+    "ChangeEventCreator"
+  ],
+  "interaction_flow": [
+    "--- PRODUCER SIDE (enqueue) ---",
+    "ProducerThread → EventDispatcher: dispatchDataChangeEvent(partition, dataCollectionId, changeRecordEmitter)",
+    "EventDispatcher → DataCollectionFilter: filter.isIncluded(dataCollectionId) [check include/exclude list]",
+    "EventDispatcher → ChangeRecordEmitter: emitChangeRecords(dataCollectionSchema, receiver)",
+    "ChangeRecordEmitter → StreamingChangeRecordReceiver: changeRecord(partition, schema, op, key, value, offset, headers)",
+    "StreamingChangeRecordReceiver → TopicNamingStrategy: dataChangeTopic(dataCollectionId) [resolve Kafka topic name]",
+    "StreamingChangeRecordReceiver → PostProcessorRegistry: doPostProcessing(key, value) [optional SMT-like processing]",
+    "StreamingChangeRecordReceiver → ChangeEventCreator: createDataChangeEvent(SourceRecord)",
+    "StreamingChangeRecordReceiver → ChangeEventQueue: enqueue(DataChangeEvent)",
+    "ChangeEventQueue → ChangeEventQueue: doEnqueue(record) [acquire ReentrantLock]",
+    "ChangeEventQueue [BACKPRESSURE]: if queue.size >= maxQueueSize OR currentQueueSizeInBytes >= maxQueueSizeInBytes → signal isFull, await isNotFull(pollInterval)",
+    "ChangeEventQueue → QueueProvider: queue.enqueue(record) [actual internal queue insert]",
+    "ChangeEventQueue: if batch threshold OR byte threshold reached → signal isFull [wake up consumer early]",
+    "ChangeEventQueue → ChangeEventQueue: unlock",
+    "--- TOMBSTONE (on DELETE) ---",
+    "StreamingChangeRecordReceiver → ChangeEventQueue: enqueue(DataChangeEvent[tombstone]) [if emitTombstonesOnDelete=true]",
+    "--- CONSUMER SIDE (poll) ---",
+    "ConsumerThread → ChangeEventQueue: poll() [Kafka Connect polling loop]",
+    "ChangeEventQueue: acquire lock, set Timer(min(pollInterval, RETURN_CONTROL_INTERVAL))",
+    "ChangeEventQueue: loop → drainRecords(records, maxBatchSize) → QueueProvider.poll()",
+    "ChangeEventQueue [WAIT]: if batch not full AND bytes below threshold AND timer not expired → signal isNotFull, await isFull(remainingTimeout)",
+    "ChangeEventQueue: release lock → return List<DataChangeEvent> [up to maxBatchSize]",
+    "ConsumerThread → Kafka: forward records to Kafka broker",
+    "--- BENCHMARK CLASSES (performance measurement) ---",
+    "ProducerPerf: setup() → builds ChangeEventQueue via Builder, spawns background consumer thread calling poll() in loop",
+    "ProducerPerf → ChangeEventQueue: benchmarkProducer() calls enqueue(EVENT) [measures producer throughput, ops/sec]",
+    "ConsumerPerf: setup() → builds ChangeEventQueue via Builder, spawns background producer thread calling enqueue() in loop",
+    "ConsumerPerf → ChangeEventQueue: benchmarkConsumer() calls poll() [measures consumer throughput, ops/sec]",
+    "QueuePerf: benchmarkChangeEventQueue() → starts producer thread (10M enqueue calls) + consumer thread (polls until 10M records received), joins both [measures round-trip latency ms]",
+    "MultiWriterQueuePerf: benchmarkChangeEventQueue() → starts 10 producer threads (1M enqueue each) + 1 consumer thread (polls until 10M records), joins all [multi-writer contention test]"
+  ],
+  "key_relationships": [
+    "ChangeEventQueue implements ChangeEventQueueMetrics",
+    "ChangeEventQueue<T extends Sizeable> holds QueueProvider<T> (strategy for underlying queue impl)",
+    "ChangeEventQueue uses DefaultQueueProvider<T> by default (via Builder if queueProvider not set)",
+    "ChangeEventQueue uses ReentrantLock + two Conditions (isFull, isNotFull) for producer-consumer coordination",
+    "EventDispatcher depends_on ChangeEventQueue<DataChangeEvent>",
+    "EventDispatcher contains StreamingChangeRecordReceiver (inner class) — calls queue.enqueue()",
+    "EventDispatcher contains BufferingSnapshotChangeRecordReceiver (inner class) — calls queue.enqueue() with buffered swap",
+    "EventDispatcher contains IncrementalSnapshotChangeRecordReceiver (inner class) — calls queue.enqueue()",
+    "EventDispatcher contains SchemaChangeEventReceiver (inner class) — calls enqueueSchemaChangeMessage() → queue.enqueue()",
+    "ChangeEventQueuePerf outer class contains ProducerPerf, ConsumerPerf, QueuePerf, MultiWriterQueuePerf as static inner JMH benchmark classes",
+    "All benchmark classes use ChangeEventQueue.Builder<DataChangeEvent> for construction"
+  ],
+  "backpressure_mechanics": {
+    "enqueue_blocks_when": "queue.size() >= maxQueueSize OR (maxQueueSizeInBytes > 0 AND currentQueueSizeInBytes >= maxQueueSizeInBytes)",
+    "enqueue_signals_consumer": "isFull.signalAll() when batch threshold OR byte threshold reached",
+    "poll_signals_producer": "isNotFull.signalAll() when draining completes",
+    "poll_waits_on": "isFull.await(remainingTimeout) when batch not full",
+    "enqueue_waits_on": "isNotFull.await(pollIntervalMillis) when queue full"
+  },
+  "buffering_mode": {
+    "description": "Optional single-cell lookahead buffer via AtomicReference<T>. Used by MySQL connector to set snapshot flags on last record",
+    "enqueue_with_buffering": "Swaps new record into bufferedEvent, enqueues the displaced record",
+    "flushBuffer": "Applies recordModifier function to buffered event, then enqueues result — used to mark last snapshot record"
+  },
+  "queue_config_params": {
+    "pollInterval": "Duration (benchmarks use 10/50/500 ms)",
+    "maxQueueSize": "DEFAULT_MAX_QUEUE_SIZE (8192)",
+    "maxBatchSize": "DEFAULT_MAX_BATCH_SIZE (2048)",
+    "maxQueueSizeInBytes": "DEFAULT_MAX_QUEUE_SIZE_IN_BYTES (0 = disabled)",
+    "queueProvider": "DefaultQueueProvider wrapping ArrayDeque or custom QueueProvider impl"
+  },
+  "event_types_enqueued": [
+    "DataChangeEvent (streaming CDC record)",
+    "DataChangeEvent tombstone (on DELETE if emitTombstonesOnDelete=true)",
+    "DataChangeEvent (transaction BEGIN/COMMIT metadata)",
+    "DataChangeEvent (schema change history record)",
+    "DataChangeEvent (notification record)"
+  ],
+  "important_notes": "ChangeEventQueue is the handover point between connector source threads (producers) and the Kafka Connect polling loop (consumer). @ThreadSafe — multiple producers can call enqueue() concurrently (protected by ReentrantLock). poll() is @SingleThreadAccess consumer side. EventDispatcher.StreamingChangeRecordReceiver is the primary path for streaming CDC events. BufferingSnapshotChangeRecordReceiver handles threaded snapshot with synchronized(queue) guard for atomic getAndSet+enqueue.",
+  "source_files_analyzed": [
+    "debezium-microbenchmark/src/main/java/io/debezium/performance/core/ChangeEventQueuePerf.java",
+    "debezium-connector-common/src/main/java/io/debezium/connector/base/ChangeEventQueue.java",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/EventDispatcher.java"
+  ]
+}

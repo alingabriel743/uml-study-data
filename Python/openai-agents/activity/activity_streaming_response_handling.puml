@@ -1,0 +1,280 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam noteBackgroundColor #FFF3CD
+skinparam noteBorderColor #856404
+
+title Streaming Response Handling\n<size:11>ChatCmplStreamHandler.handle_stream() — accumulate tokens, detect tool calls, emit events, finalize response</size>
+
+|#E8F4FD| Caller / Stream Source |
+|#F0FFF0| ChatCmplStreamHandler |
+|#FFF8E1| StreamingState |
+|#FDE8F0| Event Consumer |
+
+|ChatCmplStreamHandler|
+start
+:Initialize **StreamingState**\n(started=False, empty accumulators)\nInitialize **SequenceNumber** counter;
+
+|StreamingState|
+note right
+  Fields:
+  • started, thinking_text/signature
+  • text/refusal/reasoning_content_index_and_output
+  • function_calls, function_call_streaming
+  • function_call_output_idx, provider_data
+end note
+
+|ChatCmplStreamHandler|
+while (async for **chunk** in AsyncStream?) is (chunk received)
+
+    if (state.started == False?) then (yes — first chunk)
+        :Set state.started = True;
+        |Event Consumer|
+        :yield **ResponseCreatedEvent**\n(response, type="response.created");
+        |ChatCmplStreamHandler|
+    endif
+
+    if (chunk.usage is not None?) then (yes)
+        |StreamingState|
+        :Update usage accumulator\n(prompt_tokens, completion_tokens);
+        |ChatCmplStreamHandler|
+    endif
+
+    if (no chunk.choices OR no delta?) then (yes — empty chunk)
+        :skip → **continue** to next chunk;
+    else (no — has delta)
+
+        |StreamingState|
+        :Update **provider_data**\n(model from chunk or param,\nresponse_id from chunk.id);
+        |ChatCmplStreamHandler|
+
+        '--- BRANCH A: Anthropic Thinking Blocks ---
+        if (delta.thinking_blocks exists?\n<size:10>[Anthropic via LiteLLM]</size>) then (yes)
+            |StreamingState|
+            :Accumulate **state.thinking_text** += block["thinking"]\nStore **state.thinking_signature** = block["signature"];
+            |ChatCmplStreamHandler|
+        endif
+
+        '--- BRANCH B: OpenAI-style Reasoning Summary ---
+        if (delta.reasoning_content exists?\n<size:10>[OpenAI o-series]</size>) then (yes)
+            if (First reasoning_content chunk?\nstate.reasoning_content_index_and_output is None?) then (yes)
+                :Create **ResponseReasoningItem**\n(id=FAKE_ID, summary=[], type="reasoning");
+                |StreamingState|
+                :Set reasoning_content_index_and_output = (0, reasoning_item);
+                |ChatCmplStreamHandler|
+                |Event Consumer|
+                :yield **ResponseOutputItemAddedEvent**\n(output_index=0);
+                |ChatCmplStreamHandler|
+            endif
+            if (active_reasoning_summary_index is None?) then (yes — new summary segment)
+                :Append Summary(text="") to reasoning_item.summary\nSet active_reasoning_summary_index;
+                |Event Consumer|
+                :yield **ResponseReasoningSummaryPartAddedEvent**\n(summary_index, part);
+                |ChatCmplStreamHandler|
+            endif
+            |StreamingState|
+            :Accumulate reasoning_item.summary[index].text\n+= reasoning_content;
+            |ChatCmplStreamHandler|
+            |Event Consumer|
+            :yield **ResponseReasoningSummaryTextDeltaEvent**\n(delta=reasoning_content);
+            |ChatCmplStreamHandler|
+        endif
+
+        '--- BRANCH C: 3rd-Party Reasoning Text ---
+        if (delta.reasoning exists?\n<size:10>[DeepSeek / other providers]</size>) then (yes)
+            if (First reasoning chunk?\nstate.reasoning_content_index_and_output is None?) then (yes)
+                :Create **ResponseReasoningItem**\n(content=[Content(text="", type="reasoning_text")]);
+                |StreamingState|
+                :Set reasoning_content_index_and_output = (0, reasoning_item);
+                |ChatCmplStreamHandler|
+                |Event Consumer|
+                :yield **ResponseOutputItemAddedEvent**\n(output_index=0);
+                |ChatCmplStreamHandler|
+            endif
+            |StreamingState|
+            :Accumulate reasoning_item.content[0].text\n+= delta.reasoning;
+            |ChatCmplStreamHandler|
+            |Event Consumer|
+            :yield **ResponseReasoningTextDeltaEvent**\n(delta=reasoning_text);
+            |ChatCmplStreamHandler|
+        endif
+
+        '--- TRANSITION: Close open reasoning summary before other content ---
+        if (Reasoning active AND open summary segment AND\nnew content/refusal/tool_calls arriving?) then (yes)
+            :_finish_reasoning_summary_part();
+            |Event Consumer|
+            :yield **ResponseReasoningSummaryPartDoneEvent**;
+            |StreamingState|
+            :Reset active_reasoning_summary_index = None;
+            |ChatCmplStreamHandler|
+        endif
+
+        '--- BRANCH D: Regular Text Content ---
+        if (delta.content is not None?) then (yes)
+            if (First text chunk?\nstate.text_content_index_and_output is None?) then (yes)
+                :Compute content_index\n(0 + reasoning_offset + refusal_offset)\nCreate **ResponseOutputText**(text="")\nCreate **ResponseOutputMessage**(status="in_progress");
+                |StreamingState|
+                :Set text_content_index_and_output = (index, output_text);
+                |ChatCmplStreamHandler|
+                |Event Consumer|
+                :yield **ResponseOutputItemAddedEvent**\n(output_index = 0 or 1 based on reasoning);
+                :yield **ResponseContentPartAddedEvent**\n(part=ResponseOutputText);
+                |ChatCmplStreamHandler|
+            endif
+            :Convert logprobs via ChatCmplHelpers;
+            |StreamingState|
+            :Accumulate text_output.text += delta.content\nAppend logprobs;
+            |ChatCmplStreamHandler|
+            |Event Consumer|
+            :yield **ResponseTextDeltaEvent**\n(delta=delta.content, logprobs);
+            |ChatCmplStreamHandler|
+        endif
+
+        '--- BRANCH E: Refusal Content ---
+        if (delta.refusal exists?\n<size:10>[OpenAI — not all providers set this]</size>) then (yes)
+            if (First refusal chunk?\nstate.refusal_content_index_and_output is None?) then (yes)
+                :Compute refusal_index\n(reasoning + text offsets)\nCreate **ResponseOutputRefusal**(refusal="")\nCreate **ResponseOutputMessage**(status="in_progress");
+                |StreamingState|
+                :Set refusal_content_index_and_output = (index, output_refusal);
+                |ChatCmplStreamHandler|
+                |Event Consumer|
+                :yield **ResponseOutputItemAddedEvent**;
+                :yield **ResponseContentPartAddedEvent**\n(part=ResponseOutputRefusal);
+                |ChatCmplStreamHandler|
+            endif
+            |StreamingState|
+            :Accumulate refusal_output.refusal += delta.refusal;
+            |ChatCmplStreamHandler|
+            |Event Consumer|
+            :yield **ResponseRefusalDeltaEvent**\n(delta=delta.refusal);
+            |ChatCmplStreamHandler|
+        endif
+
+        '--- BRANCH F: Function / Tool Calls ---
+        if (delta.tool_calls exists?) then (yes)
+            :For each **tc_delta** in delta.tool_calls;
+            if (tc_delta.index NOT in state.function_calls?) then (yes — new tool call)
+                |StreamingState|
+                :Create ResponseFunctionToolCall\n(arguments="", name="", call_id="")\nSet function_call_streaming[index] = False;
+                |ChatCmplStreamHandler|
+            endif
+            |StreamingState|
+            :Accumulate function_calls[index].arguments\n+= tc_function.arguments\nSet .name from tc_function.name;
+            :Set .call_id from tc_delta.id\n<size:10>(Gemini: ChatCmplHelpers.clean_gemini_tool_call_id\nremoves __thought__ suffix)</size>\nCapture thought_signature\nfrom provider_specific_fields / extra_content;
+            |ChatCmplStreamHandler|
+            if (NOT yet streaming AND\nname AND call_id both known?) then (yes — begin streaming)
+                :Compute output_index\n(reasoning + text + refusal + prior streaming calls)\nMark function_call_streaming[index] = True\nStore function_call_output_idx[index];
+                |Event Consumer|
+                :yield **ResponseOutputItemAddedEvent**\n(item with empty arguments, output_index);
+                |ChatCmplStreamHandler|
+            endif
+            if (Streaming active AND tc_function.arguments?) then (yes)
+                |Event Consumer|
+                :yield **ResponseFunctionCallArgumentsDeltaEvent**\n(delta=tc_function.arguments);
+                |ChatCmplStreamHandler|
+            endif
+        endif
+
+    endif
+
+endwhile (stream exhausted)
+
+'============================================================
+' POST-STREAM FINALIZATION
+'============================================================
+partition "**Post-Stream Finalization**" {
+
+    :Call **_finish_reasoning_item()**;
+    note right
+      If summary reasoning:
+        → yield ResponseReasoningSummaryPartDoneEvent
+        → reset active_reasoning_summary_index
+      If 3rd-party reasoning:
+        → yield ResponseReasoningTextDoneEvent
+      Always:
+        → yield ResponseOutputItemDoneEvent (reasoning)
+        → Set reasoning_item_done = True
+    end note
+
+    if (state.text_content_index_and_output?) then (yes)
+        |Event Consumer|
+        :yield **ResponseContentPartDoneEvent**\n(part = accumulated ResponseOutputText);
+        |ChatCmplStreamHandler|
+    endif
+
+    if (state.refusal_content_index_and_output?) then (yes)
+        |Event Consumer|
+        :yield **ResponseContentPartDoneEvent**\n(part = accumulated ResponseOutputRefusal);
+        |ChatCmplStreamHandler|
+    endif
+
+    :For each **function_call** in state.function_calls;
+    if (function_call_streaming[index] == True?) then (yes — was streamed)
+        |Event Consumer|
+        :yield **ResponseOutputItemDoneEvent**\n(item with full arguments);
+        |ChatCmplStreamHandler|
+    else (no — fallback: name never arrived mid-stream)
+        |Event Consumer|
+        :yield **ResponseOutputItemAddedEvent**\nyield **ResponseFunctionCallArgumentsDeltaEvent**\n(delta = all accumulated arguments)\nyield **ResponseOutputItemDoneEvent**;
+        |ChatCmplStreamHandler|
+    endif
+
+    :Build **outputs** list:\n[ reasoning_item?, assistant_message?, ...function_calls ];
+
+    if (state.thinking_text?) then (yes — Anthropic)
+        |StreamingState|
+        :Attach thinking_text → reasoning_item.content\nAttach thinking_signature → reasoning_item.encrypted_content;
+        |ChatCmplStreamHandler|
+    endif
+
+    if (text or refusal content accumulated?) then (yes)
+        :Create final **ResponseOutputMessage**\n(status="completed", content=[text?, refusal?]);
+        |Event Consumer|
+        :yield **ResponseOutputItemDoneEvent**\n(assistant message, output_index=0 or 1);
+        |ChatCmplStreamHandler|
+    endif
+
+    :Build **final_response** = response.model_copy()\nSet output = outputs\nSet usage = ResponseUsage\n(input_tokens, output_tokens, total_tokens,\nreasoning_tokens, cached_tokens);
+    |Event Consumer|
+    :yield **ResponseCompletedEvent**\n(response=final_response, type="response.completed");
+    |ChatCmplStreamHandler|
+}
+
+stop
+
+note bottom
+  **Provider Compatibility Notes:**
+  • OpenAI: standard chunks, usage in last chunk
+  • LiteLLM: may omit chunk.usage; delta.refusal may be absent
+  • Anthropic (via LiteLLM): thinking_blocks on delta; signature in encrypted_content
+  • Gemini (via LiteLLM): tool_call.id has __thought__ suffix → cleaned; thought_signature in provider_specific_fields / extra_content
+end note
+
+@enduml

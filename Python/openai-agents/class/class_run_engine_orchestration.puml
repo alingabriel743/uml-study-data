@@ -1,0 +1,379 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+title Run Engine & Orchestration
+
+' ─────────────────────────────────────────────
+' Entry Points
+' ─────────────────────────────────────────────
+package "Entry Points" {
+
+    class Runner <<facade>> {
+        +{static} run(starting_agent, input, **kwargs) : RunResult
+        +{static} run_sync(starting_agent, input, **kwargs) : RunResult
+        +{static} run_streamed(starting_agent, input, **kwargs) : RunResultStreaming
+    }
+    note right of Runner
+        Public static facade.
+        Delegates to DEFAULT_AGENT_RUNNER
+        (AgentRunner singleton).
+    end note
+
+    class AgentRunner <<experimental>> {
+        +run(starting_agent, input, **kwargs) : RunResult
+        +run_sync(starting_agent, input, **kwargs) : RunResult
+        +run_streamed(starting_agent, input, **kwargs) : RunResultStreaming
+    }
+    note right of AgentRunner
+        WARNING: experimental, not public API.
+        Actual orchestration engine.
+        Accepts RunState as input for resume flows.
+    end note
+
+    class RunOptions <<TypedDict>> {
+        ~context : TContext | None
+        ~max_turns : int
+        ~hooks : RunHooks[TContext] | None
+        ~run_config : RunConfig | None
+        ~previous_response_id : str | None
+        ~auto_previous_response_id : bool
+        ~conversation_id : str | None
+        ~session : Session | None
+        ~error_handlers : RunErrorHandlers[TContext] | None
+    }
+}
+
+' ─────────────────────────────────────────────
+' Configuration
+' ─────────────────────────────────────────────
+package "Configuration" {
+
+    class RunConfig <<dataclass>> {
+        +model : str | Model | None
+        +model_provider : ModelProvider
+        +model_settings : ModelSettings | None
+        +handoff_input_filter : HandoffInputFilter | None
+        +nest_handoff_history : bool
+        +handoff_history_mapper : HandoffHistoryMapper | None
+        +input_guardrails : list[InputGuardrail] | None
+        +output_guardrails : list[OutputGuardrail] | None
+        +tracing_disabled : bool
+        +tracing : TracingConfig | None
+        +trace_include_sensitive_data : bool
+        +workflow_name : str
+        +trace_id : str | None
+        +group_id : str | None
+        +trace_metadata : dict[str, Any] | None
+        +session_input_callback : SessionInputCallback | None
+        +call_model_input_filter : CallModelInputFilter | None
+        +tool_error_formatter : ToolErrorFormatter | None
+        +session_settings : SessionSettings | None
+        +reasoning_item_id_policy : ReasoningItemIdPolicy | None
+        +sandbox : SandboxRunConfig | None
+    }
+    note bottom of RunConfig
+        DEFAULT_MAX_TURNS = 10.
+        call_model_input_filter hooks before
+        each model call to shape input.
+    end note
+
+    class SandboxRunConfig <<dataclass>> {
+        +client : BaseSandboxClient | None
+        +options : Any | None
+        +session : BaseSandboxSession | None
+        +session_state : SandboxSessionState | None
+        +manifest : Manifest | None
+        +snapshot : SnapshotSpec | SnapshotBase | None
+        +concurrency_limits : SandboxConcurrencyLimits
+    }
+
+    class SandboxConcurrencyLimits <<dataclass>> {
+        +manifest_entries : int | None
+        +local_dir_files : int | None
+        +validate() : None
+    }
+}
+
+' ─────────────────────────────────────────────
+' Context & Approval
+' ─────────────────────────────────────────────
+package "Context & Approval" {
+
+    class RunContextWrapper <<dataclass>> {
+        +context : TContext
+        +usage : Usage
+        +turn_input : list[TResponseInputItem]
+        -_approvals : dict[str, _ApprovalRecord]
+        +tool_input : Any | None
+        +is_tool_approved(tool_name, call_id) : bool | None
+        +approve_tool(approval_item, always_approve) : None
+        +reject_tool(approval_item, always_reject, rejection_message) : None
+        +get_approval_status(tool_name, call_id, ...) : bool | None
+        +get_rejection_message(tool_name, call_id, ...) : str | None
+        #_fork_with_tool_input(tool_input) : RunContextWrapper[TContext]
+        #_fork_without_tool_input() : RunContextWrapper[TContext]
+        #_rebuild_approvals(approvals) : None
+        #_apply_approval_decision(...) : None
+    }
+    note right of RunContextWrapper
+        Generic[TContext].
+        Wraps user context + SDK runtime state.
+        NOT passed to LLM.
+    end note
+
+    class AgentHookContext <<dataclass>> {
+    }
+    note right of AgentHookContext
+        Passed to agent lifecycle hooks
+        (on_start, on_end).
+    end note
+
+    class _ApprovalRecord <<dataclass>> {
+        +approved : bool | list[str]
+        +rejected : bool | list[str]
+        +rejection_messages : dict[str, str]
+        +sticky_rejection_message : str | None
+    }
+    note bottom of _ApprovalRecord
+        Internal. Tracks per-tool
+        approval/rejection state.
+    end note
+}
+
+' ─────────────────────────────────────────────
+' Callback / Filter Data
+' ─────────────────────────────────────────────
+package "Callback & Filter Data" {
+
+    class ModelInputData <<dataclass>> {
+        +input : list[TResponseInputItem]
+        +instructions : str | None
+    }
+
+    class CallModelData <<dataclass>> {
+        +model_data : ModelInputData
+        +agent : Agent[TContext]
+        +context : TContext | None
+    }
+    note right of CallModelData
+        Generic[TContext].
+        Passed to CallModelInputFilter
+        before each model call.
+    end note
+
+    class ToolErrorFormatterArgs <<dataclass>> {
+        +kind : Literal['approval_rejected']
+        +tool_type : Literal['function','computer','shell','apply_patch','custom']
+        +tool_name : str
+        +call_id : str
+        +default_message : str
+        +run_context : RunContextWrapper[TContext]
+    }
+
+    class AgentToolInvocation <<dataclass (frozen)>> {
+        +tool_name : str
+        +tool_call_id : str
+        +tool_arguments : str
+    }
+    note right of AgentToolInvocation
+        Immutable metadata for
+        nested Agent.as_tool() runs.
+    end note
+}
+
+' ─────────────────────────────────────────────
+' Results
+' ─────────────────────────────────────────────
+package "Results" {
+
+    abstract class RunResultBase <<dataclass (abstract)>> {
+        +input : str | list[TResponseInputItem]
+        +new_items : list[RunItem]
+        +raw_responses : list[ModelResponse]
+        +final_output : Any
+        +input_guardrail_results : list[InputGuardrailResult]
+        +output_guardrail_results : list[OutputGuardrailResult]
+        +tool_input_guardrail_results : list[ToolInputGuardrailResult]
+        +tool_output_guardrail_results : list[ToolOutputGuardrailResult]
+        +context_wrapper : RunContextWrapper[Any]
+        -_trace_state : TraceState | None
+        -_sandbox_resume_state : dict | None
+        -_sandbox_session : BaseSandboxSession | None
+        -_starting_agent_for_state : Agent | None
+        -_generated_prompt_cache_key : str | None
+        {abstract} +last_agent() : Agent[Any]
+        {abstract} +_release_last_agent_reference() : None
+        +final_output_as(cls, raise_if_incorrect_type) : T
+        +to_input_list(mode) : list[TResponseInputItem]
+        +agent_tool_invocation() : AgentToolInvocation | None
+        +last_response_id() : str | None
+        +release_agents(release_new_items) : None
+    }
+
+    class RunResult <<dataclass>> {
+        -_last_agent : Agent[Any]
+        -_last_agent_ref : weakref | None
+        -_last_processed_response : ProcessedResponse | None
+        -_tool_use_tracker_snapshot : dict[str, list[str]]
+        -_current_turn : int
+        -_conversation_id : str | None
+        -_previous_response_id : str | None
+        -_auto_previous_response_id : bool
+        -_reasoning_item_id_policy : ReasoningItemIdPolicy | None
+        +max_turns : int
+        +interruptions : list[ToolApprovalItem]
+        +last_agent() : Agent[Any]
+        +_release_last_agent_reference() : None
+        +to_state() : RunState[Any]
+        +__str__() : str
+    }
+    note bottom of RunResult
+        Returned by Runner.run() and
+        Runner.run_sync().
+        interruptions holds ToolApprovalItems
+        pending human approval.
+    end note
+
+    class RunResultStreaming <<dataclass>> {
+        +current_agent : Agent[Any]
+        +current_turn : int
+        +max_turns : int
+        +is_complete : bool
+        +trace : Trace | None
+        -_current_agent_output_schema : AgentOutputSchemaBase | None
+        -_event_queue : asyncio.Queue[StreamEvent | QueueCompleteSentinel]
+        -_input_guardrail_queue : asyncio.Queue[InputGuardrailResult]
+        +run_loop_task : asyncio.Task | None
+        -_input_guardrails_task : asyncio.Task | None
+        -_output_guardrails_task : asyncio.Task | None
+        -_stored_exception : Exception | None
+        -_cancel_mode : Literal['none','immediate','after_turn']
+        +interruptions : list[ToolApprovalItem]
+        +last_agent() : Agent[Any]
+        +_release_last_agent_reference() : None
+        +stream_events() : AsyncIterator[StreamEvent]
+        +cancel(mode) : None
+        +to_state() : RunState[Any]
+        +_check_errors() : None
+        +_cleanup_tasks() : None
+        +ensure_sandbox_cleanup_on_completion() : None
+        +__str__() : str
+    }
+    note bottom of RunResultStreaming
+        Returned by Runner.run_streamed().
+        Holds asyncio Queues and Tasks.
+        stream_events() is an async iterator.
+        cancel(mode): 'immediate' or 'after_turn'.
+    end note
+}
+
+' ─────────────────────────────────────────────
+' Run State (HITL pause/resume)
+' ─────────────────────────────────────────────
+package "Run State (HITL)" {
+
+    class RunState <<dataclass>> {
+        -_current_turn : int
+        -_current_agent : TAgent | None
+        -_starting_agent : TAgent | None
+        -_original_input : str | list
+        -_model_responses : list[ModelResponse]
+        -_context : RunContextWrapper[TContext] | None
+        -_generated_items : list[RunItem]
+        -_session_items : list[RunItem]
+        -_max_turns : int
+        -_conversation_id : str | None
+        -_previous_response_id : str | None
+        -_auto_previous_response_id : bool
+        -_input_guardrail_results : list[InputGuardrailResult]
+        -_output_guardrail_results : list[OutputGuardrailResult]
+        -_current_step : NextStepInterruption | None
+        -_last_processed_response : ProcessedResponse | None
+        -_tool_use_tracker_snapshot : dict[str, list[str]]
+        -_trace_state : TraceState | None
+        -_sandbox : dict[str, Any] | None
+        -_schema_version : str
+        +get_interruptions() : list[ToolApprovalItem]
+        +approve(approval_item, always_approve) : None
+        +reject(approval_item, always_reject, rejection_message) : None
+        +to_json(...) : str
+        +{static} from_json(json_str, ...) : RunState
+        +save(path) : None
+        +{static} load(path, ...) : RunState
+        +set_tool_use_tracker_snapshot(snapshot) : None
+        -_serialize_approvals() : dict
+        -_serialize_model_responses() : list
+    }
+    note right of RunState
+        Generic[TContext, TAgent].
+        Schema version: 1.9.
+        Serializable snapshot for
+        HITL pause/resume flows.
+        approve/reject delegates to
+        RunContextWrapper.
+    end note
+}
+
+' ─────────────────────────────────────────────
+' Relationships
+' ─────────────────────────────────────────────
+
+' Entry point delegation
+Runner ..> AgentRunner : delegates to\nDEFAULT_AGENT_RUNNER
+Runner ..> RunOptions : accepts
+AgentRunner ..> RunOptions : accepts **kwargs
+AgentRunner ..> RunConfig : creates if none provided
+AgentRunner ..> RunState : accepts as input\n(resume flow)
+
+' Runner return types
+Runner ..> RunResult : returns
+Runner ..> RunResultStreaming : returns
+
+' Config composition
+RunConfig *-- SandboxRunConfig : sandbox
+SandboxRunConfig *-- SandboxConcurrencyLimits : concurrency_limits
+
+' Context inheritance & composition
+AgentHookContext --|> RunContextWrapper : extends
+RunContextWrapper *-- _ApprovalRecord : _approvals
+
+' Context references
+RunContextWrapper ..> "Usage" : uses
+
+' Callback data composition
+CallModelData *-- ModelInputData : model_data
+CallModelData ..> "Agent" : references
+ToolErrorFormatterArgs ..> RunContextWrapper : run_context
+
+' Results inheritance
+RunResult --|> RunResultBase : extends
+RunResultStreaming --|> RunResultBase : extends
+
+' Results contain context
+RunResultBase *-- RunContextWrapper : context_wrapper
+RunResultBase ..> AgentToolInvocation : agent_tool_invocation
+
+' Results → RunState (pause/resume)
+RunResult ..> RunState : to_state()
+RunResultStreaming ..> RunState : to_state()
+
+' RunState composition
+RunState *-- RunContextWrapper : _context
+RunState ..> RunContextWrapper : approve/reject\ndelegates to
+
+@enduml

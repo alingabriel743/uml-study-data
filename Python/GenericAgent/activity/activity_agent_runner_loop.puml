@@ -1,0 +1,127 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleBackgroundColor #E9ECEF
+}
+skinparam ArrowColor #495057
+
+title Agent Runner Loop (Core Turn Cycle)
+
+|Agent Runner Loop|
+start
+
+:Build initial messages\n[{role:system, content:system_prompt},\n {role:user, content:user_input}];
+
+:Initialize: turn=0\nhandler._done_hooks=[]\nhandler.max_turns=max_turns;
+
+while (turn < handler.max_turns?) is (yes)
+
+  :turn += 1;
+  :Yield status: "LLM Running (Turn N)...";
+
+  if (turn % 10 == 0?) then (yes)
+    :Reset client.last_tools = ''\n(prevent context window bloat);
+  endif
+
+  |LLM Client|
+  :client.chat(messages, tools_schema)\n→ response_gen (streaming generator);
+
+  |Agent Runner Loop|
+  if (verbose mode?) then (yes)
+    :yield from response_gen\n→ response object\nyield newline separator;
+  else (no)
+    :exhaust(response_gen)\n→ response object\nyield compact summary;
+  endif
+
+  :Parse tool_calls from LLM response;
+
+  if (response.tool_calls is None?) then (yes)
+    :Synthesize:\ntool_calls = [{tool_name:'no_tool', args:{}}];
+  else (no)
+    :Parse each tc:\n{tool_name, args (JSON-decoded), id (str)};
+  endif
+
+  :Init: tool_results=[], next_prompts=set()\nexit_reason=None;
+
+  while (more tool_calls to process?) is (yes)
+
+    :Extract (index ii, tc):\ntool_name, args, tid;
+
+    if (tool_name == 'no_tool'?) then (no)
+      :Yield tool name + args display\n(verbose: full detail / compact: summary);
+    endif
+
+    :handler.current_turn = turn;
+
+    |Handler / Dispatcher|
+    :Lookup method: 'do_' + tool_name\non handler instance;
+
+    if (method 'do_<tool_name>' found?) then (yes)
+      :args['_index'] = index;
+      :tool_before_callback\n(tool_name, args, response);
+      :handler.do_<tool_name>(args, response)\n→ StepOutcome via try_call_generator();
+      :tool_after_callback\n(tool_name, args, response, outcome);
+    elseif (tool_name == 'bad_json'?) then (yes)
+      :Return StepOutcome\n(data=None,\nnext_prompt=args.get('msg','bad_json'),\nshould_exit=False);
+    else (unknown tool)
+      :Yield "未知工具: <name>"\nReset client.last_tools = ''\nReturn StepOutcome\n(data=None, next_prompt='未知工具 <name>');
+    endif
+
+    |Agent Runner Loop|
+    if (outcome.should_exit == True?) then (yes)
+      :exit_reason =\n{result: 'EXITED', data: outcome.data};
+      break
+    elseif (outcome.next_prompt is falsy?) then (yes)
+      :exit_reason =\n{result: 'CURRENT_TASK_DONE', data: outcome.data};
+      break
+    else (continue)
+      if (next_prompt starts with '未知工具'?) then (yes)
+        :Reset client.last_tools = '';
+      endif
+      if (outcome.data not None\nAND tool_name != 'no_tool'?) then (yes)
+        :Append {tool_use_id, content (JSON)}\nto tool_results;
+      endif
+      :Add outcome.next_prompt\nto next_prompts (deduplicated set);
+    endif
+
+  endwhile
+
+  if (next_prompts empty OR exit_reason set?) then (yes)
+    if (handler._done_hooks empty?) then (yes)
+      break
+    else (hooks pending)
+      :Pop _done_hooks[0]\n→ inject into next_prompts\n(continue via deferred hook);
+    endif
+  endif
+
+  :turn_end_callback\n(response, tool_calls, tool_results,\nturn, joined_next_prompts, exit_reason)\n→ next_prompt (caller may override);
+
+  :Rebuild messages =\n[{role:user, content:next_prompt,\n tool_results:tool_results}];
+
+endwhile (max turns reached)
+
+if (exit_reason set?) then (yes)
+  :Final turn_end_callback\n(..., content='', exit_reason)\n(notify caller of terminal condition);
+  :Return exit_reason\n{result: 'EXITED' | 'CURRENT_TASK_DONE'};
+else (no)
+  :Return\n{result: 'MAX_TURNS_EXCEEDED'};
+endif
+
+stop
+
+@enduml

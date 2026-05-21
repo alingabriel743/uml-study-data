@@ -1,0 +1,222 @@
+{
+  "scope": "transport_and_agent_communication",
+  "title": "Transport & Datadog Agent Communication",
+  "diagram_type": "use_case",
+  "description": "Flushing finished spans to the local Datadog Agent over HTTP or Unix socket. Covers production and test-mode transport implementations.",
+
+  "actors": [
+    {
+      "name": "Test Suite",
+      "type": "primary",
+      "description": "PHPUnit tests that exercise tracing logic; uses DebugTransport and DebugLogger for assertions"
+    },
+    {
+      "name": "PHP Application",
+      "type": "primary",
+      "description": "Instrumented application code calling Tracer::flush() at request end"
+    },
+    {
+      "name": "Datadog Agent",
+      "type": "external_system",
+      "description": "Local sidecar process receiving msgpack-encoded trace payloads over HTTP (DD_AGENT_HOST:DD_TRACE_AGENT_PORT) or Unix socket (DD_TRACE_AGENT_URL)"
+    },
+    {
+      "name": "C Extension / Background Sender",
+      "type": "internal_system",
+      "description": "ddtrace C extension that handles msgpack serialization and async HTTP/socket delivery via \\DDTrace\\flush()"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Flush Traces to Agent",
+      "actor": "PHP Application",
+      "description": "Tracer::flush() checks enabled flag, logs trace/span counts, then calls Transport::send($tracer) and closes ScopeManager",
+      "call_chain": "Tracer::flush() → check config['enabled'] → logDebug(count,spanCount) → Transport::send($this) → ScopeManager::close()"
+    },
+    {
+      "id": "UC2",
+      "name": "Send via Internal (Production) Transport",
+      "actor": "PHP Application",
+      "description": "Internal::send() delegates to C extension \\DDTrace\\flush() when DD_TRACE_GENERATE_ROOT_SPAN is false; setHeader() is no-op",
+      "call_chain": "Internal::send($tracer) → dd_trace_env_config('DD_TRACE_GENERATE_ROOT_SPAN') → \\DDTrace\\flush()"
+    },
+    {
+      "id": "UC3",
+      "name": "Serialize and Deliver Trace Payload",
+      "actor": "C Extension / Background Sender",
+      "description": "C extension serializes spans to msgpack, delivers to Datadog Agent via HTTP POST or Unix socket based on env config",
+      "config": ["DD_AGENT_HOST", "DD_TRACE_AGENT_PORT", "DD_TRACE_AGENT_URL", "DD_TRACE_AGENT_FLUSH_INTERVAL", "DD_TRACE_AGENT_FLUSH_AFTER_N_REQUESTS"]
+    },
+    {
+      "id": "UC4",
+      "name": "Capture Traces in Memory (Test Mode)",
+      "actor": "Test Suite",
+      "description": "DebugTransport::send() calls $tracer->getTracesAsArray() and merges into internal $traces array; no network call made",
+      "call_chain": "DebugTransport::send($tracer) → $tracer->getTracesAsArray() → array_merge($this->traces, ...)"
+    },
+    {
+      "id": "UC5",
+      "name": "Inspect Captured Traces",
+      "actor": "Test Suite",
+      "description": "Test retrieves in-memory traces via DebugTransport::getTraces() for assertion",
+      "methods": ["DebugTransport::getTraces(): array", "DebugTransport::getHeaders(): array"]
+    },
+    {
+      "id": "UC6",
+      "name": "Set Transport Header",
+      "actor": "PHP Application",
+      "description": "Transport::setHeader(key, value) allows attaching HTTP headers for agent requests; Internal ignores them (no-op), DebugTransport stores them",
+      "implementations": {
+        "Internal": "setHeader() is no-op — background sender does not accept headers",
+        "DebugTransport": "array_push($this->headers, [$key => $value])",
+        "Noop": "no-op"
+      }
+    },
+    {
+      "id": "UC7",
+      "name": "Start Web Server SAPI for Integration Testing",
+      "actor": "Test Suite",
+      "description": "WebServer::start() selects SAPI implementation based on DD_TRACE_TEST_SAPI env var, starts process, then optionally starts NginxServer for FastCGI",
+      "call_chain": "WebServer::start() → select SAPI (CliServer|PhpCgi|PhpFpm|PhpApache|RoadrunnerServer|OctaneServer|SwooleServer|FrankenphpServer) → $sapi->start() → if isFastCgi(): NginxServer::start()",
+      "default_agent_envs": {
+        "DD_TRACE_AGENT_PORT": 9126,
+        "DD_AGENT_HOST": "test-agent",
+        "DD_TRACE_AGENT_FLUSH_AFTER_N_REQUESTS": 1,
+        "DD_TRACE_AGENT_FLUSH_INTERVAL": 111
+      }
+    },
+    {
+      "id": "UC8",
+      "name": "Stop Web Server and Await BGS Flush",
+      "actor": "Test Suite",
+      "description": "WebServer::stop() sleeps 2x flush interval (usleep) to ensure Background Sender delivers traces before process dies, then stops SAPI and NginxServer",
+      "call_chain": "WebServer::stop() → usleep(DD_TRACE_AGENT_FLUSH_INTERVAL * 2 * 1000) → $sapi->stop() → $server->stop()"
+    },
+    {
+      "id": "UC9",
+      "name": "Log Debug/Warning/Error Messages",
+      "actor": "Test Suite",
+      "description": "DebugLogger captures log records for assertion; supports has(level, message) and hasOnly(level, message) queries",
+      "call_chain": "DebugLogger::debug/warning/error(message, context) → interpolate(message, context) → $records[] = [level, message]"
+    },
+    {
+      "id": "UC10",
+      "name": "Check Server Errors",
+      "actor": "Test Suite",
+      "description": "WebServer::checkErrors() reads PHP error log diff and filters for ddtrace error/warn/deprecated lines, delegates to $sapi->checkErrors() for additional checks",
+      "regex_filter": "(\\[ddtrace] \\[(error|warn|deprecated|warning)])"
+    }
+  ],
+
+  "key_classes": [
+    {
+      "name": "Transport",
+      "type": "interface",
+      "namespace": "DDTrace",
+      "file": "src/api/Transport.php",
+      "methods": ["send(TracerInterface $tracer): void", "setHeader(string $key, string $value): void"]
+    },
+    {
+      "name": "Internal",
+      "type": "class",
+      "namespace": "DDTrace\\Transport",
+      "file": "src/DDTrace/Transport/Internal.php",
+      "implements": "Transport",
+      "description": "Production transport — delegates to \\DDTrace\\flush() C extension function"
+    },
+    {
+      "name": "Noop",
+      "type": "class",
+      "namespace": "DDTrace\\Transport",
+      "file": "src/DDTrace/Transport/Noop.php",
+      "implements": "Transport",
+      "description": "No-operation transport; used when tracing is disabled"
+    },
+    {
+      "name": "DebugTransport",
+      "type": "class",
+      "namespace": "DDTrace\\Tests",
+      "file": "tests/DebugTransport.php",
+      "implements": "Transport",
+      "attributes": ["$traces: array", "$headers: array"],
+      "methods": ["send(Tracer $tracer): void", "setHeader(string $key, string $value): void", "getTraces(): array", "getHeaders(): array"]
+    },
+    {
+      "name": "Tracer",
+      "type": "class",
+      "namespace": "DDTrace",
+      "file": "src/DDTrace/Tracer.php",
+      "key_attributes": ["$transport: Transport", "$traces: array"],
+      "constructor": "__construct($transport=null, $propagators=null, array $config=[]): defaults transport to new Internal()",
+      "flush_method": "flush(): check enabled → logDebug → transport->send($this) → scopeManager->close()"
+    },
+    {
+      "name": "WebServer",
+      "type": "class",
+      "namespace": "DDTrace\\Tests",
+      "file": "tests/WebServer.php",
+      "attributes": ["$sapi: Sapi", "$server: NginxServer", "$host: string", "$port: int", "$envs: array", "$inis: array"],
+      "sapiOptions": ["CliServer", "PhpCgi (cgi-fcgi)", "PhpFpm (fpm-fcgi)", "PhpApache (apache2handler)", "RoadrunnerServer", "OctaneServer", "SwooleServer", "FrankenphpServer"],
+      "methods": ["start()", "stop()", "reload()", "mergeEnvs(array): self", "mergeInis(array): self", "checkErrors(): ?string"]
+    },
+    {
+      "name": "DebugLogger",
+      "type": "class",
+      "namespace": "DDTrace\\Tests",
+      "file": "tests/DebugLogger.php",
+      "extends": "AbstractLogger",
+      "uses_trait": "InterpolateTrait",
+      "attributes": ["$records: array"],
+      "methods": ["debug(message, context): void", "warning(message, context): void", "error(message, context): void", "has(level, message): bool", "hasOnly(level, message): bool", "all(): array"]
+    }
+  ],
+
+  "key_relationships": [
+    "DebugTransport implements Transport",
+    "Internal implements Transport",
+    "Noop implements Transport",
+    "Tracer depends_on Transport (composition, defaults to Internal)",
+    "Tracer::flush() calls Transport::send($this)",
+    "Internal::send() calls \\DDTrace\\flush() (C extension)",
+    "DebugTransport::send() calls $tracer->getTracesAsArray()",
+    "WebServer composes Sapi (one of 8 SAPI types) and optionally NginxServer",
+    "WebServer::stop() waits DD_TRACE_AGENT_FLUSH_INTERVAL*2 for BGS to flush",
+    "DebugLogger extends AbstractLogger, uses InterpolateTrait"
+  ],
+
+  "agent_communication": {
+    "protocol": "HTTP POST (default) or Unix Domain Socket",
+    "serialization": "msgpack (handled by C extension)",
+    "endpoint": "/v0.4/traces on DD_AGENT_HOST:DD_TRACE_AGENT_PORT",
+    "config_vars": {
+      "DD_AGENT_HOST": "Agent hostname (default: localhost)",
+      "DD_TRACE_AGENT_PORT": "Agent port (default: 8126, test: 9126)",
+      "DD_TRACE_AGENT_URL": "Full URL override; supports unix:// scheme for UDS",
+      "DD_TRACE_AGENT_FLUSH_INTERVAL": "Background flush interval in ms",
+      "DD_TRACE_AGENT_FLUSH_AFTER_N_REQUESTS": "Flush after N requests (useful for tests)"
+    },
+    "flush_trigger": "End of PHP request lifecycle OR explicit dd_trace_close_all_spans_and_flush() / dd_trace_synchronous_flush()"
+  },
+
+  "important_notes": [
+    "DebugTransport and WebServer live in the tests/ directory — test infrastructure, not production code",
+    "Production delivery is entirely handled by the ddtrace C extension (Background Sender / BGS) via \\DDTrace\\flush()",
+    "Internal transport is the default when no transport is injected into Tracer constructor",
+    "WebServer::stop() explicitly sleeps 2x flush interval to prevent race between BGS delivery and process shutdown",
+    "auto_flush_enabled=1 + generate_root_span=0 is the pattern used by long-lived SAPIs (Swoole, Roadrunner, FrankenPHP, Symfony Messenger)",
+    "DebugLogger is used in unit tests to assert that specific log messages were emitted during transport/tracing operations"
+  ],
+
+  "source_files_analyzed": [
+    "tests/DebugTransport.php",
+    "tests/WebServer.php",
+    "tests/DebugLogger.php",
+    "src/api/Transport.php",
+    "src/DDTrace/Transport/Internal.php",
+    "src/DDTrace/Transport/Noop.php",
+    "src/DDTrace/Tracer.php (flush() method)",
+    "src/DDTrace/OpenTelemetry/CompositeResolver.php (agent URL resolution)"
+  ]
+}

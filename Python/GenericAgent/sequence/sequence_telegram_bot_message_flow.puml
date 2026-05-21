@@ -1,0 +1,185 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #495057
+    LifeLineBackgroundColor #F8F9FA
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ParticipantFontColor #212529
+    ActorBackgroundColor #E9ECEF
+    ActorBorderColor #495057
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    DividerBackgroundColor #DEE2E6
+    GroupBackgroundColor #F1F3F5
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F0AD4E
+}
+
+title Telegram Bot Message Flow
+
+actor "Telegram User" as User
+participant "Telegram API" as TgAPI
+box "tgapp.py (Frontend)" #E8F4FD
+    participant "Application\n(Dispatcher)" as App
+    participant "handle_msg" as HandleMsg
+    participant "_stream\n(asyncio task)" as Stream
+    participant "_clean / _to_html" as Formatters
+end box
+box "agentmain.py" #EDF7ED
+    participant "GeneraticAgent" as Agent
+end box
+box "agent_loop.py" #FDF3E9
+    participant "agent_runner_loop" as RunnerLoop
+    participant "BaseHandler\n(tool dispatch)" as Handler
+end box
+participant "LLMClient\n(llmcore.py)" as LLMClient
+queue "dq\n(asyncio Queue)" as Queue
+
+== Bot Startup ==
+App -> App: socket lock (port 19527)\nsingle-instance guard
+App -> Agent: agent.run() in daemon thread
+App -> App: register handlers:\n/stop→cmd_abort, /llm→cmd_llm,\nTEXT→handle_msg
+App -> TgAPI: app.run_polling(\ndrop_pending_updates=True)
+
+== Normal Message Flow ==
+User -> TgAPI: sends text message
+TgAPI -> App: incoming Update (TEXT)
+App -> HandleMsg: dispatch(update, ctx)
+activate HandleMsg
+
+HandleMsg -> HandleMsg: auth check\n(user_id in ALLOWED set)
+HandleMsg -> TgAPI: update.message.reply_text("thinking...")
+TgAPI --> HandleMsg: msg (placeholder message object)
+
+HandleMsg -> HandleMsg: build prompt =\n"[FILE hint]\\n\\n" + message.text
+HandleMsg -> Agent: put_task(prompt, source='telegram')
+activate Agent
+Agent --> HandleMsg: dq (asyncio.Queue)
+deactivate Agent
+
+HandleMsg -> Stream: asyncio.create_task(_stream(dq, msg))
+activate Stream
+HandleMsg -> App: ctx.user_data['stream_task'] = task
+deactivate HandleMsg
+
+== Background: Agent LLM Loop ==
+Agent -> RunnerLoop: agent_runner_loop(\nclient, system_prompt,\nuser_input, handler,\ntools_schema, max_turns=40)
+activate RunnerLoop
+
+loop LLM multi-turn (up to 40 turns)
+    RunnerLoop -> LLMClient: client.chat(messages, tools_schema)\n[streaming]
+    activate LLMClient
+    LLMClient --> RunnerLoop: stream chunks (text / tool_use)
+    deactivate LLMClient
+
+    alt tool call in response
+        RunnerLoop -> Handler: handler.dispatch(tool_name, args, response)
+        activate Handler
+        Handler --> RunnerLoop: tool result
+        deactivate Handler
+        RunnerLoop -> RunnerLoop: handler.tool_before/after_callback()
+    end
+
+    RunnerLoop -> Queue: put({next: chunk_text})
+    note right of Queue: interim streaming chunks\npushed to queue
+end
+
+RunnerLoop -> RunnerLoop: handler.turn_end_callback()
+RunnerLoop -> Queue: put({done: final_text})
+deactivate RunnerLoop
+
+== Streaming Reply to Telegram ==
+loop every ~3 seconds (while not done)
+    Stream -> Queue: dq.get_nowait()
+    activate Stream
+    Queue --> Stream: {next: raw_chunk}
+
+    Stream -> Formatters: _clean(raw_chunk)\nstrip <thinking>/<summary>/<tool_use> tags,\ncollapse newlines
+    Formatters --> Stream: cleaned_text
+
+    Stream -> Formatters: _to_html(cleaned_text)\nmarkdown → Telegram HTML\n(bold/italic/code/pre)
+    Formatters --> Stream: html_text
+
+    alt text > 4000 chars
+        Stream -> TgAPI: msg.reply_text("(continued...)")
+        TgAPI --> Stream: new_msg
+        Stream -> Stream: msg = new_msg
+    end
+
+    Stream -> TgAPI: msg.edit_text(html_text,\nparse_mode='HTML') + "⏳"
+    deactivate Stream
+end
+
+== Stream Completion ==
+Stream -> Queue: dq.get_nowait()
+Queue --> Stream: {done: final_text}
+activate Stream
+
+Stream -> Formatters: _clean(final_text)
+Formatters --> Stream: clean_final
+
+loop for each [FILE:path] token in response
+    alt file is image
+        Stream -> TgAPI: msg.reply_photo(path)
+    else file is document
+        Stream -> TgAPI: msg.reply_document(path)
+    end
+end
+
+Stream -> TgAPI: msg.edit_text(clean_final, parse_mode='HTML')
+note right of Stream: final edit removes ⏳ spinner
+deactivate Stream
+
+== Abort Flow (/stop command) ==
+User -> TgAPI: /stop
+TgAPI -> App: incoming Update (COMMAND /stop)
+App -> HandleMsg: cmd_abort(update, ctx)
+activate HandleMsg
+HandleMsg -> Agent: agent.abort()
+activate Agent
+Agent --> HandleMsg: (aborted)
+deactivate Agent
+HandleMsg -> Stream: stream_task.cancel()
+note right of Stream: asyncio task cancelled
+HandleMsg -> TgAPI: update.message.reply_text("Aborted")
+deactivate HandleMsg
+
+== LLM Switch Flow (/llm command) ==
+User -> TgAPI: /llm <n>  OR  /llm
+TgAPI -> App: incoming Update (COMMAND /llm)
+App -> HandleMsg: cmd_llm(update, ctx)
+activate HandleMsg
+
+alt argument <n> provided
+    HandleMsg -> Agent: agent.next_llm(n)
+    activate Agent
+    Agent --> HandleMsg: new_llm_name
+    deactivate Agent
+    HandleMsg -> TgAPI: reply_text("Switched to <new_llm_name>")
+else no argument
+    HandleMsg -> Agent: agent.list_llms()
+    activate Agent
+    Agent --> HandleMsg: llm_list
+    deactivate Agent
+    HandleMsg -> TgAPI: reply_text(llm_list)
+end
+deactivate HandleMsg
+
+@enduml

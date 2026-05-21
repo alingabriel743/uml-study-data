@@ -1,0 +1,226 @@
+{
+  "scope": "model_training_pipeline",
+  "title": "Model Training Pipeline",
+  "diagram_type": "use_case",
+  "description": "ML Engineer launches and manages training runs for diffusion world models (3DGS + multiview diffusion)",
+
+  "actors": [
+    {
+      "name": "ML Engineer",
+      "type": "primary",
+      "description": "Launches training, monitors progress, resumes runs, configures hyperparameters"
+    },
+    {
+      "name": "WandB",
+      "type": "external_system",
+      "description": "Experiment tracking and metrics logging (log_with=wandb, tags=['cosmos_3dgs'])"
+    },
+    {
+      "name": "Distributed GPU Cluster",
+      "type": "external_system",
+      "description": "Multi-GPU execution via Accelerate (FSDP / DeepSpeed ZeRO-2 / DDP)"
+    },
+    {
+      "name": "HuggingFace Hub",
+      "type": "external_system",
+      "description": "Checkpoint/model weight storage (create_repo, upload_folder)"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC01",
+      "name": "Launch Training Run",
+      "actor": "ML Engineer",
+      "description": "Entry point: python train.py --config <yaml> --config_default configs/training/default.yaml",
+      "details": "CLI args parsed via argparse; configs merged with OmegaConf.merge(schema, config, cli_overrides)"
+    },
+    {
+      "id": "UC02",
+      "name": "Configure Training Parameters",
+      "actor": "ML Engineer",
+      "description": "Load and validate OmegaConf config; prepare_config() sets LOCAL_RANK, vae_path, use_lora defaults",
+      "details": "Supports mixed_precision (fp16/bf16), batch_size, learning_rate, gradient_accumulation_steps, max_train_steps"
+    },
+    {
+      "id": "UC03",
+      "name": "Initialize Distributed Backend",
+      "actor": "ML Engineer",
+      "description": "Accelerator is created with chosen parallelism strategy: FSDP, DeepSpeed ZeRO-2, or plain DDP",
+      "details": "DeepSpeedPlugin: zero_stage=2, train_micro_batch_size_per_gpu. FSDP: FullStateDictConfig. DistributedDataParallelKwargs for gradient accumulation"
+    },
+    {
+      "id": "UC04",
+      "name": "Load Pretrained VAE",
+      "actor": "ML Engineer",
+      "description": "VAE loaded inside deepspeed_zero_init_disabled_context_manager() to prevent ZeRO-3 partitioning",
+      "details": "load_vae(config.vae_backbone, config.vae_path); frozen (requires_grad=False); optionally compiled with torch.compile"
+    },
+    {
+      "id": "UC05",
+      "name": "Initialize Model",
+      "actor": "ML Engineer",
+      "description": "Instantiate LatentRecon(config) as the trainable transformer. For diffusion pipeline, MultiviewDiffusionModel or MultiviewExtendDiffusionModel is used",
+      "details": "MultiviewDiffusionModel extends DiffusionModel; MultiviewExtendDiffusionModel extends ExtendDiffusionModel. Both add n_views attribute and multiview-aware encode/decode"
+    },
+    {
+      "id": "UC06",
+      "name": "Configure LoRA Adapters",
+      "actor": "ML Engineer",
+      "description": "Optional LoRA fine-tuning via PEFT: LoraConfig(r=64, lora_alpha=64, target_modules=['to_k','to_q','to_v','to_out.0'])",
+      "details": "transformer.add_adapter(lora_config); trainable params filtered by lora_params list; saved separately via save_lora_weights"
+    },
+    {
+      "id": "UC07",
+      "name": "Resume Training from Checkpoint",
+      "actor": "ML Engineer",
+      "description": "resume_from_ckpt(): loads accelerator state or falls back to model-only weights via load_model_weights()",
+      "details": "Supports 'latest' (get_most_recent_checkpoint) or explicit checkpoint path. global_step and first_epoch recovered from path. Corrupt checkpoints are deleted automatically"
+    },
+    {
+      "id": "UC08",
+      "name": "Create Multi-view DataLoaders",
+      "actor": "ML Engineer",
+      "description": "get_multi_dataloader(config, accelerator) returns train_dataloader and test_dataloader",
+      "details": "Supports variable num_input_multi_views per batch; WebDataset (wds) loader enabled by default"
+    },
+    {
+      "id": "UC09",
+      "name": "Execute Training Step",
+      "actor": "Distributed GPU Cluster",
+      "description": "train_step(batch, train_loss, num_input_multi_views): full forward-backward pass per accumulation step",
+      "details": "Steps: (1) move tensors to device+dtype, (2) encode_multi_view_video(vae, video), (3) get_plucker_embedding_and_rays, (4) encode_latent_time_vae / encode_plucker_vae optionally, (5) transformer(batch) forward, (6) compute_loss(pred_images, gt_images, pred_depths, gt_depths, pred_opacity), (7) accelerator.backward(loss), (8) clip_grad_norm_, (9) optimizer.step(), (10) lr_scheduler.step()"
+    },
+    {
+      "id": "UC10",
+      "name": "Train Multiview Diffusion Model",
+      "actor": "Distributed GPU Cluster",
+      "description": "MultiviewDiffusionModel.compute_loss_with_epsilon_and_sigma(): handles context parallelism for multi-GPU, splits x0/epsilon across CP group",
+      "details": "encode(): rearranges B C (V T) H W -> (B V) C T H W before VAE. Context parallel: split_inputs_cp / cat_outputs_cp. Calls super(DiffusionModel).compute_loss_with_epsilon_and_sigma"
+    },
+    {
+      "id": "UC11",
+      "name": "Train Video Extension Model",
+      "actor": "Distributed GPU Cluster",
+      "description": "MultiviewExtendDiffusionModel.denoise(): adds conditioning from gt_latent frames (first_n or first_random_n frames)",
+      "details": "add_condition_video_indicator_and_video_input_mask() builds binary indicator tensor. Augments conditional latent with noise. Composes: new_xt = indicator*augment_latent + (1-indicator)*noise_x. Supports normalize_condition_latent and compute_loss_for_condition_region flags"
+    },
+    {
+      "id": "UC12",
+      "name": "Generate Diffusion Samples",
+      "actor": "ML Engineer",
+      "description": "generate_samples_from_batch(): classifier-free guidance sampling with ODE solver",
+      "details": "MultiviewDiffusionModel: get_x0_fn_from_batch -> conditioner.get_condition_uncondition -> sampler(x0_fn, x_sigma_max, num_steps=35, solver_option='2ab'). MultiviewExtendDiffusionModel: get_x0_fn_from_batch_with_condition_latent requires condition_latent tensor"
+    },
+    {
+      "id": "UC13",
+      "name": "Save Training Checkpoint",
+      "actor": "ML Engineer",
+      "description": "Every checkpointing_steps: accelerator.save_state(checkpoint-{global_step}). Respects checkpoints_total_limit; permanent_checkpointing_steps checkpoints are exempt from pruning",
+      "details": "save_model_hook saves transformer (+ ema_transformer if use_ema) + LoRA weights. Multi-process: save_random_state per rank. FSDP/DeepSpeed: all processes save"
+    },
+    {
+      "id": "UC14",
+      "name": "Monitor Training Metrics",
+      "actor": "WandB",
+      "description": "accelerator.log({'train_loss', 'lr'}, step=global_step); WandB run named via --wandb_run_name, group via --wandb_group_name",
+      "details": "Tags: ['cosmos_3dgs']. Overflow detection: logs 'overflow' and gradient scaler value. Config saved to output_dir/config.yaml"
+    },
+    {
+      "id": "UC15",
+      "name": "Stop Training Run",
+      "actor": "ML Engineer",
+      "description": "Training loop terminates when global_step >= max_train_steps or global_step % job_stop_steps == 0",
+      "details": "accelerator.wait_for_everyone(); accelerator.end_training(); wandb.finish() in finally block"
+    }
+  ],
+
+  "use_case_relationships": [
+    {"type": "include", "from": "UC01", "to": "UC02", "note": "Always configure after launch"},
+    {"type": "include", "from": "UC01", "to": "UC03", "note": "Always initialize distributed backend"},
+    {"type": "include", "from": "UC01", "to": "UC04", "note": "VAE always loaded"},
+    {"type": "include", "from": "UC01", "to": "UC05", "note": "Model always initialized"},
+    {"type": "extend",  "from": "UC06", "to": "UC05", "note": "Optional LoRA on top of model init"},
+    {"type": "extend",  "from": "UC07", "to": "UC01", "note": "Optional resume if resume_from_checkpoint set"},
+    {"type": "include", "from": "UC01", "to": "UC08", "note": "DataLoaders always created"},
+    {"type": "include", "from": "UC09", "to": "UC10", "note": "Training step uses MultiviewDiffusionModel"},
+    {"type": "extend",  "from": "UC11", "to": "UC10", "note": "Extend model adds video conditioning"},
+    {"type": "extend",  "from": "UC12", "to": "UC09", "note": "Sample generation (validation/inference)"},
+    {"type": "include", "from": "UC09", "to": "UC13", "note": "Checkpoint saved every N steps"},
+    {"type": "include", "from": "UC09", "to": "UC14", "note": "Metrics logged every sync step"},
+    {"type": "include", "from": "UC01", "to": "UC15", "note": "Training always ends"}
+  ],
+
+  "key_classes": [
+    {
+      "name": "MultiviewDiffusionModel",
+      "file": "cosmos_predict1/diffusion/training/models/model_multiview.py",
+      "extends": "DiffusionModel",
+      "key_attrs": ["n_views: int"],
+      "key_methods": [
+        "encode(state: Tensor) -> Tensor",
+        "decode(latent: Tensor) -> Tensor",
+        "compute_loss_with_epsilon_and_sigma(data_batch, x0_from_data_batch, x0, condition, epsilon, sigma)",
+        "generate_samples_from_batch(data_batch, guidance=1.5, seed=1, num_steps=35, solver_option='2ab') -> Tensor",
+        "get_x0_fn_from_batch(data_batch, guidance, is_negative_prompt) -> Callable"
+      ],
+      "fsdp_variant": "FSDPDiffusionModel (@diffusion_fsdp_class_decorator)"
+    },
+    {
+      "name": "MultiviewExtendDiffusionModel",
+      "file": "cosmos_predict1/diffusion/training/models/extend_model_multiview.py",
+      "extends": "ExtendDiffusionModel",
+      "key_attrs": ["n_views: int"],
+      "key_methods": [
+        "encode(state: Tensor) -> Tensor",
+        "decode(latent: Tensor) -> Tensor",
+        "compute_loss_with_epsilon_and_sigma(data_batch, x0_from_data_batch, x0, condition, epsilon, sigma)",
+        "denoise(noise_x, sigma, condition: VideoExtendCondition, condition_video_augment_sigma_in_inference=0.001) -> VideoDenoisePrediction",
+        "add_condition_video_indicator_and_video_input_mask(latent_state, condition, num_condition_t) -> VideoExtendCondition",
+        "get_x0_fn_from_batch_with_condition_latent(data_batch, guidance, condition_latent, num_condition_t, ...) -> Callable",
+        "generate_samples_from_batch(data_batch, guidance=1.5, condition_latent=None, num_condition_t=None, ...) -> Tensor"
+      ],
+      "fsdp_variant": "FSDPExtendDiffusionModel (@diffusion_fsdp_class_decorator)"
+    },
+    {
+      "name": "LatentRecon",
+      "file": "src/models/recon/model_latent_recon.py",
+      "role": "Primary trainable transformer in train.py (3DGS reconstruction)",
+      "forward_output_keys": ["images_pred", "depths_pred", "opacity_pred"]
+    }
+  ],
+
+  "key_functions": [
+    "deepspeed_zero_init_disabled_context_manager(): returns [zero3_init_context_manager(enable=False)] or [] — prevents ZeRO-3 partitioning of frozen models",
+    "train_step(batch, train_loss, num_input_multi_views): full training iteration encapsulating encode→forward→loss→backward→optimizer",
+    "resume_from_ckpt(config, accelerator, transformer): checkpoint resumption with fallback to model-only weights",
+    "encode_multi_view_video(vae, video, num_input_multi_views, vae_backbone): batched multiview VAE encoding",
+    "get_plucker_embedding_and_rays(intrinsics, c2ws, img_size, ...): camera-ray Plucker embedding computation on GPU",
+    "compute_loss(accelerator, train_loss, pred_images, gt_images, pred_depths, gt_depths, pred_opacity, config, lpips_module): combined RGB+depth+opacity+LPIPS loss"
+  ],
+
+  "distributed_strategy": {
+    "options": ["FSDP", "DeepSpeed ZeRO-2", "DDP"],
+    "deepspeed": "zero_stage=2, fp16/bf16 auto, gradient_clipping=max_grad_norm",
+    "fsdp": "FullStateDictConfig(rank0_only=False), use_orig_params=True",
+    "context_parallel": "megatron.core parallel_state; split_inputs_cp/cat_outputs_cp on temporal dim",
+    "precision": "float16 or bfloat16 for VAE+frozen; float32 or weight_dtype for transformer"
+  },
+
+  "important_notes": [
+    "deepspeed_zero_init_disabled_context_manager is a closure defined inside main() — ensures VAE loaded outside ZeRO-3 partitioning",
+    "MultiviewDiffusionModel and MultiviewExtendDiffusionModel share same encode/decode pattern: rearrange B C (V T) H W <-> (B V) C T H W before/after VAE",
+    "train.py (Lyra-1/train.py) trains LatentRecon (3DGS) model; diffusion/training/train.py trains MultiviewDiffusionModel via separate launcher (launch() function)",
+    "FSDPDiffusionModel and FSDPExtendDiffusionModel are decorator-wrapped variants for FSDP execution",
+    "Classifier-free guidance: raw_x0 = cond_x0 + guidance * (cond_x0 - uncond_x0); optional dual-guidance for trajectory conditioning",
+    "Video extension: condition_location supports 'first_n' (inference) and 'first_random_n' (training) strategies",
+    "LoRA target modules: to_k, to_q, to_v, to_out.0 (attention projections only)"
+  ],
+
+  "source_files_analyzed": [
+    "Lyra-1/train.py",
+    "Lyra-1/cosmos_predict1/diffusion/training/models/model_multiview.py",
+    "Lyra-1/cosmos_predict1/diffusion/training/models/extend_model_multiview.py",
+    "Lyra-1/cosmos_predict1/diffusion/training/train.py (partial)"
+  ]
+}

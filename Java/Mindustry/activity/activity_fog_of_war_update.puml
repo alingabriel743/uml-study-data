@@ -1,0 +1,195 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #212529
+    EndColor #212529
+    BarColor #495057
+}
+
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title Fog of War Update Cycle
+
+|Main Thread (Logic)|
+start
+:Logic.update() — game tick fires;
+
+if (state.rules.fog enabled?) then (no)
+    :Skip fog processing entirely;
+    stop
+else (yes)
+endif
+
+:FogControl.update() entered;
+
+if (fog array == null?) then (yes)
+    :Allocate FogData[256]\n(one entry per team slot);
+endif
+
+if (staticFog && !loadedStatic?) then (yes)
+    :pushStaticBlocks(initial=false)\nCollect all hasFogRadius buildings\ninto staticEvents;
+    :updateStatic() synchronously\n(Bresenham circle fill on main thread);
+    :loadedStatic = true;
+endif
+
+if (staticFogThread == null?) then (yes)
+    :Spawn StaticFogThread\n(daemon, NORM_PRIORITY-1);
+endif
+
+if (dynamicFogThread == null?) then (yes)
+    :Spawn DynamicFogThread\n(daemon, NORM_PRIORITY-1);
+endif
+
+:dynamicEventQueue.clear();
+
+|Main Thread (Logic)|
+if (!headless && Groups.build.size > 0?) then (yes)
+    :Compute iterated =\nmax(1, size / min(5, size))\n(~20% of buildings per tick);
+    :Loop buildings[lastEntityUpdateIndex\n.. lastEntityUpdateIndex + iterated];
+    repeat
+        :build.updateFogVisibility();
+        if (!wasVisible && !inFogTo(player.team())?) then (yes)
+            :Mark building visible;
+            :Update minimap shadow;
+        endif
+    repeat while (more buildings in batch?) is (yes)
+    -> no;
+    :Advance lastEntityUpdateIndex (circular);
+endif
+
+:For each non-AI team in state.teams.present;
+
+|Main Thread (Logic)|
+repeat
+    :unitEventQueue.clear();
+    :Get or create FogData for team;
+
+    :synchronized(staticEvents):;
+    repeat
+        :Get unit from team.units;
+        if (unit.type.fogRadius <= 0?) then (yes)
+            :Skip unit;
+        else (no)
+            :Compute FogEvent(tx, ty, fogRadius, teamId);
+            :Add to unitEventQueue;
+            if (unit.lastFogPos changed?) then (yes)
+                :pushEvent(event, skipRender=false)\nAdd to staticEvents;\nSend to renderer.fog\nif player's team;
+                :unit.lastFogPos = current pos;
+                :data.dynamicUpdated = true;
+            endif
+        endif
+    repeat while (more units in team?) is (yes)
+    -> no;
+
+    if (data.dynamicUpdated &&\ntimeSinceMillis(lastDynamicMs) > 40ms?) then (yes — throttle passed)
+        :data.dynamicUpdated = false;
+        :data.lastDynamicMs = now;
+        :Add all hasFogRadius buildings\nfor team → dynamicEventQueue\n(FogEvent per building);
+        :dynamicEventQueue.addAll(unitEventQueue);
+    else (no — throttled)
+    endif
+
+repeat while (more non-AI teams?) is (yes)
+-> no;
+
+if (dynamicEventQueue.size > 0?) then (yes)
+    :synchronized(dynamicEvents):\ndynamicEvents.clear();\ndynamicEvents.addAll(dynamicEventQueue);
+    :dynamicEventQueue.clear();
+    if (justLoaded?) then (yes — force no pop-in)
+        :updateDynamic(new Bits(256)) inline\non main thread;
+        :justLoaded = false;
+    else (no)
+        fork
+            :synchronized(notifyDynamic):\nnotifyDynamic.notify();
+            note right
+                Wakes DynamicFogThread.
+                May block until rendering done
+                (known bottleneck).
+            end note
+        fork again
+            |Dynamic Fog Thread|
+            :Wait on notifyDynamic.wait();
+            :Woken by main thread notify;
+            :cleared.clear();
+            :synchronized(dynamicEvents):\niterate all events;
+            repeat
+                :Decode event:\n(x, y, radius+1, teamId);
+                if (team not yet in cleared?) then (yes)
+                    :data.write.clear()\n(erase previous frame\nvisibility for team);
+                    :cleared.set(team);
+                endif
+                :circle(data.write, x, y, radius+1)\nBresenham hline fill\ninto write buffer;
+            repeat while (more dynamic events?) is (yes)
+            -> no;
+            :dynamicEvents.clear();
+            note right
+                No lock needed for swap step —
+                read/write are volatile Bits fields.
+            end note
+            :For each team in cleared:\nswap data.read ↔ data.write;
+            note right
+                data.read → current visible tiles\n(queried by isVisible(team, x, y))\ndata.write → blank scratch for next cycle
+            end note
+            :Return to wait loop;
+        end fork
+    endif
+endif
+
+|Main Thread (Logic)|
+if (staticFog && staticEvents.size > 0\n&& staticFogThread != null?) then (yes)
+    fork
+        :synchronized(notifyStatic):\nnotifyStatic.notify();
+    fork again
+        |Static Fog Thread|
+        :Wait on notifyStatic.wait();
+        :Woken by main thread notify;
+        :synchronized(staticEvents):\niterate all events;
+        repeat
+            :Decode event:\n(x, y, radius, teamId);
+            :Get FogData for team;
+            :circle(data.staticData, x, y, radius)\nBresenham hline fill\ninto staticData Bits\n(permanent — never cleared);
+        repeat while (more static events?) is (yes)
+        -> no;
+        :staticEvents.clear();
+        note right
+            staticData is append-only.
+            isDiscovered(team, x, y) reads staticData.
+            Explored tiles are never re-concealed.
+        end note
+        :Return to wait loop;
+    end fork
+else (no static events)
+endif
+
+|Main Thread (Logic)|
+:FogControl.update() complete;
+stop
+
+@enduml

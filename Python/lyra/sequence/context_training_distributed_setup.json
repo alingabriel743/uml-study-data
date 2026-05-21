@@ -1,0 +1,75 @@
+{
+  "scope": "training_distributed_setup",
+  "title": "Distributed Training Setup",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "TrainScript",
+    "Trainer",
+    "distributed_module",
+    "parallel_state (Megatron)",
+    "torch.distributed",
+    "DistributedDataParallel",
+    "Model",
+    "ddp_sync_grad (ctx mgr)"
+  ],
+  "interaction_flow": [
+    "TrainScript → Trainer.__init__(config): construct trainer",
+    "Trainer.__init__ → distributed.init(): initialize distributed environment",
+    "distributed.init() → pynvml.nvmlInit(): init GPU monitoring",
+    "distributed.init() → Device(local_rank): set GPU affinity",
+    "distributed.init() → torch.cuda.set_device(local_rank): pin CUDA device",
+    "distributed.init() → dist.init_process_group(backend='nccl', init_method='env://', timeout=timedelta): create NCCL process group",
+    "distributed.init() → libcudart.cudaDeviceSetLimit(): set L2 fetch granularity",
+    "Trainer.__init__ → parallel_state.initialize_model_parallel(pipeline_model_parallel_size, tensor_model_parallel_size, context_parallel_size): Megatron model parallel state",
+    "Trainer.__init__ → parallel_state.sequence_parallel = config.model_parallel.sequence_parallel: optional sequence parallelism flag",
+    "Trainer.train(model, dataloader_train, dataloader_val) → model.to('cuda'): move model to GPU",
+    "Trainer.train → distributed.parallel_model_wrapper(config.trainer.ddp, model): wrap model [if ddp mode]",
+    "distributed.parallel_model_wrapper → parallel_state.get_data_parallel_group(with_context_parallel=True): get DDP process group",
+    "distributed.parallel_model_wrapper → DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters, static_graph, broadcast_buffers, process_group=ddp_group): create DDP wrapper",
+    "Trainer.train → model_ddp [FSDP path: model_ddp = model, no wrapping]",
+    "Trainer.training_step → ddp_sync_grad(model_ddp, enabled=grad_accum_iter==grad_accum_iter-1): context manager to control gradient sync",
+    "ddp_sync_grad → model.require_backward_grad_sync = enabled: toggle AllReduce synchronization",
+    "Trainer.training_step → model_ddp.training_step(data, iteration): forward pass via DDP redirect",
+    "DistributedDataParallel.training_step → self.module.forward = wrapped_training_step: patch forward",
+    "DistributedDataParallel.training_step → self(*args, **kwargs): call DDP forward (triggers hooks + AllReduce)",
+    "DistributedDataParallel.training_step → self.module.training_step(*args): delegate to real model training_step",
+    "Trainer.training_step → grad_scaler.scale(loss).backward(): backward pass + gradient sync (AllReduce via NCCL)",
+    "ddp_sync_grad (finally) → model.require_backward_grad_sync = old_value: restore sync state"
+  ],
+  "key_relationships": [
+    "DistributedDataParallel extends torch.nn.parallel.DistributedDataParallel",
+    "Trainer depends_on distributed_module (init, parallel_model_wrapper, ddp_sync_grad, barrier)",
+    "Trainer depends_on parallel_state (initialize_model_parallel, get_data_parallel_group)",
+    "parallel_model_wrapper creates DistributedDataParallel wrapping Model",
+    "sync_model_states depends_on _verify_param_shape_across_processes + _sync_module_states (torch.distributed.utils)",
+    "ddp_sync_grad is a contextmanager that guards DistributedDataParallel.require_backward_grad_sync"
+  ],
+  "key_functions": {
+    "distributed.init()": "Sets LOCAL_RANK, inits NCCL via dist.init_process_group(backend='nccl', env://), sets CUDA device, configures L2 cache. Returns current device.",
+    "distributed.parallel_model_wrapper(config_ddp, model)": "If dist initialized: fetches Megatron DDP group, wraps model in custom DistributedDataParallel with find_unused_parameters/static_graph/broadcast_buffers from config.",
+    "DistributedDataParallel.training_step(*args, **kwargs)": "Forward-redirect pattern: patches module.forward → wrapped_training_step, calls self() to trigger DDP hooks, then delegates to module.training_step().",
+    "ddp_sync_grad(model, enabled)": "Context manager toggling model.require_backward_grad_sync. No-op if static_graph=True (with warning). Used for gradient accumulation — only syncs on last accumulation step.",
+    "sync_model_states(model, process_group, src, params_and_buffers_to_ignore, broadcast_buffers)": "Broadcasts all model params/buffers from src rank (default 0) to all ranks. Verifies shape consistency first. Uses 250MB broadcast buckets."
+  },
+  "ddp_config_fields": [
+    "find_unused_parameters (bool)",
+    "static_graph (bool) — incompatible with ddp_sync_grad",
+    "broadcast_buffers (bool)"
+  ],
+  "parallelism_modes": {
+    "ddp": "Wraps model with custom DistributedDataParallel; gradient sync controlled via ddp_sync_grad",
+    "fsdp": "model_ddp = model (bare), no wrapper; on_after_backward and on_before_zero_grad called directly on model"
+  },
+  "env_vars": [
+    "LOCAL_RANK: local GPU index",
+    "TORCH_NCCL_BLOCKING_WAIT=0",
+    "TORCH_NCCL_ASYNC_ERROR_HANDLING=1",
+    "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC (default 1800s)",
+    "CUDA_DEVICE_MAX_CONNECTIONS=1 (set when sequence_parallel=True)"
+  ],
+  "important_notes": "Custom DistributedDataParallel uses forward-redirection: training_step patches module.forward to redirect DDP's implicit self() call into module.training_step(), preserving DDP hooks (AllReduce). ddp_sync_grad is incompatible with static_graph=True. sync_model_states is a utility for broadcasting weights from rank0 (e.g., after loading checkpoint only on rank0 to save bandwidth).",
+  "source_files_analyzed": [
+    "Lyra-1/cosmos_predict1/utils/distributed.py",
+    "Lyra-1/cosmos_predict1/utils/trainer.py"
+  ]
+}

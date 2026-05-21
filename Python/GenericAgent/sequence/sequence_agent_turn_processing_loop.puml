@@ -1,0 +1,162 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #F1F3F5
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F0C040
+}
+
+title Agent Turn Processing Loop
+
+actor Caller as caller
+participant "agent_runner_loop" as loop
+participant "client (LLM)" as llm
+participant "BaseHandler" as handler
+participant "try_call_generator" as tcg
+participant "StepOutcome" as outcome
+
+== Initialisation ==
+
+caller -> loop : agent_runner_loop(\n  client, system_prompt, user_input,\n  handler, tools_schema, max_turns=40)
+activate loop
+
+loop -> loop : init messages = [{system}, {user: user_input}]\nturn = 0\nhandler._done_hooks = []\nhandler.max_turns = max_turns
+
+== Agentic Turn Loop (while turn < handler.max_turns) ==
+
+loop -> loop : turn += 1\nyield "LLM Running (Turn N)..."
+
+opt every 10 turns
+    loop -> llm : client.last_tools = ""\nnote right: reset tool description cache
+end
+
+loop -> llm : client.chat(messages, tools=tools_schema)
+activate llm
+llm --> loop : response_gen (generator)
+deactivate llm
+
+alt verbose mode
+    loop -> loop : response = yield from response_gen\nnote right: stream chunks to caller
+else non-verbose mode
+    loop -> loop : response = exhaust(response_gen)\nnote right: drain generator silently
+end
+
+loop -> loop : parse response.tool_calls\n→ [{tool_name, args, id}, ...]\nnote right: synthesise [{tool_name:"no_tool"}]\nif no tool_calls in response
+
+== For Each Tool Call ==
+
+loop -> loop : yield tool display string\n(name + pretty JSON args)
+
+loop -> handler : handler.dispatch(\n  tool_name, args, response, index)
+activate handler
+
+handler -> handler : method_name = "do_{tool_name}"
+
+handler -> tcg : try_call_generator(\n  self.tool_before_callback,\n  tool_name, args, response)
+activate tcg
+tcg --> handler : prer (before-hook result)
+deactivate tcg
+
+alt known tool method exists
+    handler -> tcg : try_call_generator(\n  self.do_{tool_name}, args, response)
+    activate tcg
+    tcg --> handler : ret : StepOutcome
+    deactivate tcg
+
+    handler -> tcg : try_call_generator(\n  self.tool_after_callback,\n  tool_name, args, response, ret)
+    activate tcg
+    tcg --> handler : (after-hook done)
+    deactivate tcg
+
+    handler --> loop : StepOutcome(\n  data, next_prompt, should_exit)
+    activate outcome
+
+else bad_json tool
+    handler --> loop : StepOutcome(\n  None, next_prompt=error_msg,\n  should_exit=False)
+    activate outcome
+
+else unknown tool
+    handler -> loop : yield "未知工具: {tool_name}"
+    handler --> loop : StepOutcome(\n  None, next_prompt="未知工具...",\n  should_exit=False)
+    activate outcome
+end
+
+deactivate handler
+
+== Evaluating StepOutcome ==
+
+alt outcome.should_exit == True
+    loop -> loop : exit_reason = {result:"EXITED", data:outcome.data}
+    deactivate outcome
+    loop -> loop : break
+else outcome.next_prompt is None / empty
+    loop -> loop : exit_reason = {result:"CURRENT_TASK_DONE", data:outcome.data}
+    deactivate outcome
+    loop -> loop : break
+else next_prompt starts with "未知工具"
+    loop -> llm : client.last_tools = ""\nnote right: force tool re-description next turn
+    loop -> loop : collect tool_results\n& next_prompts
+    deactivate outcome
+else continue
+    loop -> loop : collect tool_results\n& next_prompts
+    deactivate outcome
+end
+
+== End of Turn ==
+
+opt next_prompts empty and _done_hooks available
+    loop -> handler : handler._done_hooks.pop(0)
+    activate handler
+    handler --> loop : hook_prompt
+    deactivate handler
+    loop -> loop : next_prompts.add(hook_prompt)
+end
+
+loop -> handler : handler.turn_end_callback(\n  response, tool_calls, tool_results,\n  turn, joined_next_prompts, exit_reason)
+activate handler
+handler --> loop : next_prompt : str
+deactivate handler
+
+loop -> loop : messages = [{\n  role:"user",\n  content: next_prompt,\n  tool_results: tool_results\n}]
+
+note over loop : → back to LOOP START\n(while turn < handler.max_turns)
+
+== Loop Exit ==
+
+alt exit_reason set
+    loop -> handler : handler.turn_end_callback(\n  response, tool_calls, tool_results,\n  turn, "", exit_reason)\nnote right: final callback
+    activate handler
+    handler --> loop : (acknowledged)
+    deactivate handler
+    loop --> caller : exit_reason\n{result:"EXITED"|"CURRENT_TASK_DONE", data:...}
+else max turns reached
+    loop --> caller : {result:"MAX_TURNS_EXCEEDED"}
+end
+
+deactivate loop
+
+@enduml

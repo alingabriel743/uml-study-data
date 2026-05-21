@@ -1,0 +1,178 @@
+{
+  "scope": "mcp_server_connection_lifecycle",
+  "title": "MCP Server Connection Lifecycle",
+  "diagram_type": "activity",
+  "key_participants": [
+    "MCPServerManager",
+    "_ServerWorker",
+    "_ServerCommand",
+    "MCPServer"
+  ],
+  "constructor_params": {
+    "MCPServerManager.__init__": [
+      "servers: Iterable[MCPServer]",
+      "connect_timeout_seconds: float | None = 10.0",
+      "cleanup_timeout_seconds: float | None = 10.0",
+      "drop_failed_servers: bool = True",
+      "strict: bool = False",
+      "suppress_cancelled_error: bool = True",
+      "connect_in_parallel: bool = False"
+    ]
+  },
+  "state_fields": {
+    "_all_servers": "full list of servers",
+    "_active_servers": "currently active servers (subset if drop_failed_servers=True)",
+    "failed_servers": "list of servers that failed to connect",
+    "_failed_server_set": "set for O(1) dedup of failed_servers",
+    "_connected_servers": "set of successfully connected servers",
+    "errors": "dict[MCPServer, BaseException] — last error per server",
+    "_workers": "dict[MCPServer, _ServerWorker] — only used when connect_in_parallel=True"
+  },
+  "activity_flow": [
+    "START: async with MCPServerManager(servers) as manager",
+    "__aenter__ → connect_all()",
+
+    "=== connect_all() ===",
+    "Save previous_connected_servers, previous_active_servers",
+    "Reset: failed_servers=[], _failed_server_set={}, errors={}",
+    "Filter servers_to_connect via _servers_to_connect() (exclude already-connected, deduplicate)",
+    "BRANCH: connect_in_parallel?",
+
+    "  [parallel=True] → _connect_all_parallel(servers_to_connect)",
+    "    Create asyncio.Task per server calling _attempt_connect(server, raise_on_error=False)",
+    "    await asyncio.gather(*tasks, return_exceptions=True)",
+    "    If suppress_cancelled_error=False: re-raise first CancelledError result",
+    "    Re-raise first non-CancelledError BaseException result",
+    "    If strict=True AND failed_servers not empty:",
+    "      Find first_failure (skip CancelledError if suppressed)",
+    "      Raise errors[first_failure] or RuntimeError",
+
+    "  [parallel=False] → for each server in servers_to_connect:",
+    "    await _attempt_connect(server)",
+    "    If not in _failed_server_set: add to connected_servers list",
+
+    "ON BaseException during connect loop:",
+    "  [parallel=True]: await _cleanup_servers(servers_to_connect)",
+    "  [parallel=False]: await _cleanup_servers(connected_servers + failed_servers)",
+    "  If drop_failed_servers=True: restore active to previous_connected_servers intersection",
+    "  Else: restore previous_active_servers",
+    "  re-raise",
+
+    "await _refresh_active_servers()",
+    "  If drop_failed_servers=True: _active_servers = all_servers minus _failed_server_set",
+    "  Else: _active_servers = list(_all_servers)",
+    "Return _active_servers",
+
+    "=== _attempt_connect(server, raise_on_error=None) ===",
+    "raise_on_error defaults to self.strict",
+    "TRY: await _run_connect(server)",
+    "  _connected_servers.add(server)",
+    "  If server was in failed_servers: _remove_failed_server(server), errors.pop(server)",
+    "EXCEPT CancelledError:",
+    "  If suppress_cancelled_error=False: re-raise",
+    "  Else: _record_failure(server, exc, phase='connect')",
+    "EXCEPT Exception:",
+    "  _record_failure(server, exc, phase='connect')",
+    "  If raise_on_error: re-raise",
+    "EXCEPT BaseException:",
+    "  _record_failure(server, exc, phase='connect')",
+    "  Always re-raise",
+
+    "=== _run_connect(server) ===",
+    "If connect_in_parallel=True:",
+    "  worker = _get_worker(server)  [create _ServerWorker if not exists or done]",
+    "  await worker.connect()  [queues 'connect' command, awaits future]",
+    "Else:",
+    "  await _run_with_timeout(server.connect, connect_timeout_seconds)",
+
+    "=== _record_failure(server, exc, phase) ===",
+    "logger.exception(f'Failed to {phase} MCP server {server.name}')",
+    "If server not in _failed_server_set: append to failed_servers, add to _failed_server_set",
+    "errors[server] = exc",
+
+    "=== reconnect(failed_only=True) ===",
+    "If failed_only=True: servers_to_retry = unique(failed_servers)",
+    "If failed_only=False: await cleanup_all() → servers_to_retry = all_servers, reset failed/errors",
+    "Filter servers_to_retry via _servers_to_connect()",
+    "BRANCH: connect_in_parallel? (same parallel/sequential path as connect_all)",
+    "FINALLY: _refresh_active_servers()",
+    "Return _active_servers",
+
+    "=== cleanup_all() ===",
+    "For server in reversed(_all_servers):",
+    "  await _cleanup_server(server)",
+    "  EXCEPT CancelledError: suppress if suppress_cancelled_error=True, else re-raise; log debug",
+    "  EXCEPT Exception: log exception, errors[server] = exc",
+
+    "=== _cleanup_server(server) ===",
+    "If connect_in_parallel=True AND server in _workers:",
+    "  worker = _workers[server]",
+    "  If worker.is_done: pop _workers[server], _connected_servers.discard(server), return",
+    "  TRY: await worker.cleanup()  [queues 'cleanup' command, awaits future]",
+    "  FINALLY: pop _workers[server], _connected_servers.discard(server)",
+    "Else:",
+    "  TRY: await _run_with_timeout(server.cleanup, cleanup_timeout_seconds)",
+    "  FINALLY: _connected_servers.discard(server)",
+
+    "=== _ServerWorker internal loop (_run) ===",
+    "LOOP: command = await _queue.get()",
+    "  If action='connect': await _run_with_timeout_in_task(server.connect, timeout)",
+    "  If action='cleanup': await _run_with_timeout_in_task(server.cleanup, timeout); EXIT loop",
+    "  Set future.set_result(None) on success, future.set_exception(exc) on error",
+
+    "END: __aexit__ → cleanup_all()"
+  ],
+  "key_conditions": [
+    "connect_in_parallel=True → worker-per-server tasks for concurrent connection; task-affine cleanup",
+    "connect_in_parallel=False → sequential connection, timeout via asyncio.timeout or call_later",
+    "strict=True → raise on first connect failure (after gathering all parallel results)",
+    "drop_failed_servers=True → exclude failed servers from active_servers",
+    "suppress_cancelled_error=True → treat CancelledError as soft failure, log and continue",
+    "_servers_to_connect() → skip servers already in _connected_servers (idempotency)",
+    "reconnect(failed_only=False) → full cleanup before retry; avoids double-connect via _servers_to_connect filter",
+    "_record_failure deduplicates: server only added to failed_servers once even if called multiple times"
+  ],
+  "error_handling": {
+    "CancelledError_suppressed": "recorded as failure, server dropped from active (if drop_failed=True), does not propagate",
+    "CancelledError_unsuppressed": "re-raised, triggers cleanup of all attempted servers",
+    "Exception_non_strict": "recorded via _record_failure, server excluded from active_servers, loop continues",
+    "Exception_strict": "_record_failure then re-raise, triggers cleanup path",
+    "BaseException_fatal": "always re-raised regardless of strict/suppress settings, triggers cleanup"
+  },
+  "timeout_mechanism": {
+    "_run_with_timeout_in_task": "Uses asyncio.timeout (Python 3.11+) or loop.call_later fallback. Preserves task affinity for AnyIO cancel scope compatibility. Falls back to asyncio.wait_for if not in a task.",
+    "connect_timeout_seconds": "default 10.0; applied per server.connect() call",
+    "cleanup_timeout_seconds": "default 10.0; applied per server.cleanup() call"
+  },
+  "parallel_worker_lifecycle": {
+    "_ServerWorker.__init__": "creates asyncio.Queue and spawns self._task = asyncio.create_task(self._run())",
+    "connect()": "submits 'connect' command to queue, awaits Future resolution",
+    "cleanup()": "submits 'cleanup' command to queue, awaits Future; _run() exits after cleanup",
+    "is_done": "returns self._task.done(); if True, worker is stale and recreated by _get_worker()"
+  },
+  "key_relationships": [
+    "MCPServerManager composes list[MCPServer] (_all_servers)",
+    "MCPServerManager creates _ServerWorker per MCPServer when connect_in_parallel=True",
+    "_ServerWorker wraps MCPServer.connect() and MCPServer.cleanup() with timeout",
+    "_ServerCommand is a dataclass queued into _ServerWorker._queue (action, timeout_seconds, future)",
+    "MCPServerManager implements AbstractAsyncContextManager — __aenter__/connect_all, __aexit__/cleanup_all"
+  ],
+  "properties": {
+    "active_servers": "list[MCPServer] — servers excluding failed (if drop_failed=True)",
+    "all_servers": "list[MCPServer] — all managed servers regardless of status",
+    "failed_servers": "list[MCPServer] — servers that failed last connect attempt",
+    "errors": "dict[MCPServer, BaseException] — last error per server"
+  },
+  "business_rules": [
+    "MCP servers must be connected before agent can use their tools",
+    "Agents reference manager.active_servers — only successfully connected servers are exposed",
+    "Failed servers tracked in failed_servers/errors for observability and retry",
+    "reconnect() supports partial retry (failed_only=True) or full restart (failed_only=False)",
+    "Task affinity: connect and cleanup must run in same asyncio task for AnyIO cancel scope correctness; parallel mode uses _ServerWorker tasks to enforce this"
+  ],
+  "source_files_analyzed": [
+    "src/agents/mcp/manager.py",
+    "tests/mcp/test_mcp_server_manager.py",
+    "docs/mcp.md"
+  ]
+}

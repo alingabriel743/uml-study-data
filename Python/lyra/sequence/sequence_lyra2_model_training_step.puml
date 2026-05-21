@@ -1,0 +1,255 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    GroupBackgroundColor #DEE2E6
+    GroupBorderColor #6C757D
+}
+skinparam NoteBackgroundColor #FFF9C4
+skinparam NoteBorderColor #ADB5BD
+
+title Lyra2 Model Training Step
+
+actor Trainer as trainer
+participant "Lyra2Model" as lyra2
+participant "RectifiedFlow" as rf
+participant "Conditioner" as cond
+participant "Tokenizer / VAE" as vae
+participant "Sparse3DCache" as cache
+participant "DiffusionNet\n(self.net)" as net
+participant "SampleScheduler" as sched
+
+== Initialisation Guard ==
+
+trainer -> lyra2 : training_step(data_batch, iteration)
+activate lyra2
+
+opt iteration == 0 and init_framepack_weights
+    lyra2 -> net : copy_weights_to_clean_patch_embeddings()
+    activate net
+    net --> lyra2 : weights copied
+    deactivate net
+end
+
+lyra2 -> lyra2 : _update_train_stats(data_batch)
+
+== Data Conditioning (shared sub-flow) ==
+
+group get_data_and_condition(data_batch)
+    lyra2 -> lyra2 : _normalize_video_databatch_inplace(data_batch)
+
+    group _tokenizing_video_to_latents(video, dropout, data_batch)
+        note right lyra2
+          Step 1 – Window Selection
+        end note
+        lyra2 -> lyra2 : _prepare_video_window(video, start, cur_segment_id)
+        note right lyra2
+          Random start ∈ [0, video_length × starting_frame_ratio)
+          chunk_len = (cur_segment_id+1) × num_new_video_frames + 1
+          Pad or crop → prepend repeated first frame for history
+        end note
+
+        note right lyra2
+          Step 2 – VAE Encoding
+        end note
+        lyra2 -> vae : _vae_encode_with_shared_prefix(video_win)
+        activate vae
+        vae --> lyra2 : (latents [B,C,T,H,W], cond_latent)
+        deactivate vae
+
+        note right lyra2
+          Step 3 – Spatial History Cache
+        end note
+        opt num_spatial_hist > 0
+            lyra2 -> cache : add(depth, camera_w2c, intrinsics)\n[for selected stride frames]
+            activate cache
+            cache --> lyra2 : cached
+            deactivate cache
+        end
+
+        note right lyra2
+          Step 4 – Prepare Lyra2 Model Inputs
+        end note
+        lyra2 -> lyra2 : _prepare_lyra2_inputs(\n  history_full, gen_cond, spatial_cache,\n  video, buffer_depth, camera_w2c,\n  intrinsics, video_indices, is_training=True)
+        note right lyra2
+          → _get_cached_spatial_coords(H, W, num_spatial_hist)
+          → forward_warp_multiframes / unproject_points
+          → build framepack_params dict
+          → returns (latents, cond_latent, mask, buffer_cond_latents)
+        end note
+
+        note right lyra2
+          Step 5 – GT tail splice
+          latents[:,:,:T_hist] = history (clean x0)
+          latents[:,:,T_hist:] = gen_gt
+        end note
+
+        opt spatial region corruption enabled
+            lyra2 -> lyra2 : _apply_spatial_region_corruption(latents, cond_latent)
+        end
+    end
+
+    lyra2 -> cond : conditioner(data_batch)
+    activate cond
+    cond --> lyra2 : condition
+    deactivate cond
+
+    lyra2 -> lyra2 : condition.edit_data_type(DataType.VIDEO)
+end
+
+== Self-Augmentation Branch (Stage-A → Stage-B) ==
+
+alt self_aug_enabled
+
+    note over lyra2, sched
+      Stage-A: short denoise pass over augmented history
+    end note
+
+    lyra2 -> cond : get_condition_with_negative_prompt(data_batch)
+    activate cond
+    cond --> lyra2 : (condition_A, uncondition_A)
+    deactivate cond
+
+    note right lyra2
+      Build init_latents_aug:
+        history = clean x0 latents
+        gen region = noised via RectifiedFlow.get_interpolation
+    end note
+
+    loop steps_A denoising iterations
+
+        lyra2 -> net : forward(xt, timesteps, **condition_A, **framepack_params)
+        activate net
+        net --> lyra2 : vt_cond
+        deactivate net
+
+        lyra2 -> net : forward(xt, timesteps, **uncondition_A, **framepack_params)
+        activate net
+        net --> lyra2 : vt_uncond
+        deactivate net
+
+        note right lyra2
+          CFG blend:
+          vt_pred = vt_uncond + guidance × (vt_cond − vt_uncond)
+        end note
+
+        lyra2 -> sched : step(vt_pred, t, latents)
+        activate sched
+        sched --> lyra2 : next latents
+        deactivate sched
+    end
+
+    lyra2 -> vae : decode(latents_A)
+    activate vae
+    vae --> lyra2 : full_frames (pixels)
+    deactivate vae
+
+    lyra2 -> lyra2 : splice decoded frames into original timeline\n(valid_indices mapping → data_batch_aug)
+
+    note over lyra2
+      Stage-B: re-condition on augmented batch
+    end note
+
+    group get_data_and_condition(data_batch_aug)
+        lyra2 -> lyra2 : _tokenizing_video_to_latents(video_aug, dropout, data_batch_aug)
+        lyra2 -> cond : conditioner(data_batch_aug)
+        activate cond
+        cond --> lyra2 : condition [Stage-B]
+        deactivate cond
+    end
+
+else normal path
+    note over lyra2
+      Standard conditioning already performed above
+    end note
+end
+
+== Noise & Timestep Sampling ==
+
+lyra2 -> rf : sample_train_time(batch_size)
+activate rf
+rf --> lyra2 : t_B  [continuous timesteps]
+deactivate rf
+
+note right lyra2
+  Build epsilon_full:
+    T < T_hist  → x0_latents (clean, no noise)
+    T >= T_hist → randn (generated region noise)
+end note
+
+opt context parallel (CP group)
+    lyra2 -> lyra2 : broadcast(x0_latents, epsilon_full, t_B, condition)\nacross CP ranks
+    lyra2 -> net : enable_context_parallel(cp_group)
+end
+
+lyra2 -> rf : get_discrete_timestamp(t_B)
+activate rf
+rf --> lyra2 : timesteps [B, T]
+deactivate rf
+
+lyra2 -> rf : get_sigmas(timesteps)
+activate rf
+rf --> lyra2 : sigmas [B, T]
+deactivate rf
+
+lyra2 -> rf : get_interpolation(epsilon_full, x0_latents, sigmas)
+activate rf
+rf --> lyra2 : (xt, vt)  — noisy input & velocity target
+deactivate rf
+
+== Denoising Forward Pass ==
+
+lyra2 -> net : forward(\n  x_B_C_T_H_W = xt,\n  timesteps_B_T = timesteps,\n  **condition.to_dict(),\n  **framepack_params)
+activate net
+note right net
+  framepack_params:
+    framepack_indices  (arange)
+    framepack_splits   (list)
+    framepack_kernel_ids  (list)
+    framepack_kernel_types (list)
+end note
+net --> lyra2 : vt_pred_gen  [predicted velocity, gen region only]
+deactivate net
+
+== Loss Computation ==
+
+lyra2 -> rf : train_time_weight(timesteps)
+activate rf
+rf --> lyra2 : time_weights_B
+deactivate rf
+
+note over lyra2
+  MSE loss (generated region only):
+  loss = mean( time_weights_B × (vt_pred_gen − vt[:,:,T_hist:])² )
+  History region T < T_hist is excluded from loss
+end note
+
+lyra2 --> trainer : return ({edm_loss: loss}, loss)
+deactivate lyra2
+
+@enduml

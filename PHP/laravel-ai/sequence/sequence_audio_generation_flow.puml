@@ -1,0 +1,143 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    DividerBackgroundColor #DEE2E6
+    GroupBackgroundColor #E9ECEF
+}
+
+title Audio Generation (TTS) Flow
+
+actor Client
+
+participant "Audio" as Audio
+participant "PendingAudioGeneration" as Pending
+participant "Ai" as Ai
+participant "AiManager" as Manager
+participant "AudioProvider" as Provider
+participant "GenerateAudio" as Job
+participant "FakeAudioGateway" as FakeGW
+
+== Initialization ==
+
+Client -> Audio : Audio::of($text)
+activate Audio
+Audio -> Pending : new PendingAudioGeneration($text)\n[default voice='default-female', timeout=30]
+activate Pending
+Audio --> Client : PendingAudioGeneration
+deactivate Audio
+
+== Optional Configuration (chainable setters) ==
+
+Client -> Pending : ->voice($voice)  /  ->male()  /  ->female()
+Client -> Pending : ->instructions($instructions)
+Client -> Pending : ->timeout($seconds)
+
+== Path A: Synchronous generate() ==
+
+Client -> Pending : ->generate(?$provider, ?$model)
+activate Pending
+
+Pending -> Pending : Provider::formatProviderAndModelList(\n  $provider ?? config('ai.default_for_audio'),\n  $model\n)\nnote right: Resolves Lab enum,\narray, or string\ninto provider list
+
+loop foreach provider in resolved list
+    Pending -> Ai : Ai::fakeableAudioProvider($providerName)
+    activate Ai
+    Ai -> Manager : fakeableAudioProvider($name)
+    activate Manager
+    Manager -> Manager : audioProvider($name)\n→ instance($name)\n[validates AudioProvider interface]
+
+    alt Fake mode active (audioIsFaked() == true)
+        Manager -> Manager : clone $provider\n->useAudioGateway(fakeAudioGateway())
+        note right: Injects FakeAudioGateway\ninto cloned provider
+        Manager --> FakeGW : (gateway injected into clone)
+    end
+
+    Manager --> Ai : AudioProvider instance
+    deactivate Manager
+    Ai --> Pending : AudioProvider
+    deactivate Ai
+
+    alt $model is null
+        Pending -> Provider : ->defaultAudioModel()
+        activate Provider
+        Provider --> Pending : defaultModel
+        deactivate Provider
+    end
+
+    Pending -> Provider : ->audio($text, $voice, $instructions, $model, $timeout)
+    activate Provider
+
+    alt FailoverableException thrown
+        Provider --> Pending : throws FailoverableException
+        deactivate Provider
+        Pending -> Pending : event(ProviderFailedOver)\ncontinue to next provider
+    else Success
+        Provider --> Pending : AudioResponse
+        deactivate Provider
+        note right: Break out of loop\non first success
+    end
+end
+
+Pending --> Client : AudioResponse
+deactivate Pending
+
+== Path B: Asynchronous queue() ==
+
+Client -> Pending : ->queue(?$provider, ?$model)
+activate Pending
+
+Pending -> Ai : Ai::audioIsFaked()
+activate Ai
+Ai --> Pending : bool
+deactivate Ai
+
+alt Fake mode active (audioIsFaked() == true)
+    Pending -> Ai : Ai::recordAudioGeneration(\n  new QueuedAudioPrompt(...)\n)
+    activate Ai
+    Ai --> Pending : (recorded)
+    deactivate Ai
+    Pending --> Client : QueuedAudioResponse(FakePendingDispatch)
+    note right: Short-circuits —\nno real job dispatched
+else Real mode (audioIsFaked() == false)
+    Pending -> Job : GenerateAudio::dispatch($this, $provider, $model)
+    activate Job
+    Job --> Pending : PendingDispatch
+    Pending --> Client : QueuedAudioResponse(PendingDispatch)
+    deactivate Pending
+
+    == Queue Worker Execution ==
+
+    [-> Job : handle()
+    Job -> Pending : pendingAudio->generate($provider, $model)\n[via withCallbacks()]
+    activate Pending
+    note right: Executes the same\ngenerate() flow as Path A
+    Pending --> Job : AudioResponse
+    deactivate Pending
+    deactivate Job
+end
+
+@enduml

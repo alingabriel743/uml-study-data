@@ -1,0 +1,139 @@
+{
+  "scope": "vector_store_management_flow",
+  "title": "Vector Store Management Flow",
+  "diagram_type": "activity",
+  "key_participants": [
+    "Stores (static facade)",
+    "Ai (manager/resolver)",
+    "StoreProvider (interface)",
+    "ManagesStores (trait on Provider)",
+    "StoreGateway (interface)",
+    "GeminiStoreGateway",
+    "OpenAiStoreGateway",
+    "Store (entity)",
+    "StoreFileCounts (value object)",
+    "PreparesStorableFiles (trait on FileGateways)",
+    "Files (file facade)"
+  ],
+  "activity_flows": {
+    "create_store": [
+      "START: Stores::create(name, description, fileIds, expiresWhenIdleFor, provider?)",
+      "Ai::fakeableStoreProvider(provider) → resolves StoreProvider impl",
+      "StoreProvider::createStore(name, description, Collection<fileIds>, expiresWhenIdleFor)",
+      "  [ManagesStores trait] generate invocationId (UUID7)",
+      "  [if faked] Ai::recordStoreCreation(name, description, fileIds, expiresWhenIdleFor)",
+      "  dispatch event: CreatingStore(invocationId, provider, ...params)",
+      "  StoreGateway::createStore(provider, name, description, fileIds, expiresWhenIdleFor)",
+      "    [GeminiStoreGateway] POST /fileSearchStores → get store ID → call getStore()",
+      "      [if fileIds not empty] loop: addFile(provider, storeId, fileId) for each",
+      "    [OpenAiStoreGateway] POST /vector_stores with all params → call getStore(id)",
+      "  dispatch event: StoreCreated(invocationId, provider, ...params, store)",
+      "RETURN: Store(provider, id, name, fileCounts, ready)"
+    ],
+    "get_store": [
+      "START: Stores::get(storeId, provider?)",
+      "Ai::fakeableStoreProvider(provider) → resolves StoreProvider",
+      "StoreProvider::getStore(storeId)  [ManagesStores trait]",
+      "  StoreGateway::getStore(provider, storeId)",
+      "    [GeminiStoreGateway] normalize storeId → GET /fileSearchStores/{id}",
+      "      build StoreFileCounts(activeDocumentsCount, pendingDocumentsCount, failedDocumentsCount)",
+      "    [OpenAiStoreGateway] GET /vector_stores/{id}",
+      "      build StoreFileCounts(file_counts.completed, in_progress, failed)",
+      "RETURN: Store(provider, id, name, fileCounts, ready)"
+    ],
+    "delete_store_via_facade": [
+      "START: Stores::delete(storeId, provider?)",
+      "Ai::fakeableStoreProvider(provider) → resolves StoreProvider",
+      "StoreProvider::deleteStore(storeId)  [ManagesStores trait]",
+      "  [if faked] Ai::recordStoreDeletion(storeId)",
+      "  StoreGateway::deleteStore(provider, storeId)",
+      "    [GeminiStoreGateway] normalize storeId → DELETE /fileSearchStores/{id} → return true",
+      "    [OpenAiStoreGateway] DELETE /vector_stores/{id} → return response.deleted",
+      "  dispatch event: StoreDeleted(invocationId, provider, storeId)",
+      "RETURN: bool"
+    ],
+    "store_add_document": [
+      "START: Store::add(file, metadata?)",
+      "  [if UploadedFile] convert → Base64Document::fromUpload(file).as(originalName)",
+      "  [if StorableFile] Store::storeFile(file) → Files::put(file, provider) → returns HasProviderId",
+      "  [if faked] Ai::recordFileAddition(storeId, fileId, originalFile)",
+      "  StoreProvider::addFileToStore(storeId, HasProviderId, metadata)  [ManagesStores trait]",
+      "    dispatch event: AddingFileToStore(invocationId, provider, storeId, fileId)",
+      "    StoreGateway::addFile(provider, storeId, fileId, metadata)",
+      "      [GeminiStoreGateway] normalize storeId+fileId → POST /{storeId}:importFile → return basename(name)",
+      "      [OpenAiStoreGateway] POST /vector_stores/{storeId}/files → return response.id",
+      "    dispatch event: FileAddedToStore(invocationId, provider, storeId, fileId, documentId)",
+      "RETURN: AddedDocumentResponse(documentId, fileId)"
+    ],
+    "store_remove_document": [
+      "START: Store::remove(documentId, deleteFile?)",
+      "  StoreProvider::removeFileFromStore(storeId, documentId)  [ManagesStores trait]",
+      "    [if faked] Ai::recordFileRemoval(storeId, documentId)",
+      "    dispatch event: RemovingFileFromStore(invocationId, provider, storeId, documentId)",
+      "    StoreGateway::removeFile(provider, storeId, documentId)",
+      "      [GeminiStoreGateway] normalize IDs → DELETE /{storeId}/documents/{documentId} → return true",
+      "      [OpenAiStoreGateway] DELETE /vector_stores/{storeId}/files/{documentId} → return response.deleted",
+      "    dispatch event: FileRemovedFromStore(invocationId, provider, storeId, documentId)",
+      "  [if deleteFile && removed] Files::delete(documentId, provider)",
+      "RETURN: bool"
+    ],
+    "store_refresh": [
+      "START: Store::refresh()",
+      "  StoreProvider::getStore(this->id)  [delegates to ManagesStores → StoreGateway::getStore]",
+      "RETURN: new Store instance with fresh data"
+    ],
+    "store_delete_instance": [
+      "START: Store::delete()",
+      "  StoreProvider::deleteStore(this->id)  [ManagesStores trait full flow]",
+      "RETURN: bool"
+    ]
+  },
+  "key_relationships": [
+    "Stores (facade) delegates_to Ai::fakeableStoreProvider → StoreProvider",
+    "StoreProvider (interface) implemented_by GeminiProvider, OpenAiProvider (via ManagesStores trait)",
+    "ManagesStores (trait) uses storeGateway() → StoreGateway interface",
+    "StoreGateway (interface) implemented_by GeminiStoreGateway, OpenAiStoreGateway",
+    "Store holds FileProvider&StoreProvider as $provider",
+    "Store::add() uses PreparesStorableFiles concept: converts StorableFile → uploads via Files::put → HasProviderId",
+    "StoreFileCounts embedded in Store constructor (completed, pending, failed counts)",
+    "GeminiStoreGateway uses HandlesFailoverErrors trait + Http facade for API calls",
+    "OpenAiStoreGateway uses CreatesOpenAiClient + HandlesFailoverErrors traits",
+    "Events dispatched: CreatingStore, StoreCreated, AddingFileToStore, FileAddedToStore, RemovingFileFromStore, FileRemovedFromStore, StoreDeleted"
+  ],
+  "branching_conditions": [
+    "Store::add: UploadedFile → Base64Document conversion branch",
+    "Store::add: StorableFile → Files::put upload branch (PreparesStorableFiles used by FileGateways)",
+    "Store::add: HasProviderId | string | ProviderDocument → provider add call",
+    "Store::remove: deleteFile=true && removed → also deletes underlying file via Files::delete",
+    "ManagesStores::createStore: faked? → recordStoreCreation",
+    "ManagesStores::removeFileFromStore: faked? → recordFileRemoval",
+    "ManagesStores::deleteStore: faked? → recordStoreDeletion",
+    "GeminiStoreGateway::createStore: fileIds not empty → loop addFile per ID",
+    "OpenAiStoreGateway::createStore: expiresWhenIdleFor? → include expires_after block"
+  ],
+  "data_objects": {
+    "Store": "constructor(FileProvider&StoreProvider, id:string, name:?string, fileCounts:StoreFileCounts, ready:bool)",
+    "StoreFileCounts": "value object(completed:int, pending:int, failed:int) — Arrayable, JsonSerializable",
+    "AddedDocumentResponse": "wraps(documentId:string, fileId:?string)"
+  },
+  "important_notes": [
+    "Stores is a static facade; all real logic flows through Ai::fakeableStoreProvider() → concrete Provider",
+    "ManagesStores trait is the bridge: Provider interface methods → StoreGateway calls + event dispatch",
+    "GeminiStoreGateway uses 'fileSearchStores/' resource prefix; normalizeStoreId/FileId/DocumentId helpers handle path building",
+    "OpenAiStoreGateway uses 'vector_stores/' endpoints; expiresWhenIdleFor converted to days via Carbon",
+    "PreparesStorableFiles trait (on FileGateways) extracts content/mimeType/name from StorableFile for upload",
+    "File upload during Store::add is delegated to Files::put() which uses the provider's FileGateway",
+    "Full fake/testing support: FakeStoreGateway, Ai::recordStoreCreation/Deletion/FileAddition/Removal"
+  ],
+  "source_files_analyzed": [
+    "src/Stores.php",
+    "src/Store.php",
+    "src/Providers/Concerns/ManagesStores.php",
+    "src/Gateway/Concerns/PreparesStorableFiles.php",
+    "src/Contracts/Gateway/StoreGateway.php",
+    "src/Contracts/Providers/StoreProvider.php",
+    "src/Gateway/Gemini/GeminiStoreGateway.php",
+    "src/Gateway/OpenAi/OpenAiStoreGateway.php",
+    "src/Responses/Data/StoreFileCounts.php"
+  ]
+}

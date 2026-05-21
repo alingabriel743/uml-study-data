@@ -1,0 +1,183 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #212529
+    EndColor #212529
+}
+
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title Voice Pipeline Audio Processing
+
+|Caller|
+start
+:Invoke **VoicePipeline.run**(audio_input);
+
+|VoicePipeline|
+if (audio_input type?) then (AudioInput\n(single-turn))
+    :Call **_run_single_turn**(audio_input);
+    :Create **StreamedAudioResult**\n(tts_model, tts_settings, config);
+    :Launch asyncio.Task: **stream_events()**;
+    :Open **TraceCtxManager**\n(workflow_name, group_id, tracing);
+
+    |STT Model|
+    :Lazy-init **_get_stt_model()**\n[via VoiceModelProvider if not set];
+    :STTModel.**transcribe**(audio_input, stt_settings)\n→ **input_text: str**;
+
+    |Voice Workflow|
+    :workflow.**run**(input_text)\n[async generator];
+    note right
+      Yields text events one-by-one
+      as the agent processes input
+    end note
+
+    |StreamedAudioResult|
+    :Emit **VoiceStreamEventLifecycle**\n'turn_started'\n[via _start_turn() on first text];
+
+    repeat
+        :Receive **text_event** from workflow;
+        :Buffer text; run\n**tts_settings.text_splitter**;
+        if (combined_sentences\n>= 20 chars?) then (yes)
+            :Spawn asyncio.Task\n**_stream_audio**(text, local_queue);
+            note right
+              Each segment gets its own
+              local_queue to preserve
+              audio ordering
+            end note
+            if (dispatcher running?) then (no)
+                :Start **_dispatch_audio()** task\n[ordered deque of local_queues];
+            endif
+        else (no — keep buffering)
+        endif
+    repeat while (more text events?) is (yes)
+    ->no;
+
+    :_turn_done(): flush **_text_buffer**\nvia _stream_audio(text, local_queue,\nfinish_turn=True);
+    :await asyncio.gather(*_tasks);
+
+else (StreamedAudioInput\n(multi-turn))
+    |VoicePipeline|
+    :Call **_run_multi_turn**(audio_input);
+    :Create **StreamedAudioResult**\n(tts_model, tts_settings, config);
+    :Launch asyncio.Task: **process_turns()**;
+    :Open **TraceCtxManager**;
+
+    |Voice Workflow|
+    :workflow.**on_start()** [optional]\n→ yield intro texts;
+    note right
+      If on_start() raises, log warning
+      and continue — non-fatal
+    end note
+    :Stream intro texts → output._add_text();
+
+    |STT Model|
+    :Lazy-init **_get_stt_model()**;
+    :stt_model.**create_session**(audio_input,\nstt_settings) → **TranscriptionSession**;
+    :transcription_session.**transcribe_turns()**\n[async generator of turns];
+
+    |Voice Workflow|
+    repeat
+        :Receive **input_text** (transcribed turn);
+        :workflow.**run**(input_text)\n[async generator];
+
+        |StreamedAudioResult|
+        :Emit **VoiceStreamEventLifecycle**\n'turn_started';
+        :Buffer text events, split sentences,\nspawn **_stream_audio** tasks\n[same TTS buffering as single-turn];
+        :_turn_done(): flush buffer,\nawait all TTS tasks;
+    repeat while (more turns from\nTranscriptionSession?) is (yes)
+    ->no;
+endif
+
+|TTS Processing (StreamedAudioResult)|
+note
+  **_stream_audio(text, local_queue, finish_turn)**
+  runs per text segment in parallel
+end note
+:Open **speech_span**(model, voice, format=pcm);
+:TTSModel.**run**(text, tts_settings)\n[async generator of bytes chunks];
+
+repeat
+    :Receive audio **bytes chunk**;
+    :Accumulate into buffer;
+    if (buffer >= buffer_size?) then (yes)
+        :_transform_audio_buffer(buffer, dtype)\n→ numpy array (int16 or float32);
+        if (tts_settings.transform_data\ncallback set?) then (yes)
+            :Apply custom **transform_data**(audio_np);
+        endif
+        :local_queue.put(\n**VoiceStreamEventAudio**(data=audio_np));
+    endif
+repeat while (more chunks?) is (yes)
+->no;
+
+:Flush remaining buffer\n[pad if odd-length bytes];
+
+if (finish_turn?) then (yes)
+    :local_queue.put(\n**VoiceStreamEventLifecycle** 'turn_ended');
+    :_finish_turn(): close tracing span,\nreset internal buffers;
+else (no)
+    :local_queue.put(**None**)\n[segment complete sentinel];
+endif
+
+|Dispatcher & Caller|
+:**_dispatch_audio()**: iterate ordered\ndeque of local_queues;\nforward events in order to **main _queue**;
+note right
+  Ordered dispatch ensures audio
+  output matches text order even
+  when TTS tasks run in parallel
+end note
+
+if (all queues drained\nAND _completed_session?) then (yes)
+    :Enqueue **VoiceStreamEventLifecycle**\n'session_ended';
+endif
+
+:Caller iterates\n**StreamedAudioResult.stream()**;
+
+|Caller|
+repeat
+    :Consume **VoiceStreamEvent**;
+    if (event type?) then (VoiceStreamEventAudio)
+        :Play / process **audio chunk**\n(numpy int16 or float32 array);
+    elseif (VoiceStreamEventLifecycle\n'turn_started') then (yes)
+        :Handle turn start\n(e.g. clear playback buffer);
+    elseif (VoiceStreamEventLifecycle\n'turn_ended') then (yes)
+        :Handle turn end\n(e.g. signal playback complete);
+    elseif (VoiceStreamEventError) then (yes)
+        #Pink:Handle error;
+        :_cleanup_tasks(): cancel\nany outstanding asyncio tasks;
+        stop
+    endif
+repeat while (session_ended?) is (no)
+->yes;
+
+:_cleanup_tasks(): cancel\nany outstanding asyncio tasks;
+
+stop
+
+@enduml

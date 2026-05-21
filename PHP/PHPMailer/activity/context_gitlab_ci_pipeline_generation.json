@@ -1,0 +1,177 @@
+{
+  "scope": "gitlab_ci_pipeline_generation",
+  "title": "GitLab CI Pipeline Generation",
+  "diagram_type": "activity",
+  "description": "PHP dd-trace CI pipeline generation via PHP scripts that emit GitLab CI YAML. Six generator scripts each target a different component pipeline.",
+
+  "generators": [
+    {
+      "file": ".gitlab/generate-common.php",
+      "role": "Shared foundation — included by all other generators",
+      "outputs": "No standalone pipeline; provides data + helper functions",
+      "key_data": {
+        "php_versions": "7.0–8.5 (11 versions mapped to ABI numbers)",
+        "arch_targets": ["amd64", "arm64"],
+        "version_subsets": {
+          "all_minor_major_targets": "7.0–8.5",
+          "asan_minor_major_targets": "7.4–8.5 (version_compare >= 7.4)",
+          "windows_minor_major_targets": "7.2–8.5 (>= 7.2)",
+          "profiler_minor_major_targets": "7.1–8.5 (>= 7.1)",
+          "no_asan_minor_major_targets": "7.0–7.3 (diff of all minus asan)"
+        },
+        "service_bind_address": "0.0.0.0 local / 127.0.0.1 in GitLab CI (checked via GITLAB_CI env var)"
+      },
+      "helper_functions": [
+        "unset_dd_runner_env_vars() — emits 4 'unset DD_*' YAML lines",
+        "dockerhub_login() — emits dockerhub-login.sh call if docker present",
+        "windows_git_setup() — emits PowerShell: kill containers, clean workspace, git clone, submodule init",
+        "windows_git_setup_with_packages() — saves/restores packages dir around windows_git_setup()"
+      ],
+      "shared_services_defined": [
+        "test-agent (dd-apm-test-agent v1.22.1)",
+        "request-replayer (php-request-replayer-2.0)",
+        "httpbin-integration (kong/httpbin:0.2.2)",
+        "mysql (dd-trace-ci:php-mysql-dev-5.6)",
+        "elasticsearch2, elasticsearch7",
+        "zookeeper + kafka (cp-kafka:7.8.0, waits for zookeeper ruok)",
+        "redis, memcache, amqp (rabbitmq), mongodb, sqlsrv, googlespanner"
+      ],
+      "global_retry_policy": "max:2 on unknown_failure, data_integrity_failure, runner_system_failure, scheduler_failure, api_failure, stuck_or_timeout_failure, job_execution_timeout"
+    },
+    {
+      "file": ".gitlab/generate-tracer.php",
+      "role": "Tracer (ddtrace extension) development/test pipeline",
+      "includes": "generate-common.php",
+      "stages": ["compile", "test", "integrations test", "web test", "aggregate versions"],
+      "helper_functions": [
+        "after_script(execute_dir, has_test_agent) — emits JUnit artifacts + collect_artifacts.sh + silent-upload-junit",
+        "sidecar_logs() — emits _DD_DEBUG_SIDECAR_LOG_LEVEL/METHOD vars",
+        "before_script_steps(with_docker_auth) — calls dockerhub_login if needed, unset_dd_runner_env_vars, switch-php, git config, mkdir, mv ddtrace.so",
+        "agent_httpbin_service() — references test-agent, request-replayer, httpbin-integration"
+      ],
+      "job_generation_logic": [
+        "ASAN jobs: nested loop over asan_minor_major_targets × arch_targets → 'ASAN test_c', 'ASAN Internal api randomized tests', 'ASAN init hook tests', optionally 'ASAN test_c with multiple observers' (PHP>=8.0), 'ASAN Opcache tests'",
+        "Debug jobs: loop over all_minor_major_targets → test_extension_ci, Unit tests, API unit tests, Disabled test_c run (parallelism conditional on PHP>=7.4), Internal api randomized tests, Opcache tests, PHP Language Tests (resource/telemetry conditional on PHP version)",
+        "Integration/web jobs: parsed from Makefile TEST_INTEGRATIONS_* and TEST_WEB_* targets; SAPIs [cli-server, cgi-fcgi, apache2handler] for web jobs >= 7.2; service injection based on target name substring matching (kafka→kafka+zookeeper, elasticsearch8→elasticsearch7, etc.)",
+        "Specific CLI jobs: test_auto_instrumentation, test_composer, test_integration, test_distributed_tracing (per all versions)",
+        "xDebug matrix: fixed list of [php_version, xdebug_version] pairs (7.0+2.7.2 through 8.4+3.4.0)",
+        "aggregate tested versions: runs on master only, uses dd-octo-sts token, calls create_or_update_supported_versions_pr.sh"
+      ],
+      "base_templates": [
+        ".base_test (extends nothing; image bookworm-7; 60m timeout; COMPOSE_MEMORY_LIMIT=-1; before_script calls before_script_steps + wait-for-service-ready)",
+        ".asan_test (extends .base_test; SWITCH_PHP_VERSION=debug-zts-asan; ASAN_OPTIONS; sidecar_logs)",
+        ".debug_test (extends .base_test; SWITCH_PHP_VERSION=debug)",
+        ".cli_integration_test (extends .base_test; composer, make $MAKE_TARGET)"
+      ]
+    },
+    {
+      "file": ".gitlab/generate-package.php",
+      "role": "Release packaging pipeline — builds all distribution artifacts",
+      "includes": "generate-common.php",
+      "stages": ["prepare", "profiler", "appsec", "tracing", "packaging", "benchmarks", "gate", "notify", "verify", "shared-pipeline", "pre-release", "release"],
+      "external_includes": [".gitlab/one-pipeline.locked.yml", ".gitlab/benchmarks.yml"],
+      "build_platform_matrix": {
+        "linux_musl": ["x86_64-alpine-linux-musl (amd64)", "aarch64-alpine-linux-musl (arm64)"],
+        "linux_gnu": ["x86_64-unknown-linux-gnu (amd64)", "aarch64-unknown-linux-gnu (arm64)"],
+        "windows": ["x86_64-pc-windows-msvc (amd64)"]
+      },
+      "job_generation_flow": [
+        "PREPARE: 'prepare code' → composer update, make generate; 'cache cargo deps' per linux platform",
+        "PROFILER: 'compile profiler extension' per platform × profiler_minor_major_targets → .gitlab/build-profiler.sh (nts + zts builds)",
+        "APPSEC: 'compile appsec extension' per platform × all_php_versions → .gitlab/build-appsec.sh[-alpine]; 'compile appsec helper' (C, amd64+arm64); 'compile appsec helper rust'",
+        "TRACING: 'pecl build'; 'compile tracing extension' per platform × all_php_versions → .gitlab/build-tracing.sh; 'aggregate tracing extension' per arch; 'compile tracing sidecar' per platform → .gitlab/build-sidecar.sh; 'link tracing extension' per platform → .gitlab/link-tracing-extension.sh (depends on sidecar + all tracing extensions); 'compile tracing extension asan' (ASAN platforms); 'compile extension windows' per windows platform × windows versions; 'compile loader' per platform → .gitlab/build-loader.sh",
+        "PACKAGING: .package_extension_base + per-platform packaging jobs",
+        "One-pipeline overrides: validate_supported_configurations_v2_local_file, update_central_configurations_version_range_v2, configure_system_tests, package-oci (needs package loader per arch)"
+      ],
+      "artifacts_produced": {
+        "profiler": "datadog-profiling/ directory (per triplet/ABI)",
+        "appsec": "appsec_* files",
+        "tracing": "extensions_*, standalone_*, ddtrace_*.ldflags, libddtrace_php_*.*",
+        "loader": "dd_library_loader-*.so",
+        "windows": "extensions_x86_64/, extensions_x86_64_debugsymbols/",
+        "pecl": "pecl/datadog_trace-*.tgz",
+        "packages": "packages/"
+      }
+    },
+    {
+      "file": ".gitlab/generate-appsec.php",
+      "role": "AppSec component test pipeline",
+      "includes": "generate-common.php",
+      "stages": ["test", "docker-build"],
+      "job_generation_logic": [
+        "test appsec extension: parallel matrix all_minor_major_targets × arch_targets × [debug, debug-zts (no_asan), debug-zts-asan (asan)] → cmake + make xtest with ASAN_FLAG; boost-cache used",
+        "appsec integration tests: Gradle-based docker-in-docker, targets test{7.0..8.5}-release[-zts|-musl] (parallel matrix per target)",
+        "appsec integration tests (ssi): test8.3-release-ssi",
+        "appsec integration tests (helper-rust): -PuseHelperRust flag on 4 selected versions",
+        "helper-rust build and test: ./gradlew testHelperRust",
+        "helper-rust code coverage: coverageHelperRust + codecov upload (vault for token)",
+        "helper-rust integration coverage: buildHelperRustWithCoverage + test8.3-debug + generateHelperRustIntegrationCoverage",
+        "appsec code coverage: llvm-profdata-17 + llvm-cov-17 → lcov → codecov + Datadog CI upload",
+        "appsec lint: clang-format-17 + clang-tidy via cmake format/tidy targets",
+        "test appsec helper asan: cmake ASAN build, ./appsec/build/tests/helper/ddappsec_helper_test",
+        "push appsec images: ./gradlew pushAll (manual); push appsec docker images multiarch: ./gradlew pushMultiArch (needs push job)",
+        "check libxml2 version: Python script comparing local VERSION with GNOME GitLab tags"
+      ],
+      "ecr_login_snippet": "Inlined in before_script of docker jobs: curl awscli → aws sts assume-role → aws ecr get-login-password"
+    },
+    {
+      "file": ".gitlab/generate-profiler.php",
+      "role": "Profiler (Rust) test pipeline",
+      "includes": "generate-common.php",
+      "stages": ["test"],
+      "profiler_targets": "profiler_minor_major_targets (PHP 7.1–8.5)",
+      "job_generation_logic": [
+        "profiling tests: parallel matrix profiler_minor_major_targets × arch_targets × [alpine image, centos-7 image] → switch-php NTS → cargo build profiler-release --all-features → run phpt NTS tests; touch build.rs; switch-php ZTS → cargo build → run phpt ZTS tests; after_script: skip JUnit upload on centos-7",
+        "clippy NTS: per profiler_minor_major_targets on bookworm, switch-php nts, sed Cargo.toml to rlib, cargo clippy -D warnings",
+        "Cargo test: single job on php-8.5_bookworm-7, switch-php nts, cargo test --all-features"
+      ]
+    },
+    {
+      "file": ".gitlab/generate-shared.php",
+      "role": "Shared C components and ZAI (Zend Abstract Interface) test pipeline",
+      "includes": "generate-common.php",
+      "stages": ["build", "test"],
+      "switch_php_versions": ["debug", "debug-zts-asan", "nts", "zts"],
+      "job_generation_logic": [
+        "C components ASAN: per [centos-7, alpine, bookworm-7] image → cmake ASAN toolchain → make all + test",
+        "C components UBSAN: bookworm-7 → cmake UBSAN toolchain → make all + test (repeat until-fail:10)",
+        "Build & Test Tea: parallel all_minor_major_targets × switch_php_versions (no-asan for <7.4) → .gitlab/build-tea.sh $SWITCH_PHP_VERSION → cmake Tea + make test",
+        "Configuration Consistency: generates + diffs metadata/supported-configurations.json",
+        "Zend Abstract Interface Tests: per all_minor_major_targets × switch_php_versions → depends on Build & Test Tea → cmake ZAI + make test; toolchain: asan for debug-zts-asan, ubsan for debug on >=7.4",
+        "ZAI Shared Tests: PHP 7.4 + 8.0, shared-ext image, nts, -DRUN_SHARED_EXTS_TESTS=1",
+        "Extension Tea Tests: per all_minor_major_targets × switch_php_versions → make install (ddtrace.so) → cmake tests/tea + make test"
+      ]
+    }
+  ],
+
+  "cross_cutting_patterns": [
+    "All generators include generate-common.php first to inherit PHP version matrices and shared helper functions",
+    "Version-gated logic: version_compare() guards control parallelism, ASAN support, Windows, profiler support, telemetry disable",
+    "Service injection: generate-tracer.php parses services from generate-common.php via regex, then matches target names to inject services",
+    "Makefile parsing: generate-tracer.php uses regex on Makefile to extract TEST_INTEGRATIONS_* and TEST_WEB_* targets dynamically",
+    "Artifact chain: prepare code → component compilation jobs → packaging jobs (no compile job depends directly on another compile job except link-tracing-extension)",
+    "Cache strategy: Cargo caches are keyed by triplet+Cargo.lock; compile jobs pull cache; cache-cargo-deps job pushes",
+    "ASSERT_NO_MEMLEAKS constant: '2>&1 | tee /dev/stderr | { ! grep -qe \"=== Total [0-9]+ memory leaks detected ===\"; }' appended to test scripts"
+  ],
+
+  "key_conditions_and_branching": [
+    "PHP >= 7.4: enables ASAN builds, higher parallelism (CPU=8), telemetry disable",
+    "PHP >= 7.2: enables Windows builds, multi-SAPI web tests [cli-server, cgi-fcgi, apache2handler]",
+    "PHP >= 8.0: enables test_c_observer job in ASAN suite",
+    "PHP >= 8.2: disables DD_INSTRUMENTATION_TELEMETRY_ENABLED in PHP language tests",
+    "Alpine platform: adds 'apk add cmake gcc g++ git python3 autoconf coreutils' before appsec build",
+    "centos-7 image: skips JUnit upload in profiler after_script (old glibc/OpenSSL)",
+    "master branch: CI jobs set interruptible=false; aggregate versions job runs automatically (non-master: manual+allow_failure)",
+    "GITLAB_CI=true: service_bind_address becomes 127.0.0.1 instead of 0.0.0.0",
+    "xdebug!=2.7.2 && !=2.9.2: additionally runs unit tests with xdebug extension loaded"
+  ],
+
+  "source_files_analyzed": [
+    ".gitlab/generate-common.php",
+    ".gitlab/generate-tracer.php",
+    ".gitlab/generate-package.php",
+    ".gitlab/generate-appsec.php",
+    ".gitlab/generate-profiler.php",
+    ".gitlab/generate-shared.php"
+  ]
+}

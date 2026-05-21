@@ -1,0 +1,233 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    NoteBackgroundColor #FFF3CD
+    NoteBorderColor #FFCA28
+}
+
+title PHP Binary Discovery and Prerequisite Checking\n(datadog-setup.php — Datadog PHP Tracer Installer)
+
+participant "install()" as install
+participant "check_library_prerequisite\n_or_exit()" as chklib
+participant "search_for_working\n_ldconfig()" as ldconfig
+participant "require_binaries\n_or_exit()" as reqbin
+participant "search_php_binaries()" as searchbin
+participant "build_known_command\n_names_matrix()" as matrix
+participant "resolve_command\n_full_path()" as resolve
+participant "check_php_ext\n_prerequisite_or_exit()" as chkext
+participant "OS / Shell" as os
+
+== 1. Library Prerequisite Checks ==
+
+install -> chklib: check_library_prerequisite_or_exit('libcurl')
+activate chklib
+
+alt Windows
+    chklib --> install: return (no-op — skipped on Windows)
+else Alpine Linux
+    chklib -> os: find /usr/local/lib /usr/lib -name '*libcurl*.so*'
+    activate os
+    os --> chklib: found / not found
+    deactivate os
+else Linux
+    chklib -> ldconfig: search_for_working_ldconfig()
+    activate ldconfig
+    note right of ldconfig
+        Static cache (singleton pattern).
+        Searches /sbin, /usr/sbin, etc.
+        Falls back to iterating $PATH entries.
+        Returns bare "ldconfig" if not found.
+    end note
+    ldconfig -> os: find {/sbin,/usr/sbin,...} -name ldconfig
+    activate os
+    os --> ldconfig: ldconfig path (or not found)
+    deactivate os
+    ldconfig --> chklib: ldconfig path (cached)
+    deactivate ldconfig
+    chklib -> os: ldconfig -p | grep libcurl
+    activate os
+    os --> chklib: matches / empty
+    deactivate os
+end
+
+alt empty result
+    chklib -> install: print_error_and_exit()
+else found
+    chklib --> install: ok
+end
+deactivate chklib
+
+install -> chklib: check_library_prerequisite_or_exit('libgcc_s')
+activate chklib
+note right of chklib: Same OS-branch logic as above
+chklib --> install: ok / exit
+deactivate chklib
+
+opt OPT_ENABLE_PROFILING && !Alpine
+    install -> chklib: check_library_prerequisite_or_exit('libdl.so')
+    activate chklib
+    chklib --> install: ok / exit
+    deactivate chklib
+    install -> chklib: check_library_prerequisite_or_exit('libpthread')
+    activate chklib
+    chklib --> install: ok / exit
+    deactivate chklib
+    install -> chklib: check_library_prerequisite_or_exit('librt')
+    activate chklib
+    chklib --> install: ok / exit
+    deactivate chklib
+end
+
+== 2. PHP Binary Resolution ==
+
+install -> reqbin: require_binaries_or_exit($options)
+activate reqbin
+
+alt --php-bin not provided OR --php-bin=all
+    reqbin -> searchbin: search_php_binaries($prefix='')
+    activate searchbin
+
+    searchbin -> matrix: build_known_command_names_matrix()
+    activate matrix
+    matrix -> matrix: get_supported_php_versions()
+    note right of matrix
+        Builds unique array of all versioned
+        command variants per supported PHP version:
+        php, php-fpm, php{M}, php{M}{m},
+        php{M}.{m}, php{M}-fpm, ...
+        (+ .exe suffix on Windows)
+    end note
+    matrix --> searchbin: command name array
+    deactivate matrix
+
+    loop for each command in matrix
+        searchbin -> resolve: resolve_command_full_path($command)
+        activate resolve
+        alt Linux
+            resolve -> os: command -v {command}
+            activate os
+            os --> resolve: path / not found
+            deactivate os
+        else Windows
+            resolve -> os: where {command}
+            activate os
+            os --> resolve: path / not found
+            deactivate os
+        end
+        resolve -> resolve: realpath($path)\n[resolve symlinks]
+        resolve --> searchbin: full path | false
+        deactivate resolve
+    end
+
+    opt Linux
+        note over searchbin
+            Also builds Remi Safe paths:
+            /opt/remi/php{M}{m}/root/usr/sbin
+            and Plesk paths:
+            /opt/plesk/php/{version}/bin
+        end note
+        searchbin -> os: find -L {std+remi+plesk paths} -type f \( -name php -o ... \)
+        activate os
+        os --> searchbin: additional binary paths
+        deactivate os
+    end
+
+    opt Windows
+        searchbin -> os: scandir(boot disk + Chocolatey dir) for php* dirs
+        activate os
+        os --> searchbin: Windows binary paths
+        deactivate os
+    end
+
+    searchbin -> searchbin: deduplicate via realpath()
+
+    loop for each resolved binary
+        searchbin -> os: file_get_contents($path, 0, 2)\n[shebang check: starts with '#!']
+        activate os
+        os --> searchbin: first 2 bytes
+        deactivate os
+        note right of searchbin
+            Binaries starting with '#!' are
+            script wrappers. Flagged as shebang=true.
+            Filtered out when --php-bin=all is used.
+        end note
+    end
+
+    searchbin --> reqbin: [command => {shebang: bool, path: string}]
+    deactivate searchbin
+
+    alt --php-bin not provided (interactive)
+        reqbin -> reqbin: pick_binaries_interactive($options, results)
+    else --php-bin=all
+        reqbin -> reqbin: filter out shebang (script wrapper) binaries
+    end
+
+else --php-bin=<specific command>
+    reqbin -> resolve: resolve_command_full_path($command)
+    activate resolve
+    resolve -> os: command -v / where {command}
+    activate os
+    os --> resolve: path | not found
+    deactivate os
+    resolve --> reqbin: full path | false
+    deactivate resolve
+
+    alt path not found
+        reqbin -> install: print_error_and_exit()
+    end
+end
+
+reqbin --> install: selected PHP binaries map
+deactivate reqbin
+
+== 3. PHP Extension Prerequisite Check (per binary) ==
+
+loop for each selected PHP binary
+    install -> chkext: check_php_ext_prerequisite_or_exit($binaryPath, 'json')
+    activate chkext
+    chkext -> os: {binary} -m
+    activate os
+    os --> chkext: list of loaded modules / null
+    deactivate os
+    alt null output OR no [PHP Modules] section
+        chkext -> chkext: echo WARNING
+    else 'json' extension missing
+        chkext -> install: print_error_and_exit()
+    else 'json' extension present
+        chkext --> install: ok
+    end
+    deactivate chkext
+end
+
+note over install
+    All library prereqs are checked once globally.
+    PHP extension prereqs are checked per binary.
+    Binary discovery covers standard PATH, Remi Safe,
+    and Plesk paths. Results are deduplicated via realpath().
+end note
+
+@enduml

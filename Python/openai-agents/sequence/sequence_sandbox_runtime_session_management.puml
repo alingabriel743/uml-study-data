@@ -1,0 +1,284 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    DividerBackgroundColor #DEE2E6
+    GroupBackgroundColor #CED4DA
+    NoteBackgroundColor #FFF3CD
+    NoteBorderColor #FFC107
+}
+
+title Sandbox Runtime Session Management
+
+actor "Caller" as caller
+
+participant "Runner" as runner
+participant "SandboxRuntimeSessionManager" as mgr
+participant "_SandboxConcurrencyGuard" as guard
+participant "RunState" as runstate
+participant "SandboxRunConfig" as runconfig
+participant "BaseSandboxClient" as client
+participant "BaseSandboxSession" as session
+participant "_SandboxSessionResources" as resources
+participant "Capability[ ]" as caps
+participant "prepare_sandbox_agent" as prep
+
+== Initialization ==
+
+caller -> runner: Runner.run(agent, input, run_config)
+activate runner
+
+runner -> mgr: __init__(starting_agent, sandbox_config, run_state)
+activate mgr
+mgr -> runstate: _build_agent_identity_keys_by_id(resume_identity_root)
+activate runstate
+runstate --> mgr: agent_identity_keys (stable resume keys)
+deactivate runstate
+note right of mgr
+  Resume keys are stable identifiers
+  derived from the agent name hierarchy
+  to survive across runs
+end note
+
+== Agent Acquisition ==
+
+runner -> mgr: acquire_agent(agent: SandboxAgent)
+activate mgr
+
+mgr -> mgr: get or create _SandboxConcurrencyGuard for agent
+mgr -> guard: check active_runs > 0?
+activate guard
+alt concurrent reuse detected
+    guard --> mgr: active_runs > 0
+    mgr --> runner: raise RuntimeError\n(concurrent reuse of same SandboxAgent)
+else no concurrent run
+    guard --> mgr: ok
+    mgr -> guard: active_runs += 1
+    deactivate guard
+    mgr -> mgr: _ensure_resume_key(agent)
+end
+
+== Session Provisioning ==
+
+runner -> mgr: ensure_session(agent, capabilities, is_resumed_state)
+activate mgr
+
+mgr -> mgr: _resources_by_agent.get(agent_id)?
+note right of mgr: Cache miss → _create_resources(agent, capabilities)
+
+alt [Branch A] Live session injected (sandbox_config.session is not None)
+    mgr -> runconfig: sandbox_config.session
+    activate runconfig
+    runconfig --> mgr: existing BaseSandboxSession
+    deactivate runconfig
+    mgr -> mgr: _configure_session_materialization(session, concurrency_limits)
+    mgr -> session: running()
+    activate session
+    session --> mgr: is_running (bool)
+    deactivate session
+    mgr -> mgr: _process_live_session_manifest(agent, capabilities, session, running)
+    mgr -> caps: capability.process_manifest(manifest) [for each]
+    activate caps
+    caps --> mgr: processed manifests
+    deactivate caps
+    opt entries differ from live session state
+        mgr -> session: _apply_entry_batch(entries_to_apply, base_dir)
+        activate session
+        session --> mgr: entries applied
+        deactivate session
+    end
+    mgr -> resources: create(session, client=None, owns_session=False)
+    activate resources
+    note right of resources
+      owns_session=False: live injected sessions
+      cannot change root/env/users/groups/mounts;
+      only file additions allowed
+    end note
+
+else [Branch B] Resume from prior run state
+    mgr -> mgr: _resolve_client() → BaseSandboxClient
+    mgr -> client: (instantiate client)
+    activate client
+    mgr -> mgr: _resume_state_payload_for_agent(client, agent, agent_id)
+    mgr -> runstate: read _sandbox dict, match backend_id + resume key
+    activate runstate
+    runstate --> mgr: serialized session payload
+    deactivate runstate
+    mgr -> client: deserialize_session_state(payload)
+    client --> mgr: session_state object
+    mgr -> mgr: _process_resumed_state_manifest(agent, capabilities, session_state)
+    mgr -> caps: capability.process_manifest(manifest) [for each]
+    activate caps
+    caps --> mgr: processed manifests
+    deactivate caps
+    mgr -> client: resume(explicit_state)\n[span: sandbox.resume_session]
+    client --> mgr: resumed BaseSandboxSession
+    deactivate client
+    mgr -> mgr: _configure_session_materialization(resumed_session, concurrency_limits)
+    mgr -> resources: create(resumed_session, client, owns_session=True)
+
+else [Branch C] Create fresh session
+    mgr -> mgr: _resolve_client() → BaseSandboxClient
+    mgr -> client: (instantiate client)
+    activate client
+    mgr -> mgr: _resolve_manifest(agent, resume_from_run_state)
+    mgr -> mgr: _process_manifest(capabilities, manifest, run_as_user)
+    mgr -> caps: capability.process_manifest(manifest) [for each]
+    activate caps
+    caps --> mgr: processed manifests
+    deactivate caps
+    mgr -> client: create(snapshot, manifest, options)\n[span: sandbox.create_session]
+    client --> mgr: new BaseSandboxSession
+    deactivate client
+    mgr -> mgr: _configure_session_materialization(session, concurrency_limits)
+    mgr -> mgr: _ensure_session_manifest_has_run_as_user(session, agent)
+    mgr -> resources: create(session, client, owns_session=True)
+end
+
+== Session Start ==
+
+mgr -> resources: ensure_started()
+resources -> session: running()?
+activate session
+alt session not yet started
+    session --> resources: not started
+    resources -> session: session.start()
+    session --> resources: started
+else already running
+    session --> resources: running
+end
+deactivate session
+resources --> mgr: session ready
+deactivate resources
+mgr --> runner: BaseSandboxSession
+deactivate mgr
+deactivate mgr
+
+== Agent Preparation ==
+
+runner -> prep: prepare_sandbox_agent(agent, session, capabilities, run_config_model)
+activate prep
+
+prep -> session: session.state.manifest
+activate session
+session --> prep: Manifest
+deactivate session
+
+prep -> caps: capability.required_capability_types() [validate deps]
+activate caps
+caps --> prep: dependency types
+deactivate caps
+
+prep -> caps: capability.tools() → capability_tools
+activate caps
+caps --> prep: tool list
+deactivate caps
+
+prep -> prep: resolve_sandbox_model_name(agent, run_config_model)
+
+prep -> caps: capability.sampling_params() → deep_merge extra_args
+activate caps
+caps --> prep: merged sampling params
+deactivate caps
+
+prep -> prep: build_sandbox_instructions(\n  base_instructions, additional_instructions,\n  capabilities, manifest)
+note right of prep
+  build_sandbox_instructions:
+  1. get_default_sandbox_instructions() [cached]
+  2. capability.instructions(manifest) [each]
+  3. build_remote_mount_policy_instructions(manifest)
+  4. _filesystem_instructions(manifest) [render_manifest_description]
+end note
+
+prep -> prep: agent.clone(instructions, model_settings, tools, capabilities)
+prep -> prep: set_public_agent(prepared_agent, agent)
+prep --> runner: prepared SandboxAgent (cloned with merged config)
+deactivate prep
+
+== Cleanup ==
+
+runner -> mgr: cleanup()
+activate mgr
+
+note right of mgr: sandbox.cleanup_sessions [custom tracing span]
+
+loop for each _SandboxSessionResources (owns_session=True)
+    mgr -> resources: cleanup()
+    activate resources
+    resources -> session: run_pre_stop_hooks()
+    activate session
+    session --> resources: hooks completed
+    deactivate session
+    resources -> session: stop()
+    activate session
+    session --> resources: stopped
+    deactivate session
+    resources -> session: shutdown()
+    activate session
+    session --> resources: shut down
+    deactivate session
+    resources -> client: delete(session) [if SandboxSession]
+    activate client
+    client --> resources: deleted
+    deactivate client
+    resources -> session: _aclose_dependencies()
+    activate session
+    session --> resources: dependencies closed
+    deactivate session
+    deactivate resources
+end
+
+note right of mgr
+  Cleanup is idempotent via _cleanup_lock;
+  all steps attempt before propagating errors
+end note
+
+mgr -> mgr: serialize_resume_state()
+mgr -> mgr: _resolve_client()
+mgr -> mgr: _serialize_sessions_by_agent(client)
+mgr -> client: serialize_session_state(agent_resources.state)
+activate client
+client --> mgr: serialized state dict
+deactivate client
+
+note right of mgr
+  Resume state schema:
+  • backend_id: client.backend_id
+  • current_agent_key: stable resume key
+  • current_agent_name: agent.name
+  • session_state: serialized session (current agent)
+  • sessions_by_agent: dict[key → {name, state}]
+end note
+
+mgr -> mgr: _release_agents()\n[decrement active_runs for each guard]
+mgr --> runner: resume_state dict
+deactivate mgr
+
+runner --> caller: RunResult
+deactivate runner
+deactivate mgr
+
+@enduml

@@ -1,0 +1,216 @@
+{
+  "scope": "data_loading_and_dataset_management",
+  "title": "Data Loading & Dataset Management",
+  "diagram_type": "use_case",
+  "description": "System loads, provides, and manages training datasets including fields and batch sampling",
+
+  "actors": [
+    "TrainingSystem",
+    "DataLoader",
+    "Developer"
+  ],
+
+  "use_cases": [
+    "Configure Dataset",
+    "Register Dataset in Registry",
+    "Load Video Files (MP4)",
+    "Load Depth Data (EXR/ZIP)",
+    "Load Camera Poses (NPZ)",
+    "Load Camera Intrinsics (NPZ)",
+    "Load Instance Masks (PNG/ZIP)",
+    "Load Optical Flow (EXR/ZIP)",
+    "Load Captions (TXT)",
+    "Sample Frame Indices",
+    "Mirror Frames for Short Clips",
+    "Apply Image Transforms (Crop/Resize/Normalize)",
+    "Select View Indices (Multi-View)",
+    "Enumerate Available Data Fields",
+    "Get Data for Video Index",
+    "Provide Batches with Weighted Dataset Sampling",
+    "Iterate Multiple Datasets (Ratio-Based)",
+    "Load T5 Text Embeddings"
+  ],
+
+  "key_classes": [
+    {
+      "name": "BaseDataset",
+      "kind": "abstract class",
+      "source": "Lyra-1/src/models/data/base.py, Lyra-2/lyra_2/_src/datasets/base.py",
+      "abstract_methods": [
+        "available_data_fields() -> List[DataField]",
+        "num_videos() -> int",
+        "num_views(video_idx: int) -> int",
+        "num_frames(video_idx: int, view_idx: int) -> int",
+        "_read_data(video_idx, frame_idxs, view_idxs, data_fields) -> dict[DataField, Any]"
+      ],
+      "concrete_methods": [
+        "read_video_metadata(video_idx) -> dict",
+        "read_view_metadata(video_idx, view_idx) -> dict",
+        "read(video_idx, frame_idxs, view_idxs, data_fields) -> dict[DataField, Any]"
+      ],
+      "notes": "read() handles None frame/view index defaults; delegates to _read_data()"
+    },
+    {
+      "name": "DataField",
+      "kind": "str Enum",
+      "source": "Lyra-1/src/models/data/datafield.py",
+      "values": [
+        "IMAGE_RGB", "CAMERA_C2W_TRANSFORM", "CAMERA_INTRINSICS", "CAPTION",
+        "METRIC_DEPTH", "DYNAMIC_INSTANCE_MASK", "BACKWARD_FLOW", "RAY_DIRECTION",
+        "OBJECT_BBOX", "POINT_CLOUD", "TRAJECTORY", "META_DATA",
+        "LANGUAGE_EMBEDDING", "LATENT_RGB"
+      ]
+    },
+    {
+      "name": "Radym",
+      "kind": "class",
+      "inherits": "BaseDataset",
+      "source": "Lyra-1/src/models/data/radym.py, Lyra-2/lyra_2/_src/datasets/radym.py",
+      "init_params": ["root_path", "filter_list_path", "num_views=-1", "depth_folder='depth'", "custom_folders", "custom_fields"],
+      "key_fields": ["mp4_file_paths (recursive glob rgb/*.mp4)", "zip_descriptors (LRU cache)", "n_views"],
+      "available_fields": [
+        "IMAGE_RGB (mp4 via decord VideoReader)",
+        "CAMERA_C2W_TRANSFORM (.npz pose)",
+        "CAMERA_INTRINSICS (.npz intrinsics)",
+        "METRIC_DEPTH (EXR in ZIP)",
+        "DYNAMIC_INSTANCE_MASK (PNG in ZIP)",
+        "BACKWARD_FLOW (EXR in ZIP)",
+        "OBJECT_BBOX (JSON in ZIP)",
+        "CAPTION (.txt)"
+      ],
+      "notes": "LRU(10) zip handle cache per worker; multi-view via n_views param"
+    },
+    {
+      "name": "RadymWrapper",
+      "kind": "class",
+      "inherits": "Radym",
+      "source": "Lyra-1/src/models/data/radym_wrapper.py",
+      "init_params": ["is_static: bool=True", "is_multi_view: bool=False", "**kwargs"],
+      "key_fields": ["is_static", "num_cameras", "sample_list"],
+      "methods": [
+        "count_frames(video_idx: int) -> int",
+        "count_cameras(video_idx: int) -> int",
+        "get_data(idx, data_fields, frame_indices, view_indices, camera_convention='opencv') -> dict"
+      ],
+      "notes": "get_data() iterates view_indices and concatenates tensors across views via _read_data()"
+    },
+    {
+      "name": "Provider",
+      "kind": "class",
+      "inherits": "torch.utils.data.Dataset",
+      "source": "Lyra-1/src/models/data/provider.py",
+      "init_params": ["dataset_name", "opt", "training=True", "num_repeat=1"],
+      "key_fields": [
+        "dataset (RadymWrapper or other registry cls)",
+        "data_fields [IMAGE_RGB, CAMERA_C2W_TRANSFORM, CAMERA_INTRINSICS, optionally METRIC_DEPTH, LATENT_RGB]",
+        "image_transform (ImageTransform)",
+        "num_target_views"
+      ],
+      "methods": [
+        "__len__() -> len(dataset)",
+        "_setup_image_transforms(sample_size, crop_size, use_flip, max_crop)",
+        "_preprocess(file_name, rgbs, c2ws, intrinsics, depths, timesteps, latents, target_index, num_input_multi_views)",
+        "_norm_camera_scale(c2ws: Tensor)",
+        "_get_view_indices(num_views, camera_count, start_view_idx=0)",
+        "_get_view_indices_from_input(view_indices_input)",
+        "_get_num_input_multi_views()",
+        "_get_indices_dynamic(idx)",
+        "_get_indices_static_multi_view(start_frame, end_frame, total_num_frames, mirror_frames, num_input_multi_views)",
+        "get_random_static_indices(start_frame, end_frame)",
+        "get_camera_count(idx)"
+      ],
+      "notes": "Reads dataset config from dataset_registry; loads latent stats if is_generated_cosmos_latent"
+    },
+    {
+      "name": "InfiniteCommonDataset",
+      "kind": "class",
+      "source": "Lyra-2/lyra_2/_src/datasets/depth_warp_dataloader.py",
+      "init_params": ["dataset_cfg", "data_name", "batch_size", "sample_n_frames", "sample_size", "crop_size", "video_mirror", "video_mirror_when_short_only", "t5_embedding_path"],
+      "key_fields": ["dataset (instantiated from dataset_cfg target)", "n_data_per_node", "data_start_idx", "multiplier", "img_transform", "norm_image"],
+      "methods": [
+        "__len__() -> multiplier * n_data_per_node",
+        "_get_frame_indices(n_total_frames) -> list",
+        "_transform(images, w2c, depths, intrinsics) -> dict",
+        "_to_w2c_and_intrinsics(data) -> dict",
+        "__getitem__(idx) -> sample dict"
+      ],
+      "notes": "__getitem__ calls dataset._read_data() for RGB/pose/intrinsics/depth; loads T5 embeddings from .pkl; supports DP sharding via megatron parallel_state"
+    },
+    {
+      "name": "DepthWarpDataset",
+      "kind": "class",
+      "source": "Lyra-2/lyra_2/_src/datasets/depth_warp_dataloader.py",
+      "methods": ["build_dataset() -> InfiniteCommonDataset"],
+      "notes": "Merges DATAVERSE_CONFIG with kwargs; factory for InfiniteCommonDataset"
+    },
+    {
+      "name": "IterativeGEN3CDataLoader",
+      "kind": "class",
+      "source": "Lyra-2/lyra_2/_src/datasets/depth_warp_dataloader.py",
+      "init_params": ["dataloaders: dict"],
+      "notes": "Weighted ratio-based random sampling across multiple named dataloaders; yields batches with 'dataset_name' key"
+    },
+    {
+      "name": "ImageTransform",
+      "kind": "class",
+      "source": "Lyra-1/src/models/utils/data.py",
+      "methods": [
+        "preprocess_images(images, depths) -> (video, depths, shift, scale, flip_flag)",
+        "apply_img_transform(i, j, shift, scale) -> (i, j)"
+      ],
+      "notes": "CenterCrop + Resize; optional max_crop mode; optional flip"
+    }
+  ],
+
+  "key_relationships": [
+    "Radym extends BaseDataset",
+    "RadymWrapper extends Radym (adds multi-view, static/dynamic modes)",
+    "Provider wraps RadymWrapper (or any registry dataset) as torch.Dataset",
+    "InfiniteCommonDataset wraps Radym (instantiated via config target string)",
+    "DepthWarpDataset builds InfiniteCommonDataset",
+    "IterativeGEN3CDataLoader aggregates multiple MyDataLoader instances",
+    "MyDataLoader wraps DepthWarpDataset.build_dataset()",
+    "Provider uses ImageTransform for crop/resize/normalize",
+    "DataField enum used as keys in all _read_data() output dicts"
+  ],
+
+  "data_flow": [
+    "Developer/Config → DATAVERSE_CONFIG or dataset_registry → dataset class + params",
+    "Provider.__init__ / DepthWarpDataset.build_dataset() → instantiate Radym/RadymWrapper",
+    "Provider.__getitem__ / InfiniteCommonDataset.__getitem__ → _get_frame_indices → sample N frames",
+    "→ dataset._read_data(video_idx, frame_idxs, view_idxs, data_fields) → dict[DataField, Tensor]",
+    "→ Radym reads: MP4 via VideoReader, depth/flow EXR from ZIP, pose/intrinsics from .npz, masks PNG from ZIP, caption .txt",
+    "→ _to_w2c_and_intrinsics / _preprocess → transform c2w, normalize, crop/resize",
+    "→ T5 embeddings loaded from .pkl keyed by frame chunk",
+    "→ _dict_collation_fn stacks samples into batch",
+    "→ IterativeGEN3CDataLoader ratio-samples across multiple datasets → yield batch to TrainingSystem"
+  ],
+
+  "use_case_actor_assignments": [
+    "TrainingSystem → Configure Dataset, Load Video Files, Load Depth Data, Load Camera Poses, Sample Frame Indices, Apply Image Transforms, Provide Batches, Get Data for Video Index",
+    "DataLoader → Iterate Multiple Datasets (Ratio-Based), Provide Batches with Weighted Dataset Sampling",
+    "Developer → Register Dataset in Registry, Configure Dataset, Enumerate Available Data Fields"
+  ],
+
+  "important_notes": [
+    "Two parallel codebases: Lyra-1 (Provider/RadymWrapper pattern) and Lyra-2 (InfiniteCommonDataset/DepthWarpDataset pattern)",
+    "DataField is shared across both codebases as str+Enum for typed dictionary keys",
+    "LRU cache (size 10) for ZIP file handles per worker prevents descriptor leaks",
+    "Megatron parallel_state used for DP sharding of dataset index ranges in Lyra-2",
+    "Both Radym implementations support optional video mirroring to handle short clips",
+    "InfiniteCommonDataset uses multiplier = 2M * batch_size / n_data_per_node for infinite-style length"
+  ],
+
+  "source_files_analyzed": [
+    "Lyra-1/src/models/data/base.py",
+    "Lyra-1/src/models/data/datafield.py",
+    "Lyra-1/src/models/data/radym_wrapper.py",
+    "Lyra-1/src/models/data/provider.py",
+    "Lyra-1/src/models/utils/data.py",
+    "Lyra-2/lyra_2/_src/datasets/base.py",
+    "Lyra-2/lyra_2/_src/datasets/radym.py",
+    "Lyra-2/lyra_2/_src/datasets/depth_warp_dataloader.py",
+    "Lyra-2/lyra_2/_src/datasets/config_dataverse.py",
+    "ir_postprocessed.json (Provider, RadymWrapper, DataField, BaseDataset entries)"
+  ]
+}

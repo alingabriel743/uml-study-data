@@ -1,0 +1,181 @@
+{
+  "scope": "user_registration_and_account_management",
+  "title": "User Registration and Account Management",
+  "diagram_type": "use_case",
+  "actors": [
+    "Guest",
+    "TemporaryUser",
+    "RegisteredUser",
+    "EmailService",
+    "OIDCProvider",
+    "RateLimitService"
+  ],
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Sign Up",
+      "endpoint": "POST /signup",
+      "actor": "Guest",
+      "service": "PuterAPIService → signupRouter",
+      "preconditions": ["captcha passed (strictMode)", "rate limit check on 'signup'", "signup not disabled"],
+      "actions": ["validate username/email/password", "generate UUID", "hash password (bcrypt)", "create user in DB", "send email verification"],
+      "supports_temp_user": true,
+      "errors": ["too_many_requests", "email_in_use", "username_in_use"]
+    },
+    {
+      "id": "UC2",
+      "name": "Save Account (Upgrade Temp User)",
+      "endpoint": "POST /save_account",
+      "actor": "TemporaryUser",
+      "service": "PuterAPIService → saveAccountRouter",
+      "preconditions": ["authenticated", "user.password === null (temp user)", "signup not disabled"],
+      "actions": ["validate username/email/password", "hash password (bcrypt)", "update user in DB", "send email verification"],
+      "errors": ["account already saved", "username invalid/taken", "email invalid"]
+    },
+    {
+      "id": "UC3",
+      "name": "Change Password",
+      "endpoint": "POST /user-protected/change-password",
+      "actor": "RegisteredUser",
+      "service": "UserProtectedEndpointsService → change-password router",
+      "preconditions": ["session token (HTTP-only cookie)", "identity revalidated (password or OIDC cookie)", "not temp user"],
+      "actions": ["hash new password (bcrypt)", "db.write UPDATE users SET password", "invalidate_cached_user", "send email: password_change_notification", "list_sessions + revoke_session (all sessions)"],
+      "errors": ["password_mismatch", "password_required", "oidc_revalidation_required"]
+    },
+    {
+      "id": "UC4",
+      "name": "Change Email",
+      "endpoint": "POST /user-protected/change-email",
+      "actor": "RegisteredUser",
+      "service": "UserProtectedEndpointsService → change-email router",
+      "preconditions": ["session token", "identity revalidated", "not temp user"],
+      "actions": ["validate new_email", "svc_cleanEmail.clean + validate", "check email not already in use", "db.write UPDATE users SET email_confirm_token", "send: email_verification_link (new)", "send: email_change_request (new)", "send: email_change_notification (old)", "db.write UPDATE confirm pending"],
+      "errors": ["field_missing: new_email", "field_invalid: new_email", "email_not_allowed", "email_already_in_use"]
+    },
+    {
+      "id": "UC5",
+      "name": "Change Username",
+      "endpoint": "POST /user-protected/change-username",
+      "actor": "RegisteredUser",
+      "service": "UserProtectedEndpointsService → change-username router",
+      "preconditions": ["session token", "identity revalidated", "not temp user", "rate limit on /user-protected/change-username"],
+      "actions": ["validate new_username (regex, length, reserved words)", "check username not taken", "check rate-limited changes in DB", "db.write UPDATE users SET username"],
+      "errors": ["field_missing", "field_invalid", "field_too_long", "username_already_in_use", "too_many_username_changes"]
+    },
+    {
+      "id": "UC6",
+      "name": "Disable 2FA",
+      "endpoint": "POST /user-protected/disable-2fa",
+      "actor": "RegisteredUser",
+      "service": "UserProtectedEndpointsService → disable-2fa router",
+      "preconditions": ["session token", "identity revalidated", "not temp user"],
+      "actions": ["db.write UPDATE users SET otp_enabled=false", "invalidate_cached_user_by_id", "svc_email.send_email: disabled_2fa notification"],
+      "errors": []
+    },
+    {
+      "id": "UC7",
+      "name": "Delete Own Account",
+      "endpoint": "POST /user-protected/delete-own-user",
+      "actor": "RegisteredUser",
+      "actor_alt": "TemporaryUser",
+      "service": "UserProtectedEndpointsService → delete-own-user router",
+      "preconditions": ["session token", "identity revalidated (temp users bypassed)"],
+      "actions": ["deleteUser(req.user)", "invalidate_cached_user(req.user)"],
+      "notes": "Only use case exempt from the temp-user block middleware"
+    },
+    {
+      "id": "UC8",
+      "name": "Confirm Email",
+      "endpoint": "via confirmEmailRouter",
+      "actor": "RegisteredUser",
+      "service": "PuterAPIService → confirmEmailRouter",
+      "actions": ["verify token", "update email_confirmed in DB"]
+    },
+    {
+      "id": "UC9",
+      "name": "Send Email Confirmation",
+      "endpoint": "via sendConfirmEmailRouter",
+      "actor": "RegisteredUser",
+      "service": "PuterAPIService → sendConfirmEmailRouter",
+      "actions": ["generate verification token", "svc_email.send_email"]
+    },
+    {
+      "id": "UC10",
+      "name": "Password Recovery",
+      "endpoints": ["POST /send-pass-recovery-email", "POST /verify-pass-recovery-token", "POST /set-pass-using-token"],
+      "actor": "Guest",
+      "service": "PuterAPIService (3-step flow)",
+      "actions": ["send recovery email", "verify token", "set new password using token"]
+    },
+    {
+      "id": "UC11",
+      "name": "Configure 2FA",
+      "endpoint": "via configure2faRouter",
+      "actor": "RegisteredUser",
+      "service": "PuterAPIService → configure2faRouter",
+      "actions": ["enable/configure TOTP 2FA"]
+    }
+  ],
+  "middleware_chain_user_protected": [
+    "1. Edge rate limit check (svc_edgeRateLimit.check) → 429 on fail",
+    "2. configurable_auth({ no_options_auth: true, allow_cached_user: false })",
+    "3. Actor type check: must be UserActorType with hasHttpOnlyCookie → session_required",
+    "4. Refresh user from DB (get_user force=true)",
+    "5. Block temp users (password===null && email===null), EXCEPT /delete-own-user",
+    "6. Identity revalidation: bcrypt.compare(password, user.password) OR jwt.verify(revalidationCookie) with purpose='revalidate'"
+  ],
+  "key_services": [
+    {
+      "name": "UserProtectedEndpointsService",
+      "extends": "BaseService",
+      "route_prefix": "/user-protected",
+      "method": "__on_install.routes()",
+      "manages": ["change-password", "change-email", "change-username", "disable-2fa", "delete-own-user"],
+      "private_method": "#revalidateUrlFields(req, user) → OIDC revalidate URL from svc_oidc"
+    },
+    {
+      "name": "PuterAPIService",
+      "extends": "BaseService",
+      "method": "__on_install.routes()",
+      "registers": ["signup", "save_account", "login", "logout", "confirmEmail", "sendConfirmEmail", "change_email", "change_username", "passwd", "send-pass-recovery-email", "verify-pass-recovery-token", "set-pass-using-token", "configure-2fa", "oidc", "list-sessions", "revoke-session", "create-access-token", "revoke-access-token"]
+    },
+    {
+      "name": "APIErrorService",
+      "extends": "BaseService",
+      "static_field": "codes = APIError.codes",
+      "methods": ["register(codes: Object) → void", "create(code, fields) → APIError"],
+      "error_codes_user_mgmt": ["too_many_requests", "user_tokens_only", "session_required", "temporary_account", "oidc_revalidation_required", "password_mismatch", "password_required", "field_missing", "field_invalid", "field_too_long", "username_already_in_use", "too_many_username_changes", "email_not_allowed", "email_already_in_use"]
+    }
+  ],
+  "key_relationships": [
+    "UserProtectedEndpointsService extends BaseService",
+    "PuterAPIService extends BaseService",
+    "APIErrorService extends BaseService",
+    "APIErrorService aggregates APIError.codes (static)",
+    "UserProtectedEndpointsService uses APIError.create() directly",
+    "UserProtectedEndpointsService uses configurable_auth middleware",
+    "UserProtectedEndpointsService uses svc_oidc for OIDC revalidation URL",
+    "change-password uses svc_auth.list_sessions + revoke_session",
+    "change-email uses svc_cleanEmail for validation",
+    "All user-protected routers use svc_email.send_email for notifications"
+  ],
+  "auth_mechanisms": [
+    "Session token (HTTP-only cookie) — required for /user-protected",
+    "Password revalidation (bcrypt) — for accounts with password",
+    "OIDC revalidation cookie (JWT, purpose='revalidate') — for OIDC-only accounts",
+    "JWT tokens (jsonwebtoken) for revalidation cookie verification"
+  ],
+  "important_notes": "Two registration paths: (1) direct signup via POST /signup with temp or real user mode; (2) save_account to upgrade temp→real. All account modification use cases live under /user-protected with a 6-layer middleware chain enforcing session tokens and identity revalidation. OIDC accounts (no password) must use OIDC revalidation flow. Temporary users can only access delete-own-user from the protected routes.",
+  "source_files_analyzed": [
+    "src/backend/src/services/web/UserProtectedEndpointsService.js",
+    "src/backend/src/modules/web/APIErrorService.js",
+    "src/backend/src/services/PuterAPIService.js",
+    "src/backend/src/routers/signup.js",
+    "src/backend/src/routers/save_account.js",
+    "src/backend/src/routers/user-protected/change-password.js",
+    "src/backend/src/routers/user-protected/change-email.js",
+    "src/backend/src/routers/user-protected/change-username.js",
+    "src/backend/src/routers/user-protected/disable-2fa.js",
+    "src/backend/src/routers/user-protected/delete-own-user.js"
+  ]
+}

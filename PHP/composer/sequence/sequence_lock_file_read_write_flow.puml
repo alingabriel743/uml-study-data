@@ -1,0 +1,196 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #DEE2E6
+    GroupHeaderFontColor #212529
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #F1F3F5
+}
+
+title Lock File Read and Write Flow
+
+participant "Installer" as installer
+participant "Locker" as locker
+participant "JsonFile\n(composer.lock)" as jsonfile
+participant "ArrayLoader" as loader
+participant "LockArrayRepository" as lockRepo
+participant "Solver" as solver
+participant "LockTransaction" as lockTx
+participant "ArrayDumper" as dumper
+participant "InstalledFilesystemRepository" as installedRepo
+participant "InstallationManager" as installMgr
+
+== READ FLOW: doInstall (install from lock) ==
+
+installer -> locker : getLockedRepository(withDevReqs: bool)
+activate locker
+
+alt lockDataCache is null
+    locker -> jsonfile : read()
+    activate jsonfile
+    jsonfile --> locker : array (composer.lock JSON)
+    deactivate jsonfile
+    note right of locker : Caches result in\n$lockDataCache
+end
+
+locker -> lockRepo ** : new LockArrayRepository()
+
+loop foreach package in lockData['packages'] (+ 'packages-dev' if withDevReqs)
+    locker -> loader : load(packageInfo: array)
+    activate loader
+    loader --> locker : PackageInterface
+    deactivate loader
+    locker -> lockRepo : addPackage(package)
+end
+
+loop foreach alias in lockData['aliases']
+    locker -> lockRepo : addPackage(CompleteAliasPackage)
+    note right of locker : AliasPackages reconstructed\nfrom aliases array
+end
+
+locker --> installer : LockArrayRepository
+deactivate locker
+
+installer -> locker : isFresh()
+activate locker
+note right of locker : Compares contentHash\nwith lock['content-hash']
+locker --> installer : bool
+deactivate locker
+
+installer -> locker : getMissingRequirementInfo(rootPackage, withDevReqs)
+activate locker
+locker --> installer : array (missing requirements)
+deactivate locker
+
+installer -> locker : getPlatformRequirements(withDevReqs: bool)
+activate locker
+note right of locker : Reads platform / platform-dev\nfrom lock data as Link[]
+locker --> installer : Link[]
+deactivate locker
+
+loop foreach package in lockedRepository->getPackages()
+    installer -> installer : request->fixLockedPackage(package)
+end
+
+installer -> installer : new LocalRepoTransaction(lockedRepository, localRepo)
+note right of installer : Diffs lock vs installed\nto derive operations
+
+installer -> installMgr : execute install/update/uninstall operations
+activate installMgr
+installMgr --> installer : done
+deactivate installMgr
+
+installer -> installedRepo : write(devMode, installationManager)
+activate installedRepo
+
+loop foreach package in repository
+    installedRepo -> dumper : dump(package)
+    activate dumper
+    dumper --> installedRepo : array (serialized package)
+    deactivate dumper
+    installedRepo -> installMgr : getInstallPath(package)
+    activate installMgr
+    installMgr --> installedRepo : string (path)
+    deactivate installMgr
+end
+
+installedRepo -> jsonfile : write(data)
+note right of installedRepo : Writes\nvendor/composer/installed.json
+activate jsonfile
+jsonfile --> installedRepo : void
+deactivate jsonfile
+deactivate installedRepo
+
+== WRITE FLOW: doUpdate (resolve + write lock) ==
+
+installer -> solver : solve(request, platformRequirementFilter)
+activate solver
+solver --> installer : LockTransaction
+deactivate solver
+
+installer -> installer : extractDevPackages(lockTransaction, ...)
+note right of installer : Separates dev from\nnon-dev in transaction
+
+installer -> installer : extractPlatformRequirements(rootPackage->getRequires())
+note right of installer : Filters by\nPlatformRepository::isPlatformPackage
+
+installer -> lockTx : getNewLockPackages(false, updateMirrors)
+activate lockTx
+lockTx --> installer : PackageInterface[] (prod packages)
+deactivate lockTx
+
+installer -> lockTx : getNewLockPackages(true, updateMirrors)
+activate lockTx
+lockTx --> installer : PackageInterface[] (dev packages)
+deactivate lockTx
+
+installer -> lockTx : getAliases(aliases)
+activate lockTx
+lockTx --> installer : array (resolved aliases)
+deactivate lockTx
+
+installer -> locker : setLockData(packages, devPackages, platformReqs,\nplatformDevReqs, aliases, minimumStability,\nstabilityFlags, preferStable, preferLowest,\nplatformOverrides, write: bool)
+activate locker
+
+locker -> locker : lockPackages(packages)
+activate locker
+note right of locker : Private — serializes\neach package to lock format
+
+loop foreach package (skip AliasPackage)
+    locker -> dumper : dump(package)
+    activate dumper
+    dumper --> locker : array (serialized)
+    deactivate dumper
+    note right of locker : Unsets version_normalized\nand installation-source;\nsorts by name+version
+end
+locker --> locker : array (locked packages)
+deactivate locker
+
+locker -> locker : fixupJsonDataType(lock)
+note right of locker : Empty arrays → stdClass\nfor JSON objects;\nksort stability-flags
+
+locker -> locker : isLocked()
+note right of locker : Checks if existing lock present
+
+alt changed AND write == true
+    locker -> jsonfile : write($lock)
+    activate jsonfile
+    note right of jsonfile : Writes composer.lock\nto disk
+    jsonfile --> locker : void
+    deactivate jsonfile
+    note right of locker : lockDataCache = null\n(cache invalidated)
+else changed AND write == false (dry-run)
+    note right of locker : virtualFileWritten = true\nlockDataCache = parsed in-memory lock\n(no disk write)
+end
+
+locker --> installer : bool (updatedLock)
+deactivate locker
+
+opt updatedLock AND writeLock AND executeOperations
+    installer -> installer : io->writeError('Writing lock file')
+end
+
+@enduml

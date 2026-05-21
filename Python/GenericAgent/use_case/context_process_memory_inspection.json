@@ -1,0 +1,135 @@
+{
+  "scope": "process_memory_inspection",
+  "title": "Process Memory Inspection",
+  "diagram_type": "use_case",
+  "description": "Agent scans process memory regions to extract runtime data (e.g., credentials, UI state) from other running processes on Windows via Win32 API and YARA pattern matching.",
+
+  "actors": [
+    {
+      "name": "Agent/Operator",
+      "type": "primary",
+      "description": "Invokes scanner via CLI (procmem_scanner.py <PID> <pattern> [--mode] [--llm]) or imports scan_memory() directly"
+    },
+    {
+      "name": "Windows Kernel (kernel32.dll)",
+      "type": "system",
+      "description": "Provides OpenProcess, VirtualQueryEx, ReadProcessMemory, CloseHandle WinAPI calls via ctypes.windll.kernel32"
+    },
+    {
+      "name": "Target Process",
+      "type": "secondary",
+      "description": "The running Windows process identified by PID whose virtual memory is being inspected"
+    },
+    {
+      "name": "YARA Engine",
+      "type": "system",
+      "description": "Compiles and applies pattern-matching rules against raw memory buffers"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Scan Process Memory",
+      "actor": "Agent/Operator",
+      "entry_point": "scan_memory(pid, pattern, context_size=256, mode='auto', llm_mode=False)",
+      "description": "Top-level use case: opens target process, iterates all committed readable memory regions, applies YARA pattern, returns matches with address context",
+      "includes": ["UC2", "UC3", "UC4", "UC5", "UC6"]
+    },
+    {
+      "id": "UC2",
+      "name": "Build YARA Pattern Rule",
+      "actor": "Agent/Operator",
+      "entry_point": "build_rules(pattern, mode='auto')",
+      "description": "Classifies pattern as hex bytes or ASCII/wide string, compiles a YARA rule object. Auto-detects hex via is_hex_pattern().",
+      "includes": []
+    },
+    {
+      "id": "UC3",
+      "name": "Open Process Handle",
+      "actor": "Windows Kernel (kernel32.dll)",
+      "entry_point": "k32.OpenProcess(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ, False, pid)",
+      "description": "Acquires handle with flags 0x0400|0x0010 (PROCESS_QUERY_INFORMATION | PROCESS_VM_READ). Fails on system/higher-integrity processes.",
+      "includes": []
+    },
+    {
+      "id": "UC4",
+      "name": "Enumerate Memory Regions",
+      "actor": "Windows Kernel (kernel32.dll)",
+      "entry_point": "k32.VirtualQueryEx(h_proc, curr_addr, byref(mbi), sizeof(mbi))",
+      "description": "Iterates 64-bit user-space (0x0 to 0x7FFFFFFFFFFF). Populates MEMORY_BASIC_INFORMATION with BaseAddress, RegionSize, State, Protect. Filters for MEM_COMMIT (0x1000) and readable protect flags (0xEE bitmask).",
+      "includes": []
+    },
+    {
+      "id": "UC5",
+      "name": "Read Memory Region",
+      "actor": "Windows Kernel (kernel32.dll)",
+      "entry_point": "k32.ReadProcessMemory(h_proc, mbi.BaseAddress, buf, mbi.RegionSize, byref(read))",
+      "description": "Copies committed+readable region bytes into a ctypes string buffer. Only proceeds if VirtualQueryEx indicates readable state.",
+      "includes": []
+    },
+    {
+      "id": "UC6",
+      "name": "Match Pattern in Memory Buffer",
+      "actor": "YARA Engine",
+      "entry_point": "rules.match(data=raw_bytes)",
+      "description": "Applies compiled YARA rule to raw memory bytes. On match, extracts offset and matched_data from inst.instances[0].",
+      "includes": ["UC7"]
+    },
+    {
+      "id": "UC7",
+      "name": "Format Match Context",
+      "actor": "Agent/Operator",
+      "entry_point": "format_llm_context(data, offset, base_addr, length=64)  |  hex context string",
+      "description": "Two output modes: (1) llm_mode=True → format_llm_context() returns dict {address, offset, hex, ascii, hit_pos}; (2) default → returns 'Addr: 0x...\nHex: ...' string with context_size bytes around match.",
+      "includes": []
+    },
+    {
+      "id": "UC8",
+      "name": "Perform Differential Address Scan",
+      "actor": "Agent/Operator",
+      "entry_point": "read_addrs(pid, addrs) [defined in procmem_scanner_sop.md]",
+      "description": "Advanced use case for locating dynamic fields: full scan → store address set → switch UI state → ReadProcessMemory on stored addresses → filter changed/unchanged → converge to unique address. Uses raw k32.ReadProcessMemory directly.",
+      "includes": ["UC3", "UC5"]
+    }
+  ],
+
+  "key_structures": [
+    {
+      "name": "MEMORY_BASIC_INFORMATION",
+      "kind": "ctypes.Structure",
+      "fields": ["BaseAddress (LPVOID)", "AllocationBase (LPVOID)", "AllocationProtect (DWORD)", "RegionSize (SIZE_T)", "State (DWORD)", "Protect (DWORD)", "Type (DWORD)"]
+    }
+  ],
+
+  "winapi_calls": [
+    "OpenProcess(0x0400|0x0010, False, pid) → HANDLE",
+    "VirtualQueryEx(hProc, addr, &mbi, sizeof(mbi)) → SIZE_T",
+    "ReadProcessMemory(hProc, baseAddr, buf, size, &bytesRead) → BOOL",
+    "CloseHandle(hProc)"
+  ],
+
+  "key_conditions_guards": [
+    "mbi.State == 0x1000 (MEM_COMMIT) AND mbi.Protect & 0xEE (readable) — required before ReadProcessMemory",
+    "h_proc == NULL → early return error (cannot open higher-integrity or system process)",
+    "next_addr <= curr_addr → break (prevents infinite loop on address overflow)",
+    "mode='auto': is_hex_pattern() decides hex vs string rule; mode='hex'/'string' forces type"
+  ],
+
+  "data_flow": [
+    "pid + pattern → build_rules() → YARA rules object",
+    "pid → OpenProcess() → h_proc handle",
+    "h_proc + curr_addr → VirtualQueryEx() → MEMORY_BASIC_INFORMATION (region metadata)",
+    "MEMORY_BASIC_INFORMATION (committed+readable) → ReadProcessMemory() → raw bytes buffer",
+    "raw bytes → rules.match() → match offsets",
+    "match offsets → format_llm_context() OR hex string → results list",
+    "results list → JSON output (llm_mode) OR match count (default)"
+  ],
+
+  "security_notes": "This is a process memory scraping tool targeting Windows. It extracts runtime credentials, UI state (e.g., WeChat active session), and arbitrary in-memory data from other processes. Requires PROCESS_QUERY_INFORMATION + PROCESS_VM_READ on target PID. The SOP explicitly describes extracting session titles and dynamic fields from messaging apps (WeChat/Weixin.exe).",
+
+  "source_files_analyzed": [
+    "memory/procmem_scanner.py",
+    "memory/procmem_scanner_sop.md"
+  ]
+}

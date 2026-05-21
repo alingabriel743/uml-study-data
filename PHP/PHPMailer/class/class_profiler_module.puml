@@ -1,0 +1,412 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+title Profiler Module\n<size:11>(Datadog PHP Profiler — Rust Extension)</size>
+
+' ─────────────────────────────────────────────
+' CORE ORCHESTRATION
+' ─────────────────────────────────────────────
+package "Core Orchestration" {
+
+    class Profiler <<singleton>> {
+        -fork_barrier: Arc<Barrier>
+        -interrupt_manager: Arc<InterruptManager>
+        -message_sender: Sender<ProfilerMessage>
+        -upload_sender: Sender<UploadMessage>
+        -time_collector_handle: JoinHandle<()>
+        -uploader_handle: JoinHandle<()>
+        -should_join: AtomicBool
+        -sample_types_filter: SampleTypeFilter
+        -system_settings: AtomicPtr<SystemSettings>
+        --
+        +{static} init(system_settings: &SystemSettings)
+        +{static} get() -> Option<&Profiler>
+        +{static} stop(timeout: Duration) <<unsafe>>
+        +{static} shutdown(timeout: Duration) <<unsafe>>
+        +{static} kill() <<unsafe>>
+        +add_interrupt(interrupt: VmInterrupt)
+        +remove_interrupt(interrupt: VmInterrupt)
+        +fork_prepare() -> Result
+        +post_fork_parent()
+        +send_sample(message: SampleMessage) -> Result
+        +send_local_root_span_resource(message: LocalRootSpanResourceMessage)
+        +collect_time(execute_data, interrupt_count: u32)
+        +collect_allocations(execute_data, alloc_samples: i64, alloc_size: i64)
+        +collect_exception(execute_data, exception: String, message: Option<String>)
+        +collect_compile_string(now: i64, duration: i64, filename: String)
+        +collect_compile_file(now: i64, duration: i64, filename: String)
+        +collect_idle(now: i64, duration: i64, reason: &str)
+        +collect_garbage_collection(now: i64, duration: i64, collected: i64)
+        +collect_fatal(now: i64, file: String, line: u32, message: String)
+        +collect_opcache_restart(now: i64, file: String, reason: &str)
+        -collect_stack_sample_timed(execute_data) -> Result<Backtrace>
+        -prepare_and_send_message(frames, samples, labels, timestamp)
+        -{static} common_labels(n_extra_labels) -> Vec<Label>
+    }
+    note right of Profiler
+        Global singleton in OnceLock<Profiler>.
+        Initialized on first RINIT; destroyed on mshutdown.
+        Upload period = 67s, wall-time tick = 10ms.
+        Fork-safe via Arc<Barrier> (3 participants).
+    end note
+
+    class TimeCollector <<thread: ddprof_time>> {
+        -fork_barrier: Arc<Barrier>
+        -interrupt_manager: Arc<InterruptManager>
+        -message_receiver: Receiver<ProfilerMessage>
+        -upload_sender: Sender<UploadMessage>
+        -upload_period: Duration
+        --
+        +run(self)
+        -handle_timeout(profiles, last_export) -> WallTime
+        -{static} handle_sample_message(message, profiles, started_at)
+        -{static} handle_resource_message(message, profiles)
+        -{static} create_profile(message: &SampleMessage, started_at: SystemTime) -> InternalProfile
+    }
+    note bottom of TimeCollector
+        Ticks every 10ms via InterruptManager.
+        Aggregates SampleMessages into
+        HashMap<ProfileIndex, InternalProfile>.
+        Sends UploadRequest every 67s.
+    end note
+
+    class Uploader <<thread: ddprof_upload>> {
+        -fork_barrier: Arc<Barrier>
+        -receiver: Receiver<UploadMessage>
+        -output_pprof: Option<Cow<str>>
+        -endpoint: AgentEndpoint
+        -start_time: String
+        -process_tags: Option<String>
+        --
+        +new(fork_barrier, receiver, endpoint, ...) -> Self
+        +run(self)
+        -upload(message: Box<UploadRequest>, last_cpu: &mut Option<ThreadTime>) -> Result<u16>
+        -{static} create_internal_metadata() -> Option<Value>
+        -create_profiler_info() -> Option<Value>
+    }
+    note bottom of Uploader
+        Serializes InternalProfile to compressed pprof
+        via libdd_profiling::ProfileExporter.
+        Sends HTTP to Datadog agent endpoint.
+        Supports .zst file output for debug.
+    end note
+
+    class Globals {
+        +interrupt_count: AtomicU32
+        +last_interrupt: SystemTime
+    }
+}
+
+' ─────────────────────────────────────────────
+' INTERRUPT MANAGEMENT
+' ─────────────────────────────────────────────
+package "Interrupt Management" {
+
+    class InterruptManager {
+        -vm_interrupts: Arc<Mutex<HashSet<VmInterrupt>>>
+        --
+        +new() -> Self
+        +add_interrupt(interrupt: VmInterrupt)
+        +remove_interrupt(interrupt: VmInterrupt)
+        +has_interrupts() -> bool
+        +trigger_interrupts()
+    }
+    note right of InterruptManager
+        trigger_interrupts() atomically increments
+        interrupt_count and sets PHP engine flag,
+        causing PHP thread to call collect_time().
+    end note
+
+    class VmInterrupt <<unsafe Send>> {
+        +interrupt_count_ptr: *const AtomicU32
+        +engine_ptr: *const AtomicBool
+    }
+    note bottom of VmInterrupt
+        Raw pointers into PHP VM thread-local state.
+        Unsafe Send impl required.
+    end note
+}
+
+' ─────────────────────────────────────────────
+' SAMPLE TYPE FILTERING
+' ─────────────────────────────────────────────
+package "Sample Type Filtering" {
+
+    class SampleTypeFilter {
+        -sample_types: Vec<ValueType>
+        -sample_types_mask: [bool; 23]
+        --
+        +new(system_settings: &SystemSettings) -> Self
+        +sample_types() -> Vec<ValueType>
+        +filter(sample_values: SampleValues) -> Vec<i64>
+    }
+    note right of SampleTypeFilter
+        23 possible sample types.
+        Always-on: sample/count, wall-time/ns.
+        Optional: cpu-time, alloc-samples, alloc-size,
+        timeline, exception-samples, 16 I/O types.
+    end note
+
+    class ValueType <<Copy, Eq, Hash>> {
+        +type_name: &'static str
+        +unit: &'static str
+        --
+        +{static} new(type_name, unit) -> Self
+    }
+
+    class SampleValues {
+        +interrupt_count: i64
+        +wall_time: i64
+        +cpu_time: i64
+        +alloc_samples: i64
+        +alloc_size: i64
+        +timeline: i64
+        +exception: i64
+        +socket_read_time: i64
+        +socket_write_time: i64
+        +file_read_time: i64
+        +file_write_time: i64
+        +socket_read_size: i64
+        +socket_write_size: i64
+        +file_read_size: i64
+        +file_write_size: i64
+    }
+}
+
+' ─────────────────────────────────────────────
+' MESSAGING
+' ─────────────────────────────────────────────
+package "Messaging" {
+
+    enum ProfilerMessage {
+        Cancel
+        Sample(SampleMessage)
+        LocalRootSpanResource(LocalRootSpanResourceMessage)
+        Pause
+        Wake
+    }
+
+    enum UploadMessage {
+        Pause
+        Upload(Box<UploadRequest>)
+    }
+
+    class SampleMessage {
+        +key: ProfileIndex
+        +value: SampleData
+    }
+
+    class LocalRootSpanResourceMessage {
+        +local_root_span_id: u64
+        +resource: String
+    }
+
+    class SampleData {
+        +frames: Backtrace
+        +labels: Vec<Label>
+        +sample_values: Vec<i64>
+        +timestamp: i64
+    }
+
+    class ProfileIndex <<Clone, Eq, Hash>> {
+        +sample_types: Vec<ValueType>
+        +tags: Arc<Vec<Tag>>
+    }
+    note bottom of ProfileIndex
+        HashMap key — different services/tags
+        produce separate pprof profiles.
+    end note
+
+    class UploadRequest {
+        +index: ProfileIndex
+        +profile: InternalProfile
+        +end_time: SystemTime
+        +duration: Option<Duration>
+    }
+}
+
+' ─────────────────────────────────────────────
+' STACK WALKING
+' ─────────────────────────────────────────────
+package "Stack Walking" {
+
+    class Backtrace {
+        -frames: Vec<ZendFrame>
+        --
+        +new(frames: Vec<ZendFrame>) -> Self
+        +len() -> usize
+        +is_empty() -> bool
+        +iter() -> impl Iterator<Item = &ZendFrame>
+    }
+    note right of Backtrace
+        Implements Deref<Target=[ZendFrame]>.
+        Max depth = 512 frames;
+        last frame replaced with [truncated].
+    end note
+
+    class ZendFrame {
+        +function: Cow<'static, str>
+        +file: Option<Cow<'static, str>>
+        +line: u32
+    }
+    note bottom of ZendFrame
+        Max string length = 16,383 bytes.
+        Long strings truncated to
+        [suspiciously large string].
+    end note
+}
+
+' ─────────────────────────────────────────────
+' LABELS
+' ─────────────────────────────────────────────
+package "Labels" {
+
+    class Label {
+        +key: &'static str
+        +value: LabelValue
+    }
+    note right of Label
+        Common labels: thread_id, thread_name,
+        local_root_span_id, span_id, trace_endpoint.
+        Converts to ApiLabel (libdd_profiling).
+    end note
+
+    enum LabelValue {
+        Str(Cow<'static, str>)
+        Num(i64, &'static str)
+    }
+}
+
+' ─────────────────────────────────────────────
+' SAMPLING STATISTICS
+' ─────────────────────────────────────────────
+package "Sampling Statistics" {
+
+    class AllocationProfilingStats <<thread-local>> {
+        -next_sample: i64
+        -poisson: Poisson<f64>
+        -rng: StdRng | ThreadRng
+        --
+        +new(sampling_distance: NonZeroU64) -> Self
+        +next_sampling_interval()
+        +should_collect_allocation(len: size_t) -> bool
+    }
+    note bottom of AllocationProfilingStats
+        Default sampling distance = 4 MiB.
+        Poisson sampling. Thread-local.
+        ALLOCATION_PROFILING_INTERVAL: AtomicU64.
+    end note
+
+    class ExceptionProfilingStats <<thread-local>> {
+        -next_sample: u32
+        -poisson: Poisson<f64>
+        -rng: ThreadRng
+        --
+        +new() -> Self
+        +next_sampling_interval()
+        +should_collect_exception() -> bool
+    }
+    note bottom of ExceptionProfilingStats
+        Default interval = every 100 exceptions.
+        Poisson sampling. Thread-local.
+        EXCEPTION_PROFILING_INTERVAL: AtomicU32.
+    end note
+}
+
+' ─────────────────────────────────────────────
+' EXTERNAL DEPENDENCIES
+' ─────────────────────────────────────────────
+package "External / Config" {
+
+    class SystemSettings <<external>> {
+        +profiling_enabled: bool
+        +profiling_experimental_cpu_time_enabled: bool
+        +profiling_allocation_enabled: bool
+        +profiling_exception_enabled: bool
+        +profiling_timeline_enabled: bool
+        +profiling_io_enabled: bool
+        +profiling_endpoint_collection_enabled: bool
+        +uri: AgentEndpoint
+        +output_pprof: Option<String>
+    }
+
+    class InternalProfile <<libdd_profiling>> {
+    }
+
+    class AgentEndpoint <<libdd_profiling>> {
+    }
+}
+
+' ─────────────────────────────────────────────
+' RELATIONSHIPS
+' ─────────────────────────────────────────────
+
+' Profiler core composition & ownership
+Profiler *-- SampleTypeFilter : owns
+Profiler o-- InterruptManager : shares (Arc)
+Profiler ..> TimeCollector : spawns thread\n(owns JoinHandle)
+Profiler ..> Uploader : spawns thread\n(owns JoinHandle)
+Profiler ..> SystemSettings : reads config (AtomicPtr)
+
+' Channel-based messaging
+Profiler ..> ProfilerMessage : sends via\nbounded channel (cap=100)
+TimeCollector ..> UploadMessage : sends via\nbounded channel (cap=8)
+
+' TimeCollector internals
+TimeCollector o-- InterruptManager : shares (Arc)
+TimeCollector ..> SampleMessage : handles
+TimeCollector ..> InternalProfile : creates via\nlibdd_profiling
+
+' Uploader internals
+Uploader o-- AgentEndpoint : uses
+Uploader ..> UploadRequest : processes
+
+' Message structure
+ProfilerMessage ..> SampleMessage : wraps
+ProfilerMessage ..> LocalRootSpanResourceMessage : wraps
+UploadMessage ..> UploadRequest : wraps
+
+' Sample message composition
+SampleMessage *-- ProfileIndex : key
+SampleMessage *-- SampleData : value
+SampleData *-- Backtrace : contains
+SampleData o-- Label : contains Vec<Label>
+
+' Upload request composition
+UploadRequest *-- ProfileIndex : key
+UploadRequest *-- InternalProfile : payload
+
+' Stack walking
+Backtrace *-- ZendFrame : contains Vec<ZendFrame>
+
+' Label value
+Label *-- LabelValue : value
+
+' Sample type filter
+SampleTypeFilter ..> SystemSettings : reads feature flags
+SampleTypeFilter o-- ValueType : uses Vec<ValueType>
+ProfileIndex o-- ValueType : uses Vec<ValueType>
+
+' Interrupt management
+InterruptManager *-- VmInterrupt : manages HashSet<VmInterrupt>
+
+' Sampling stats call back into profiler
+AllocationProfilingStats ..> Profiler : calls collect_allocations()
+ExceptionProfilingStats ..> Profiler : calls collect_exception()
+
+@enduml

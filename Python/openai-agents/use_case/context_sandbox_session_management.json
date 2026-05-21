@@ -1,0 +1,198 @@
+{
+  "scope": "sandbox_session_management",
+  "title": "Sandbox Session Lifecycle Management",
+  "diagram_type": "use_case",
+  "source_files_analyzed": [
+    "src/agents/sandbox/runtime_session_manager.py",
+    "src/agents/sandbox/session/sandbox_session.py",
+    "src/agents/sandbox/session/base_sandbox_session.py",
+    "src/agents/sandbox/session/sandbox_session_state.py",
+    "src/agents/run_config.py",
+    "docs/sandbox_agents.md"
+  ],
+
+  "actors": [
+    {
+      "name": "Runner",
+      "description": "Orchestrates agent execution; initiates session lifecycle via SandboxRuntimeSessionManager"
+    },
+    {
+      "name": "SandboxAgent",
+      "description": "Provides default_manifest, capabilities, run_as user identity; acquired before session use"
+    },
+    {
+      "name": "BaseSandboxClient",
+      "description": "Backend adapter; creates, resumes, and deletes sandbox sessions (e.g., UnixLocalSandboxClient, Docker)"
+    },
+    {
+      "name": "External Caller / Developer",
+      "description": "Configures SandboxRunConfig (client, session, session_state, snapshot, manifest, options)"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "name": "Acquire Sandbox Agent",
+      "actor": "Runner",
+      "description": "Lock a SandboxAgent for exclusive use in a run. Raises RuntimeError if agent is already active in another concurrent run.",
+      "method": "SandboxRuntimeSessionManager.acquire_agent(agent)",
+      "details": "Uses threading.Lock (_SandboxConcurrencyGuard) to increment active_runs counter; also assigns a stable resume key for the agent."
+    },
+    {
+      "name": "Ensure/Get Active Session",
+      "actor": "Runner",
+      "description": "Retrieve or create a sandbox session for an agent, starting it if needed.",
+      "method": "SandboxRuntimeSessionManager.ensure_session(agent, capabilities, is_resumed_state)",
+      "details": "Returns cached _SandboxSessionResources if already created; otherwise delegates to _create_resources(). Calls resources.ensure_started()."
+    },
+    {
+      "name": "Create Fresh Sandbox Session",
+      "actor": "Runner",
+      "description": "Create a brand-new sandbox session via the configured backend client.",
+      "method": "BaseSandboxClient.create(snapshot, manifest, options) → SandboxSession",
+      "details": "Resolves snapshot spec (local default or NoopSnapshotSpec), effective manifest from agent.default_manifest or SandboxRunConfig.manifest, processes capabilities into manifest, calls client.create(). Configures concurrency limits on session. owns_session=True."
+    },
+    {
+      "name": "Resume Suspended Session",
+      "actor": "Runner",
+      "description": "Restore a previously suspended session from serialized state (session_state or run_state._sandbox payload).",
+      "method": "BaseSandboxClient.resume(session_state) → SandboxSession",
+      "details": "Looks up session payload by agent resume key or agent name in sessions_by_agent dict. Deserializes via client.deserialize_session_state(). Processes manifest capabilities before resuming. owns_session=True."
+    },
+    {
+      "name": "Inject Live Session",
+      "actor": "External Caller / Developer",
+      "description": "Supply a pre-existing running session via SandboxRunConfig.session (no new session created).",
+      "method": "_create_resources() path when sandbox_config.session is not None",
+      "details": "Applies manifest diff entries to the live session if capabilities changed (entries-only; root/env/users/mounts cannot change on running sessions). owns_session=False — cleanup does NOT stop or delete the injected session."
+    },
+    {
+      "name": "Materialize Workspace / Apply Manifest",
+      "actor": "Runner",
+      "description": "Stage files, directories, and mounts into the sandbox workspace from the Manifest.",
+      "method": "BaseSandboxSession._apply_entry_batch(entries, base_dir); session._set_concurrency_limits(limits)",
+      "details": "Controlled by SandboxConcurrencyLimits (manifest_entries: max concurrent entries; local_dir_files: max concurrent file copies per LocalDir entry). Capabilities can add/transform manifest entries via Capability.process_manifest()."
+    },
+    {
+      "name": "Serialize Resume State",
+      "actor": "Runner",
+      "description": "Capture the current session state into a serializable dict so the run can be resumed later.",
+      "method": "SandboxRuntimeSessionManager.serialize_resume_state() → dict",
+      "details": "Returns None if a live injected session is used (SandboxRunConfig.session). Produces {backend_id, current_agent_key, current_agent_name, session_state, sessions_by_agent}. Each entry in sessions_by_agent: {agent_name, session_state}. State serialized via client.serialize_session_state(resources.state)."
+    },
+    {
+      "name": "Clean Up Session",
+      "actor": "Runner",
+      "description": "Gracefully stop and destroy a sandbox session after a run completes.",
+      "method": "_SandboxSessionResources.cleanup()",
+      "details": "Only executes if owns_session=True. Sequence: session.run_pre_stop_hooks() → session.stop() → session.shutdown() → client.delete(session) → session._aclose_dependencies(). Protected by asyncio.Lock to prevent double-cleanup. Errors are propagated after all steps complete."
+    },
+    {
+      "name": "Release Acquired Agents",
+      "actor": "Runner",
+      "description": "Decrement concurrency guard on all agents after cleanup so they can be reused in future runs.",
+      "method": "SandboxRuntimeSessionManager._release_agents()",
+      "details": "Decrements _SandboxConcurrencyGuard.active_runs for each acquired agent; clears internal tracking maps."
+    },
+    {
+      "name": "Assign Stable Resume Key",
+      "actor": "Runner",
+      "description": "Assign a deterministic, collision-free key to each agent for use in resume state serialization.",
+      "method": "SandboxRuntimeSessionManager._ensure_resume_key(agent)",
+      "details": "Prefers stable key derived from agent graph topology (_build_agent_identity_keys_by_id), falls back to agent.name, or allocated unique key to avoid collisions."
+    }
+  ],
+
+  "key_classes": [
+    {
+      "name": "SandboxRuntimeSessionManager",
+      "file": "src/agents/sandbox/runtime_session_manager.py",
+      "role": "Central lifecycle orchestrator",
+      "key_attrs": ["_sandbox_config: SandboxRunConfig", "_run_state: RunState", "_resources_by_agent: dict[int, _SandboxSessionResources]", "_acquired_agents: dict[int, SandboxAgent]", "_resume_keys_by_agent_id: dict[int, str]"],
+      "key_methods": ["acquire_agent()", "ensure_session()", "serialize_resume_state()", "cleanup()", "_create_resources()", "_configure_session_materialization()", "_release_agents()"]
+    },
+    {
+      "name": "_SandboxSessionResources",
+      "file": "src/agents/sandbox/runtime_session_manager.py",
+      "role": "Internal holder for session + client + ownership flag",
+      "key_attrs": ["session: BaseSandboxSession", "client: BaseSandboxClient | None", "owns_session: bool", "_cleanup_lock: asyncio.Lock", "_cleaned: bool"],
+      "key_methods": ["ensure_started()", "cleanup()"]
+    },
+    {
+      "name": "SandboxSession",
+      "file": "src/agents/sandbox/session/sandbox_session.py",
+      "role": "Instrumented decorator around BaseSandboxSession; wraps ops with audit events and tracing spans",
+      "key_methods": ["start()", "stop()", "shutdown()", "exec()", "read()", "write()", "running()", "persist_workspace()", "hydrate_workspace()", "resolve_exposed_port()"]
+    },
+    {
+      "name": "BaseSandboxSession",
+      "file": "src/agents/sandbox/session/base_sandbox_session.py",
+      "role": "Abstract base; implements manifest application, workspace archive, apply_patch, PTY, concurrency semaphores",
+      "key_attrs": ["state: SandboxSessionState", "dependencies: Dependencies"],
+      "key_methods": ["start()", "stop()", "shutdown()", "running()", "_apply_entry_batch()", "run_pre_stop_hooks()", "_set_concurrency_limits()", "persist_workspace()", "hydrate_workspace()"]
+    },
+    {
+      "name": "SandboxSessionState",
+      "file": "src/agents/sandbox/session/sandbox_session_state.py",
+      "role": "Pydantic model capturing full serializable session state; base class for backend-specific subtypes",
+      "key_attrs": ["type: str", "session_id: uuid.UUID", "snapshot: SnapshotBase", "manifest: Manifest", "exposed_ports: tuple[int,...]", "workspace_root_ready: bool"]
+    },
+    {
+      "name": "SandboxRunConfig",
+      "file": "src/agents/run_config.py",
+      "role": "Configuration dataclass supplied by developer via RunConfig.sandbox",
+      "key_attrs": ["client: BaseSandboxClient", "options: Any", "session: BaseSandboxSession", "session_state: SandboxSessionState", "manifest: Manifest", "snapshot: SnapshotSpec | SnapshotBase", "concurrency_limits: SandboxConcurrencyLimits"]
+    },
+    {
+      "name": "SandboxConcurrencyLimits",
+      "file": "src/agents/run_config.py",
+      "role": "Controls parallelism during workspace materialization",
+      "key_attrs": ["manifest_entries: int | None", "local_dir_files: int | None"]
+    },
+    {
+      "name": "_SandboxConcurrencyGuard",
+      "file": "src/agents/sandbox/runtime_session_manager.py",
+      "role": "Per-agent guard preventing concurrent runs; attached to SandboxAgent instance",
+      "key_attrs": ["lock: threading.Lock", "active_runs: int"]
+    }
+  ],
+
+  "session_creation_paths": [
+    "Path 1 (Inject): SandboxRunConfig.session is set → configure materialization → diff/apply manifest entries on live session → owns_session=False",
+    "Path 2 (Resume): session_state or run_state._sandbox has payload for this agent → process manifest → client.resume(state) → owns_session=True",
+    "Path 3 (Fresh): No state available → resolve manifest + snapshot → client.create(snapshot, manifest, options) → owns_session=True"
+  ],
+
+  "resume_state_structure": {
+    "backend_id": "string — identifies sandbox backend type",
+    "current_agent_key": "string — resume key for currently-active agent",
+    "current_agent_name": "string — agent name for legacy compatibility",
+    "session_state": "dict — serialized SandboxSessionState for current agent",
+    "sessions_by_agent": "dict[resume_key, {agent_name, session_state}] — multi-agent session map"
+  },
+
+  "cleanup_sequence": [
+    "1. session.run_pre_stop_hooks()",
+    "2. session.stop()",
+    "3. session.shutdown()",
+    "4. client.delete(session) — only for SandboxSession instances",
+    "5. session._aclose_dependencies()",
+    "6. serialize_resume_state() — captured before clearing state",
+    "7. _resources_by_agent.clear()",
+    "8. _release_agents() — decrement concurrency guards"
+  ],
+
+  "key_relationships": [
+    "SandboxRuntimeSessionManager manages 1..* _SandboxSessionResources",
+    "SandboxRuntimeSessionManager depends_on SandboxRunConfig",
+    "SandboxRuntimeSessionManager depends_on BaseSandboxClient (create/resume/delete)",
+    "_SandboxSessionResources owns BaseSandboxSession (owns_session=True) or references it (=False)",
+    "SandboxSession decorates BaseSandboxSession (instrumented wrapper pattern)",
+    "BaseSandboxSession holds SandboxSessionState",
+    "SandboxSessionState references Manifest and SnapshotBase",
+    "SandboxAgent carries _SandboxConcurrencyGuard (attached at runtime)",
+    "SandboxConcurrencyLimits is injected into BaseSandboxSession via _set_concurrency_limits()"
+  ],
+
+  "important_notes": "SandboxAgent cannot be used concurrently across multiple Runner.run() calls — enforced by threading.Lock. Resume keys are stable across runs (derived from agent graph topology). Injected live sessions (SandboxRunConfig.session) skip creation/destruction. Running injected sessions cannot change root, environment, users, groups, or mounts — only add new non-mount entries. serialize_resume_state() returns None when a live session is injected. Tracing spans emitted for sandbox.create_session, sandbox.resume_session, sandbox.cleanup_sessions, and all per-operation events."
+}

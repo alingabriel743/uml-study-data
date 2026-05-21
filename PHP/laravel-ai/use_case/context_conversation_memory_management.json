@@ -1,0 +1,177 @@
+{
+  "scope": "conversation_memory_management",
+  "title": "Conversation Memory Management",
+  "diagram_type": "use_case",
+  "description": "Developer persists and retrieves multi-turn conversation history across requests using conversation stores and the RememberConversation middleware.",
+
+  "actors": [
+    {
+      "name": "Developer",
+      "type": "primary",
+      "description": "Application developer who configures agents with conversation persistence"
+    },
+    {
+      "name": "ConversationalAgent",
+      "type": "system_internal",
+      "description": "Any agent class using the RemembersConversations trait; satisfies the Conversational contract"
+    },
+    {
+      "name": "RememberConversation",
+      "type": "system_internal",
+      "description": "Middleware that auto-persists conversation turns after each agent response"
+    },
+    {
+      "name": "ConversationStore",
+      "type": "system_internal",
+      "description": "Interface for CRUD operations on conversations and messages; default impl: DatabaseConversationStore"
+    },
+    {
+      "name": "Database",
+      "type": "secondary",
+      "description": "Persistence layer; tables: agent_conversations, agent_conversation_messages"
+    },
+    {
+      "name": "TextProvider",
+      "type": "secondary",
+      "description": "AI provider used by RememberConversation to auto-generate a conversation title"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Start New Conversation for User",
+      "actor": "Developer",
+      "description": "Developer calls agent->forUser($user) to associate a user with a fresh conversation (conversationId = null).",
+      "method": "RemembersConversations::forUser($user): static",
+      "triggers": "Developer sets up agent before first prompt"
+    },
+    {
+      "id": "UC2",
+      "name": "Continue Existing Conversation",
+      "actor": "Developer",
+      "description": "Developer calls agent->continue($conversationId, $user) to resume a known conversation thread.",
+      "method": "RemembersConversations::continue(string $conversationId, object $as): static",
+      "triggers": "Developer knows the conversation UUID from a previous interaction"
+    },
+    {
+      "id": "UC3",
+      "name": "Resume Latest Conversation",
+      "actor": "Developer",
+      "description": "Developer calls agent->continueLastConversation($user); the trait resolves the most recent conversation UUID via ConversationStore.",
+      "method": "RemembersConversations::continueLastConversation(object $as): static",
+      "calls": "ConversationStore::latestConversationId($user->id)"
+    },
+    {
+      "id": "UC4",
+      "name": "Retrieve Conversation History",
+      "actor": "ConversationalAgent",
+      "description": "Agent exposes past messages via messages(); used internally when building the prompt context. Returns up to 100 messages by default.",
+      "method": "RemembersConversations::messages(): iterable",
+      "calls": "ConversationStore::getLatestConversationMessages($conversationId, 100)",
+      "returns": "Collection<Message|AssistantMessage|ToolResultMessage>"
+    },
+    {
+      "id": "UC5",
+      "name": "Auto-Persist Conversation Turn",
+      "actor": "RememberConversation",
+      "description": "Middleware intercepts the post-response callback: creates a conversation record if none exists, then stores user and assistant messages.",
+      "method": "RememberConversation::handle(AgentPrompt $prompt, Closure $next)",
+      "flow": [
+        "1. Pass prompt to next handler",
+        "2. On response: check agent->currentConversation()",
+        "3. If null: store->storeConversation(userId, generateTitle(prompt))",
+        "4. Call agent->continue(conversationId, participant)",
+        "5. store->storeUserMessage(conversationId, userId, prompt)",
+        "6. store->storeAssistantMessage(conversationId, userId, prompt, response)",
+        "7. response->withinConversation(conversationId, participant)"
+      ]
+    },
+    {
+      "id": "UC6",
+      "name": "Auto-Generate Conversation Title",
+      "actor": "RememberConversation",
+      "description": "On first message, RememberConversation calls the cheapest text model to produce a 3-5 word title. Falls back to truncated prompt on error.",
+      "method": "RememberConversation::generateTitle(string $prompt): string",
+      "calls": "TextProvider::textGateway()->generateText(..., cheapestTextModel(), systemPrompt, [UserMessage])",
+      "fallback": "Str::limit($prompt, 100, preserveWords: true)"
+    },
+    {
+      "id": "UC7",
+      "name": "Store New Conversation Record",
+      "actor": "ConversationStore",
+      "description": "Creates a row in agent_conversations with UUID7 id, user_id, title, timestamps.",
+      "method": "ConversationStore::storeConversation(string|int|null $userId, string $title): string",
+      "impl": "DatabaseConversationStore — DB::table('agent_conversations')->insert(...)"
+    },
+    {
+      "id": "UC8",
+      "name": "Store User Message",
+      "actor": "ConversationStore",
+      "description": "Inserts a user-role row in agent_conversation_messages from AgentPrompt data (prompt text, attachments).",
+      "method": "ConversationStore::storeUserMessage(string $conversationId, string|int|null $userId, AgentPrompt $prompt): string",
+      "impl": "DatabaseConversationStore — role='user', content=prompt->prompt, attachments JSON"
+    },
+    {
+      "id": "UC9",
+      "name": "Store Assistant Message",
+      "actor": "ConversationStore",
+      "description": "Inserts an assistant-role row in agent_conversation_messages from AgentResponse (text, toolCalls, toolResults, usage, meta).",
+      "method": "ConversationStore::storeAssistantMessage(string $conversationId, string|int|null $userId, AgentPrompt $prompt, AgentResponse $response): string",
+      "impl": "DatabaseConversationStore — role='assistant', content=response->text, tool_calls/tool_results/usage/meta as JSON"
+    },
+    {
+      "id": "UC10",
+      "name": "Fetch Latest Conversation ID",
+      "actor": "ConversationStore",
+      "description": "Queries agent_conversations ordered by updated_at desc to return the most recent conversation UUID for a user.",
+      "method": "ConversationStore::latestConversationId(string|int $userId): ?string"
+    },
+    {
+      "id": "UC11",
+      "name": "Load Recent Messages into Prompt Context",
+      "actor": "ConversationalAgent",
+      "description": "GeneratesText provider detects RemembersConversations trait and participant; if present, injects RememberConversation middleware automatically.",
+      "trigger": "GeneratesText::gatherMiddlewareFor() checks class_uses_recursive($agent) for RemembersConversations and $agent->hasConversationParticipant()",
+      "auto_registers": "new RememberConversation(ConversationStore, TextProvider)"
+    }
+  ],
+
+  "key_relationships": [
+    "RemembersConversations (trait) implements Conversational interface via messages()",
+    "ConversationalAgent uses RemembersConversations trait",
+    "AnonymousAgent implements Agent, Conversational, HasTools",
+    "RememberConversation depends_on ConversationStore (injected)",
+    "RememberConversation depends_on TextProvider (for title generation)",
+    "DatabaseConversationStore implements ConversationStore",
+    "DatabaseConversationStore uses DB facade → agent_conversations + agent_conversation_messages tables",
+    "AiServiceProvider binds ConversationStore::class → DatabaseConversationStore::class (singleton)",
+    "GeneratesText middleware pipeline: auto-inserts RememberConversation when agent has participant",
+    "AssistantMessage extends Message (role='assistant', carries Collection<ToolCall>)"
+  ],
+
+  "db_schema": {
+    "agent_conversations": ["id (uuid7)", "user_id", "title", "created_at", "updated_at"],
+    "agent_conversation_messages": ["id (uuid7)", "conversation_id", "user_id", "agent", "role (user|assistant)", "content", "attachments (json)", "tool_calls (json)", "tool_results (json)", "usage (json)", "meta (json)", "created_at", "updated_at"]
+  },
+
+  "important_notes": [
+    "Middleware is auto-registered only if agent uses RemembersConversations trait AND has a conversationParticipant set",
+    "Default max conversation messages is 100 (overridable via maxConversationMessages())",
+    "getLatestConversationMessages reconstructs AssistantMessage+ToolResultMessage pairs from stored JSON",
+    "Title generation uses cheapest available text model; silently falls back to truncated prompt on failure",
+    "ConversationStore bound as singleton in service container by AiServiceProvider"
+  ],
+
+  "source_files_analyzed": [
+    "src/Middleware/RememberConversation.php",
+    "src/Concerns/RemembersConversations.php",
+    "src/Contracts/ConversationStore.php",
+    "src/Contracts/Conversational.php",
+    "src/Storage/DatabaseConversationStore.php",
+    "src/Messages/AssistantMessage.php",
+    "src/AnonymousAgent.php",
+    "src/AiServiceProvider.php",
+    "src/Providers/Concerns/GeneratesText.php (lines 90-108)"
+  ]
+}

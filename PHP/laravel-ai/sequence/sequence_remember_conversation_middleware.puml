@@ -1,0 +1,155 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipantBorderColor #495057
+skinparam sequenceParticipantBackgroundColor #F8F9FA
+skinparam sequenceParticipantFontColor #212529
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceBoxBackgroundColor #E9ECEF
+skinparam sequenceBoxBorderColor #6C757D
+skinparam noteBackgroundColor #FFF9C4
+skinparam noteBorderColor #F9A825
+
+title Remember Conversation Middleware
+
+actor Caller as caller
+participant "AnonymousAgent\n(Promptable)" as agent
+participant "TextProvider\n(Provider)" as provider
+participant "RememberConversation\n(Middleware)" as middleware
+participant "ConversationStore\n(DatabaseConversationStore)" as store
+participant "TextGateway" as gateway
+
+== Agent Prompt Dispatch ==
+
+caller -> agent : prompt(string $prompt, array $attachments)
+activate agent
+
+agent -> provider : prompt(new AgentPrompt(agent, prompt,\n  attachments, provider, model, timeout))
+activate provider
+
+== Middleware Intercept ==
+
+provider -> middleware : handle(AgentPrompt $prompt, Closure $next)
+activate middleware
+
+note right of middleware
+  Middleware intercepts the prompt
+  before it reaches the LLM
+end note
+
+middleware -> provider : next($prompt)\n[pass through to LLM]
+activate provider
+
+provider --> middleware : AgentResponse
+deactivate provider
+
+== Register Post-Response Callback ==
+
+middleware -> middleware : AgentResponse::then(callback)\n[register post-processing callback]
+
+note right of middleware
+  The real LLM call has already completed.
+  The .then() callback now executes
+  to persist conversation data.
+end note
+
+== Callback Execution (Post-Response) ==
+
+box "Post-Response Callback" #E9ECEF
+  middleware -> agent : currentConversation()\n[check for existing conversation]
+  activate agent
+  agent --> middleware : ?string conversationId
+  deactivate agent
+
+  alt No current conversation (conversationId IS NULL)
+
+    == Auto-Generate Title ==
+
+    middleware -> middleware : generateTitle(string $prompt)
+    activate middleware
+
+    middleware -> provider : textGateway()
+    activate provider
+    provider --> middleware : TextGateway
+    deactivate provider
+
+    middleware -> provider : cheapestTextModel()
+    activate provider
+    provider --> middleware : string $model
+    deactivate provider
+
+    middleware -> gateway : generateText(provider, model,\n  instructions, [UserMessage(Str::limit($prompt, 500))])
+    activate gateway
+
+    alt Success
+      gateway --> middleware : TextResponse
+      deactivate gateway
+      middleware -> middleware : Str::limit(response->text, 100)\n[truncate title to 100 chars]
+    else Throwable (any error)
+      middleware -> middleware : Str::limit($prompt, 100, preserveWords:true)\n[fallback: use prompt as title]
+    end
+
+    deactivate middleware
+
+    == Store New Conversation ==
+
+    middleware -> store : storeConversation(participant->id, generatedTitle)\n[INSERT into agent_conversations]
+    activate store
+    store --> middleware : string $conversationId (UUID7)
+    deactivate store
+
+    middleware -> agent : continue(conversationId, conversationParticipant())\n[set conversationId + user on agent]
+    activate agent
+    agent --> middleware : void
+    deactivate agent
+
+  else Existing conversation (conversationId IS NOT NULL)
+    note right of middleware
+      Skip conversation creation —
+      use existing conversationId
+    end note
+  end
+
+  == Persist Messages (Always) ==
+
+  middleware -> store : storeUserMessage(conversationId, participant->id, AgentPrompt)\n[INSERT role=user row into agent_conversation_messages]
+  activate store
+  store --> middleware : string $messageId (UUID7)
+  deactivate store
+
+  middleware -> store : storeAssistantMessage(conversationId, participant->id,\n  AgentPrompt, AgentResponse)\n[INSERT role=assistant row with text/toolCalls/usage/meta]
+  activate store
+  store --> middleware : string $messageId (UUID7)
+  deactivate store
+
+  == Annotate Response ==
+
+  middleware -> middleware : AgentResponse::withinConversation(\n  conversationId, conversationParticipant())\n[attach conversation context to response]
+
+end box
+
+middleware --> provider : AgentResponse\n(with conversation context)
+deactivate middleware
+
+provider --> agent : AgentResponse
+deactivate provider
+
+agent --> caller : AgentResponse\n(conversation metadata attached)
+deactivate agent
+
+@enduml

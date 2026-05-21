@@ -1,0 +1,143 @@
+{
+  "scope": "single_agent_turn_execution",
+  "title": "Single Agent Turn Execution",
+  "diagram_type": "activity",
+  "description": "Processing one turn: build prompt, call model, receive response, decide next action (tool call, handoff, or final answer)",
+
+  "entry_point": "run_single_turn() in run_loop.py",
+
+  "activity_steps": [
+    "START: run_single_turn(bindings, all_tools, original_input, generated_items, hooks, context_wrapper, run_config, ...)",
+    "Convert original_input → turn_input list via ItemHelpers.input_to_new_input_list()",
+    "[if should_run_agent_start_hooks] → fire hooks.on_agent_start() + agent.hooks.on_start() in parallel",
+    "Fetch system_prompt via execution_agent.get_system_prompt(context_wrapper) [parallel with get_prompt()]",
+    "Fetch prompt_config via execution_agent.get_prompt(context_wrapper)",
+    "Resolve output_schema via get_output_schema(execution_agent)",
+    "Resolve enabled handoffs via get_handoffs(execution_agent, context_wrapper) — checks is_enabled per handoff",
+    "Prepare input items: _prepare_turn_input_items(original_input, generated_items, reasoning_item_id_policy) OR server_conversation_tracker.prepare_input()",
+    "--- CALL get_new_response() ---",
+    "  Apply optional input filter: maybe_filter_model_input() → ModelInputData",
+    "  Deduplicate input items",
+    "  Resolve model: get_model(execution_agent, run_config)",
+    "  Resolve model_settings; maybe_reset_tool_choice if tool_use_tracker indicates needed",
+    "  Fire hooks.on_llm_start() + agent.hooks.on_llm_start() in parallel",
+    "  Call model.get_response(system_instructions, input, model_settings, tools, output_schema, handoffs, ...) via get_response_with_retry()",
+    "  [on retry] rewind_session_items() + server_conversation_tracker.rewind_input()",
+    "  Accumulate usage: context_wrapper.usage.add(new_response.usage)",
+    "  Fire hooks.on_llm_end() + agent.hooks.on_llm_end() in parallel",
+    "  RETURN ModelResponse(output, usage, response_id)",
+    "--- CALL get_single_step_result_from_response(bindings, new_response, ...) ---",
+    "  process_model_response(agent, all_tools, response, output_schema, handoffs) → ProcessedResponse",
+    "    Iterate response.output items, classify by type:",
+    "    → message_output → MessageOutputItem",
+    "    → reasoning → ReasoningItem",
+    "    → function_call (handoff name match) → ToolRunHandoff",
+    "    → function_call (tool name match) → ToolRunFunction",
+    "    → computer_use_call → ToolRunComputerAction",
+    "    → local_shell_call → ToolRunLocalShellCall",
+    "    → shell_call → ToolRunShellCall",
+    "    → apply_patch_call → ToolRunApplyPatchCall",
+    "    → mcp_call / mcp_list_tools / mcp_approval_request → MCP items",
+    "    → file_search / web_search / code_interpreter / image_generation → hosted tool items",
+    "    → compaction → CompactionItem",
+    "  RETURN ProcessedResponse(new_items, handoffs, functions, computer_actions, ...)",
+    "  tool_use_tracker.record_processed_response()",
+    "  CALL execute_tools_and_side_effects(bindings, processed_response, ...)",
+    "  --- DECISION LOGIC IN execute_tools_and_side_effects ---",
+    "  _build_plan_for_fresh_turn(processed_response, agent, context_wrapper, approval_items_by_call_id)",
+    "  _dedupe_tool_call_items() → new_step_items",
+    "  _execute_tool_plan(plan, bindings, hooks, context_wrapper, run_config)",
+    "    → Executes: function_results, computer_results, custom_tool_results, shell_results, apply_patch_results, local_shell_results",
+    "    → Applies: tool_input_guardrail_results, tool_output_guardrail_results per tool",
+    "  _build_tool_result_items() → append results to new_step_items",
+    "  _collect_tool_interruptions() from function/custom/shell/apply_patch results",
+    "  _append_mcp_callback_results() for approved MCP responses",
+    "  [DECISION] interruptions present? → YES → RETURN SingleStepResult(next_step=NextStepInterruption)",
+    "  [DECISION] handoffs present? → YES → execute_handoffs() → apply input_filter if set → nest_handoff_history if configured → RETURN SingleStepResult(next_step=NextStepHandoff(new_agent))",
+    "  [DECISION] tool_use_behavior == 'stop_on_first_tool'? → YES → RETURN final output from first tool result",
+    "  [DECISION] tool_use_behavior == stop_at_tool_names dict? → check match → RETURN final output if matched",
+    "  [DECISION] tool_use_behavior callable? → call agent.tool_use_behavior(context_wrapper, tool_results) → if is_final_output → RETURN final output",
+    "  [DECISION] has_tools_or_approvals_to_run()? → YES (more tools/approvals pending) → RETURN SingleStepResult(next_step=NextStepRunAgain)",
+    "  [DECISION] no pending tools → check message_items for final text",
+    "    [output_schema and not plain_text?] → validate JSON via output_schema.validate_json() → RETURN SingleStepResult(next_step=NextStepFinalOutput)",
+    "    [no schema or plain text] → RETURN SingleStepResult(next_step=NextStepFinalOutput(text))",
+    "  On final output path: run_final_output_hooks() → hooks.on_agent_end() + agent.hooks.on_end()",
+    "END: returns SingleStepResult"
+  ],
+
+  "key_decision_points": [
+    "should_run_agent_start_hooks → triggers on_agent_start lifecycle hooks",
+    "call_model_input_filter set → modifies input before sending to model",
+    "model retry policy → rewinds session/server state on failure",
+    "interruptions present → NextStepInterruption (human-in-the-loop approval required)",
+    "handoffs in processed_response → NextStepHandoff (agent delegation)",
+    "tool_use_behavior controls whether tools produce final output: 'run_llm_again' (default) | 'stop_on_first_tool' | {stop_at_tool_names:[...]} | callable",
+    "has_tools_or_approvals_to_run() → NextStepRunAgain (loop continues)",
+    "no more tools + has message → NextStepFinalOutput",
+    "output_schema is_plain_text() vs structured → JSON validation before final output"
+  ],
+
+  "key_classes": {
+    "run_single_turn": "run_loop.py — top-level entry; orchestrates prompt build + model call + result resolution",
+    "get_new_response": "run_loop.py — calls model with retry, fires on_llm_start/end hooks",
+    "process_model_response": "turn_resolution.py — parses ModelResponse output items into ProcessedResponse",
+    "execute_tools_and_side_effects": "turn_resolution.py — runs tool plan, applies guardrails, decides next_step",
+    "execute_handoffs": "turn_resolution.py — applies input filter/nesting, fires on_handoff hooks, returns NextStepHandoff",
+    "execute_final_output": "turn_resolution.py — fires on_agent_end hooks, returns NextStepFinalOutput",
+    "ModelResponse": "items.py — @dataclass: output:list[TResponseOutputItem], usage:Usage, response_id:str|None",
+    "ProcessedResponse": "run_steps.py — @dataclass: new_items, handoffs, functions, computer_actions, local_shell_calls, shell_calls, apply_patch_calls, mcp_approval_requests, interruptions, custom_tool_calls, tools_used",
+    "SingleStepResult": "run_steps.py — @dataclass: original_input, model_response, pre_step_items, new_step_items, next_step, tool_input_guardrail_results, tool_output_guardrail_results, output_guardrail_results, processed_response",
+    "NextStepHandoff": "run_steps.py — @dataclass: new_agent:Agent",
+    "NextStepFinalOutput": "run_steps.py — @dataclass: output:Any",
+    "NextStepRunAgain": "run_steps.py — @dataclass (empty) — loop continues",
+    "NextStepInterruption": "run_steps.py — @dataclass: interruptions:list[ToolApprovalItem]",
+    "AgentBindings": "agent_bindings.py — wraps public_agent + execution_agent",
+    "ToolRunHandoff": "run_steps.py — @dataclass: handoff:Handoff, tool_call:ResponseFunctionToolCall",
+    "ToolRunFunction": "run_steps.py — @dataclass: tool_call, function_tool:FunctionTool"
+  },
+
+  "tool_type_routing": [
+    "ResponseFunctionToolCall → handoff_map match → ToolRunHandoff",
+    "ResponseFunctionToolCall → function_map match → ToolRunFunction",
+    "ResponseComputerToolCall → ComputerTool → ToolRunComputerAction",
+    "LocalShellCall → LocalShellTool → ToolRunLocalShellCall",
+    "shell_call → ShellTool → ToolRunShellCall",
+    "apply_patch_call → ApplyPatchTool → ToolRunApplyPatchCall",
+    "McpApprovalRequest → HostedMCPTool → ToolRunMCPApprovalRequest",
+    "McpCall/McpListTools → hosted MCP items (no local execution)",
+    "ResponseFileSearchToolCall / ResponseFunctionWebSearch / ResponseCodeInterpreterToolCall → hosted (no local exec, just recorded)"
+  ],
+
+  "hooks_fired_in_turn": [
+    "on_agent_start (RunHooks + AgentHooks) — first turn only",
+    "on_llm_start (RunHooks + AgentHooks) — before model call",
+    "on_llm_end (RunHooks + AgentHooks) — after model response",
+    "on_tool_start / on_tool_end (per tool) — during _execute_tool_plan",
+    "on_handoff (RunHooks + AgentHooks) — on handoff execution",
+    "on_agent_end (RunHooks + AgentHooks) — on final output"
+  ],
+
+  "guardrails": [
+    "call_model_input_filter (RunConfig) — optional pre-model input transform",
+    "tool_input_guardrail per FunctionTool — checked before tool execution",
+    "tool_output_guardrail per FunctionTool — checked after tool execution",
+    "output_guardrails (RunConfig) — checked after final output produced (in run_loop outer layer)"
+  ],
+
+  "important_notes": [
+    "tool_use_behavior='run_llm_again' (default) means all tool results feed back into the loop",
+    "Interruptions (ToolApprovalItem) pause the loop; resumption goes through resolve_interrupted_turn()",
+    "server_conversation_tracker enables server-managed multi-turn (previous_response_id / conversation_id)",
+    "session persistence: save_turn_items_if_needed() is called at the run_loop level after each turn",
+    "Streaming variant is run_single_turn_streamed() — same logic but emits events to asyncio.Queue",
+    "Output schema validation: structured JSON output is validated against AgentOutputSchema before returning as final"
+  ],
+
+  "source_files_analyzed": [
+    "src/agents/run_internal/run_loop.py (run_single_turn, get_new_response — lines 1684-1894)",
+    "src/agents/run_internal/turn_resolution.py (process_model_response, execute_tools_and_side_effects, execute_handoffs, execute_final_output — lines 225-716, 1420-1580, 1861-1911)",
+    "src/agents/run_internal/run_steps.py (ProcessedResponse, SingleStepResult, NextStep*, ToolRun* — full file)",
+    "src/agents/run_internal/turn_preparation.py (get_output_schema, get_handoffs, get_model, maybe_filter_model_input — full file)",
+    "src/agents/items.py (ModelResponse — lines 629-648)"
+  ]
+}

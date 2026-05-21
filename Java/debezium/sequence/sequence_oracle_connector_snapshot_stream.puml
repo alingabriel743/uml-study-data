@@ -1,0 +1,247 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #495057
+    LifeLineBackgroundColor #F8F9FA
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    GroupBackgroundColor #DEE2E6
+    GroupBorderColor #6C757D
+    DividerBackgroundColor #CED4DA
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #ADB5BD
+}
+
+title Oracle Connector Snapshot and Stream Transition
+
+actor "Kafka Connect\nFramework" as kafka
+participant "OracleConnector" as connector
+participant "OracleSnapshotChange\nEventSource" as snapshot
+participant "OracleOffsetContext" as offset
+participant "OracleConnection\n(JDBC)" as jdbcconn
+participant "OracleDatabaseSchema" as schema
+participant "EventDispatcher" as dispatcher
+participant "AbstractLogMinerStreaming\nChangeEventSource" as logminer
+participant "LogMinerSessionContext" as session
+participant "LogFileCollector" as logfiles
+participant "LogMinerEventRow" as eventrow
+
+== SNAPSHOT PHASE ==
+
+kafka -> connector : start()
+activate connector
+
+connector -> snapshot : prepare(partition, onDemand)
+activate snapshot
+snapshot --> connector : OracleSnapshotContext(catalogName)
+
+connector -> snapshot : determineSnapshotOffset(ctx, config, jdbcConnection)
+activate snapshot
+snapshot -> jdbcconn : getCurrentScn()
+activate jdbcconn
+jdbcconn --> snapshot : currentScn
+deactivate jdbcconn
+snapshot -> offset : Builder.snapshotScn(currentScn).build()
+activate offset
+note right of offset
+  SCN watermark captured here.
+  Stored as SNAPSHOT_SCN_KEY
+  in the offset map.
+end note
+offset --> snapshot : OracleOffsetContext
+deactivate offset
+deactivate snapshot
+
+opt PDB mode
+    connector -> jdbcconn : setSessionToPdb(pdbName)
+end
+
+connector -> snapshot : getAllTableIds(catalogName)
+activate snapshot
+snapshot -> jdbcconn : query catalog tables
+jdbcconn --> snapshot : tableIds[]
+deactivate snapshot
+
+opt Schema locking enabled
+    connector -> jdbcconn : setSavepoint('dbz_schema_snapshot')
+end
+
+connector -> snapshot : readTableStructure()
+activate snapshot
+snapshot -> jdbcconn : read DDL for captured tables
+jdbcconn --> snapshot : DDL statements
+snapshot -> schema : applySchemaChanges(ddl)
+deactivate snapshot
+
+connector -> snapshot : readTableData() [flashback query]
+activate snapshot
+loop For each captured table
+    snapshot -> jdbcconn : SELECT * FROM table AS OF SCN <snapshotScn>
+    activate jdbcconn
+    jdbcconn --> snapshot : ResultSet (rows)
+    deactivate jdbcconn
+    loop For each row
+        snapshot -> offset : setSnapshotContext(INITIAL, snapshot_completed=false)
+        snapshot -> dispatcher : dispatchDataChangeEvent(partition, tableId, offset, READ)
+        activate dispatcher
+        note right of dispatcher
+          First record: source.snapshot='first'
+          Last record: source.snapshot='last',
+          snapshot_completed=true
+        end note
+        dispatcher --> snapshot : ack
+        deactivate dispatcher
+    end
+end
+snapshot -> offset : persistSnapshotScn(SNAPSHOT_SCN_KEY)
+deactivate snapshot
+
+== STREAM HANDOFF PHASE ==
+
+connector -> logminer : init(offsetContext)
+activate logminer
+note right of logminer
+  effectiveOffset = offsetContext
+  (carries snapshotScn from snapshot phase)
+end note
+
+connector -> logminer : execute(context, partition, offsetContext)
+
+logminer -> jdbcconn : prepareJdbcConnection()
+logminer -> jdbcconn : checkDatabaseAndTableState()
+logminer -> jdbcconn : logOnlineRedoLogSizes()
+
+logminer -> offset : getScn()
+activate offset
+offset --> logminer : offsetScn
+deactivate offset
+
+logminer -> offset : getSnapshotScn()
+activate offset
+offset --> logminer : snapshotScn
+deactivate offset
+
+logminer -> jdbcconn : getFirstScnInLogs(archiveLogRetention, destinations)
+activate jdbcconn
+jdbcconn --> logminer : firstScn
+deactivate jdbcconn
+
+alt offsetScn == snapshotScn  (first run after snapshot)
+    logminer -> offset : getSnapshotPendingTransactions()
+    activate offset
+    offset --> logminer : pendingTxMap
+    deactivate offset
+
+    alt No pending transactions
+        logminer -> logminer : startScn = snapshotScn
+    else Transactions straddle snapshot boundary
+        logminer -> logminer : startScn = min(pendingTx.startScn)
+        note right
+          Mining starts before snapshotScn
+          to capture in-flight transactions
+        end note
+    end
+
+    logminer -> offset : commitScn.setCommitScnOnAllThreads(snapshotScn - 1)
+    note right
+      Guard against double-emitting
+      pre-snapshot committed transactions
+    end note
+    logminer -> offset : setScn(startScn)
+else offsetScn < firstScn - 1  (gap in archive logs)
+    logminer -> kafka : throw DebeziumException("Please perform a new snapshot")
+end
+
+== LOGMINER STREAMING PHASE ==
+
+loop Per mining iteration (while context.isRunning())
+
+    logminer -> logfiles : collectLogFiles(startScn, endScn)
+    activate logfiles
+    logfiles --> logminer : logFileList
+    deactivate logfiles
+
+    logminer -> session : startSession(startScn, endScn, committedDataOnly)
+    activate session
+    session --> logminer : sessionStarted
+    deactivate session
+
+    logminer -> jdbcconn : executeQuery(miningStatement)
+    activate jdbcconn
+    jdbcconn --> logminer : ResultSet
+    deactivate jdbcconn
+
+    loop While resultSet.next()
+        logminer -> eventrow : fromResultSet(resultSet, schema, connectorConfig)
+        activate eventrow
+        note right of eventrow
+          Reads: SCN, SQL_REDO, OPERATION_CODE,
+          TX_ID, TABLE_NAME, ROW_ID, ROLLBACK_FLAG,
+          STATUS, START_SCN, COMMIT_SCN, SEQUENCE
+          SQL_REDO: handles CSF=1 multi-row
+          continuation (up to 100KB / 25 rows)
+        end note
+        eventrow --> logminer : LogMinerEventRow
+        deactivate eventrow
+
+        logminer -> logminer : processEvent(eventRow)
+        alt eventType == START
+            logminer -> logminer : handleStartEvent(event)
+        else eventType == COMMIT
+            logminer -> logminer : handleCommitEvent(event)
+            logminer -> dispatcher : dispatchDataChangeEvent(partition, tableId, offset, eventType)
+            activate dispatcher
+            dispatcher --> logminer : ack
+            deactivate dispatcher
+        else eventType == ROLLBACK
+            logminer -> logminer : handleRollbackEvent(event)
+        else eventType == DDL
+            logminer -> offset : setEventScn(event.getScn())
+            logminer -> dispatcher : dispatchSchemaChangeEvent(partition, offset, tableId, OracleSchemaChangeEventEmitter)
+            activate dispatcher
+            dispatcher --> logminer : ack
+            deactivate dispatcher
+        else eventType == INSERT / UPDATE / DELETE
+            logminer -> logminer : handleDataChangeEvent(event)
+            logminer -> dispatcher : dispatchDataChangeEvent(partition, tableId, offset, eventType)
+            activate dispatcher
+            dispatcher --> logminer : ack
+            deactivate dispatcher
+        else eventType == MISSING_SCN
+            logminer -> logminer : handleMissingScnEvent(event) [logs warning]
+        end
+    end
+
+    logminer -> logminer : getBatchMetrics().updateStreamingMetrics()
+    logminer -> logminer : OffsetActivityMonitor.checkForStaleOffsets()
+
+    logminer -> session : endMiningSession()
+    activate session
+    session --> logminer : sessionEnded
+    deactivate session
+
+    logminer -> logminer : advanceStartScn(endScn)
+end
+
+deactivate logminer
+deactivate connector
+
+@enduml

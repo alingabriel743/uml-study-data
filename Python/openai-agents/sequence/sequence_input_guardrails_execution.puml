@@ -1,0 +1,169 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #E9ECEF
+    GroupBorderColor #495057
+    GroupBackgroundColor #DEE2E6
+    DividerBorderColor #495057
+    DividerBackgroundColor #CED4DA
+    NoteBackgroundColor #FFF3CD
+    NoteBorderColor #FBBF24
+}
+
+title Input Guardrails Execution
+
+participant "Runner\n(run.py)" as Runner
+participant "run_input_guardrails\n/ _with_queue" as RunGuardrails
+participant "asyncio\n(task scheduler)" as Asyncio
+participant "run_single_input_guardrail" as RunSingle
+participant "guardrail_span\n(tracing)" as Span
+participant "InputGuardrail" as Guardrail
+participant "guardrail_function\n(user-defined)" as GuardrailFn
+participant "_input_guardrail_queue\n(streaming)" as Queue
+
+note over Runner
+  Input guardrails only run on turn==1
+  (first agent in chain). Defined on the
+  Agent, not passed to Runner.run().
+end note
+
+== Dispatch: Non-Streaming Mode ==
+
+Runner -> Runner: split guardrails by run_in_parallel flag
+note right of Runner
+  sequential_guardrails = [g for g if not g.run_in_parallel]
+  parallel_guardrails   = [g for g if g.run_in_parallel]
+end note
+
+group Blocking (run_in_parallel=False) — agent has NOT started yet
+    Runner -> RunGuardrails: run_input_guardrails(\n  agent, sequential_guardrails, input, context)
+    activate RunGuardrails
+
+    RunGuardrails -> Asyncio: create_task(run_single_input_guardrail(...))\nfor each sequential guardrail
+    activate Asyncio
+
+    loop for each completed task (asyncio.as_completed)
+        Asyncio --> RunGuardrails: next completed task result
+
+        RunGuardrails -> RunSingle: run_single_input_guardrail(\n  agent, guardrail, input, context)
+        activate RunSingle
+
+        RunSingle -> Span: guardrail_span(guardrail.get_name())
+        activate Span
+
+        RunSingle -> Guardrail: InputGuardrail.run(\n  agent, input, context)
+        activate Guardrail
+
+        Guardrail -> GuardrailFn: guardrail_function(\n  context, agent, input)
+        activate GuardrailFn
+        note right of GuardrailFn
+          Supports both sync and async
+          functions (inspect.isawaitable).
+          Returns GuardrailFunctionOutput
+          {output_info, tripwire_triggered}
+        end note
+        GuardrailFn --> Guardrail: GuardrailFunctionOutput
+        deactivate GuardrailFn
+
+        Guardrail --> RunSingle: InputGuardrailResult\n(guardrail=self, output=GuardrailFunctionOutput)
+        deactivate Guardrail
+
+        RunSingle -> Span: span_data.triggered =\n  result.output.tripwire_triggered
+        deactivate Span
+
+        RunSingle --> RunGuardrails: InputGuardrailResult
+        deactivate RunSingle
+
+        alt tripwire_triggered == True
+            RunGuardrails -> Asyncio: cancel all remaining guardrail tasks
+            RunGuardrails -> Asyncio: gather(return_exceptions=True)
+            RunGuardrails -> Span: attach SpanError\n{message, data: {guardrail, type}}
+            RunGuardrails -> Runner: raise InputGuardrailTripwireTriggered(result)
+            note right of Runner
+              Agent never starts.
+              No tokens consumed.
+              Caller handles exception.
+            end note
+        else tripwire_triggered == False
+            RunGuardrails -> RunGuardrails: append result to guardrail_results
+        end
+    end
+
+    deactivate Asyncio
+    RunGuardrails --> Runner: list[InputGuardrailResult]
+    deactivate RunGuardrails
+    Runner -> Runner: proceed to model call\n(all sequential guardrails passed)
+end
+
+group Concurrent (run_in_parallel=True, default) — best latency
+    Runner -> Asyncio: asyncio.gather(\n  run_input_guardrails(parallel_guardrails, ...),\n  run_single_turn(...)\n)
+    note right of Asyncio
+      Guardrail and model call run
+      concurrently. If tripwire fires,
+      agent may have already consumed
+      tokens / executed tools.
+    end note
+end
+
+== Dispatch: Streaming Mode ==
+
+Runner -> Asyncio: asyncio.create_task(\n  run_input_guardrails_with_queue(\n    agent, guardrails, input, context,\n    streamed_result, parent_span))
+activate Asyncio
+
+Asyncio -> RunGuardrails: run_input_guardrails_with_queue(...)
+activate RunGuardrails
+
+RunGuardrails -> Queue: queue = streamed_result._input_guardrail_queue
+RunGuardrails -> Asyncio: create_task(run_single_input_guardrail(...))\nper guardrail
+
+loop for each completed task (asyncio.as_completed)
+    Asyncio --> RunGuardrails: next completed InputGuardrailResult
+
+    alt tripwire_triggered == True
+        RunGuardrails -> RunGuardrails: streamed_result.input_guardrail_results\n  += guardrail_results
+        RunGuardrails -> RunGuardrails: streamed_result._triggered_input_guardrail_result\n  = result
+        RunGuardrails -> Queue: queue.put_nowait(result)
+        note right of Queue
+          Downstream consumer receives
+          the tripwire result in real time
+          via the async queue.
+        end note
+        RunGuardrails -> Asyncio: cancel all remaining guardrail tasks
+        RunGuardrails -> Span: attach SpanError to parent_span
+        RunGuardrails -> RunGuardrails: break loop
+    else tripwire_triggered == False
+        RunGuardrails -> RunGuardrails: guardrail_results.append(result)
+        RunGuardrails -> Queue: queue.put_nowait(result)
+    end
+end
+
+RunGuardrails -> RunGuardrails: streamed_result.input_guardrail_results\n  += remaining guardrail_results
+deactivate RunGuardrails
+deactivate Asyncio
+
+@enduml

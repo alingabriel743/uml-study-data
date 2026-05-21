@@ -1,0 +1,188 @@
+{
+  "scope": "Web Browsing & JavaScript Execution",
+  "diagram_type": "use_case",
+  "system_boundary": "TMWebDriver Browser Automation System",
+
+  "actors": [
+    {
+      "name": "Agent",
+      "type": "primary",
+      "description": "AI agent (ga.py) that invokes browser tools: web_execute_js, do_web_scan, do_web_execute_js",
+      "source": "ga.py"
+    },
+    {
+      "name": "Browser Extension",
+      "type": "primary",
+      "description": "Chrome MV3 extension (tmwd_cdp_bridge/background.js) that executes JS in tabs and relays results via WebSocket",
+      "source": "assets/tmwd_cdp_bridge/background.js"
+    },
+    {
+      "name": "Browser Tab",
+      "type": "secondary",
+      "description": "Individual Chrome tab; JS executed via chrome.scripting.executeScript (MAIN world) or CDP fallback",
+      "source": "assets/tmwd_cdp_bridge/background.js"
+    },
+    {
+      "name": "Remote TMWebDriver",
+      "type": "secondary",
+      "description": "Optional remote instance of TMWebDriver; local instance proxies commands via HTTP /link endpoint",
+      "source": "TMWebDriver.py"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Initialize Driver",
+      "actor": "Agent",
+      "description": "TMWebDriver.__init__ checks if remote instance exists; if local, starts WS server (port 18765) and HTTP server (port 18766)",
+      "key_methods": ["TMWebDriver.__init__", "start_ws_server()", "start_http_server()"],
+      "notes": "is_remote flag set by probing port+1; remote mode routes all commands via HTTP /link"
+    },
+    {
+      "id": "UC2",
+      "name": "Connect Browser Session",
+      "actor": "Browser Extension",
+      "description": "Extension connects WS to ws://127.0.0.1:18765 and sends ext_ready with all open tabs; JSExecutor.handle() registers each tab as a Session",
+      "key_methods": ["connectWS()", "JSExecutor.handle(type=ext_ready|tabs_update)", "_register_client(session_id, client, session_info)"],
+      "session_types": ["ws (content script)", "ext_ws (extension manages multiple tabs)", "http (long-poll fallback)"],
+      "notes": "Session tracks id, url, title, type, ws_client/http_queue, connect_at, disconnect_at"
+    },
+    {
+      "id": "UC3",
+      "name": "Find / Select Session",
+      "actor": "Agent",
+      "description": "Agent queries available sessions by URL pattern to target a specific browser tab",
+      "key_methods": ["get_all_sessions()", "find_session(url_pattern)", "set_session(url_pattern)", "get_session_dict()"],
+      "notes": "set_session updates default_session_id; remote mode proxies via /link?cmd=find_session"
+    },
+    {
+      "id": "UC4",
+      "name": "Execute JavaScript in Browser",
+      "actor": "Agent",
+      "description": "Core use case: agent submits JS code; TMWebDriver dispatches to correct session; browser executes and returns DOM result",
+      "key_methods": [
+        "web_execute_js(script, switch_tab_id)",
+        "simphtml.execute_js_rich(script, driver)",
+        "TMWebDriver.execute_js(code, timeout, session_id)",
+        "JSExecutor.handle(type=result|error|ack)"
+      ],
+      "dispatch_flow": [
+        "Agent → ga.web_execute_js(script)",
+        "ga → simphtml.execute_js_rich(script, driver)",
+        "simphtml → driver.execute_js(code)",
+        "driver → session.ws_client.send_message(payload) [ws/ext_ws] OR session.http_queue.put(payload) [http]",
+        "Browser Extension → handleWsExec(data) → chrome.scripting.executeScript",
+        "Browser Tab executes JS in MAIN world",
+        "Extension → ws.send({type:result, id, result}) OR ws.send({type:error, ...})",
+        "driver → self.results[exec_id] set → execute_js returns {data, newTabs}"
+      ],
+      "ack_protocol": "Extension sends {type:ack, id} immediately on receipt; driver resets timeout on ACK",
+      "csp_fallback": "If executeScript fails (CSP), extension falls back to Chrome Debugger Protocol (CDP Runtime.evaluate)"
+    },
+    {
+      "id": "UC5",
+      "name": "Navigate Browser (Jump / New Tab)",
+      "actor": "Agent",
+      "description": "Agent navigates current tab or opens a new tab via JS execution wrappers",
+      "key_methods": ["TMWebDriver.jump(url, timeout)", "TMWebDriver.newtab(url)"],
+      "notes": "jump executes window.location.href=url; newtab executes GM_openInTab(url); both rely on execute_js"
+    },
+    {
+      "id": "UC6",
+      "name": "Scan Page HTML",
+      "actor": "Agent",
+      "description": "Agent retrieves and simplifies page HTML for LLM context; optionally lists tabs only",
+      "key_methods": [
+        "ga.do_web_scan(args)",
+        "simphtml.get_html(driver)",
+        "simphtml.get_main_block(driver)",
+        "driver.execute_js(js_optHTML)"
+      ],
+      "notes": "HTML is simplified/truncated via BeautifulSoup to reduce token count; tabs_only=true skips HTML fetch"
+    },
+    {
+      "id": "UC7",
+      "name": "Monitor Page Changes",
+      "actor": "Agent",
+      "description": "Before/after JS execution, capture DOM diff and transient text strings to report what changed",
+      "key_methods": [
+        "simphtml.execute_js_rich (captures last_html before, current_html after)",
+        "simphtml.find_changed_elements(last_html, current_html)",
+        "simphtml.start_temp_monitor(driver)",
+        "simphtml.get_temp_texts(driver)"
+      ],
+      "notes": "Transient text monitor injects JS polling interval; detects ephemeral UI feedback (toasts, alerts)"
+    },
+    {
+      "id": "UC8",
+      "name": "Handle Session Reconnect / Disconnect",
+      "actor": "Browser Extension",
+      "description": "Extension reconnects on page reload; stale sessions are detected and marked; auto-failover to any alive session",
+      "key_methods": [
+        "JSExecutor.handle_close() → _unregister_client(client)",
+        "Session.mark_disconnected()",
+        "Session.reconnect(client, info)",
+        "TMWebDriver.clean_sessions()"
+      ],
+      "notes": "Sessions inactive >600s are deleted; execute_js auto-switches to alive session if default is disconnected"
+    },
+    {
+      "id": "UC9",
+      "name": "Receive Long-Poll Commands (HTTP Mode)",
+      "actor": "Browser Tab",
+      "description": "For environments without WS support, browser tab polls /api/longpoll every 5s; results posted to /api/result",
+      "key_methods": [
+        "HTTP GET/POST /api/longpoll",
+        "HTTP POST /api/result",
+        "session.http_queue.put(payload)",
+        "msgQ.get(timeout=0.2)"
+      ],
+      "notes": "HTTP sessions timeout after 60s inactivity; long-poll blocks up to 5s per request"
+    },
+    {
+      "id": "UC10",
+      "name": "Execute CDP / Cookie / Batch Commands",
+      "actor": "Agent",
+      "description": "Agent sends structured JSON as JS code; extension routes to handleExtMessage for CDP, cookie, tab management, or batch operations",
+      "key_methods": [
+        "background.handleExtMessage(msg)",
+        "background.handleCDP(msg)",
+        "background.handleCookies(msg)",
+        "background.handleBatch(msg)"
+      ],
+      "notes": "Code payload parsed as JSON object with .cmd field to trigger extension protocol vs raw JS execution"
+    },
+    {
+      "id": "UC11",
+      "name": "Proxy Commands to Remote Driver",
+      "actor": "Agent",
+      "description": "When is_remote=True, all commands (execute_js, get_all_sessions, find_session) are forwarded via HTTP POST to remote /link endpoint",
+      "key_methods": ["TMWebDriver._remote_cmd(cmd)", "HTTP POST /link"],
+      "notes": "Enables multi-process or remote-host browser control without running a local WS server"
+    }
+  ],
+
+  "key_relationships": [
+    "Agent uses TMWebDriver (via ga.web_execute_js / simphtml.execute_js_rich)",
+    "TMWebDriver composes Session (1..*) — one per browser tab",
+    "TMWebDriver creates JSExecutor (inner WebSocket handler class) inside start_ws_server",
+    "JSExecutor handles WebSocket messages → dispatches to TMWebDriver._register_client / results dict",
+    "Browser Extension connects to TMWebDriver WebSocket server",
+    "Browser Extension executes JS in Browser Tab via chrome.scripting.executeScript (MAIN world)",
+    "Browser Extension falls back to CDP (chrome.debugger) for CSP-restricted pages",
+    "simphtml.execute_js_rich extends execute_js with before/after DOM diffing",
+    "Remote mode: TMWebDriver delegates to another TMWebDriver instance via HTTP /link"
+  ],
+
+  "important_notes": "Three session transport types: ws (content script WebSocket), ext_ws (Chrome extension manages all tabs via single WS), http (long-polling). Extension sends ext_ready on connect listing all open tabs; tabs_update on tab open/close/navigate. CSP headers stripped by extension declarativeNetRequest rule. exec_id UUID used for request/response correlation. Payload dispatched by session type: ws_client.send_message() or http_queue.put(). Ports: WS=18765, HTTP=18766.",
+
+  "source_files_analyzed": [
+    "TMWebDriver.py",
+    "ga.py",
+    "simphtml.py",
+    "assets/tmwd_cdp_bridge/background.js",
+    "assets/tmwd_cdp_bridge/content.js",
+    "diagrams/use_case/ir_view_use_case.json"
+  ]
+}

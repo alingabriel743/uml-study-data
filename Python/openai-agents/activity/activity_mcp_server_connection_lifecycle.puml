@@ -1,0 +1,257 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #343A40
+    EndColor #343A40
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleFontSize 13
+    TitleBackgroundColor #E9ECEF
+}
+skinparam note {
+    BackgroundColor #FFF3CD
+    BorderColor #856404
+    FontColor #212529
+}
+
+title MCP Server Connection Lifecycle
+
+|#DDEEFF| MCPServerManager |
+|#E8F5E9| _ServerWorker |
+|#FFF8E1| MCPServer |
+
+|MCPServerManager|
+
+start
+:Create **MCPServerManager**(servers,\nconnect_timeout=10s, cleanup_timeout=10s,\ndrop_failed_servers=True, strict=False,\nsuppress_cancelled_error=True,\nconnect_in_parallel=False);
+
+note right
+  State initialised:
+  _all_servers, _active_servers,
+  failed_servers, errors, _workers
+end note
+
+:**__aenter__**() → **connect_all**();
+
+:Save previous_connected_servers\nand previous_active_servers;
+:Reset: failed_servers=[], errors={},\n_failed_server_set={};
+:Determine **servers_to_connect**\nvia _servers_to_connect()\n(skip already-connected, deduplicate);
+
+note right
+  Idempotency: servers already in
+  _connected_servers are excluded
+end note
+
+if (connect_in_parallel?) then (True)
+    :Spawn **asyncio.Task** per server\ncalling _attempt_connect(server,\nraise_on_error=False);
+    :await asyncio.gather(*tasks,\nreturn_exceptions=True);
+
+    if (Any CancelledError result\nAND suppress_cancelled_error=False?) then (yes)
+        :Re-raise first CancelledError;
+        stop
+    endif
+
+    if (Any non-CancelledError\nBaseException result?) then (yes)
+        :Re-raise first fatal exception;
+        stop
+    endif
+
+    if (strict=True AND\nfailed_servers not empty?) then (yes)
+        :Find first_failure\n(skip suppressed CancelledError);
+        :Raise errors[first_failure]\nor RuntimeError;
+        stop
+    endif
+
+else (False)
+    :for each server in servers_to_connect (sequential);
+    repeat
+        :await **_attempt_connect**(server);
+        if (server NOT in _failed_server_set?) then (yes)
+            :Add server to\nconnected_servers list;
+        endif
+    repeat while (more servers?)
+endif
+
+fork
+    |MCPServerManager|
+    :—— _attempt_connect(server) ——;
+    :raise_on_error defaults\nto self.strict;
+
+    if (connect_in_parallel=True?) then (yes)
+        :_get_worker(server)\n[create _ServerWorker\nif not exists or stale];
+
+        |_ServerWorker|
+        :__init__: create asyncio.Queue\nspawn self._task =\nasyncio.create_task(self._run());
+        :worker.**connect**(): enqueue\n_ServerCommand(action='connect',\ntimeout, future);
+
+        |MCPServer|
+        :Execute **server.connect**()\nwith timeout (asyncio.timeout\nor call_later fallback);
+
+        |_ServerWorker|
+        if (Connect succeeded?) then (yes)
+            :future.set_result(None);
+        else (no)
+            :future.set_exception(exc);
+        endif
+
+        |MCPServerManager|
+        :Await Future resolution;
+    else (no)
+        |MCPServerManager|
+        :await _run_with_timeout(\n  server.connect,\n  connect_timeout_seconds);
+
+        |MCPServer|
+        :Execute **server.connect**();
+
+        |MCPServerManager|
+    endif
+
+    if (Connect succeeded?) then (yes)
+        :_connected_servers.add(server);
+        if (server was previously failed?) then (yes)
+            :_remove_failed_server(server)\nerrors.pop(server);
+        endif
+    elseif (CancelledError raised?) then
+        if (suppress_cancelled_error=True?) then (yes)
+            :_record_failure(server, exc,\nphase='connect')\n[log, add to failed_servers, errors];
+            note right: Treated as soft failure — execution continues
+        else (no)
+            :Re-raise CancelledError;
+        endif
+    elseif (Exception raised?) then
+        :_record_failure(server, exc,\nphase='connect');
+        if (raise_on_error=True?) then (yes)
+            :Re-raise Exception;
+        endif
+    else (BaseException — fatal)
+        :_record_failure(server, exc,\nphase='connect');
+        :Always re-raise;
+    endif
+
+fork again
+    |MCPServerManager|
+    :—— BaseException during connect loop ——;
+    if (connect_in_parallel=True?) then (yes)
+        :_cleanup_servers(servers_to_connect);
+    else (no)
+        :_cleanup_servers(\n  connected_servers + failed_servers);
+    endif
+
+    if (drop_failed_servers=True?) then (yes)
+        :Restore active to\nprevious_connected_servers\n∩ current state;
+    else (no)
+        :Restore previous_active_servers;
+    endif
+    :Re-raise exception;
+    stop
+end fork
+
+|MCPServerManager|
+
+:await **_refresh_active_servers**();
+if (drop_failed_servers=True?) then (yes)
+    :_active_servers = _all_servers\nminus _failed_server_set;
+else (no)
+    :_active_servers = list(_all_servers);
+endif
+
+note right
+  Agent references manager.active_servers —
+  only successfully connected servers
+  are exposed for tool use
+end note
+
+:Return **active_servers**\n[context body runs here];
+
+' ===== RECONNECT PATH =====
+detach
+
+|MCPServerManager|
+:Optional: **reconnect**(failed_only=True/False);
+
+if (failed_only=True?) then (yes)
+    :servers_to_retry =\nunique(failed_servers);
+else (no)
+    :await cleanup_all()\n→ servers_to_retry = _all_servers\nReset failed/errors;
+endif
+
+:Filter via _servers_to_connect()\n(skip already-connected);
+
+if (connect_in_parallel?) then (True)
+    :Parallel connect path\n(same as __aenter__ above);
+else (False)
+    :Sequential connect path\n(same as __aenter__ above);
+endif
+
+:FINALLY: _refresh_active_servers();
+:Return updated active_servers;
+
+detach
+
+' ===== SHUTDOWN PATH =====
+|MCPServerManager|
+:**__aexit__**() → **cleanup_all**();
+
+:for server in **reversed**(_all_servers);
+repeat
+    :await **_cleanup_server**(server);
+
+    if (connect_in_parallel=True\nAND server in _workers?) then (yes)
+        |_ServerWorker|
+        if (worker.is_done?) then (yes)
+            |MCPServerManager|
+            :pop _workers[server]\n_connected_servers.discard(server)\nReturn early;
+        else (no)
+            :worker.**cleanup**(): enqueue\n_ServerCommand(action='cleanup',\ntimeout, future);
+
+            |MCPServer|
+            :Execute **server.cleanup**()\nwith timeout;
+
+            |_ServerWorker|
+            :Set future result/exception\n→ **EXIT** _run() loop;
+
+            |MCPServerManager|
+            :FINALLY: pop _workers[server]\n_connected_servers.discard(server);
+        endif
+    else (no)
+        |MCPServerManager|
+        :await _run_with_timeout(\n  server.cleanup,\n  cleanup_timeout_seconds);
+
+        |MCPServer|
+        :Execute **server.cleanup**();
+
+        |MCPServerManager|
+        :FINALLY:\n_connected_servers.discard(server);
+    endif
+
+    if (CancelledError?) then (yes)
+        if (suppress_cancelled_error=True?) then (yes)
+            :Log debug, suppress error;
+        else (no)
+            :Re-raise CancelledError;
+            stop
+        endif
+    elseif (Exception?) then
+        :Log exception\nerrors[server] = exc\n(continue cleanup loop);
+    endif
+
+repeat while (more servers?)
+
+:All servers cleaned up\nContext manager exits;
+
+stop
+
+@enduml

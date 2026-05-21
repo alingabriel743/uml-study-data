@@ -1,0 +1,116 @@
+{
+  "scope": "audio_and_transcription_flow",
+  "title": "Audio Generation & Transcription Flow",
+  "diagram_type": "activity",
+  "key_participants": [
+    "Caller",
+    "AudioProvider (interface)",
+    "GeneratesAudio (trait)",
+    "HasAudioGateway (trait)",
+    "ElevenLabsProvider",
+    "AudioGateway (interface)",
+    "ElevenLabsGateway",
+    "TranscriptionProvider (interface)",
+    "GeneratesTranscriptions (trait)",
+    "HasTranscriptionGateway (trait)",
+    "TranscriptionGateway (interface)",
+    "Ai (static helper)",
+    "Events (Dispatcher)"
+  ],
+
+  "audio_generation_flow": [
+    "START: Caller invokes AudioProvider::audio(text, voice='default-female', instructions=null, model=null, timeout=30)",
+    "GeneratesAudio::audio() generates invocationId = Str::uuid7()",
+    "Resolve model: model = model ?? defaultAudioModel() [ElevenLabsProvider default: 'eleven_multilingual_v2']",
+    "Create AudioPrompt(text, voice, instructions, provider, model, timeout)",
+    "BRANCH: if Ai::audioIsFaked() → Ai::recordAudioGeneration(prompt) [fake/test path]",
+    "Dispatch GeneratingAudio(invocationId, provider, model, prompt) via events",
+    "Resolve gateway: HasAudioGateway::audioGateway() returns $audioGateway ?? $gateway",
+    "  [ElevenLabsProvider::audioGateway() returns $audioGateway ?? new ElevenLabsGateway]",
+    "ElevenLabsGateway::generateAudio(provider, model, text, voice, instructions, timeout) called",
+    "  Map voice alias: 'default-male' → 'onwK4e9ZLuTAKqWW03F9', 'default-female' → 'XrExE9yKIg1WjnnlVkGX', else pass-through",
+    "  HTTP POST https://api.elevenlabs.io/v1/text-to-speech/{voice} with xi-api-key header, body: {model_id, text}",
+    "  BRANCH: withErrorHandling wraps the HTTP call (HandlesFailoverErrors trait handles errors)",
+    "  Return AudioResponse(base64_encode(responseBody), Meta(providerName, model), 'audio/mpeg')",
+    "Dispatch AudioGenerated(invocationId, provider, model, prompt, response) via events",
+    "END: Return AudioResponse to caller"
+  ],
+
+  "transcription_flow": [
+    "START: Caller invokes TranscriptionProvider::transcribe(audio: TranscribableAudio, language=null, diarize=false, model=null)",
+    "GeneratesTranscriptions::transcribe() generates invocationId = Str::uuid7()",
+    "Resolve model: model = model ?? defaultTranscriptionModel() [ElevenLabsProvider default: 'scribe_v2']",
+    "Create TranscriptionPrompt(audio, language, diarize, provider, model, timeout)",
+    "BRANCH: if Ai::transcriptionsAreFaked() → Ai::recordTranscriptionGeneration(prompt) [fake/test path]",
+    "Dispatch GeneratingTranscription(invocationId, provider, model, prompt) via events",
+    "Resolve gateway: HasTranscriptionGateway::transcriptionGateway() returns $transcriptionGateway ?? $gateway",
+    "  [ElevenLabsProvider::transcriptionGateway() returns $transcriptionGateway ?? new ElevenLabsGateway]",
+    "ElevenLabsGateway::generateTranscription(provider, model, audio, language, diarize, timeout) called",
+    "  Extract: audioContent = audio->content(), mimeType = audio->mimeType()",
+    "  HTTP POST https://api.elevenlabs.io/v1/speech-to-text with xi-api-key header, file attachment, body: {model_id, language, diarize}",
+    "  Parse JSON response",
+    "  BRANCH diarize=true: map response['words'] filtering type='word' → TranscriptionSegment(text, speaker_id, start, end)",
+    "  BRANCH diarize=false: segments = [] (empty collection)",
+    "  Return TranscriptionResponse(response['text'], Collection<TranscriptionSegment>, Usage, Meta(providerName, model))",
+    "Dispatch TranscriptionGenerated(invocationId, provider, model, prompt, response) via events",
+    "END: Return TranscriptionResponse to caller"
+  ],
+
+  "key_interfaces": {
+    "AudioProvider": ["audio(text, voice, instructions, model, timeout): AudioResponse", "audioGateway(): AudioGateway", "useAudioGateway(AudioGateway): self", "defaultAudioModel(): string"],
+    "AudioGateway": ["generateAudio(AudioProvider, model, text, voice, instructions, timeout): AudioResponse"],
+    "TranscriptionProvider": ["transcribe(TranscribableAudio, language, diarize, model): TranscriptionResponse", "transcriptionGateway(): TranscriptionGateway", "useTranscriptionGateway(TranscriptionGateway): self", "defaultTranscriptionModel(): string"],
+    "TranscriptionGateway": ["generateTranscription(TranscriptionProvider, model, TranscribableAudio, language, diarize, timeout): TranscriptionResponse"]
+  },
+
+  "key_relationships": [
+    "ElevenLabsProvider extends Provider, implements AudioProvider + TranscriptionProvider",
+    "ElevenLabsProvider uses traits: GeneratesAudio, GeneratesTranscriptions, HasAudioGateway, HasTranscriptionGateway",
+    "ElevenLabsGateway implements AudioGateway + TranscriptionGateway",
+    "GeneratesAudio depends_on AudioGateway (via audioGateway())",
+    "GeneratesTranscriptions depends_on TranscriptionGateway (via transcriptionGateway())",
+    "HasAudioGateway stores AudioGateway, fallback to $this->gateway",
+    "AudioGenerated event carries: invocationId, Provider, model, AudioPrompt, AudioResponse",
+    "TranscriptionSegment implements Arrayable + JsonSerializable; fields: text, speaker, startSeconds, endSeconds"
+  ],
+
+  "data_objects": {
+    "AudioPrompt": ["text: string", "voice: string", "instructions: ?string", "provider: AudioProvider", "model: string", "timeout: int"],
+    "AudioResponse": ["base64-encoded audio body", "Meta(providerName, model)", "mimeType='audio/mpeg'"],
+    "TranscriptionPrompt": ["audio: TranscribableAudio", "language: ?string", "diarize: bool", "provider: TranscriptionProvider", "model: string", "timeout: ?int"],
+    "TranscriptionResponse": ["text: string", "segments: Collection<TranscriptionSegment>", "usage: Usage", "meta: Meta"],
+    "TranscriptionSegment": ["text: string", "speaker: string", "startSeconds: float", "endSeconds: float"],
+    "AudioGenerated (event)": ["invocationId: string", "provider: Provider", "model: string", "prompt: AudioPrompt", "response: AudioResponse"]
+  },
+
+  "branching_conditions": [
+    "Ai::audioIsFaked() → record prompt for testing (no HTTP call in fake mode)",
+    "Ai::transcriptionsAreFaked() → record prompt for testing (no HTTP call in fake mode)",
+    "voice alias matching: 'default-male'|'default-female' → ElevenLabs voice ID, else pass raw voice ID",
+    "diarize=true → parse response['words'], filter type='word', map to TranscriptionSegments",
+    "diarize=false → return empty segments collection",
+    "ElevenLabsGateway uses HandlesFailoverErrors trait → wraps HTTP calls in withErrorHandling(providerName, fn)"
+  ],
+
+  "api_endpoints": {
+    "TTS": "POST https://api.elevenlabs.io/v1/text-to-speech/{voice}  body: {model_id, text}",
+    "STT": "POST https://api.elevenlabs.io/v1/speech-to-text  multipart: file attachment + {model_id, language, diarize}"
+  },
+
+  "important_notes": "Both pipelines are symmetric: resolve model → create prompt → optional fake recording → dispatch 'Generating' event → call gateway → dispatch 'Generated' event → return response. ElevenLabsGateway is the single concrete implementation for both TTS and STT in this project. Default TTS model: eleven_multilingual_v2. Default STT model: scribe_v2. Auth via 'xi-api-key' header from providerCredentials()['key'].",
+
+  "source_files_analyzed": [
+    "src/Gateway/ElevenLabsGateway.php",
+    "src/Contracts/Providers/AudioProvider.php",
+    "src/Contracts/Providers/TranscriptionProvider.php",
+    "src/Contracts/Gateway/AudioGateway.php",
+    "src/Contracts/Gateway/TranscriptionGateway.php",
+    "src/Providers/ElevenLabsProvider.php",
+    "src/Providers/Concerns/GeneratesAudio.php",
+    "src/Providers/Concerns/GeneratesTranscriptions.php",
+    "src/Providers/Concerns/HasAudioGateway.php",
+    "src/Events/AudioGenerated.php",
+    "src/Prompts/AudioPrompt.php",
+    "src/Responses/Data/TranscriptionSegment.php"
+  ]
+}

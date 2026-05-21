@@ -1,0 +1,355 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #F1F3F5
+    DividerBackgroundColor #DEE2E6
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #F1F3F5
+}
+
+title Session Lifecycle and Cache Management
+
+actor Caller as caller
+participant "SessionService" as svc
+participant "Redis\n(redisClient)" as redis
+participant "Database\n(db)" as db
+participant "UserRedisCacheSpace" as userCache
+
+note over redis
+  Key Prefixes:
+  session-cache:{uuid}          (TTL 300s)
+  session-cache:user-sessions:{user_id}
+  session-cache:flush-pending
+  session-cache:flush-lock:{uuid} (TTL 30s)
+end note
+
+== Session Creation ==
+
+caller -> svc : create_session(user, meta)
+activate svc
+
+svc -> db : INSERT INTO sessions\n(uuid, user_id, meta, last_activity, created_at)
+activate db
+db --> svc : session row
+deactivate db
+
+svc -> svc : cacheSession(session, {flushState: 'unchanged'})
+activate svc
+
+svc -> redis : SET session-cache:{uuid} JSON EX 300
+activate redis
+redis --> svc : OK
+deactivate redis
+
+svc -> redis : SADD session-cache:user-sessions:{user_id} {uuid}
+activate redis
+redis --> svc : (integer)
+deactivate redis
+
+svc -> redis : EXPIRE session-cache:user-sessions:{user_id} 300
+activate redis
+redis --> svc : OK
+deactivate redis
+
+deactivate svc
+
+svc --> caller : session
+deactivate svc
+
+|||
+
+== Session Retrieval (getSession) ==
+
+caller -> svc : getSession(uuid)
+activate svc
+
+svc -> svc : #getSession(uuid)  [private]
+activate svc
+
+svc -> svc : getCachedSession(uuid)
+activate svc
+
+svc -> redis : GET session-cache:{uuid}
+activate redis
+redis --> svc : (value or nil)
+deactivate redis
+
+alt Cache Hit
+    svc --> svc : parse JSON → validate uuid field\nreturn session
+    note right of svc : UUID field validated\nagainst key to prevent\ncache poisoning
+else Cache Miss
+    svc --> svc : return null
+    deactivate svc
+
+    svc -> db : SELECT * FROM sessions\nWHERE uuid = ? LIMIT 1
+    activate db
+    db --> svc : session row
+    deactivate db
+
+    svc -> db : get_user({ id: session.user_id })\n[resolve user_uid]
+    activate db
+    db --> svc : user record
+    deactivate db
+
+    svc -> svc : cacheSession(session, {flushState: 'pending'})
+    activate svc
+
+    svc -> redis : SET session-cache:{uuid} JSON EX 300
+    activate redis
+    redis --> svc : OK
+    deactivate redis
+
+    svc -> redis : SADD session-cache:user-sessions:{user_id} {uuid}
+    activate redis
+    redis --> svc : (integer)
+    deactivate redis
+
+    svc -> redis : SADD session-cache:flush-pending {uuid}
+    activate redis
+    redis --> svc : (integer)
+    deactivate redis
+
+    deactivate svc
+end
+
+deactivate svc
+
+svc --> caller : session (internal values stripped)
+deactivate svc
+
+|||
+
+== Session Invalidation ==
+
+caller -> svc : invalidateCachedSession(uuid, userId?)
+activate svc
+
+svc -> redis : DEL session-cache:{uuid}
+activate redis
+redis --> svc : (integer)
+deactivate redis
+
+svc -> redis : SREM session-cache:flush-pending {uuid}
+activate redis
+redis --> svc : (integer)
+deactivate redis
+
+opt userId provided
+    svc -> redis : SREM session-cache:user-sessions:{userId} {uuid}
+    activate redis
+    redis --> svc : (integer)
+    deactivate redis
+end
+
+deactivate svc
+
+|||
+
+== Get User Sessions ==
+
+caller -> svc : get_user_sessions(user)
+activate svc
+
+svc -> redis : SMEMBERS session-cache:user-sessions:{user.id}
+activate redis
+redis --> svc : [uuid1, uuid2, ...]
+deactivate redis
+
+loop for each sessionUuid in set
+    svc -> svc : getCachedSession(sessionUuid)
+    activate svc
+
+    svc -> redis : GET session-cache:{sessionUuid}
+    activate redis
+    redis --> svc : (value or nil)
+    deactivate redis
+
+    alt Session invalid or user_id mismatch
+        svc -> redis : SREM session-cache:user-sessions:{user.id} {uuid}
+        activate redis
+        redis --> svc : (integer)
+        deactivate redis
+        note right : Stale UUID cleaned up on read
+    end
+
+    deactivate svc
+end
+
+svc --> caller : sessions[] (internal values stripped)
+deactivate svc
+
+|||
+
+== Session Removal ==
+
+caller -> svc : remove_session(uuid)
+activate svc
+
+svc -> svc : getCachedSession(uuid)  [get user_id]
+activate svc
+
+svc -> redis : GET session-cache:{uuid}
+activate redis
+redis --> svc : JSON or nil
+deactivate redis
+
+deactivate svc
+
+opt Cache miss — fallback to DB for user_id
+    svc -> db : SELECT user_id FROM sessions\nWHERE uuid = ? LIMIT 1
+    activate db
+    db --> svc : user_id
+    deactivate db
+end
+
+svc -> svc : invalidateCachedSession(uuid, userId)
+activate svc
+svc -> redis : DEL session-cache:{uuid}
+activate redis
+redis --> svc : OK
+deactivate redis
+svc -> redis : SREM session-cache:flush-pending {uuid}
+activate redis
+redis --> svc : (integer)
+deactivate redis
+svc -> redis : SREM session-cache:user-sessions:{userId} {uuid}
+activate redis
+redis --> svc : (integer)
+deactivate redis
+deactivate svc
+
+svc -> db : DELETE FROM sessions WHERE uuid = ?
+activate db
+db --> svc : result
+deactivate db
+
+svc --> caller : db result
+deactivate svc
+
+|||
+
+== Background Flush Loop (updateSessions) ==
+
+note over svc
+  Timer fires every 5–60 seconds (randomised)
+  via #scheduleSessionFlushLoop()
+end note
+
+[-> svc : [timer tick] #updateSessions()
+activate svc
+
+svc -> redis : SMEMBERS session-cache:flush-pending
+activate redis
+redis --> svc : [pendingUuid1, pendingUuid2, ...]
+deactivate redis
+
+loop for each pendingUuid
+    svc -> redis : SET session-cache:flush-lock:{uuid} 1 EX 30 NX\n[acquire distributed lock]
+    activate redis
+    redis --> svc : OK or nil
+    deactivate redis
+
+    alt Lock acquired
+        svc -> svc : getCachedSession(uuid)
+        activate svc
+
+        svc -> redis : GET session-cache:{uuid}
+        activate redis
+        redis --> svc : JSON or nil
+        deactivate redis
+
+        deactivate svc
+
+        alt Session missing or not flushPending
+            svc -> redis : SREM session-cache:flush-pending {uuid}
+            activate redis
+            redis --> svc : (integer)
+            deactivate redis
+            note right : Skip — nothing to flush
+        else Session valid and flushPending
+            svc -> db : UPDATE sessions\nSET meta=?, last_activity=?\nWHERE uuid=? AND last_activity < ?
+            activate db
+            db --> svc : rowsAffected
+            deactivate db
+
+            alt No rows affected — check existence
+                svc -> db : SELECT uuid FROM sessions\nWHERE uuid = ?
+                activate db
+                db --> svc : row or nil
+                deactivate db
+
+                opt Session gone from DB
+                    svc -> svc : invalidateCachedSession(uuid)
+                end
+            else Rows updated
+                svc -> svc : cacheSession(session, {flushState: 'flushed'})
+                activate svc
+                svc -> redis : SET session-cache:{uuid} JSON EX 300
+                activate redis
+                redis --> svc : OK
+                deactivate redis
+                svc -> redis : SREM session-cache:flush-pending {uuid}
+                activate redis
+                redis --> svc : (integer)
+                deactivate redis
+                deactivate svc
+            end
+        end
+
+        svc -> redis : DEL session-cache:flush-lock:{uuid}\n[release lock]
+        activate redis
+        redis --> svc : (integer)
+        deactivate redis
+
+    else Lock not acquired (another instance holds it)
+        note right of svc : Skip this session —\nanother node is flushing it
+    end
+end
+
+note over svc : After loop — update user last_activity_ts\nfor all flushed sessions
+
+loop for each updated userId
+    svc -> db : UPDATE user\nSET last_activity_ts=?\nWHERE id=?
+    activate db
+    db --> svc : OK
+    deactivate db
+
+    svc -> redis : GET UserRedisCacheSpace key for user
+    activate redis
+    redis --> svc : cached user or nil
+    deactivate redis
+
+    opt Cached user record outdated
+        svc -> userCache : setUser(updatedUser)
+        activate userCache
+        userCache --> svc : OK
+        deactivate userCache
+    end
+end
+
+deactivate svc
+
+@enduml

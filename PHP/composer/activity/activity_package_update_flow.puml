@@ -1,0 +1,187 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam ArrowColor #495057
+skinparam NoteBackgroundColor #FFF9C4
+skinparam NoteBorderColor #F0AD00
+
+title Package Update Flow
+
+|InstallationManager|
+start
+:execute(repo, operations, devMode,\nrunScripts, downloadOnly);
+:Register signal handler\n(SIGINT / SIGTERM / SIGHUP → runCleanup + exit);
+:Partition operations into batches\n(packages with **plugin-modifies-downloads**\nget an isolated batch);
+
+repeat
+
+  ' ─────────────────────────────────────────
+  ' DOWNLOAD PHASE
+  ' ─────────────────────────────────────────
+  #D0E8FF:DOWNLOAD PHASE;
+
+  |LibraryInstaller / DownloadManager|
+  :For each **install / update** operation\n(uninstall ops are skipped)\nRegister cleanupPromise[op];
+  :LibraryInstaller::download()\n→ Resolve **installPath** for package;
+  :DownloadManager::download()\n→ ensureDirectoryExists(targetDir);
+  :getAvailableSources()\n→ Rank **dist** vs **source** by preference flags;
+  :Set **package.installationSource** = chosen source;
+  :getDownloaderForPackage()\n→ Resolve concrete **DownloaderInterface**\n(zip / tar / git / svn / …);
+  :downloader->download(package, targetDir, prevPackage)\n[async Promise];
+
+  |InstallationManager|
+  if (Download failed\n(RuntimeException)?) then (yes)
+    if (sourceFallback enabled AND\nalternative sources remain?) then (yes)
+      |LibraryInstaller / DownloadManager|
+      :Retry download with\nnext available source;
+    else (no)
+      :Throw exception\n→ runCleanup then rethrow;
+      stop
+    endif
+  else (no)
+    :Collect download Promise;
+  endif
+
+  |InstallationManager|
+  :Await all download promises\n(**Loop::wait**(promises));
+
+  if (downloadOnly == true?) then (yes)
+    :runCleanup(cleanupPromises);
+    stop
+  else (no)
+  endif
+
+  ' ─────────────────────────────────────────
+  ' EXECUTION PHASE
+  ' ─────────────────────────────────────────
+  #D0F0D0:EXECUTION PHASE;
+  :Re-partition ops into sub-batches\n(**composer-plugin** / **composer-installer**\npackages get an isolated sub-batch);
+
+  repeat
+
+    if (Alias operation?) then (yes)
+      :markAliasInstalled /\nmarkAliasUninstalled → next op;
+    else (no)
+
+      |EventDispatcher|
+      :Dispatch **PRE_PACKAGE_UPDATE** /\nPRE_PACKAGE_INSTALL /\nPRE_PACKAGE_UNINSTALL event;
+
+      |LibraryInstaller / DownloadManager|
+      :prepare(opType, package, prevPackage)\n→ DownloadManager::prepare()\n→ downloader->prepare();
+
+      |InstallationManager|
+      if (Operation type?) then (update)
+
+        if (initialType ==\ntargetType?) then (yes — same type)
+
+          |BinaryInstaller|
+          :removeBinaries(initialPackage);
+
+          |LibraryInstaller / DownloadManager|
+          if (Same downloader type\nbetween versions?) then (yes)
+            :downloader->update(initial, target, targetDir);
+            if (RuntimeException AND\ninteractive mode?) then (yes)
+              :Prompt user: reinstall package?;
+              if (User confirms?) then (yes)
+                :initialDownloader->remove(initial, targetDir);
+                :DownloadManager::install(target, targetDir)\n→ downloader->install(target, targetDir);
+              else (no)
+                :Skip reinstall;
+              endif
+            endif
+          else (no — type changed)
+            :initialDownloader->remove(initial, targetDir);
+            :DownloadManager::install(target, targetDir)\n→ downloader->install(target, targetDir);
+          endif
+
+          |BinaryInstaller|
+          :installBinaries(targetPackage, installPath);
+
+          |InstalledRepository|
+          :removePackage(initialPackage);
+          :addPackage(clone of targetPackage);
+
+          |InstallationManager|
+          :markForNotification(targetPackage);
+
+        else (no — cross-type)
+
+          |InstallationManager|
+          :getInstaller(initialType)\n→ installer->uninstall(repo, initial);
+          :getInstaller(targetType)\n→ installer->install(repo, target);
+
+        endif
+
+      else (install / uninstall)
+        |LibraryInstaller / DownloadManager|
+        :installer->install(repo, package) /\ninstaller->uninstall(repo, package);
+        |InstallationManager|
+      endif
+
+      :Run cleanupPromise[op]();
+
+      |InstalledRepository|
+      if (Operation error?) then (yes)
+        :Log "<error>update of package failed</error>";
+        :Rethrow exception;
+        stop
+      else (no)
+        :repo->write(devMode, installationManager);
+      endif
+
+      |EventDispatcher|
+      :Queue **POST_PACKAGE_UPDATE** /\nPOST_PACKAGE_INSTALL /\nPOST_PACKAGE_UNINSTALL callback;
+
+    endif
+
+  repeat while (more ops in\ncurrent sub-batch?) is (yes)
+  -> no;
+
+  |InstallationManager|
+  :Await all prepare + execute + cleanup promises\n(**Loop::wait**());
+  :Platform::workaroundFilesystemIssues();
+
+  |EventDispatcher|
+  :Run all queued POST event callbacks;
+
+repeat while (more batches?) is (yes)
+-> no;
+
+|InstalledRepository|
+:Final **repo->write**(devMode, installationManager);
+
+|InstallationManager|
+:notifyInstalls(io)\n→ HTTP POST to package notification URLs;
+:reset()\n→ Clear notifiablePackages\n+ FileDownloader::$downloadMetadata;
+
+stop
+
+@enduml

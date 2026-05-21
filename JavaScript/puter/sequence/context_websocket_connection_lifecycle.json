@@ -1,0 +1,174 @@
+{
+  "scope": "websocket_connection_lifecycle",
+  "title": "WebSocket / Socket.IO Connection Lifecycle",
+  "diagram_type": "sequence",
+  "library_version": "Socket.IO v4.7.2 (engine.io client embedded)",
+  "key_participants": [
+    "Client App",
+    "io() / lookup()",
+    "Manager",
+    "Socket (SIO namespace socket)",
+    "EngineSocket (Socket$1)",
+    "Transport (Polling / WS / WT)",
+    "Server"
+  ],
+
+  "interaction_flow": [
+    "--- INITIAL CONNECTION ---",
+    "Client App → io(url, opts): calls lookup(uri, opts)",
+    "lookup() → Manager: new Manager(source, opts) [cached by id unless forceNew]",
+    "Manager constructor → Manager: _autoConnect=true → this.open()",
+    "Manager.open() → EngineSocket: new Socket$1(uri, opts) [transports: polling, websocket, webtransport]",
+    "EngineSocket constructor → EngineSocket: this.open() [readyState='opening']",
+    "EngineSocket.open() → EngineSocket: createTransport('polling') → transport.open()",
+    "EngineSocket.open() → EngineSocket: setTransport(transport) [binds drain/packet/error/close]",
+    "Transport.open() → Transport: readyState='opening', doOpen()",
+
+    "--- ENGINE.IO HANDSHAKE (over polling) ---",
+    "Polling.doOpen() → Server: HTTP GET /engine.io/?EIO=4&transport=polling",
+    "Server → Polling: HTTP 200 {type:'open', data:{sid, upgrades, pingInterval, pingTimeout}}",
+    "Polling.onData(data) → Polling: decodePacket() → onPacket(packet)",
+    "Transport.onPacket() → EngineSocket: emits 'packet' event",
+    "EngineSocket.onPacket(packet) → EngineSocket: case 'open' → onHandshake(JSON.parse(packet.data))",
+    "EngineSocket.onHandshake({sid, upgrades, pingInterval, pingTimeout}) → EngineSocket: stores id/upgrades/pingInterval/pingTimeout, calls onOpen(), resetPingTimeout()",
+    "EngineSocket.onOpen() → EngineSocket: readyState='open', emits 'open', flush(), starts upgrade probes",
+
+    "--- WEBSOCKET UPGRADE PROBE ---",
+    "EngineSocket.onOpen() → EngineSocket: for each upgrade in upgrades → probe(name)",
+    "EngineSocket.probe('websocket') → EngineSocket: createTransport('websocket') → wsTransport.open()",
+    "WS.doOpen() → Browser: new WebSocket(wss://host/engine.io/?...&transport=websocket&sid=X)",
+    "Browser WebSocket → Server: WS upgrade handshake (HTTP 101)",
+    "WS.addEventListeners() → WS: ws.onopen → onOpen(); ws.onmessage → onData(); ws.onclose → onClose()",
+    "WS.onOpen() → EngineSocket probe: transport is open → send [{type:'ping', data:'probe'}]",
+    "Server → WS: {type:'pong', data:'probe'}",
+    "WS probe receives pong → EngineSocket: upgrading=true, pause polling transport",
+    "EngineSocket.setTransport(ws) → EngineSocket: switch to WS, send [{type:'upgrade'}], flush()",
+    "EngineSocket.emitReserved('upgrade', wsTransport) → Manager: now on WebSocket",
+
+    "--- SOCKET.IO NAMESPACE CONNECT ---",
+    "Manager.open() listener: socket 'open' → Manager.onopen()",
+    "Manager.onopen() → Manager: cleanup(), readyState='open', emits 'open', subscribes [ping, data, error, close, decoded]",
+    "lookup() → Manager: io.socket(nsp, opts) → new Socket(manager, '/', opts)",
+    "Socket constructor → Socket: _autoConnect → this.connect()",
+    "Socket.connect() → Socket: subEvents() [listens manager open/packet/error/close], manager.open(), if ready → onopen()",
+    "Socket.onopen() → Socket: _sendConnectPacket({auth})",
+    "Socket._sendConnectPacket() → Manager._packet(): encode CONNECT(type=0) packet → engine.write()",
+    "Server → Manager: CONNECT packet {type:0, data:{sid, pid?}}",
+    "Manager.ondata(data) → Decoder.add() → decoded event → Manager.ondecoded() → emits 'packet'",
+    "Socket.onpacket(packet) → Socket: case CONNECT → onconnect(sid, pid)",
+    "Socket.onconnect(sid, pid) → Socket: connected=true, emitBuffered(), emits 'connect', _drainQueue(true)",
+    "Socket emits 'connect' → Client App: connection established",
+
+    "--- PING / PONG HEARTBEAT ---",
+    "Server → EngineSocket: {type:'ping'} packet (every pingInterval ms)",
+    "EngineSocket.onPacket({type:'ping'}) → EngineSocket: sendPacket('pong'), emits 'ping', emits 'pong', resetPingTimeout()",
+    "EngineSocket.resetPingTimeout() → EngineSocket: clearTimeout(), setTimeout(pingInterval+pingTimeout) → onClose('ping timeout') if no ping received",
+    "Manager.onping() → Manager: emits 'ping' (forwarded to Socket.IO layer)",
+
+    "--- EVENT EMISSION ---",
+    "Client App → Socket.emit('eventName', data): creates {type:EVENT(2), data:[name,...args]}",
+    "Socket.emit() → Socket: if connected → notifyOutgoingListeners(), this.packet(packet)",
+    "Socket.packet() → Manager._packet(): Encoder.encode() → engine.write(encodedStr)",
+    "EngineSocket.write() → Transport.send(packets) → WS.write() → ws.send(data)",
+    "Server → Manager: EVENT packet → Manager.ondata() → Decoder.add() → ondecoded() → 'packet' event",
+    "Socket.onpacket({type:EVENT}) → Socket.onevent() → emitEvent(args) → Emitter.emit(eventName, ...args)",
+
+    "--- DISCONNECTION & RECONNECTION ---",
+    "EngineSocket.onClose(reason) → EngineSocket: readyState='closed', clearPingTimeout, transport.close(), emits 'close'",
+    "Manager.onclose(reason) → Manager: cleanup(), backoff.reset(), readyState='closed', emits 'close'",
+    "Manager.onclose() → Manager: if _reconnection && !skipReconnect → reconnect()",
+    "Manager.reconnect() → Manager: if attempts < max → delay=backoff.duration(), _reconnecting=true",
+    "Backoff.duration() → Backoff: ms * factor^attempts (min:1000, max:5000, jitter:0.5), attempts++",
+    "After delay → Manager: emits 'reconnect_attempt', self.open(fn)",
+    "If open success → Manager.onreconnect(): _reconnecting=false, backoff.reset(), emits 'reconnect'",
+    "If open fails → Manager: reconnect() again (recursive), emits 'reconnect_error'",
+    "If attempts >= reconnectionAttempts → Manager: backoff.reset(), emits 'reconnect_failed'"
+  ],
+
+  "key_relationships": [
+    "Manager extends Emitter; owns EngineSocket (Socket$1) and namespace Sockets",
+    "Socket (SIO) depends_on Manager (via this.io); sends packets via io._packet()",
+    "EngineSocket (Socket$1) extends Emitter; owns current Transport (Polling/WS/WT)",
+    "Transport (abstract) extends Emitter; Polling/WS/WT extend Transport",
+    "WS (WebSocket transport) wraps browser WebSocket; WT wraps browser WebTransport",
+    "Manager.engine = EngineSocket instance; Manager subscribes to engine events on open",
+    "Decoder (Emitter) decodes raw data; Manager.ondata() feeds Decoder, listens for 'decoded'",
+    "Backoff: exponential back-off for reconnection (min:1000ms, max:5000ms, factor:2, jitter:0.5)",
+    "lookup() caches Manager instances by URL id (multiplex by default)"
+  ],
+
+  "class_hierarchy": [
+    "Emitter <- Transport <- Polling (XHR long-polling)",
+    "Emitter <- Transport <- WS (WebSocket, wraps browser WebSocket)",
+    "Emitter <- Transport <- WT (WebTransport, wraps browser WebTransport API)",
+    "Emitter <- Socket$1 (EngineSocket - engine.io layer, manages transports + handshake + ping)",
+    "Emitter <- Socket (SIO namespace socket - user-facing API)",
+    "Emitter <- Manager (manages engine socket + reconnection + namespace routing)",
+    "Emitter <- Decoder"
+  ],
+
+  "key_methods": {
+    "EngineSocket": [
+      "open(): readyState='opening', createTransport(first), transport.open(), setTransport()",
+      "createTransport(name): builds opts with EIO/transport/sid query params, new transports[name](opts)",
+      "setTransport(t): binds drain/packet/error/close listeners",
+      "probe(name): creates candidate transport, ping-pong test, pauses old, calls setTransport(), sends upgrade",
+      "onHandshake({sid, upgrades, pingInterval, pingTimeout}): stores session data, calls onOpen(), resetPingTimeout()",
+      "onPacket(packet): routes by type: open→onHandshake, ping→sendPong+resetTimeout, error→onError, message→emitData",
+      "resetPingTimeout(): setTimeout(pingInterval+pingTimeout) → onClose('ping timeout')",
+      "sendPacket(type, data): pushes to writeBuffer, flush()",
+      "close(): readyState='closing', onClose('forced close'), transport.close()"
+    ],
+    "Manager": [
+      "open(fn): creates EngineSocket, sets up open/error listeners with 20s timeout",
+      "onopen(): cleanup(), readyState='open', subscribe [ping,data,error,close,decoded]",
+      "ondata(data): decoder.add(data)",
+      "ondecoded(packet): nextTick → emitReserved('packet', packet)",
+      "_packet(packet): encoder.encode() → engine.write()",
+      "socket(nsp, opts): create or return cached Socket for namespace",
+      "onclose(reason): cleanup, backoff.reset, emits 'close', triggers reconnect()",
+      "reconnect(): exponential backoff delay → open() → onreconnect() or retry"
+    ],
+    "Socket (SIO)": [
+      "connect(): subEvents() [manager open/packet/error/close], manager.open()",
+      "onopen(): _sendConnectPacket(auth) → packet({type:CONNECT})",
+      "onpacket(packet): routes CONNECT→onconnect, EVENT→onevent, ACK→onack, DISCONNECT→ondisconnect",
+      "onconnect(id, pid): connected=true, emitBuffered(), emits 'connect'",
+      "emit(ev, ...args): creates EVENT packet, packet() if connected else sendBuffer.push()",
+      "disconnect(): send DISCONNECT packet, destroy(), onclose('io client disconnect')"
+    ],
+    "WS (Transport)": [
+      "doOpen(): new WebSocket(uri, protocols), addEventListeners()",
+      "addEventListeners(): ws.onopen→onOpen(), ws.onclose→onClose(), ws.onmessage→onData(), ws.onerror→onError()",
+      "write(packets): encodePacket per packet, ws.send(data), fake drain on last"
+    ]
+  },
+
+  "socket_io_packet_types": {
+    "0": "CONNECT",
+    "1": "DISCONNECT",
+    "2": "EVENT",
+    "3": "ACK",
+    "4": "CONNECT_ERROR",
+    "5": "BINARY_EVENT",
+    "6": "BINARY_ACK"
+  },
+
+  "engine_io_packet_types": ["open", "close", "ping", "pong", "message", "upgrade", "noop"],
+
+  "important_notes": [
+    "Transport upgrade: starts on polling, probes WebSocket (ping/pong probe), then upgrades; WebTransport preferred if in upgrades list",
+    "Handshake: first engine.io packet from server is type='open' with {sid, upgrades, pingInterval, pingTimeout, maxPayload}",
+    "Ping/pong: server-initiated; client replies pong; timer set to pingInterval+pingTimeout; no ping = timeout close",
+    "Reconnection defaults: delay=1000ms, delayMax=5000ms, randomizationFactor=0.5, attempts=Infinity",
+    "Socket.IO CONNECT packet (type=0) sent after engine.io handshake completes; server responds with CONNECT {sid,pid?}",
+    "Connection state recovery: pid (previous id) sent in CONNECT packet; server may recover missed packets",
+    "Key scope identifiers: 'wt' likely = WT (WebTransport class); 'bt' likely = Backoff; 'X' = io()/lookup(); 'open' = Socket$1.open/Manager.open; 'onHandshake' = Socket$1.onHandshake; 'reconnection' = Manager reconnect flow",
+    "Multiplexing: multiple Socket namespaces share one Manager/EngineSocket connection",
+    "Event emission while disconnected: buffered in sendBuffer, flushed on onconnect() via emitBuffered()"
+  ],
+
+  "source_files_analyzed": [
+    "src/gui/src/lib/socket.io/socket.io.js (Socket.IO v4.7.2, lines 1-4385)"
+  ]
+}

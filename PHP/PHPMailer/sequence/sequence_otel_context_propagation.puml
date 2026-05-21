@@ -1,0 +1,256 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #DEE2E6
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #ADB5BD
+}
+
+title OpenTelemetry Context and Propagation Flow
+
+actor Caller as caller
+
+box "OpenTelemetry Layer" #E8F4FD
+    participant "Context\n(OTel\\Context\\Context)" as otelCtx
+    participant "ScopeInterface\n(OTel\\Context\\ScopeInterface)" as otelScope
+end box
+
+box "DDTrace Layer" #FFF3CD
+    participant "Tracer\n(DDTrace\\Tracer)" as tracer
+    participant "ScopeManager\n(DDTrace\\ScopeManager)" as scopeMgr
+    participant "Scope\n(DDTrace\\Scope)" as ddScope
+    participant "SpanContext\n(DDTrace\\SpanContext)" as spanCtx
+end box
+
+box "Propagation Layer" #F0FFF0
+    participant "TextMap\n(DDTrace\\Propagators\\TextMap)" as textMap
+end box
+
+' =========================================================
+' SCENARIO A: OTel Context Activation
+' =========================================================
+group A: OTel Context Activation [immutable context, storage-backed]
+
+    caller -> otelCtx : getCurrent()
+    activate otelCtx
+    otelCtx --> caller : ContextInterface\n(active context from storage)
+    deactivate otelCtx
+
+    caller -> otelCtx : getRoot()
+    activate otelCtx
+    otelCtx --> caller : ContextInterface\n(@internal immutable root)
+    deactivate otelCtx
+
+    caller -> otelCtx : resolve($context)
+    activate otelCtx
+    note right of otelCtx
+        false / null → getCurrent()
+        allows optional parent contexts safely
+    end note
+    otelCtx --> caller : ContextInterface
+    deactivate otelCtx
+
+    caller -> otelCtx : with(ContextKeyInterface, $value)
+    activate otelCtx
+    otelCtx --> caller : Context (new immutable copy)
+    deactivate otelCtx
+
+    caller -> otelCtx : withContextValue(ImplicitContextKeyedInterface)
+    activate otelCtx
+    note right of otelCtx
+        Attaches a Span or Baggage
+        to the context immutably
+    end note
+    otelCtx --> caller : ContextInterface (new copy)
+    deactivate otelCtx
+
+    caller -> otelCtx : activate()
+    activate otelCtx
+    note right of otelCtx
+        Makes context current via storage.
+        This is the sole mutation point.
+    end note
+    otelCtx --> caller : ScopeInterface
+    deactivate otelCtx
+    activate otelScope
+
+    caller -> otelCtx : get(ContextKeyInterface)
+    activate otelCtx
+    otelCtx --> caller : mixed (value stored at key)
+    deactivate otelCtx
+
+    caller -> otelScope : detach()
+    note right of otelScope
+        Ends active period,
+        restores previous context
+    end note
+    otelScope --> caller : void
+    deactivate otelScope
+
+end group
+
+' =========================================================
+' SCENARIO F: DDTrace Scope Lifecycle
+' =========================================================
+group F: DDTrace Scope Lifecycle [explicit active-span stack]
+
+    caller -> scopeMgr : activate(Span, finishSpanOnClose=true)
+    activate scopeMgr
+    note right of scopeMgr
+        Pushes span onto the active stack.
+        Distinct from OTel ScopeInterface.
+    end note
+    scopeMgr --> caller : Scope (DDTrace\\Scope)
+    deactivate scopeMgr
+    activate ddScope
+
+    caller -> scopeMgr : getActive()
+    activate scopeMgr
+    scopeMgr --> caller : ?Scope (top of stack)
+    deactivate scopeMgr
+
+    caller -> tracer : getRootScope()
+    activate tracer
+    note right of tracer
+        Returns root Scope saved by
+        startRootSpan() (unlike startActiveSpan())
+    end note
+    tracer --> caller : ?Scope
+    deactivate tracer
+
+    caller -> ddScope : close()
+    note right of ddScope
+        Pops from active stack;
+        optionally finishes the span
+    end note
+    ddScope --> caller : void
+    deactivate ddScope
+
+end group
+
+' =========================================================
+' SCENARIO B: Outbound Propagation (Inject)
+' =========================================================
+group B: Outbound Propagation — Inject [x-datadog-* headers]
+
+    caller -> tracer : getScopeManager()
+    activate tracer
+    tracer --> caller : ScopeManager
+    deactivate tracer
+
+    caller -> scopeMgr : getActive()
+    activate scopeMgr
+    scopeMgr --> caller : ?Scope
+    deactivate scopeMgr
+
+    caller -> ddScope : getSpan()
+    activate ddScope
+    ddScope --> caller : SpanInterface
+    deactivate ddScope
+
+    caller -> spanCtx : getContext()
+    activate spanCtx
+    spanCtx --> caller : SpanContext (DDTrace\\Contracts\\SpanContext)
+    deactivate spanCtx
+
+    caller -> tracer : inject(spanContext, Formats::HTTP_HEADERS, &$carrier)
+    activate tracer
+    tracer -> textMap : inject(spanContext, &$carrier)\n[dispatch by format key]
+    activate textMap
+
+    textMap -> textMap : carrier['x-datadog-trace-id'] = spanContext->traceId
+    textMap -> textMap : carrier['x-datadog-parent-id'] = spanContext->spanId
+    textMap -> textMap : carrier['x-datadog-sampling-priority'] = propagatedPrioritySampling
+    textMap -> textMap : carrier['x-datadog-origin'] = spanContext->origin
+    textMap -> textMap : carrier['ot-baggage-{key}'] = baggageItem\n(for each baggage item)
+
+    textMap --> tracer : void
+    deactivate textMap
+    tracer --> caller : void (carrier populated)
+    deactivate tracer
+
+end group
+
+' =========================================================
+' SCENARIO C: Inbound Propagation (Extract)
+' =========================================================
+group C: Inbound Propagation — Extract [distributed trace context]
+
+    caller -> tracer : extract(Formats::HTTP_HEADERS, $carrier)
+    activate tracer
+    tracer -> textMap : extract($carrier)\n[dispatch by format key]
+    activate textMap
+
+    textMap -> textMap : read x-datadog-trace-id
+    textMap -> textMap : read x-datadog-parent-id
+    textMap -> textMap : read x-datadog-sampling-priority
+    textMap -> textMap : read x-datadog-origin
+    textMap -> textMap : read ot-baggage-* items
+
+    textMap -> spanCtx : new SpanContext(\n  traceId, spanId, parentId,\n  baggageItems,\n  isDistributedTracingActivationContext=true\n)
+    activate spanCtx
+    note right of spanCtx
+        isDistributedTracingActivationContext=true
+        signals distributed (remote) context
+    end note
+    spanCtx --> textMap : SpanContext
+    deactivate spanCtx
+
+    textMap --> tracer : SpanContext
+    deactivate textMap
+    tracer --> caller : ?SpanContext
+    deactivate tracer
+
+end group
+
+' =========================================================
+' SCENARIO D: OTel SpanContext Creation
+' =========================================================
+group D: OTel SpanContext Creation [bridge DDTrace ↔ OTel]
+
+    caller -> spanCtx : SpanContext::createFromRemoteParent(\n  traceId, spanId, traceFlags, ?traceState\n)
+    activate spanCtx
+    note right of spanCtx : isRemote = true
+    spanCtx --> caller : SpanContextInterface
+    deactivate spanCtx
+
+    caller -> spanCtx : SpanContext::createFromLocalSpan(\n  SpanData, sampled, ?traceId, ?spanId\n)
+    activate spanCtx
+    note right of spanCtx
+        Bridges DDTrace\\SpanData internal
+        span to OTel SpanContextInterface
+    end note
+    spanCtx --> caller : SpanContextInterface
+    deactivate spanCtx
+
+    caller -> spanCtx : SpanContext::getInvalid()
+    activate spanCtx
+    spanCtx --> caller : SpanContextInterface (NOOP)
+    deactivate spanCtx
+
+end group
+
+@enduml

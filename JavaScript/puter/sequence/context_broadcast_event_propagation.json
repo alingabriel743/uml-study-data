@@ -1,0 +1,93 @@
+{
+  "scope": "broadcast_event_propagation",
+  "title": "Broadcast Event Propagation Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "EventSource",
+    "EventService",
+    "BroadcastService (backend)",
+    "Redis",
+    "WebhookPeer",
+    "BroadcastService (GUI)",
+    "AppIframe"
+  ],
+  "interaction_flow": [
+    "EventSource → EventService: emit('outer.*', data, meta)",
+    "EventService → EventService: match listeners by prefix (outer.*)",
+    "EventService → BroadcastService(backend): outBroadcastEventHandler(key, data, meta) [registered via svc_event.on('outer.*', ...)]",
+    "BroadcastService(backend) → BroadcastService(backend): guard — if meta.from_outside return early",
+    "BroadcastService(backend) → BroadcastService(backend): #normalizeMeta(meta) → safeMeta",
+    "BroadcastService(backend) → Redis: #publishWebhookEventsToRedis([{key,data,meta}]) [filters only outer.pub / outer.pub.*]",
+    "Redis → Redis: publish('broadcast.webhook.events', {sourceId, events})",
+    "BroadcastService(backend) → BroadcastService(backend): #enqueueOutboundEvent({key,data,meta})",
+    "BroadcastService(backend) → BroadcastService(backend): #createDedupKey(event) → JSON.stringify(event)",
+    "BroadcastService(backend) → BroadcastService(backend): outboundEventsByDedupKey.set(key, event)",
+    "BroadcastService(backend) → BroadcastService(backend): #scheduleOutboundFlush() — setTimeout(#flushOutboundEvents, outboundFlushMs)",
+    "note: flush timer fires after outboundFlushMs (default 2000-5000ms)",
+    "BroadcastService(backend) → BroadcastService(backend): #flushOutboundEvents() — collect events, clear map",
+    "loop [for each webhookPeer in #webhookPeers]",
+    "BroadcastService(backend) → BroadcastService(backend): #sendWebhookToPeer(peer_config, events)",
+    "BroadcastService(backend) → BroadcastService(backend): sign payload HMAC-SHA256(timestamp.nonce.rawBody)",
+    "BroadcastService(backend) → WebhookPeer: POST /broadcast/webhook [headers: X-Broadcast-Peer-Id, X-Broadcast-Timestamp, X-Broadcast-Nonce, X-Broadcast-Signature]",
+    "WebhookPeer → BroadcastService(backend): HTTP 200 {ok:true}",
+    "end loop",
+    "--- Incoming webhook path ---",
+    "WebhookPeer → BroadcastService(backend): POST /broadcast/webhook (incoming from remote peer)",
+    "BroadcastService(backend) → BroadcastService(backend): #handleWebhookRequest(req, res)",
+    "BroadcastService(backend) → BroadcastService(backend): validate timestamp window (±300s/60s)",
+    "BroadcastService(backend) → BroadcastService(backend): #isNonceReplayForPeer({timestamp,nonce,peerId})",
+    "BroadcastService(backend) → BroadcastService(backend): verify HMAC signature (timingSafeEqual)",
+    "BroadcastService(backend) → Redis: #publishWebhookEventsToRedis(incomingEvents)",
+    "BroadcastService(backend) → EventService: #emitIncomingEventsSequentially(events) → svcEvent.emit(key, data, {from_outside:true})",
+    "--- Redis pub/sub path (same-cluster replicas) ---",
+    "Redis → BroadcastService(backend): message on 'broadcast.webhook.events' channel",
+    "BroadcastService(backend) → BroadcastService(backend): #handleRedisPubSubMessage — skip if sourceId == self",
+    "BroadcastService(backend) → EventService: #emitIncomingEventsSequentially(events) → svcEvent.emit(key, data, {from_outside:true})",
+    "--- GUI broadcast path ---",
+    "BroadcastService(GUI): sendBroadcast(name, data, {sendToNewAppInstances})",
+    "BroadcastService(GUI) → AppIframe: postMessage({msg:'broadcast', name, data}, '*') [to each .window-app-iframe[data-appUsesSDK=true]]",
+    "opt [sendToNewAppInstances == true]",
+    "BroadcastService(GUI) → BroadcastService(GUI): broadcastsToSendToNewAppInstances.set(name, data)",
+    "end opt",
+    "BroadcastService(GUI): sendSavedBroadcastsTo(appInstanceID) → postMessage each saved broadcast to specific iframe"
+  ],
+  "key_relationships": [
+    "BroadcastService(backend) extends BaseService",
+    "BroadcastService(backend) depends_on EventService [via services.get('event')]",
+    "BroadcastService(backend) depends_on redisClient [singleton, for pub/sub]",
+    "BroadcastService(backend) depends_on axios [for outbound webhook POST]",
+    "EventService extends BaseService",
+    "EventService uses Context.arun for async listener isolation",
+    "Emitter (putility) uses EmitterFeature mixin — adds .on()/.emit()/.on_all()",
+    "BroadcastService(GUI) extends Service (GUI Service base)",
+    "IPCService(GUI) extends Service — manages InternalConnection objects between processes",
+    "InternalConnection.send(data) → svc_process.get_by_uuid(target) → process.send(channel, data)"
+  ],
+  "event_key_patterns": {
+    "outbound_trigger": "outer.*  (wildcard — any outer.X event triggers outBroadcastEventHandler)",
+    "redis_filter": "outer.pub or outer.pub.*  (only pub events forwarded via Redis pub/sub)",
+    "incoming_guard": "meta.from_outside == true prevents re-broadcast loops"
+  },
+  "security_model": {
+    "hmac_algo": "SHA-256",
+    "signed_payload": "{timestamp}.{nonce}.{rawBody}",
+    "headers": ["X-Broadcast-Peer-Id", "X-Broadcast-Timestamp", "X-Broadcast-Nonce", "X-Broadcast-Signature"],
+    "replay_protection": "timestamp window (#webhookReplayWindowSeconds=300s) + monotonic nonce per peer"
+  },
+  "important_notes": [
+    "outboundFlushMs default is 2000ms (config) falling back to 5000ms — events are batched, not sent immediately",
+    "Dedup: events are keyed by JSON.stringify(event) before flush — duplicates within a flush window are collapsed",
+    "Redis pub/sub mirrors all outer.pub events to same-cluster replicas (sourceId prevents self-echo)",
+    "GUI BroadcastService is entirely separate from backend BroadcastService — GUI uses postMessage to iframes",
+    "IPCService (GUI) is not in the outbound broadcast path — it handles internal process-to-process comms",
+    "BroadcastService(backend) registers route '__on_install.routes' → POST /broadcast/webhook"
+  ],
+  "source_files_analyzed": [
+    "src/backend/src/modules/broadcast/BroadcastService.js",
+    "src/backend/src/services/EventService.js",
+    "src/putility/src/libs/event.js",
+    "src/putility/src/features/EmitterFeature.js",
+    "src/gui/src/services/BroadcastService.js",
+    "src/gui/src/services/IPCService.js"
+  ]
+}

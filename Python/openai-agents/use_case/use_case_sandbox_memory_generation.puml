@@ -1,0 +1,134 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam actor {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam usecase {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+    ArrowColor #495057
+}
+skinparam rectangle {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+    FontColor #212529
+}
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #F9A825
+}
+
+title Sandbox Memory Generation and Persistence
+
+left to right direction
+
+' ── Initiating actors (left side) ──────────────────────────────
+actor "Sandbox Runtime" as SandboxRuntime
+actor "Sandbox Session\n(BaseSandboxSession)\npre-stop hook" as Session
+
+' ── Supporting / system actors (right side) ─────────────────────
+actor "Memory Worker\n(asyncio.Task)" as MemoryWorker
+actor "Phase 1 Model\n(gpt-5.4-mini)" as PhaseOneModel
+actor "Phase 2 Model\n(gpt-5.4 + reasoning=medium)" as PhaseTwoModel
+actor "Sandbox Memory\nStorage (filesystem)" as Storage
+
+rectangle "Sandbox Memory Generation Pipeline" {
+
+    ' ── Lifecycle management ──────────────────────────────────────
+    usecase "Get or Create\nMemory Manager" as UC_Factory
+    note right of UC_Factory
+      Keyed by (memories_dir, sessions_dir).
+      Raises UserError on conflicting configs
+      or overlapping layout directories.
+    end note
+
+    usecase "Ensure Memory\nDirectory Layout" as UC_Layout
+
+    ' ── Rollout ingestion ─────────────────────────────────────────
+    usecase "Enqueue Run Result" as UC_Enqueue
+    usecase "Write Rollout to\nsessions_dir/<id>.jsonl" as UC_WriteJSONL
+
+    ' ── Phase 1 processing ────────────────────────────────────────
+    usecase "Flush & Drain\nMemory Queue\n(pre-stop)" as UC_Flush
+    usecase "Process Rollout File\n(Phase 1)" as UC_Phase1
+    usecase "Extract Per-Rollout\nMemory & Summary\n(RolloutExtractionArtifacts)" as UC_Extract
+    usecase "Write raw_memories/\n<id>.md & rollout_summaries/\n<id>_<slug>.md" as UC_WritePhase1
+
+    ' ── Phase 2 consolidation ─────────────────────────────────────
+    usecase "Build Phase 2\nInput Selection\n(PhaseTwoInputSelection)" as UC_Selection
+    usecase "Consolidate Agent\nMemory (Phase 2)" as UC_Phase2
+    usecase "Persist Phase 2\nResults to Filesystem" as UC_WritePhase2
+
+}
+
+' ── Actor → use case associations ───────────────────────────────
+SandboxRuntime  --> UC_Enqueue
+SandboxRuntime  --> UC_Factory
+
+Session         --> UC_Flush
+
+MemoryWorker    --> UC_Phase1
+
+PhaseOneModel   --> UC_Extract
+
+PhaseTwoModel   --> UC_Phase2
+
+Storage         --> UC_WriteJSONL
+Storage         --> UC_WritePhase1
+Storage         --> UC_WritePhase2
+Storage         --> UC_Layout
+Storage         --> UC_Selection
+
+' ── Include relationships (mandatory sub-flows) ─────────────────
+UC_WriteJSONL   ..> UC_Layout      : <<include>>
+
+UC_Flush        ..> UC_Phase1      : <<include>>
+UC_Phase1       ..> UC_Extract     : <<include>>
+UC_Extract      ..> UC_WritePhase1 : <<include>>
+
+UC_Flush        ..> UC_Phase2      : <<include>>
+UC_Phase2       ..> UC_Selection   : <<include>>
+UC_Phase2       ..> UC_WritePhase2 : <<include>>
+
+' ── Notes for key business rules ────────────────────────────────
+note bottom of UC_Phase1
+  MemoryWorker reads JSONL, renders
+  phase-1 prompt, runs SandboxAgent
+  via Runner.run(). Excluded item types:
+  compaction, image_generation_call, reasoning.
+  rollout_id must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$
+end note
+
+note bottom of UC_Selection
+  Sorted by updated_at desc.
+  Capped at max_raw_memories_for_consolidation
+  (default 256, max 4096).
+  Older rollouts pruned when limit exceeded.
+  Persists phase_two_selection.json.
+end note
+
+note bottom of UC_WritePhase2
+  Writes MEMORY.md (consolidated agent memory)
+  and memory_summary.md via Phase 2 SandboxAgent.
+  flush() is idempotent via _stopped flag.
+end note
+
+@enduml

@@ -1,0 +1,393 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #6C757D
+    GroupBackgroundColor #F1F3F5
+    GroupBorderColor #868E96
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Container Sandbox Sessions (Docker / Modal / E2B)
+
+actor Caller as caller
+
+box "Docker Backend" #EBF5FB
+    participant "DockerSandboxClient" as dockerClient
+    participant "DockerSandboxSession\n(BaseSandboxSession)" as dockerSession
+    participant "docker.Container\n(DockerSDK)" as dockerSDK
+end box
+
+box "Modal Backend" #EBF8EE
+    participant "ModalSandboxClient" as modalClient
+    participant "ModalSandboxSession\n(BaseSandboxSession)" as modalSession
+    participant "modal.Sandbox / modal.App\n(ModalSDK)" as modalSDK
+end box
+
+box "E2B Backend" #FEF9E7
+    participant "E2BSandboxClient" as e2bClient
+    participant "E2BSandboxSession\n(BaseSandboxSession)" as e2bSession
+    participant "_E2BSandboxFactoryAPI\n(E2BSDK)" as e2bSDK
+end box
+
+' ─────────────────────────────────────────────────────────────
+== DOCKER: CREATE & START ==
+' ─────────────────────────────────────────────────────────────
+
+caller -> dockerClient : create(manifest, options\n[image, exposed_ports])
+activate dockerClient
+
+dockerClient -> dockerSDK : _create_container(image, manifest,\nexposed_ports, session_id)
+activate dockerSDK
+dockerSDK --> dockerClient : container handle
+deactivate dockerSDK
+
+dockerClient -> dockerSDK : container.start()
+activate dockerSDK
+dockerSDK --> dockerClient : ok
+deactivate dockerSDK
+
+dockerClient -> dockerSession ** : new DockerSandboxSession\n(docker_client, container, state)
+dockerClient --> caller : SandboxSession
+deactivate dockerClient
+
+caller -> dockerSession : start()  [BaseSandboxSession.start()]
+activate dockerSession
+
+dockerSession -> dockerSession : _ensure_backend_started()
+note right: container.reload() then\ncontainer.start() if not running
+dockerSession -> dockerSDK : container.reload()
+activate dockerSDK
+dockerSDK --> dockerSession : current state
+deactivate dockerSDK
+
+opt container not running
+    dockerSession -> dockerSDK : container.start()
+    activate dockerSDK
+    dockerSDK --> dockerSession : ok
+    deactivate dockerSDK
+end
+
+dockerSession -> dockerSession : _probe_workspace_root_for_preserved_resume()
+dockerSession -> dockerSession : _prepare_backend_workspace()
+note right: no-op for Docker
+dockerSession -> dockerSession : _ensure_runtime_helpers()
+dockerSession -> dockerSession : _start_workspace()\n[snapshot restore OR manifest apply]
+dockerSession -> dockerSession : _after_start()\n[_workspace_root_ready = True]
+dockerSession --> caller : session ready
+deactivate dockerSession
+
+' ─────────────────────────────────────────────────────────────
+== DOCKER: EXEC ==
+' ─────────────────────────────────────────────────────────────
+
+caller -> dockerSession : exec(*command, timeout, shell, user)
+activate dockerSession
+
+dockerSession -> dockerSession : _exec_internal()
+dockerSession -> dockerSession : _exec_internal_for_user()
+dockerSession -> dockerSession : _exec_run(cmd, workdir, user, timeout)
+dockerSession -> dockerSDK : exec_create + exec_start\n(socket-based via _DockerExecSocket)
+activate dockerSDK
+dockerSDK --> dockerSession : stdout / stderr stream
+deactivate dockerSDK
+
+dockerSession --> caller : ExecResult(stdout, stderr, exit_code)
+deactivate dockerSession
+
+' ─────────────────────────────────────────────────────────────
+== DOCKER: STOP & SHUTDOWN ==
+' ─────────────────────────────────────────────────────────────
+
+caller -> dockerSession : stop()  [persist workspace]
+activate dockerSession
+
+dockerSession -> dockerSession : _before_stop() → pty_terminate_all()
+dockerSession -> dockerSession : _persist_snapshot()\n[tar / archive workspace]
+dockerSession -> dockerSDK : _workspace_archive_stream()\n[docker archive API]
+activate dockerSDK
+dockerSDK --> dockerSession : archive stream
+deactivate dockerSDK
+
+dockerSession --> caller : snapshot persisted
+deactivate dockerSession
+
+caller -> dockerClient : delete(session)
+activate dockerClient
+dockerClient -> dockerSession : shutdown()
+activate dockerSession
+
+dockerSession -> dockerSession : _shutdown_backend()
+dockerSession -> dockerSDK : container.stop()
+activate dockerSDK
+dockerSDK --> dockerSession : ok
+deactivate dockerSDK
+dockerSession -> dockerSDK : container.remove()
+activate dockerSDK
+dockerSDK --> dockerSession : ok
+deactivate dockerSDK
+
+dockerSession --> dockerClient : done
+deactivate dockerSession
+dockerClient --> caller : deleted
+deactivate dockerClient
+
+' ─────────────────────────────────────────────────────────────
+== MODAL: CREATE & START ==
+' ─────────────────────────────────────────────────────────────
+
+caller -> modalClient : create(manifest, options\n[app_name, image, timeout,\nworkspace_persistence])
+activate modalClient
+
+modalClient -> modalSession ** : from_state(state, image, sandbox)
+modalClient -> modalSession : _ensure_sandbox()
+activate modalSession
+
+alt resume: sandbox_id exists
+    modalSession -> modalSDK : _call_modal(modal.Sandbox.from_id, sandbox_id)
+    activate modalSDK
+    modalSDK --> modalSession : sandbox handle
+    deactivate modalSDK
+    modalSession -> modalSDK : _call_modal(sandbox.poll)
+    activate modalSDK
+    modalSDK --> modalSession : running status
+    deactivate modalSDK
+    note right: reuse if still running;\nclear sandbox_id if dead
+else fresh: no sandbox_id (or dead)
+    modalSession -> modalSDK : _call_modal(modal.App.lookup,\napp_name, create_if_missing=True)
+    activate modalSDK
+    modalSDK --> modalSession : app handle
+    deactivate modalSDK
+    modalSession -> modalSDK : modal.Sandbox.create(app, image, ...)
+    activate modalSDK
+    modalSDK --> modalSession : sandbox handle
+    deactivate modalSDK
+    modalSession -> modalSession : state.sandbox_id = sandbox.object_id
+end
+
+modalSession --> modalClient : sandbox ready
+deactivate modalSession
+
+modalClient --> caller : SandboxSession
+deactivate modalClient
+
+caller -> modalSession : start()  [BaseSandboxSession.start()]
+activate modalSession
+
+modalSession -> modalSession : _ensure_backend_started()\n→ _ensure_sandbox()
+note right: _call_modal prefers .aio\non every SDK method; falls back\nto loop.run_in_executor
+modalSession -> modalSession : _prepare_backend_workspace()\nexec('mkdir -p <workspace_root>')
+modalSession -> modalSDK : _call_modal(sandbox.exec,\n['mkdir', '-p', workspace_root])
+activate modalSDK
+modalSDK --> modalSession : ok
+deactivate modalSDK
+
+modalSession -> modalSession : _start_workspace()\n[snapshot restore OR manifest apply]
+modalSession -> modalSession : _after_start()\n[_running = True]
+modalSession --> caller : session ready
+deactivate modalSession
+
+' ─────────────────────────────────────────────────────────────
+== MODAL: EXEC ==
+' ─────────────────────────────────────────────────────────────
+
+caller -> modalSession : exec(*command, timeout, shell, user)
+activate modalSession
+
+modalSession -> modalSession : _exec_internal(cmd, workdir, timeout, user)
+modalSession -> modalSDK : _call_modal(sandbox.exec, cmd_list)\n[prefers .aio, fallback run_in_executor]
+activate modalSDK
+modalSDK --> modalSession : ContainerProcess\n(stdout/stderr streams)
+deactivate modalSDK
+
+modalSession --> caller : ExecResult(stdout, stderr, exit_code)
+deactivate modalSession
+
+' ─────────────────────────────────────────────────────────────
+== MODAL: STOP & SHUTDOWN ==
+' ─────────────────────────────────────────────────────────────
+
+caller -> modalSession : stop()  [persist workspace]
+activate modalSession
+
+modalSession -> modalSession : persist_workspace()
+note right: workspace_persistence:\n'tar' | 'snapshot_filesystem'\n| 'snapshot_directory'
+
+alt workspace_persistence = snapshot_filesystem
+    modalSession -> modalSDK : _call_modal(sandbox.snapshot_filesystem())
+    activate modalSDK
+    modalSDK --> modalSession : snapshot id
+    deactivate modalSDK
+else workspace_persistence = tar
+    modalSession -> modalSDK : _call_modal(sandbox.exec, tar_cmd)
+    activate modalSDK
+    modalSDK --> modalSession : archive stream
+    deactivate modalSDK
+end
+
+modalSession --> caller : snapshot persisted
+deactivate modalSession
+
+caller -> modalClient : delete(session)
+activate modalClient
+modalClient -> modalSession : shutdown()
+activate modalSession
+
+modalSession -> modalSession : _shutdown_backend()
+
+alt live sandbox handle available
+    modalSession -> modalSDK : _call_modal(sandbox.terminate)
+    activate modalSDK
+    modalSDK --> modalSession : terminated
+    deactivate modalSDK
+else no live handle
+    modalSession -> modalSDK : _call_modal(modal.Sandbox.from_id, sandbox_id)
+    activate modalSDK
+    modalSDK --> modalSession : sandbox handle
+    deactivate modalSDK
+    modalSession -> modalSDK : _call_modal(sandbox.terminate)
+    activate modalSDK
+    modalSDK --> modalSession : terminated
+    deactivate modalSDK
+end
+
+modalSession -> modalSession : clear sandbox_id
+modalSession --> modalClient : done
+deactivate modalSession
+modalClient --> caller : deleted
+deactivate modalClient
+
+' ─────────────────────────────────────────────────────────────
+== E2B: CREATE & START ==
+' ─────────────────────────────────────────────────────────────
+
+caller -> e2bClient : create(manifest, options\n[template, timeout, sandbox_type,\nworkspace_persistence])
+activate e2bClient
+
+e2bClient -> e2bSDK : _import_sandbox_class(sandbox_type)
+note right: lazy import — E2B SDK\nis an optional dependency
+activate e2bSDK
+e2bSDK --> e2bClient : SandboxClass
+deactivate e2bSDK
+
+e2bClient -> e2bSDK : _sandbox_create(SandboxClass, template,\ntimeout, metadata, envs)
+activate e2bSDK
+note right: sandbox is live immediately\nafter create(); no deferred start
+e2bSDK --> e2bClient : sandbox handle (already running)
+deactivate e2bSDK
+
+e2bClient -> e2bSession ** : new E2BSandboxSession(sandbox, state)
+e2bClient --> caller : SandboxSession
+deactivate e2bClient
+
+caller -> e2bSession : start()  [BaseSandboxSession.start()]
+activate e2bSession
+
+e2bSession -> e2bSession : _ensure_backend_started()
+note right: no-op — sandbox already\ncreated and live from create()
+
+e2bSession -> e2bSession : _prepare_backend_workspace()
+
+alt fresh session
+    e2bSession -> e2bSession : _ensure_workspace_root()
+    e2bSession -> e2bSession : _prepare_workspace_root_for_exec()
+else preserved resume
+    e2bSession -> e2bSession : _prepare_workspace_root_for_exec()\n[only if not workspace_root_ready]
+end
+
+e2bSession -> e2bSession : _start_workspace()\n[snapshot restore OR manifest apply]
+e2bSession -> e2bSession : _after_start()\n[reinstall runtime helpers\nif sandbox_id changed]
+e2bSession --> caller : session ready
+deactivate e2bSession
+
+' ─────────────────────────────────────────────────────────────
+== E2B: EXEC ==
+' ─────────────────────────────────────────────────────────────
+
+caller -> e2bSession : exec(*command, timeout, shell, user)
+activate e2bSession
+
+e2bSession -> e2bSession : _exec_internal(cmd, workdir, timeout, user)
+e2bSession -> e2bSDK : _sandbox_run_command(sandbox, cmd,\ntimeout, cwd, envs, user)
+activate e2bSDK
+e2bSDK -> e2bSDK : sandbox.commands.run(command, ...)
+e2bSDK --> e2bSession : CommandResult (stdout, stderr, exit_code)
+deactivate e2bSDK
+
+e2bSession --> caller : ExecResult(stdout, stderr, exit_code)
+deactivate e2bSession
+
+' ─────────────────────────────────────────────────────────────
+== E2B: STOP & SHUTDOWN ==
+' ─────────────────────────────────────────────────────────────
+
+caller -> e2bSession : stop()  [persist workspace]
+activate e2bSession
+
+e2bSession -> e2bSession : persist_workspace()
+note right: workspace_persistence:\n'tar' | 'snapshot'
+
+alt workspace_persistence = snapshot
+    e2bSession -> e2bSDK : _sandbox_create_snapshot(sandbox)\n→ sandbox.create_snapshot()
+    activate e2bSDK
+    e2bSDK --> e2bSession : snapshot id
+    deactivate e2bSDK
+else workspace_persistence = tar
+    e2bSession -> e2bSDK : sandbox.commands.run(tar_cmd)
+    activate e2bSDK
+    e2bSDK --> e2bSession : archive bytes
+    deactivate e2bSDK
+end
+
+e2bSession --> caller : snapshot persisted
+deactivate e2bSession
+
+caller -> e2bSession : shutdown()
+activate e2bSession
+
+e2bSession -> e2bSession : _shutdown_backend()
+
+alt pause_on_exit = True
+    e2bSession -> e2bSDK : _sandbox_pause(sandbox)\n→ sandbox.pause()
+    activate e2bSDK
+    e2bSDK --> e2bSession : paused (restorable)
+    deactivate e2bSDK
+    note right: sandbox is paused and\ncan be resumed later
+else pause_on_exit = False
+    e2bSession -> e2bSDK : _sandbox_kill(sandbox)\n→ sandbox.kill()
+    activate e2bSDK
+    e2bSDK --> e2bSession : killed
+    deactivate e2bSDK
+end
+
+e2bSession --> caller : done
+deactivate e2bSession
+
+@enduml

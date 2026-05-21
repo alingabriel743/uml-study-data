@@ -1,0 +1,159 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Anonymous Agent Text Generation Flow
+
+actor Client
+participant "agent()\n[functions.php]" as agentHelper
+participant "AnonymousAgent" as agent
+participant "Promptable\n[trait]" as promptable
+participant "Ai\n[facade]" as aiFacade
+participant "AiManager" as aiManager
+participant "TextProvider\n[e.g. AnthropicProvider]" as provider
+
+== Agent Creation ==
+
+Client -> agentHelper : agent(instructions, messages, tools)
+activate agentHelper
+
+agentHelper -> agent : new AnonymousAgent(instructions, messages, tools)
+activate agent
+agent --> agentHelper : AnonymousAgent instance
+deactivate agent
+
+agentHelper --> Client : AnonymousAgent\n(implements Agent, Conversational, HasTools\n+ uses Promptable)
+deactivate agentHelper
+
+== Text Prompt Invocation ==
+
+Client -> agent : prompt(prompt, attachments?, provider?, model?, timeout?)
+activate agent
+
+agent -> promptable : withModelFailover(callback, provider, model)
+activate promptable
+
+promptable -> promptable : getProvidersAndModels(provider, model)
+activate promptable
+
+note over promptable
+  Resolution order:
+  1. Explicit $provider arg
+  2. provider() method on agent
+  3. #[Provider] PHP attribute
+  4. config('ai.default')
+end note
+
+promptable -> promptable : Provider::formatProviderAndModelList(provider, model)
+promptable --> promptable : [providerName => model|null, ...]
+deactivate promptable
+
+== Provider Resolution Loop (with Failover) ==
+
+loop for each resolved provider
+
+    promptable -> aiFacade : textProviderFor(agent, providerName)
+    activate aiFacade
+
+    aiFacade -> aiManager : textProviderFor(Agent, name?)
+    activate aiManager
+
+    aiManager -> aiManager : textProvider(name)\n[via MultipleInstanceManager::instance()]
+    note right of aiManager
+      Validates instance implements
+      TextProvider contract —
+      throws LogicException if not
+    end note
+
+    aiManager -> aiManager : hasFakeGatewayFor(agent)
+    note right of aiManager
+      If faked via Ai::fakeAgent(),
+      clones provider and swaps in
+      FakeTextGateway
+    end note
+
+    aiManager --> aiFacade : TextProvider instance
+    deactivate aiManager
+
+    aiFacade --> promptable : TextProvider
+    deactivate aiFacade
+
+    opt model is null
+        promptable -> promptable : getDefaultModelFor(provider)
+        note over promptable
+          Checks PHP attributes:
+          #[UseSmartestModel] → provider.smartestTextModel()
+          #[UseCheapestModel] → provider.cheapestTextModel()
+          default → provider.defaultTextModel()
+        end note
+    end
+
+    promptable -> promptable : getTimeout(timeout)
+    note right of promptable
+      Resolves from:
+      1. $timeout arg
+      2. timeout() method
+      3. #[Timeout] attribute
+      4. Default: 60s
+    end note
+
+    == Prompt Execution ==
+
+    promptable -> provider : callback(provider, model)\n→ provider.prompt(AgentPrompt)
+    activate provider
+
+    note over provider
+      Constructs AgentPrompt:
+      new AgentPrompt(agent, prompt,
+        attachments, provider, model, timeout)
+    end note
+
+    alt Success
+        provider --> promptable : AgentResponse
+        deactivate provider
+        promptable --> agent : AgentResponse
+        agent --> Client : AgentResponse
+    else FailoverableException
+        provider --> promptable : FailoverableException
+        deactivate provider
+        promptable -> promptable : event(AgentFailedOver\n  (agent, provider, model, exception))
+        note right of promptable : Fires failover event\nand continues to next provider
+    end
+
+end
+
+alt All providers exhausted
+    promptable --> agent : throw RuntimeException\n('No AI providers were configured.')
+    deactivate promptable
+    agent --> Client : RuntimeException
+    deactivate agent
+end
+
+@enduml

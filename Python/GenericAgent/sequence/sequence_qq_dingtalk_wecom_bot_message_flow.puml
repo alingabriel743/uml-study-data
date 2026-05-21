@@ -1,0 +1,242 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #495057
+    LifeLineBackgroundColor #E9ECEF
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #E9ECEF22
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #6C757D
+    DividerFontColor #212529
+}
+skinparam NoteBackgroundColor #FFF3CD
+skinparam NoteBorderColor #FFC107
+
+title QQ / DingTalk / WeCom Bot Message Flow
+
+' ─── Participants ───────────────────────────────────────────
+actor       "User"                    as User
+participant "QQPlatform\n(botpy SDK)" as QQPlat   #D4EDDA
+participant "QQBot\n(botpy.Client)"   as QQBot    #D4EDDA
+participant "QQApp\n(AgentChatMixin)" as QQApp    #C3E6CB
+
+participant "DingTalkPlatform\n(dingtalk_stream)" as DTPlat   #D1ECF1
+participant "_DingTalkHandler\n(CallbackHandler)" as DTHandler #D1ECF1
+participant "DingTalkApp\n(AgentChatMixin)"        as DTApp    #BEE5EB
+
+participant "WeComPlatform\n(WSClient)"       as WCPlat  #FFF3CD
+participant "WeComApp\n(AgentChatMixin)"      as WCApp   #FFEEBA
+
+participant "AgentChatMixin\n(chatapp_common)" as Mixin  #E2D9F3
+participant "GeneraticAgent\n(daemon thread)"  as Agent  #F8D7DA
+
+' ═══════════════════════════════════════════════════════════════
+== QQ Flow ==
+' ═══════════════════════════════════════════════════════════════
+
+User  -> QQPlat   : send group @ mention\nor direct message
+
+alt Group mention (GroupMessage)
+    QQPlat -> QQBot : on_group_at_message_create(GroupMessage)
+else Direct message (C2CMessage)
+    QQPlat -> QQBot : on_c2c_message_create(C2CMessage)
+end
+
+activate QQBot
+QQBot -> QQApp : on_message(data, is_group=True/False)
+deactivate QQBot
+
+activate QQApp
+note right of QQApp
+  Dedup: check PROCESSED_IDS
+  deque(maxlen=1000) by msg_id
+  Extract: content, user_id,
+  chat_id (group_openid / user_openid)
+end note
+
+QQApp -> QQApp : public_access(ALLOWED) guard
+
+alt Command (starts with /)
+    QQApp -> Mixin : handle_command(chat_id, content, msg_id, is_group)
+    activate Mixin
+    Mixin --> QQApp : command result
+    deactivate Mixin
+    QQApp -> QQApp : send_text(chat_id, result)
+    QQApp -> QQPlat : post_group_message / post_c2c_message\n(split_text chunks, msg_seq counter)
+else Regular message
+    QQApp -> Mixin : asyncio.create_task → run_agent\n(chat_id, content, msg_id, is_group)
+    activate Mixin
+    Mixin -> QQApp  : send_text(chat_id, "思考中...")
+    QQApp  -> QQPlat : post_group_message / post_c2c_message\n(split ≤1500 chars)
+    Mixin -> Agent  : put_task(text, source='qq')
+    activate Agent
+    Agent --> Mixin : deque dq (result queue)
+    loop poll dq every 3 s (asyncio.to_thread)
+        Mixin -> Agent : dq.get(True, 3)
+        alt Q.Empty + still running + ping interval exceeded
+            Mixin -> QQApp : send_text(chat_id, "⏳ 还在处理中...")
+            QQApp -> QQPlat : post_group_message / post_c2c_message
+        else item['done'] received
+            Agent --> Mixin : {"done": response_text}
+            deactivate Agent
+            Mixin -> QQApp  : send_done(chat_id, response_text)
+            QQApp -> QQPlat : post_group_message / post_c2c_message\n(final response, split ≤1500 chars)
+            QQPlat --> User : response delivered
+        end
+    end
+    deactivate Mixin
+end
+deactivate QQApp
+
+' ═══════════════════════════════════════════════════════════════
+== DingTalk Flow ==
+' ═══════════════════════════════════════════════════════════════
+
+User -> DTPlat : send message via DingTalk
+
+DTPlat -> DTHandler : process(message)\n[ChatbotMessage.TOPIC stream callback]
+activate DTHandler
+
+note right of DTHandler
+  Parse: ChatbotMessage.from_dict(message.data)
+  Extract: text.content or
+  extensions.content.recognition
+  sender_id, sender_name,
+  conversationType, conversationId
+end note
+
+DTHandler -> DTApp : on_message(text, sender_id, sender_name,\nconversation_type, conversation_id)
+DTHandler --> DTPlat : AckMessage.STATUS_OK, 'OK'
+deactivate DTHandler
+
+activate DTApp
+DTApp -> DTApp : public_access(ALLOWED) guard
+DTApp -> DTApp : chat_id = "group:{conversationId}"\nor sender_id (1-to-1)
+
+alt Command (starts with /)
+    DTApp -> Mixin : handle_command(chat_id, content)
+    activate Mixin
+    Mixin --> DTApp : command result
+    deactivate Mixin
+    DTApp -> DTApp : send_text(chat_id, result)
+    DTApp -> DTPlat : POST groupMessages/send\nor oToMessages/batchSend (REST API)
+else Regular message
+    DTApp -> Mixin : asyncio.create_task → run_agent\n(chat_id, content) [tracked in background_tasks]
+    activate Mixin
+    Mixin -> DTApp  : send_text(chat_id, "思考中...")
+    activate DTApp
+    DTApp -> DTApp  : _get_access_token()\n[POST oauth2/accessToken, cached until expiry-60s]
+    DTApp -> DTApp  : _send_batch_message(chat_id,\n'sampleMarkdown', {text, title})
+    DTApp -> DTPlat : POST groupMessages/send\nor oToMessages/batchSend
+    deactivate DTApp
+    Mixin -> Agent  : put_task(text, source='dingtalk')
+    activate Agent
+    Agent --> Mixin : deque dq
+    loop poll dq every 3 s (asyncio.to_thread)
+        Mixin -> Agent : dq.get(True, 3)
+        alt Q.Empty + still running + ping interval exceeded
+            Mixin -> DTApp  : send_text(chat_id, "⏳ 还在处理中...")
+            DTApp  -> DTPlat : POST sampleMarkdown API
+        else item['done'] received
+            Agent --> Mixin : {"done": response_text}
+            deactivate Agent
+            Mixin -> DTApp  : send_done(chat_id, response_text)
+            DTApp  -> DTPlat : POST groupMessages/send\nor oToMessages/batchSend\n(final response, split ≤1800 chars)
+            DTPlat --> User  : response delivered
+        end
+    end
+    deactivate Mixin
+end
+deactivate DTApp
+
+' ═══════════════════════════════════════════════════════════════
+== WeCom Flow ==
+' ═══════════════════════════════════════════════════════════════
+
+User -> WCPlat : send text message via WeCom
+
+WCPlat -> WCApp : on_text(frame)\n[WSClient 'message.text' event]
+activate WCApp
+
+note right of WCApp
+  Extract: body from frame.body or frame dict
+  Dedup: PROCESSED_IDS by msgid
+  or chatid+sendertime key
+  Extract: sender_id (from.userid),
+  chat_id (chatid), content (text.content)
+  Store frame in self.chat_frames[chat_id]
+end note
+
+WCApp -> WCApp : public_access(ALLOWED) guard
+
+alt Command (starts with /)
+    WCApp -> Mixin : handle_command(chat_id, content)
+    activate Mixin
+    Mixin --> WCApp : command result
+    deactivate Mixin
+    WCApp -> WCApp  : send_text(chat_id, result)
+    WCApp -> WCPlat : WSClient.reply_stream(frame, req_id,\npart, finish=True)
+else Regular message
+    WCApp -> Mixin : asyncio.create_task → run_agent\n(chat_id, content)
+    activate Mixin
+    Mixin -> WCApp  : send_text(chat_id, "思考中...")
+    WCApp  -> WCPlat : WSClient.reply_stream(frame, req_id,\npart, finish=True)
+    Mixin -> Agent  : put_task(text, source='wecom')
+    activate Agent
+    Agent --> Mixin : deque dq
+    loop poll dq every 3 s (asyncio.to_thread)
+        Mixin -> Agent : dq.get(True, 3)
+        alt Q.Empty + still running + ping interval exceeded
+            Mixin -> WCApp  : send_text(chat_id, "⏳ 还在处理中...")
+            WCApp  -> WCPlat : WSClient.reply_stream(frame, ...)
+        else item['done'] received
+            Agent --> Mixin : {"done": response_text}
+            deactivate Agent
+            Mixin -> WCApp  : send_done(chat_id, response_text)
+            WCApp  -> WCPlat : WSClient.reply_stream(frame, req_id,\nchunks, finish=True)\n(split ≤1200 chars)
+            WCPlat --> User  : response delivered
+        end
+    end
+    deactivate Mixin
+end
+deactivate WCApp
+
+' ─── Shared notes ───────────────────────────────────────────
+note over Agent
+  GeneraticAgent is a shared singleton running
+  on a daemon thread. All frontends share the
+  same instance. put_task() enqueues work and
+  returns a deque used as an async result queue.
+end note
+
+note over Mixin
+  AgentChatMixin.run_agent handles three
+  terminal states:
+  • item['done']  → send_done() + break
+  • running=False → send "⏹️ 已停止"
+  • exception     → send "❌ 错误: {e}"
+end note
+
+@enduml

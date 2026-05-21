@@ -1,0 +1,200 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    GroupBackgroundColor #DEE2E6
+    GroupBorderColor #6C757D
+    NoteBackgroundColor #FFF3CD
+    NoteBorderColor #FFC107
+}
+
+title AppSec Event Handling and Blocking Flow
+
+actor "PHP Framework / SAPI" as sapi
+participant "DDTrace\\UserRequest\n(PHP API)" as userreq
+participant "RequestLifecycle\n(request_lifecycle.c)" as lifecycle
+participant "ddtrace.c\n(Symbol Bridge)" as ddtrace
+participant "AppSec Helper\nDaemon" as daemon
+participant "$blockingFunction\n(PHP callable)" as blockfn
+participant "RootSpanData\n(Span)" as span
+
+== Startup: Listener Registration ==
+
+lifecycle -> ddtrace : dd_trace_user_req_add_listeners(\n  &dd_user_req_listeners)
+note right of ddtrace
+  Listeners registered with priority=-10:
+  _start_user_req, _response_commit,
+  _set_blocking_function, _finish_user_req
+end note
+activate ddtrace
+ddtrace -> ddtrace : _ddtrace_user_req_add_listeners()\n[via dlsym to ddtrace ext]
+deactivate ddtrace
+
+== PHP Request Begin (SAPI RINIT path) ==
+
+sapi -> lifecycle : PHP SAPI RINIT
+activate lifecycle
+lifecycle -> lifecycle : _do_request_begin_php()
+lifecycle -> lifecycle : dd_request_body_buffered(max_body_size)
+lifecycle -> lifecycle : _do_request_begin(rbe_zv)
+deactivate lifecycle
+
+== User Request Begin (DDTrace notify_start path) ==
+
+sapi -> userreq : notify_start(RootSpanData $span,\n  array $data, mixed $body): ?array
+activate userreq
+userreq -> ddtrace : _start_user_req(listener, span,\n  superglob_equiv, rbe_zv)
+activate ddtrace
+note right of ddtrace
+  Stores _cur_req_span and
+  _superglob_equiv for this request
+end note
+ddtrace -> lifecycle : _do_request_begin_user_req(rbe_zv)
+activate lifecycle
+lifecycle -> lifecycle : _do_request_begin(rbe_zv)
+deactivate lifecycle
+deactivate ddtrace
+deactivate userreq
+
+== Core Request Init: WAF Evaluation ==
+
+lifecycle -> ddtrace : dd_entity_body_rinit()
+activate ddtrace
+ddtrace -> ddtrace : [optional] dd_config_sync(conn)
+ddtrace -> daemon : dd_request_init(conn, &req_info)\n[headers, body, params]
+activate daemon
+note right of daemon
+  WAF evaluates rules against
+  all incoming request data
+end note
+daemon --> ddtrace : dd_result:\n  dd_success | dd_should_block |\n  dd_should_redirect | dd_should_record
+deactivate daemon
+deactivate ddtrace
+
+== Blocking Decision at Request Begin ==
+
+alt res == dd_should_block or dd_should_redirect
+    lifecycle -> lifecycle : dd_req_lifecycle_abort(\n  REQUEST_STAGE_REQUEST_BEGIN,\n  res, &block_params)
+    activate lifecycle
+    note right of lifecycle
+      block_params = {
+        security_response_id,
+        redirection_location
+      }
+    end note
+    lifecycle -> lifecycle : dd_request_abort_static_page_spec()\n  OR dd_request_abort_redirect_spec()
+    lifecycle --> sapi : blocking spec\n{status, headers, body}
+    deactivate lifecycle
+    sapi -> sapi : send block response to client
+end
+
+== Register Mid-Request Blocking Callback ==
+
+sapi -> userreq : set_blocking_function(\n  RootSpanData $span,\n  callable $blockingFunction): void
+activate userreq
+userreq -> ddtrace : _set_blocking_function(\n  self, span, blocking_function)
+activate ddtrace
+note right of ddtrace
+  Validates: _cur_req_span match,
+  not already set, not after shutdown.
+  Stores: ZVAL_COPY(&_blocking_function)
+end note
+ddtrace --> userreq : registered
+deactivate ddtrace
+deactivate userreq
+
+== Mid-Request WAF Trigger ==
+
+daemon -> lifecycle : WAF fires mid-request event
+activate lifecycle
+lifecycle -> lifecycle : dd_req_lifecycle_abort(\n  REQUEST_STAGE_MID_REQUEST,\n  dd_should_block, &block_params)
+lifecycle -> lifecycle : dd_request_abort_static_page_spec()\n  OR dd_request_abort_redirect_spec()
+lifecycle -> blockfn : invoke $blockingFunction(spec)\n[via zend_call_function()]
+activate blockfn
+note right of blockfn
+  Registered by framework integration
+  (e.g., Symfony/Laravel) to handle
+  blocking gracefully: throw exception
+  or send early response
+end note
+blockfn --> lifecycle : (handled)
+deactivate blockfn
+deactivate lifecycle
+
+== Response Commit / Request End ==
+
+sapi -> userreq : notify_commit(RootSpanData $span,\n  int $status, array $headers,\n  mixed $body): ?array
+activate userreq
+userreq -> ddtrace : _response_commit(listener, span,\n  status, resp_headers, rbe_zv)
+activate ddtrace
+ddtrace -> lifecycle : _do_request_finish_user_req(\n  false, superglob_equiv,\n  status, headers, rbe)
+activate lifecycle
+lifecycle -> daemon : dd_request_shutdown(conn, &ctx)
+activate daemon
+daemon --> lifecycle : dd_result (re-evaluate rules at response)
+deactivate daemon
+
+alt res == dd_should_block or dd_should_redirect
+    lifecycle -> lifecycle : dd_req_lifecycle_abort(\n  REQUEST_STAGE_REQUEST_END, ...)
+    lifecycle --> sapi : blocking spec returned to framework
+end
+
+lifecycle -> span : dd_tags_add_tags(_cur_req_span,\n  superglob_equiv)
+note right of span
+  Adds security tags to root span:
+  appsec.events.*, _dd.appsec.*
+end note
+deactivate lifecycle
+deactivate ddtrace
+deactivate userreq
+
+== ASM Event Emission ==
+
+group Path A: Internal / Test API
+    sapi -> userreq : DDTrace\\Testing\\emit_asm_event()
+    activate userreq
+    userreq -> ddtrace : dd_trace_emit_asm_event()
+    deactivate userreq
+end
+
+group Path B: User Tracking (Production)
+    sapi -> ddtrace : track_user_login_success() /\n  track_user_login_failure()
+    activate ddtrace
+    ddtrace -> ddtrace : _emit_user_event()
+    ddtrace -> span : dd_tags_set_user_event_triggered()\n[sets appsec.events.users.* tags]
+    ddtrace -> ddtrace : dd_trace_emit_asm_event()
+    deactivate ddtrace
+end
+
+activate ddtrace
+note right of ddtrace
+  _asm_event_emitted guard:
+  prevents duplicate ASM events
+  per request
+end note
+ddtrace -> ddtrace : check _asm_event_emitted flag
+ddtrace -> ddtrace : _ddtrace_emit_asm_event()\n[via dlsym to ddtrace ext]
+ddtrace -> span : emit ASM event on root span
+deactivate ddtrace
+
+@enduml

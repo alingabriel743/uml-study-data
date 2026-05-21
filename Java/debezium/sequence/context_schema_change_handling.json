@@ -1,0 +1,150 @@
+{
+  "scope": "schema_change_handling",
+  "title": "Schema Change (DDL) Handling Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "BinlogConnector",
+    "BinlogDatabaseSchema",
+    "AntlrDdlParser",
+    "Lexer",
+    "CommonTokenStream",
+    "ParseTreeWalker",
+    "AntlrDdlParserListener",
+    "DdlChanges",
+    "SchemaChangeEvent",
+    "HistorizedRelationalDatabaseSchema"
+  ],
+  "interaction_flow": [
+    "BinlogConnector → BinlogDatabaseSchema: parseStreamingDdl(partition, ddlStatements, databaseName, offset, sourceTime) [or parseSnapshotDdl]",
+    "BinlogDatabaseSchema → BinlogDatabaseSchema: parseDdl(partition, ddlStatements, databaseName, offset, sourceTime, snapshot)",
+    "parseDdl: check ignoredQueryStatements (BEGIN/END/FLUSH PRIVILEGES) → return empty list if matched",
+    "BinlogDatabaseSchema → AntlrDdlParser: setCurrentSchema(databaseName)",
+    "BinlogDatabaseSchema → AntlrDdlParser: parse(ddlStatements, tables()) → DdlChanges",
+    "AntlrDdlParser: CharStreams.fromString(ddlContent) → CodePointCharStream",
+    "AntlrDdlParser → Lexer: createNewLexerInstance(CaseChangingCharStream) → L extends Lexer",
+    "AntlrDdlParser → CommonTokenStream: new CommonTokenStream(lexer)",
+    "AntlrDdlParser → Parser: createNewParserInstance(commonTokenStream) → P extends Parser",
+    "AntlrDdlParser: parser.removeErrorListener(ConsoleErrorListener); parser.addErrorListener(ParsingErrorListener)",
+    "AntlrDdlParser → Parser: parseTree(parser) → ParseTree",
+    "AntlrDdlParser: if no parse errors → createParseTreeWalkerListener() → AntlrDdlParserListener",
+    "AntlrDdlParser → ParseTreeWalker: DEFAULT.walk(antlrDdlParserListener, parseTree)",
+    "ParseTreeWalker → AntlrDdlParserListener: notifies on each grammar rule (enterXxx/exitXxx)",
+    "AntlrDdlParserListener → AntlrDdlParser: signalCreateTable / signalAlterTable / signalDropTable / signalTruncateTable / signalSetVariable",
+    "AntlrDdlParser: signals recorded in DdlChanges (implements DdlParserListener)",
+    "AntlrDdlParser → BinlogDatabaseSchema: return getAndResetDdlChanges() → DdlChanges",
+    "BinlogDatabaseSchema: if ddlChanges.isEmpty() → handleDatabaseEvent(offset, databaseName, sourceTime); add SchemaChangeEvent.ofDatabase(...)",
+    "BinlogDatabaseSchema: if !ddlChanges.isEmpty() && acceptableDatabase → DdlChanges.getEventsByDatabase(consumer)",
+    "DdlChanges → consumer: iterate events grouped by database name",
+    "BinlogDatabaseSchema: per event → handleTableEvent(offset, dbName, tableIds, sourceTime)",
+    "BinlogDatabaseSchema: per event type → emitChangeEvent(partition, offset, schemaChangeEvents, dbName, event, tableId, type, snapshot)",
+    "emitChangeEvent: if RENAME → SchemaChangeEvent.ofRename(partition, offset, dbName, null, statement, table, previousTableId)",
+    "emitChangeEvent: else → SchemaChangeEvent.of(type, partition, offset, dbName, null, statement, table, snapshot)",
+    "BinlogDatabaseSchema → parseDdl caller: return List<SchemaChangeEvent>",
+    "BinlogConnector → BinlogDatabaseSchema: applySchemaChange(schemaChangeEvent) [called for each returned event]",
+    "applySchemaChange: CREATE/ALTER → buildAndRegisterSchema(table); DROP → removeSchema(id)",
+    "applySchemaChange: if captureFilter passes → record(schemaChange, tableChanges) [persists to SchemaHistory]"
+  ],
+  "event_type_routing": [
+    "TableCreatedEvent → SchemaChangeEventType.CREATE",
+    "TableAlteredEvent | TableIndexCreatedEvent | TableIndexDroppedEvent → SchemaChangeEventType.ALTER",
+    "TableAlteredEvent with previousTableId != null → SchemaChangeEvent.ofRename()",
+    "TableDroppedEvent → SchemaChangeEventType.DROP",
+    "TableTruncatedEvent → SchemaChangeEventType.TRUNCATE",
+    "SetVariableEvent (order==0 only) → SchemaChangeEventType.DATABASE",
+    "Other events → SchemaChangeEventType.DATABASE"
+  ],
+  "key_classes": {
+    "BinlogDatabaseSchema": {
+      "package": "io.debezium.connector.binlog",
+      "extends": "HistorizedRelationalDatabaseSchema",
+      "type": "abstract",
+      "key_fields": ["DdlParser ddlParser", "RelationalTableFilters filters", "Map<Long,TableId> tableIdsByTableNumber", "BinlogConnectorConfig connectorConfig"],
+      "key_methods": [
+        "parseSnapshotDdl(P partition, String ddlStatements, String databaseName, O offset, Instant sourceTime): List<SchemaChangeEvent>",
+        "parseStreamingDdl(P partition, String ddlStatements, String databaseName, O offset, Instant sourceTime): List<SchemaChangeEvent>",
+        "applySchemaChange(SchemaChangeEvent): void",
+        "skipSchemaChangeEvent(SchemaChangeEvent): boolean",
+        "setSystemVariables(Scope, Map<String,String>): void",
+        "createDdlParser(BinlogConnectorConfig, V): DdlParser [abstract]",
+        "private parseDdl(...): List<SchemaChangeEvent>",
+        "private emitChangeEvent(...): void"
+      ]
+    },
+    "AntlrDdlParser": {
+      "package": "io.debezium.antlr",
+      "extends": "AbstractDdlParser",
+      "type": "abstract",
+      "key_methods": [
+        "parse(String ddlContent, Tables databaseTables): DdlChanges",
+        "parseTree(P parser): ParseTree [abstract]",
+        "createParseTreeWalkerListener(): AntlrDdlParserListener [abstract]",
+        "createNewLexerInstance(CharStream): L [abstract]",
+        "createNewParserInstance(CommonTokenStream): P [abstract]",
+        "signalCreateTable(TableId, ParserRuleContext): void",
+        "signalAlterTable(TableId, TableId, ParserRuleContext): void",
+        "signalDropTable(TableId, ParserRuleContext): void",
+        "signalTruncateTable(TableId, ParserRuleContext): void",
+        "signalSetVariable(String, String, int, ParserRuleContext): void"
+      ]
+    },
+    "DdlChanges": {
+      "package": "io.debezium.relational.ddl",
+      "implements": "DdlParserListener",
+      "key_methods": [
+        "getEventsByDatabase(DatabaseEventConsumer): void",
+        "anyMatch(RelationalTableFilters): boolean",
+        "isEmpty(): boolean"
+      ]
+    },
+    "SchemaChangeEvent": {
+      "package": "io.debezium.schema",
+      "key_factories": [
+        "of(SchemaChangeEventType, Partition, OffsetContext, String db, String schema, String ddl, Table, boolean snapshot)",
+        "ofDatabase(Partition, OffsetContext, String databaseName, String ddl, boolean snapshot)",
+        "ofRename(Partition, OffsetContext, String db, String schema, String ddl, Table, TableId previousTableId)"
+      ],
+      "fields": ["String database", "String ddl", "Set<Table> tables", "SchemaChangeEventType type", "TableChanges tableChanges", "boolean isFromSnapshot"]
+    },
+    "TokenStream": {
+      "package": "io.debezium.text",
+      "note": "Used by non-ANTLR parsers (not in the ANTLR DDL pipeline). ANTLR pipeline uses org.antlr.v4.runtime.CommonTokenStream instead.",
+      "key_methods": ["start()", "hasNext(): boolean", "consume(): String", "canConsume(String): boolean", "matches(String): boolean"]
+    },
+    "BinlogAntlrDdlParserTest": {
+      "package": "io.debezium.connector.binlog",
+      "type": "abstract test",
+      "generics": "<V extends BinlogValueConverters, D extends BinlogDefaultValueConverter, P extends AntlrDdlParser>",
+      "setup": "@BeforeEach: creates SimpleDdlParserListener, parser=getParser(listener), Tables, TableSchemaBuilder",
+      "test_pattern": "parser.parse(ddl, tables) → assert tables / columns"
+    }
+  },
+  "key_relationships": [
+    "BinlogDatabaseSchema extends HistorizedRelationalDatabaseSchema",
+    "BinlogDatabaseSchema composes DdlParser (created via abstract createDdlParser())",
+    "MySqlAntlrDdlParser / MariaDbAntlrDdlParser extend AntlrDdlParser (connector-specific implementations)",
+    "AntlrDdlParser extends AbstractDdlParser",
+    "AntlrDdlParser uses CommonTokenStream (ANTLR runtime) internally",
+    "AntlrDdlParser produces DdlChanges (implements DdlParserListener)",
+    "DdlChanges groups DdlParserListener.Event objects by database",
+    "BinlogDatabaseSchema.applySchemaChange() calls HistorizedRelationalDatabaseSchema.record() for schema history persistence",
+    "SchemaChangeEvent constructor auto-populates TableChanges based on event type (CREATE/ALTER/DROP/RENAME)"
+  ],
+  "important_notes": [
+    "TokenStream (debezium-util) is a general tokenization utility — the ANTLR DDL pipeline uses org.antlr.v4.runtime.CommonTokenStream, not debezium TokenStream",
+    "DDL parsing is connector-specific: createDdlParser() is abstract; MySQL and MariaDB provide concrete implementations",
+    "ignoredQueryStatements = {BEGIN, END, FLUSH PRIVILEGES} are short-circuited before parsing",
+    "DdlChanges.getEventsByDatabase() enables grouping events by affected database, supporting fully-qualified DDL names",
+    "applySchemaChange() records to SchemaHistory AFTER building schema (for failure recovery safety)",
+    "skipSchemaChangeEvent() filters events for non-captured databases before they reach schema history",
+    "SetVariableEvent with order > 0 is suppressed to emit only one change event per SET statement",
+    "BinlogAntlrDdlParserTest uses SimpleDdlParserListener to capture and assert events without full connector wiring"
+  ],
+  "source_files_analyzed": [
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogDatabaseSchema.java",
+    "debezium-connector-binlog/src/test/java/io/debezium/connector/binlog/BinlogAntlrDdlParserTest.java",
+    "debezium-util/src/main/java/io/debezium/text/TokenStream.java",
+    "debezium-ddl-parser/src/main/java/io/debezium/antlr/AntlrDdlParser.java",
+    "debezium-connector-common/src/main/java/io/debezium/schema/SchemaChangeEvent.java",
+    "debezium-connector-common/src/main/java/io/debezium/relational/ddl/DdlChanges.java"
+  ]
+}

@@ -1,0 +1,214 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam enum {
+    BackgroundColor #FFF3CD
+    BorderColor #856404
+}
+skinparam note {
+    BackgroundColor #E8F4F8
+    BorderColor #5B9BD5
+}
+
+title Lyra-2 Datasets and Data Loading
+
+' ─────────────────────────────────────────────
+' External dependency
+' ─────────────────────────────────────────────
+package "torch.utils.data" <<External>> {
+    class DataLoader {
+        +__init__(dataset, batch_size, ...)
+        +__iter__()
+    }
+}
+
+' ─────────────────────────────────────────────
+' Core data field enum
+' ─────────────────────────────────────────────
+package "lyra_2._src.datasets" {
+
+    enum DataField {
+        IMAGE_RGB
+        CAMERA_C2W_TRANSFORM
+        CAMERA_INTRINSICS
+        METRIC_DEPTH
+        DYNAMIC_INSTANCE_MASK
+        BACKWARD_FLOW
+        OBJECT_BBOX
+        CAPTION
+    }
+
+    ' ─────────────────────────────────────────
+    ' Base dataset abstraction
+    ' ─────────────────────────────────────────
+    package "base" {
+        abstract class BaseDataset {
+            {abstract} +available_data_fields() : List[DataField]
+            {abstract} +num_videos() : int
+            {abstract} +num_views(video_idx: int) : int
+            {abstract} +num_frames(video_idx: int, view_idx: int) : int
+            {abstract} #_read_data(video_idx, frame_idxs, view_idxs, data_fields)
+            +read_video_metadata(video_idx: int) : dict
+            +read_view_metadata(video_idx: int, view_idx: int) : dict
+            +read(video_idx, frame_idxs, view_idxs, data_fields) : dict[DataField, Any]
+        }
+    }
+
+    ' ─────────────────────────────────────────
+    ' Radym: low-level file reader
+    ' ─────────────────────────────────────────
+    package "radym" {
+        class Radym {
+            {static} +MAX_ZIP_DESCRIPTORS : int = 10
+            {static} +MAX_MP4_READERS : int = 2
+            -root_path : str
+            -filter_set : Optional[set]
+            -n_views : int
+            -mp4_file_paths : List[Path]
+            -worker_id : Optional[int]
+            -zip_descriptors : LRU
+            -depth_folder : str
+            -custom_folders : Optional[List[str]]
+            -custom_fields : Optional[List[str]]
+            +__init__(root_path, filter_list_path, num_views, depth_folder, custom_folders, custom_fields)
+            +available_data_fields() : List[DataField]
+            +num_videos() : int
+            +num_views(video_idx: int) : int
+            +num_frames(video_idx: int, view_idx: int) : int
+            #_read_data(video_idx, frame_idxs, view_idxs, data_fields) : dict
+            -_get_zip_handle(idx, attr, view_idx) : ZipFile
+            -_get_mp4_reader(idx, attr, view_idx) : VideoReader
+            -_check_worker_id()
+            {static} -_evict_zip_handle(zip_handle)
+            {static} -_evict_mp4_reader(mp4_reader)
+        }
+    }
+
+    ' ─────────────────────────────────────────
+    ' Depth warp dataloader pipeline
+    ' ─────────────────────────────────────────
+    package "depth_warp_dataloader" {
+
+        class InfiniteCommonDataset {
+            -dataset : BaseDataset
+            -data_name : str
+            -n_data : int
+            -n_data_per_node : int
+            -data_start_idx : int
+            -multiplier : int
+            -sample_n_frames : int
+            -sample_size : List[int]
+            -crop_size : List[int]
+            -video_mirror : bool
+            -video_mirror_when_short_only : bool
+            -t5_embedding_path : Optional[str]
+            -img_transform : transforms.Compose
+            -norm_image : transforms.Normalize
+            +__init__(dataset_cfg, data_name, batch_size, sample_n_frames, sample_size, crop_size, video_mirror, t5_embedding_path)
+            +__len__() : int
+            +__getitem__(idx) : dict
+            -_get_frame_indices(n_total_frames) : List[int]
+            -_transform(images, w2c, depths, intrinsics) : dict
+            -_to_w2c_and_intrinsics(data) : dict
+        }
+
+        class DepthWarpDataset {
+            -video_size : dict
+            -dataset_config : OmegaConf
+            +__init__(dataset_name, resolution, chunk_size, **kwargs)
+            +build_dataset() : InfiniteCommonDataset
+        }
+
+        class MyDataLoader {
+            +__init__(dataset: DepthWarpDataset, batch_size: int, *args, **kw)
+        }
+
+        class IterativeGEN3CDataLoader {
+            -dataloader_list : List[MyDataLoader]
+            -dataset_name_list : List[str]
+            -data_ratios : List[int]
+            -ratio_sum : int
+            -data_len : int
+            -dataloaders : List[Iterator]
+            +__init__(dataloaders: dict)
+            +__len__() : int
+            +__iter__()
+        }
+    }
+
+    ' ─────────────────────────────────────────
+    ' Validation config helper
+    ' ─────────────────────────────────────────
+    package "data_sources" {
+        class ItemDatasetConfig <<dataclass>> {
+            +path : str
+            +length : int
+        }
+    }
+
+}
+
+' ─────────────────────────────────────────────
+' Factory functions (notes)
+' ─────────────────────────────────────────────
+note as FactoryNote
+  **Factory Functions**
+  get_depth_warp_dataset(dataset_name, resolution,
+    chunk_size, **kwargs) -> DepthWarpDataset
+
+  get_gen3c_multiple_video_dataloader(dataset_list,
+    dataset_weight_list, shuffle, num_workers,
+    prefetch_factor, mode) -> OmegaConf(IterativeGEN3CDataLoader)
+end note
+
+note as ConfigNote
+  **DATAVERSE_CONFIG** (config_dataverse.py)
+  Maps dataset name -> dataset_cfg
+  (target=Radym, sample_n_frames,
+   sample_size, crop_size, t5_embedding_path, ...)
+
+  **VIDEO_RES_SIZE_INFO** (utils.py)
+  Maps resolution_str -> {aspect_ratio -> (H,W)}
+end note
+
+' ─────────────────────────────────────────────
+' Relationships
+' ─────────────────────────────────────────────
+
+' Inheritance
+Radym --|> BaseDataset : extends
+MyDataLoader --|> DataLoader : extends
+
+' Composition / aggregation
+InfiniteCommonDataset *-- BaseDataset : dataset\n(instantiated via\n_instantiate_from_config)
+MyDataLoader *-- DepthWarpDataset : wraps\n(calls build_dataset())
+IterativeGEN3CDataLoader *-- "N" MyDataLoader : aggregates
+
+' Creation / factory
+DepthWarpDataset ..> InfiniteCommonDataset : <<creates>>\nbuild_dataset()
+
+' Usage / dependency
+BaseDataset ..> DataField : uses (method signatures)
+Radym ..> DataField : uses (available_data_fields,\n_read_data)
+InfiniteCommonDataset ..> DataField : uses (read keys)
+
+' Config links
+DepthWarpDataset .. ConfigNote
+FactoryNote .. DepthWarpDataset
+FactoryNote .. IterativeGEN3CDataLoader
+
+@enduml

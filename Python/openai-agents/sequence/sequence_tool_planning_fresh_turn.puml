@@ -1,0 +1,231 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    DividerBackgroundColor #DEE2E6
+    GroupBackgroundColor #F1F3F5
+    GroupBorderColor #6C757D
+}
+skinparam NoteBackgroundColor #FFF9C4
+skinparam NoteBorderColor #F0AD4E
+
+title Tool Planning (Fresh Turn)
+
+box "turn_resolution.py" #EAF4FB
+    participant "execute_tools_and\n_side_effects" as ETAS
+end box
+
+box "tool_planning.py" #EAF4FB
+    participant "_build_plan_for\n_fresh_turn" as BPFT
+    participant "_collect_mcp\n_approval_plan" as CMAP
+    participant "_partition_mcp\n_approval_requests" as PMAR
+    participant "_apply_manual\n_mcp_approvals" as AMMA
+    participant "_execute_tool_plan" as ETP
+    participant "_build_tool\n_result_items" as BTRI
+    participant "_collect_tool\n_interruptions" as CTI
+    participant "_append_mcp\n_callback_results" as AMCR
+end box
+
+box "tool_execution.py" #EDF7ED
+    participant "collect_manual\n_mcp_approvals" as CMMA
+    participant "Tool Executors\n[function/computer/custom\n/shell/patch/local_shell]" as TE
+    participant "execute_mcp\n_approval_requests" as EMAR
+end box
+
+participant "RunContextWrapper" as RCW
+participant "ToolExecutionPlan" as TEP
+
+actor "AgentRunner\n(Caller)" as Caller
+
+== Initialization ==
+
+Caller -> ETAS : execute_tools_and_side_effects(\n  processed_response, agent,\n  bindings, hooks,\n  context_wrapper, run_config)
+activate ETAS
+
+ETAS -> ETAS : index_approval_items_by_call_id(\n  pre_step_items)\nnote right: Mapping[call_id → ToolApprovalItem]\nfor lookup during approval checks
+
+== Plan Construction ==
+
+ETAS -> BPFT : _build_plan_for_fresh_turn(\n  processed_response, agent,\n  context_wrapper,\n  approval_items_by_call_id)
+activate BPFT
+
+note over BPFT : Fresh turn: ALL tool runs from\nProcessedResponse are included\ndirectly (no per-run approval\nexcept for MCP requests)
+
+BPFT -> CMAP : _collect_mcp_approval_plan(\n  mcp_approval_requests,\n  agent, context_wrapper,\n  approval_items_by_call_id,\n  pending_interruption_adder)
+activate CMAP
+
+CMAP -> PMAR : _partition_mcp_approval_requests(\n  mcp_approval_requests)
+activate PMAR
+PMAR --> CMAP : (with_callback_requests[],\n manual_requests[])
+deactivate PMAR
+
+note over PMAR : Split: requests with\non_approval_request callback\nvs. manual (no callback)
+
+CMAP -> AMMA : _apply_manual_mcp_approvals(\n  agent, manual_requests,\n  context_wrapper,\n  approval_items_by_call_id,\n  pending_interruption_adder)
+activate AMMA
+
+AMMA -> CMMA : collect_manual_mcp_approvals(\n  manual_requests, agent,\n  context_wrapper,\n  approval_items_by_call_id)
+activate CMMA
+
+loop for each manual MCP request
+    CMMA -> RCW : get_approval_status(\n  tool_name, call_id)
+    activate RCW
+
+    alt approval_status == True
+        RCW --> CMMA : True (approved)
+        note over CMMA : Add to approved_responses[]
+    else approval_status == False
+        RCW --> CMMA : False (rejected)
+        note over CMMA : Build rejection ToolCallOutputItem
+    else approval_status == None
+        RCW --> CMMA : None (pending)
+        note over CMMA : Create ToolApprovalItem → pending_items[]
+    end
+    deactivate RCW
+end
+
+CMMA --> AMMA : (approved_responses[],\n pending_items[])
+deactivate CMMA
+
+loop for each pending_item
+    AMMA -> AMMA : pending_interruption_adder(\n  approval_item)
+    note right: appends to\npending_interruptions[]
+end
+
+AMMA --> CMAP : (approved_mcp_responses[],\n pending interruptions registered)
+deactivate AMMA
+
+CMAP --> BPFT : (mcp_requests_with_callback[],\n approved_mcp_responses[])
+deactivate CMAP
+
+BPFT -> TEP ** : create ToolExecutionPlan(\n  function_runs[],\n  computer_actions[],\n  custom_tool_calls[],\n  shell_calls[],\n  apply_patch_calls[],\n  local_shell_calls[],\n  pending_interruptions[],\n  approved_mcp_responses[],\n  mcp_requests_with_callback[])
+
+BPFT --> ETAS : ToolExecutionPlan
+deactivate BPFT
+
+== Pre-Execution Deduplication ==
+
+ETAS -> ETAS : _dedupe_tool_call_items(\n  existing=pre_step_items,\n  new=processed_response.new_items)\nnote right: Produces new_step_items[]\nwithout duplicate tool call entries
+
+== Parallel Tool Execution ==
+
+ETAS -> ETP : _execute_tool_plan(\n  plan, bindings, hooks,\n  context_wrapper, run_config)
+activate ETP
+
+note over ETP : When parallel=True (default),\nasyncio.gather() dispatches all\n6 executor types simultaneously
+
+par asyncio.gather() — parallel dispatch
+    ETP -> TE : execute_function_tool_calls(\n  bindings, plan.function_runs,\n  hooks, context_wrapper,\n  run_config, isolate_parallel_failures)
+    activate TE
+    TE --> ETP : (function_results[],\n input_guardrail_results[],\n output_guardrail_results[])
+    deactivate TE
+and
+    ETP -> TE : execute_computer_actions(\n  agent, plan.computer_actions, ...)
+    activate TE
+    TE --> ETP : computer_results[]
+    deactivate TE
+and
+    ETP -> TE : execute_custom_tool_calls(\n  agent, plan.custom_tool_calls, ...)
+    activate TE
+    TE --> ETP : custom_results[]
+    deactivate TE
+and
+    ETP -> TE : execute_shell_calls(\n  agent, plan.shell_calls, ...)
+    activate TE
+    TE --> ETP : shell_results[]
+    deactivate TE
+and
+    ETP -> TE : execute_apply_patch_calls(\n  agent, plan.apply_patch_calls, ...)
+    activate TE
+    TE --> ETP : patch_results[]
+    deactivate TE
+and
+    ETP -> TE : execute_local_shell_calls(\n  agent, plan.local_shell_calls, ...)
+    activate TE
+    TE --> ETP : local_shell_results[]
+    deactivate TE
+end
+
+note over ETP : isolate_parallel_failures=True\nwhen multiple function runs OR\nparallel with other tool types
+
+ETP --> ETAS : (function_results, input_guardrail_results,\n output_guardrail_results, computer_results,\n custom_results, shell_results,\n patch_results, local_shell_results)
+deactivate ETP
+
+== Result Aggregation ==
+
+ETAS -> BTRI : _build_tool_result_items(\n  function_results, computer_results,\n  custom_results, shell_results,\n  patch_results, local_shell_results)
+activate BTRI
+BTRI --> ETAS : ordered RunItem[]
+deactivate BTRI
+
+ETAS -> ETAS : new_step_items.extend(tool_result_items)
+
+ETAS -> CTI : _collect_tool_interruptions(\n  function_results, custom_results,\n  shell_results, patch_results)
+activate CTI
+note over CTI : Also captures nested Agent.as_tool()\ninterruptions via\nresult.agent_run_result.interruptions
+CTI --> ETAS : tool_interruptions (ToolApprovalItem[])
+deactivate CTI
+
+== MCP Approved / Interruption Merge ==
+
+alt plan.approved_mcp_responses is not empty
+    ETAS -> ETAS : new_step_items.extend(\n  plan.approved_mcp_responses)
+end
+
+alt plan.pending_interruptions is not empty
+    ETAS -> ETAS : interruptions.extend(\n  plan.pending_interruptions)\nnote right: ToolApprovalItem items added\nto BOTH interruptions[] AND\nnew_step_items[] for visibility
+    ETAS -> ETAS : new_step_items.extend(\n  plan.pending_interruptions)
+end
+
+== Interruption Short-Circuit ==
+
+alt interruptions exist (plan OR tool-level)
+    ETAS --> Caller : SingleStepResult(\n  next_step=NextStepInterruption,\n  new_step_items,\n  tool_input_guardrail_results,\n  tool_output_guardrail_results)
+    note over Caller : Handoffs and final output\nare SKIPPED when interrupted
+
+else no interruptions
+    ETAS -> AMCR : _append_mcp_callback_results(\n  agent, plan.mcp_requests_with_callback,\n  context_wrapper,\n  append_item=new_step_items.append)
+    activate AMCR
+    AMCR -> EMAR : execute_mcp_approval_requests(\n  agent, approval_requests,\n  context_wrapper)
+    activate EMAR
+    EMAR --> AMCR : MCPApprovalResponseItem[]
+    deactivate EMAR
+    AMCR --> ETAS : (items appended to new_step_items)
+    deactivate AMCR
+
+    alt handoffs present in processed_response
+        ETAS -> ETAS : execute_handoffs(...)
+        ETAS --> Caller : SingleStepResult(\n  next_step=NextStepHandoff)
+    else
+        ETAS -> ETAS : _maybe_finalize_from_tool_results\nor execute_final_output
+        ETAS --> Caller : SingleStepResult(\n  next_step=NextStepFinalOutput\n  | NextStepRunAgain)
+    end
+end
+
+deactivate ETAS
+
+@enduml

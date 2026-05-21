@@ -1,0 +1,178 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #495057
+    LifeLineBackgroundColor #F8F9FA
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ParticipantFontColor #212529
+    ActorBorderColor #495057
+    ActorBackgroundColor #E9ECEF
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    DividerBackgroundColor #DEE2E6
+    GroupBackgroundColor #F1F3F5
+    GroupBorderColor #6C757D
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #ADB5BD
+}
+
+title Audio Transcription Flow
+
+actor Client
+participant "Transcription\n(static facade)" as Transcription
+participant "PendingTranscription\nGeneration" as Pending
+participant "Ai (facade)" as Ai
+participant "AiManager" as AiManager
+participant "TranscriptionProvider\n(interface)" as Provider
+participant "TranscriptionGateway" as Gateway
+participant "GenerateTranscription\n(Job)" as Job
+
+== Audio Input & Wrapping ==
+
+alt of(UploadedFile $file) or of(string $base64)
+    Client -> Transcription: of($audio)
+    activate Transcription
+    note right of Transcription
+        string  → new Base64Audio($audio)
+        UploadedFile → Base64Audio::fromUpload($audio)
+    end note
+else fromPath(string $path, ?string $mimeType)
+    Client -> Transcription: fromPath($path, $mimeType)
+    activate Transcription
+    note right of Transcription: new LocalAudio($path, $mimeType)
+else fromStorage(string $path, ?string $disk)
+    Client -> Transcription: fromStorage($path, $disk)
+    activate Transcription
+    note right of Transcription: new StoredAudio($path, $disk)
+else fromBase64(string $base64, ?string $mimeType)
+    Client -> Transcription: fromBase64($base64, $mimeType)
+    activate Transcription
+    note right of Transcription: new Base64Audio($base64, $mimeType)
+end
+
+Transcription --> Client: new PendingTranscriptionGeneration($audio)
+deactivate Transcription
+
+== Fluent Configuration ==
+
+Client -> Pending: language("en")
+activate Pending
+Pending --> Client: $this
+deactivate Pending
+
+Client -> Pending: diarize(true)
+activate Pending
+Pending --> Client: $this
+deactivate Pending
+
+Client -> Pending: timeout(30)
+activate Pending
+Pending --> Client: $this
+deactivate Pending
+
+== Execution ==
+
+alt Synchronous: generate(?provider, ?model)
+
+    Client -> Pending: generate($provider, $model)
+    activate Pending
+
+    Pending -> Pending: formatProviderAndModelList(\n  $provider ?? config('ai.default_for_transcription'),\n  $model\n)
+
+    loop For each [provider, model] pair in list
+
+        Pending -> Ai: fakeableTranscriptionProvider($providerName)
+        activate Ai
+        Ai -> AiManager: transcriptionProvider($providerName)
+        activate AiManager
+        note right of AiManager
+            Validates that driver
+            implements TranscriptionProvider
+        end note
+        AiManager --> Ai: TranscriptionProvider instance
+        deactivate AiManager
+        Ai --> Pending: TranscriptionProvider
+        deactivate Ai
+
+        alt model is null
+            Pending -> Provider: defaultTranscriptionModel()
+            activate Provider
+            Provider --> Pending: $model
+            deactivate Provider
+        end
+
+        Pending -> Provider: transcribe(\n  $audio,\n  $language,\n  $diarize,\n  $model,\n  $timeout\n)
+        activate Provider
+        Provider -> Gateway: HTTP transcription request
+        activate Gateway
+        Gateway --> Provider: raw response
+        deactivate Gateway
+        Provider --> Pending: TranscriptionResponse
+        deactivate Provider
+
+        alt FailoverableException thrown
+            note over Pending, Provider
+                fire ProviderFailedOver event
+                continue to next provider in list
+            end note
+        else All providers failed
+            Pending --> Client: throw last FailoverableException
+        end
+
+    end
+
+    Pending --> Client: TranscriptionResponse
+    deactivate Pending
+
+else Asynchronous: queue(?provider, ?model)
+
+    Client -> Pending: queue($provider, $model)
+    activate Pending
+
+    alt audio is Base64Audio
+        Pending --> Client: throw InvalidArgumentException\n(Base64Audio not serialisable)
+    end
+
+    alt Faked (test mode)
+        Pending -> Ai: recordTranscriptionGeneration(\n  QueuedTranscriptionPrompt\n)
+        activate Ai
+        Ai --> Pending: FakePendingDispatch
+        deactivate Ai
+        Pending --> Client: QueuedTranscriptionResponse(FakePendingDispatch)
+    else Real dispatch
+        Pending -> Job: GenerateTranscription::dispatch(\n  $pendingTranscription,\n  $provider,\n  $model\n)
+        activate Job
+        Job --> Pending: PendingDispatch
+        deactivate Job
+        Pending --> Client: QueuedTranscriptionResponse(PendingDispatch)
+    end
+
+    deactivate Pending
+
+    note over Job
+        **Async execution** (worker picks up job)
+        GenerateTranscription::handle()
+        → $pendingTranscription->generate($provider, $model)
+        (same flow as synchronous path above)
+    end note
+
+end
+
+@enduml

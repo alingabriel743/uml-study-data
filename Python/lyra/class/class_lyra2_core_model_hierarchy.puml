@@ -1,0 +1,268 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #F9A825
+}
+
+title Lyra-2 Core Model Hierarchy
+
+' ─────────────────────────────────────────────
+' External base
+' ─────────────────────────────────────────────
+package "PyTorch" <<Frame>> {
+    class "nn.Module" as NNModule {
+    }
+}
+
+' ─────────────────────────────────────────────
+' Imaginaire abstract base
+' ─────────────────────────────────────────────
+package "lyra_2._ext.imaginaire" <<Frame>> {
+    abstract class ImaginaireModel {
+        {abstract} +training_step(data_batch: dict, iteration: int): tuple[dict, Tensor]
+        {abstract} +validation_step(data_batch: dict, iteration: int): tuple[dict, Tensor]
+        {abstract} +forward(*args, **kwargs): Any
+        +init_optimizer_scheduler(optimizer_config: LazyDict, scheduler_config: LazyDict): tuple[Optimizer, LRScheduler]
+        +on_train_start(memory_format): None
+        +on_before_zero_grad(optimizer, scheduler, iteration): None
+        +on_after_backward(iteration): None
+    }
+}
+
+' ─────────────────────────────────────────────
+' Config dataclasses
+' ─────────────────────────────────────────────
+package "lyra_2._src.models — Config" <<Frame>> {
+    class EMAConfig <<dataclass>> {
+        +enabled: bool = True
+        +rate: float = 0.1
+        +iteration_shift: int = 0
+    }
+
+    class I4LoraConfig <<dataclass>> {
+        +enabled: bool = False
+        +pretrained_lora_path: str = ""
+        +lora_rank: int = -1
+        +adapter_name: str = "default"
+        +lora_target_modules: list[str] = []
+        +init_lora_weights: str = "kaiming"
+    }
+
+    class T2VModelConfig <<dataclass>> {
+        +tokenizer: LazyDict = None
+        +conditioner: LazyDict = None
+        +net: LazyDict = None
+        +ema: EMAConfig
+        +lora_config: I4LoraConfig
+        +fsdp_shard_size: int = 1
+        +precision: str = "bfloat16"
+        +input_data_key: str = "video"
+        +input_image_key: str = "image"
+        +input_caption_key: str = "ai_caption"
+        +use_torch_compile: bool = False
+        +use_mp_policy_fsdp: bool = False
+        +keep_original_net_dtype: bool = False
+        +state_ch: int = 16
+        +state_t: int = 8
+        +resolution: str = "512"
+        +shift: int = 5
+        +use_dynamic_shift: bool = False
+        +train_time_weight: str = "uniform"
+        +train_time_distribution: str = "logitnormal"
+        +max_timestep_boundary: float = 1.0
+        +min_timestep_boundary: float = 0.0
+    }
+
+    class Lyra2T2VConfig <<dataclass>> {
+        ' Spatial / framepack settings
+        +init_framepack_weights: bool = True
+        +framepack_type: str = "f16k4f2k2f1k1_g3"
+        +num_frames_per_latent: int = 4
+        +max_segments: int = 10
+        +starting_frame_ratio: float = 0.1
+        +apply_corruption_to_spatial_region: str = "none"
+        ' Self-augmentation settings
+        +self_aug_enabled: bool = False
+        +self_aug_steps: int = 5
+        +self_aug_num_discrete_timesteps: int = 8
+        +self_aug_guidance: Optional[float] = None
+        +self_aug_prob: float = 1.0
+        +self_aug_max_T: int = 50
+        +self_aug_i2v_ratio: float = 0.3
+        ' Spatial memory settings
+        +spatial_memory_stride: int = 8
+        +spatial_memory_skip_recent: int = 100
+        +spatial_memory_use_image: bool = False
+        +spatial_memory_dropout_rate: float = 0.1
+        +spatial_memory_drop_rate: float = 0.1
+        +multibuffer_max_spatial_frames: Optional[int] = None
+        +warp_chunk_size: int = 2
+    }
+}
+
+' ─────────────────────────────────────────────
+' Core model classes
+' ─────────────────────────────────────────────
+package "lyra_2._src.models — Models" <<Frame>> {
+    class WANDiffusionModel {
+        -config: T2VModelConfig
+        -precision: torch.dtype
+        -tensor_kwargs: dict
+        -flow_matching_kwargs: dict
+        -input_data_key: str
+        -input_image_key: str
+        -sample_scheduler: FlowUniPCMultistepScheduler
+        -tokenizer: BaseVAE
+        -net: nn.Module
+        -net_ema: nn.Module
+        -net_ema_worker: FastEmaModelUpdater
+        -rectified_flow: RectifiedFlow
+        -conditioner: nn.Module
+        -fsdp_device_mesh: Optional[DeviceMesh]
+        -data_parallel_size: int
+        __
+        +__init__(config: T2VModelConfig)
+        +setup_data_key(): None
+        +build_net(): nn.Module
+        +set_up_model(): None
+        +maybe_inject_lora_to_net(net, lora_config, skip_inject, skip_load)
+        +add_lora_to_model(adapter_name, lora_rank, lora_target_modules, init_lora_weights, training_mode, model)
+        +load_lora_weights(lora_path, adapter_name, lora_alpha, training_mode, skip_inject, skip_load, model)
+        +is_lora_model(model): bool
+        +training_step(data_batch: dict, iteration: int): tuple[dict, Tensor]
+        +get_data_and_condition(data_batch, return_latent_state): tuple[Tensor, Tensor, T2VCondition]
+        +get_x0_fn_from_batch(data_batch, guidance, is_negative_prompt): Callable
+        +generate_samples_from_batch(data_batch, guidance, ...): Any
+        +encode(state: Tensor): Tensor
+        +decode(latent: Tensor, T_latent_seq_lens: Optional[Tensor]): Tensor
+        +forward(xt, t, condition: T2VCondition)
+        +state_dict(): dict
+        +load_state_dict(state_dict, strict, assign, pretrain_copy): None
+        +init_optimizer_scheduler(optimizer_config, scheduler_config): tuple[Optimizer, LRScheduler]
+        +on_train_start(memory_format): None
+        +on_before_zero_grad(optimizer, scheduler, iteration): None
+        #_normalize_video_databatch_inplace(data_batch, input_key): None
+        #_augment_image_dim_inplace(data_batch, input_key): None
+        #_update_train_stats(data_batch): None
+        +is_image_batch(data_batch): bool
+        +broadcast_split_for_model_parallelsim(x0, condition, epsilon, sigma): tuple
+    }
+
+    class Lyra2Model {
+        -config: Lyra2T2VConfig
+        -_collect_return_condition_state: bool
+        -_latest_condition_state_pixels: Optional[Tensor]
+        -_latest_plucker_rays_pixels: Optional[Tensor]
+        -_latest_gt_gen_pixels: Optional[Tensor]
+        -framepack_weights_initialized: bool
+        -_cached_spatial_coords: Optional[Tensor]
+        -_spatial_history_positions: tuple[int, ...]
+        -framepack_num_new_video_frames: int
+        -framepack_num_history_latent: int
+        -framepack_clean_latent_frame_splits: list
+        -framepack_starting_frame_ratio: float
+        -framepack_max_segments: int
+        __
+        +__init__(config: Lyra2T2VConfig)
+        #_init_lyra2_metadata(): None
+        #_compute_spatial_history_positions(): tuple[int, ...]
+        #_apply_spatial_region_corruption(latents: Tensor, cond_latent: Tensor): None
+        #_prepare_video_window(video, start, cur_segment_id): tuple
+        +training_step(data_batch: dict, iteration: int): tuple[dict, Tensor]
+        +generate_samples_from_batch(data_batch, ...): Any
+        +decode(latents): Any
+        #_tokenizing_video_to_latents(data_batch): tuple
+        +augment_conditional_latent_frames(latents, target_mode): tuple
+    }
+
+    class Sparse3DCache {
+        +__init__(...)
+    }
+}
+
+' ─────────────────────────────────────────────
+' External dependencies (simplified)
+' ─────────────────────────────────────────────
+package "External Dependencies" <<Frame>> {
+    class FlowUniPCMultistepScheduler <<external>> {
+    }
+    class RectifiedFlow <<external>> {
+    }
+    class BaseVAE <<external>> {
+    }
+    class FastEmaModelUpdater <<external>> {
+    }
+    class "peft.LoraConfig" as PeftLoraConfig <<external>> {
+    }
+}
+
+' ─────────────────────────────────────────────
+' Inheritance
+' ─────────────────────────────────────────────
+NNModule <|-- ImaginaireModel
+ImaginaireModel <|-- WANDiffusionModel
+WANDiffusionModel <|-- Lyra2Model
+
+T2VModelConfig <|-- Lyra2T2VConfig
+
+' ─────────────────────────────────────────────
+' Composition / Aggregation (configs)
+' ─────────────────────────────────────────────
+T2VModelConfig *-- EMAConfig : ema
+T2VModelConfig *-- I4LoraConfig : lora_config
+
+WANDiffusionModel *-- T2VModelConfig : config
+Lyra2Model *-- Lyra2T2VConfig : config (override)
+
+' ─────────────────────────────────────────────
+' Dependencies
+' ─────────────────────────────────────────────
+WANDiffusionModel ..> FlowUniPCMultistepScheduler : sample_scheduler
+WANDiffusionModel ..> RectifiedFlow : rectified_flow
+WANDiffusionModel ..> BaseVAE : tokenizer
+WANDiffusionModel ..> FastEmaModelUpdater : net_ema_worker
+WANDiffusionModel ..> PeftLoraConfig : optional LoRA injection
+
+Lyra2Model ..> Sparse3DCache : spatial memory
+
+' ─────────────────────────────────────────────
+' Notes
+' ─────────────────────────────────────────────
+note right of ImaginaireModel
+  Abstract base — training_step,
+  validation_step, and forward
+  raise NotImplementedError
+end note
+
+note right of WANDiffusionModel
+  Full diffusion training/inference.
+  LoRA injection guarded by
+  I4LoraConfig.enabled (peft optional).
+  FSDP enabled when fsdp_shard_size > 1.
+end note
+
+note right of Lyra2Model
+  Adds AR framepack spatial memory
+  (Sparse3DCache) and multi-buffer
+  slots on top of WANDiffusionModel.
+  Overrides training_step,
+  generate_samples_from_batch, decode.
+end note
+
+@enduml

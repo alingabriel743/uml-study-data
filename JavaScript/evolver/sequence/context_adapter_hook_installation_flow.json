@@ -1,0 +1,85 @@
+{
+  "scope": "adapter_hook_installation_flow",
+  "title": "IDE Adapter Hook Installation Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Caller",
+    "hookAdapter (setupHooks)",
+    "hookAdapter (loadAdapter)",
+    "claudeCode (install)",
+    "codex (install)",
+    "cursor (install)",
+    "FileSystem"
+  ],
+  "interaction_flow": [
+    "Caller → hookAdapter: setupHooks({ platform?, cwd?, force?, uninstall?, evolverRoot? })",
+    "hookAdapter → hookAdapter: detectPlatform(cwd) [if platform not provided] — scans cwd then homedir for .cursor/.claude/.codex",
+    "hookAdapter → hookAdapter: resolveConfigRoot(platformId, cwd) — returns cwd or homedir based on detector presence",
+    "hookAdapter → hookAdapter: loadAdapter(platformId) — switch: 'cursor'→cursor.js, 'claude-code'→claudeCode.js, 'codex'→codex.js",
+    "hookAdapter → adapter: adapter.install({ configRoot, evolverRoot, force }) OR adapter.uninstall({ configRoot, evolverRoot })",
+
+    "--- Claude Code install path ---",
+    "claudeCode.install → claudeCode: buildClaudeHooks(evolverRoot) → returns hooks JSON (SessionStart, PostToolUse[matcher=Write], Stop)",
+    "claudeCode.install → hookAdapter: mergeJsonFile(settingsPath, hooksCfg) — deepMerge into .claude/settings.json, writes via tmp file, sets _evolver_managed=true",
+    "claudeCode.install → hookAdapter: copyHookScripts(.claude/hooks, evolverRoot/src/adapters) — copies 3 .js scripts, chmod 755",
+    "claudeCode.install → hookAdapter: appendSectionToFile(CLAUDE.md, EVOLVER_MARKER, mdSection) — skips if marker already present",
+    "claudeCode.install → Caller: { ok:true, platform:'claude-code', files:[settingsPath, CLAUDE.md, ...copied] }",
+
+    "--- Codex install path ---",
+    "codex.install → codex: buildCodexHooksJson(evolverRoot) → returns hooks JSON (SessionStart, PostToolUse, Stop) for .codex/hooks",
+    "codex.install → hookAdapter: mergeJsonFile(.codex/hooks.json, hooksCfg)",
+    "codex.install → hookAdapter: copyHookScripts(.codex/hooks, evolverRoot/src/adapters)",
+    "codex.install → codex: ensureConfigToml(.codex) — adds [features]\\ncodex_hooks=true to .codex/config.toml if absent",
+    "codex.install → hookAdapter: appendSectionToFile(AGENTS.md, EVOLVER_MARKER, mdSection)",
+    "codex.install → Caller: { ok:true, platform:'codex', files:[hooks.json, config.toml, AGENTS.md, ...copied] }",
+
+    "--- Cursor install path ---",
+    "cursor.install → cursor: buildHooksJson(evolverRoot, isUserLevel) — isUserLevel=true if configRoot===homedir; scripts base = './hooks' vs '.cursor/hooks'",
+    "cursor.install → hookAdapter: mergeJsonFile(.cursor/hooks.json, hooksCfg) — hooks: sessionStart, afterFileEdit[matcher=Write], stop[loop_limit=1]",
+    "cursor.install → hookAdapter: copyHookScripts(.cursor/hooks, evolverRoot/src/adapters)",
+    "cursor.install → Caller: { ok:true, platform:'cursor', files:[hooks.json, ...copied] }"
+  ],
+  "key_relationships": [
+    "hookAdapter orchestrates: detectPlatform, resolveConfigRoot, loadAdapter, mergeJsonFile, copyHookScripts, appendSectionToFile",
+    "claudeCode imports from hookAdapter: mergeJsonFile, copyHookScripts, appendSectionToFile, removeHookScripts",
+    "codex imports from hookAdapter: mergeJsonFile, copyHookScripts, appendSectionToFile, removeHookScripts",
+    "cursor imports from hookAdapter: mergeJsonFile, copyHookScripts, removeEvolverHooks, removeHookScripts",
+    "All adapters implement interface: { install({configRoot, evolverRoot, force}), uninstall({configRoot, evolverRoot}) }"
+  ],
+  "guard_conditions": [
+    "Already installed guard: if !force && _evolver_managed in existing config → return { ok:true, skipped:true }",
+    "appendSectionToFile: if EVOLVER_MARKER already in file → skip (idempotent)",
+    "Platform not detected → return { ok:false, error:'platform_not_detected' }",
+    "No adapter found → return { ok:false, error:'no_adapter' }",
+    "copyHookScripts: warns if source script not found, continues for remaining scripts"
+  ],
+  "key_functions": {
+    "setupHooks": "async, entry point; resolves platform, configRoot, adapter; delegates to install/uninstall",
+    "loadAdapter": "pure switch on platformId → returns required module",
+    "detectPlatform": "checks cwd then homedir for .cursor/.claude/.codex detector dirs",
+    "mergeJsonFile": "reads existing JSON, deepMerge with patch, sets _evolver_managed=true, atomic write via .tmp rename",
+    "copyHookScripts": "copies [evolver-session-start.js, evolver-signal-detect.js, evolver-session-end.js] from evolverRoot/src/adapters/scripts → destDir, chmod 755",
+    "appendSectionToFile": "idempotent marker-based append to markdown file",
+    "buildClaudeHooks": "returns settings.json patch: hooks.SessionStart, hooks.PostToolUse(matcher=Write), hooks.Stop",
+    "buildCodexHooksJson": "returns hooks.json patch: hooks.SessionStart, hooks.PostToolUse, hooks.Stop — no matcher on PostToolUse",
+    "buildHooksJson": "returns cursor hooks.json: version=1, sessionStart/afterFileEdit(matcher=Write)/stop(loop_limit=1); path relative to isUserLevel flag",
+    "ensureConfigToml": "codex-only; injects codex_hooks=true under [features] in .codex/config.toml"
+  },
+  "config_files_written": {
+    "claude-code": [".claude/settings.json (hooks)", "CLAUDE.md (markdown section)"],
+    "codex": [".codex/hooks.json (hooks)", ".codex/config.toml (features flag)", "AGENTS.md (markdown section)"],
+    "cursor": [".cursor/hooks.json (hooks, version=1)"]
+  },
+  "hook_events": {
+    "claude-code": ["SessionStart → evolver-session-start.js (3s)", "PostToolUse[Write] → evolver-signal-detect.js (2s)", "Stop → evolver-session-end.js (8s)"],
+    "codex": ["SessionStart → evolver-session-start.js (3s)", "PostToolUse → evolver-signal-detect.js (2s)", "Stop → evolver-session-end.js (8s)"],
+    "cursor": ["sessionStart → evolver-session-start.js (3s)", "afterFileEdit[Write] → evolver-signal-detect.js (2s)", "stop[loop_limit=1] → evolver-session-end.js (8s)"]
+  },
+  "important_notes": "All adapters are idempotent (marker-based). mergeJsonFile uses atomic tmp-rename write. Cursor differentiates user-level (homedir) vs project-level paths. Codex uniquely requires enabling the feature flag in config.toml. No markdown section is written for Cursor (unlike Claude Code / Codex). Scripts are always chmod 755 (no-op on Windows).",
+  "source_files_analyzed": [
+    "src/adapters/hookAdapter.js",
+    "src/adapters/claudeCode.js",
+    "src/adapters/codex.js",
+    "src/adapters/cursor.js"
+  ]
+}

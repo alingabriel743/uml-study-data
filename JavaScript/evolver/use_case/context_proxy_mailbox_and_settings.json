@@ -1,0 +1,219 @@
+{
+  "scope": "proxy_mailbox_and_settings",
+  "title": "Proxy Mailbox & Settings",
+  "diagram_type": "use_case",
+  "description": "Mailbox stores messages for the agent and manages local proxy configuration",
+
+  "actors": [
+    {
+      "name": "Agent",
+      "type": "primary",
+      "description": "GEP agent process that sends/receives messages through the proxy via mailboxTransport"
+    },
+    {
+      "name": "ProxyHttpServer",
+      "type": "system",
+      "description": "Local HTTP server (127.0.0.1, default port 19820) that exposes mailbox & proxy routes"
+    },
+    {
+      "name": "MailboxStore",
+      "type": "system",
+      "description": "JSONL-backed in-memory message store (messages.jsonl + state.json) with bi-directional message queues"
+    },
+    {
+      "name": "SettingsFile",
+      "type": "secondary",
+      "description": "~/.evolver/settings.json — persists proxy url, pid, started_at for discovery by other processes"
+    },
+    {
+      "name": "Hub / GEP Backend",
+      "type": "secondary",
+      "description": "Remote service that pulls outbound messages and pushes inbound messages via sync loops"
+    }
+  ],
+
+  "system_boundary": "Proxy Mailbox Module (src/proxy/)",
+
+  "use_cases": [
+    {
+      "id": "UC01",
+      "name": "Send Outbound Message",
+      "actor": "Agent",
+      "entry_point": "mailboxTransport.send(message)",
+      "http_route": "POST /mailbox/send",
+      "store_call": "MailboxStore.send({ type, payload, channel, priority, refId, expiresAt })",
+      "result": "Message appended to messages.jsonl with status=pending, direction=outbound; returns { message_id, status }",
+      "notes": "type and payload required; priority defaults to 'normal'; channel defaults to 'evomap-hub'"
+    },
+    {
+      "id": "UC02",
+      "name": "Poll Inbound Messages",
+      "actor": "Agent",
+      "entry_point": "mailboxTransport.receive(opts)",
+      "http_route": "POST /mailbox/poll",
+      "store_call": "MailboxStore.poll({ channel, type, limit })",
+      "result": "Returns up to limit (max 100) pending inbound messages matching channel/type filters",
+      "notes": "Default limit 20; only returns status=pending messages"
+    },
+    {
+      "id": "UC03",
+      "name": "Acknowledge Inbound Messages",
+      "actor": "Agent",
+      "entry_point": "POST /mailbox/ack (direct HTTP)",
+      "http_route": "POST /mailbox/ack",
+      "store_call": "MailboxStore.ack(message_ids[])",
+      "result": "Sets status=delivered on each inbound message, evicts from in-memory inbound index",
+      "notes": "message_ids array required; only works on direction=inbound messages"
+    },
+    {
+      "id": "UC04",
+      "name": "List Messages by Type",
+      "actor": "Agent",
+      "entry_point": "mailboxTransport.list(opts)",
+      "http_route": "GET /mailbox/list?type=&direction=&status=&limit=&offset=",
+      "store_call": "MailboxStore.list({ type, direction, status, limit, offset })",
+      "result": "Sorted (newest first) paginated message list; type is required",
+      "notes": "type='%' acts as wildcard; default limit 20, max 100"
+    },
+    {
+      "id": "UC05",
+      "name": "Get Message Status",
+      "actor": "Agent",
+      "entry_point": "GET /mailbox/status/:id (direct HTTP)",
+      "http_route": "GET /mailbox/status/:id",
+      "store_call": "MailboxStore.getById(id)",
+      "result": "Returns full message object or 404",
+      "notes": "Reads from in-memory map; returns a shallow copy"
+    },
+    {
+      "id": "UC06",
+      "name": "Start Proxy Server",
+      "actor": "Agent",
+      "entry_point": "ProxyHttpServer.start()",
+      "flow": [
+        "clearIfStale() — clears settings if previous proxy pid is dead",
+        "http.createServer() bound to _handleRequest",
+        "tryListen() scans ports from basePort up to +100",
+        "writeSettings({ proxy: { url, pid, started_at } }) on success"
+      ],
+      "result": "Server listening on first free port; URL registered in ~/.evolver/settings.json"
+    },
+    {
+      "id": "UC07",
+      "name": "Stop Proxy Server",
+      "actor": "Agent",
+      "entry_point": "ProxyHttpServer.stop()",
+      "flow": [
+        "server.close()",
+        "clearSettings() — deletes proxy key from ~/.evolver/settings.json"
+      ],
+      "result": "Server shut down; proxy entry removed from settings"
+    },
+    {
+      "id": "UC08",
+      "name": "Discover Proxy URL",
+      "actor": "Agent (mailboxTransport / any consumer)",
+      "entry_point": "getProxyUrl()",
+      "flow": [
+        "readSettings() — reads ~/.evolver/settings.json",
+        "returns settings.proxy.url or null"
+      ],
+      "result": "Used by mailboxTransport._request() to construct all HTTP calls",
+      "notes": "If null, all transport calls reject with 'Proxy not running' error"
+    },
+    {
+      "id": "UC09",
+      "name": "Get Proxy Status",
+      "actor": "Agent",
+      "http_route": "GET /proxy/status",
+      "store_calls": [
+        "MailboxStore.countPending({ direction: 'outbound' })",
+        "MailboxStore.countPending({ direction: 'inbound' })",
+        "MailboxStore.getState('node_id')",
+        "MailboxStore.getState('last_sync_at')"
+      ],
+      "result": "{ status, node_id, proxy_protocol_version, schema_version, outbound_pending, inbound_pending, last_sync_at }"
+    },
+    {
+      "id": "UC10",
+      "name": "Get Proxy Config",
+      "actor": "Agent",
+      "http_route": "GET /proxy/config",
+      "result": "{ channel: 'evomap-hub', proxy_protocol_version, schema_version }",
+      "notes": "Static config; no store access needed"
+    },
+    {
+      "id": "UC11",
+      "name": "Manage Cursors / State",
+      "actor": "Hub sync loops (internal)",
+      "store_calls": [
+        "MailboxStore.getCursor(key) → state['cursor:<key>']",
+        "MailboxStore.setCursor(key, value) → persists state.json",
+        "MailboxStore.getState(key)",
+        "MailboxStore.setState(key, value)"
+      ],
+      "result": "Durable key-value store used for sync cursors, node_id, last_sync_at"
+    },
+    {
+      "id": "UC12",
+      "name": "Compact Message Log",
+      "actor": "Internal / maintenance",
+      "store_call": "MailboxStore.compact()",
+      "flow": [
+        "Write all in-memory messages to .tmp file (no update ops)",
+        "Atomic rename .tmp → messages.jsonl",
+        "_rebuildIndex()"
+      ],
+      "result": "Reduces JSONL file size by eliminating accumulated update records"
+    },
+    {
+      "id": "UC13",
+      "name": "Register mailbox Transport",
+      "actor": "Agent bootstrap",
+      "entry_point": "registerMailboxTransport()",
+      "flow": [
+        "require('./a2aProtocol').registerTransport('mailbox', mailboxTransport)"
+      ],
+      "result": "mailboxTransport (send/receive/list) registered as 'mailbox' transport in a2aProtocol registry"
+    }
+  ],
+
+  "key_relationships": [
+    "mailboxTransport depends_on getProxyUrl (settings.js) to locate ProxyHttpServer",
+    "mailboxTransport.send → POST /mailbox/send → MailboxStore.send()",
+    "mailboxTransport.receive → POST /mailbox/poll → MailboxStore.poll()",
+    "mailboxTransport.list → GET /mailbox/list → MailboxStore.list()",
+    "ProxyHttpServer.start() writes proxy config to SettingsFile",
+    "ProxyHttpServer.stop() clears proxy config from SettingsFile",
+    "buildRoutes(store, ...) wires MailboxStore to all HTTP route handlers",
+    "MailboxStore persists to dataDir/messages.jsonl + dataDir/state.json",
+    "MailboxStore runs schema migrations on load via MIGRATIONS registry"
+  ],
+
+  "message_lifecycle": {
+    "statuses": ["pending", "synced", "delivered", "failed", "rejected"],
+    "terminal_statuses": ["synced", "delivered", "failed", "rejected"],
+    "directions": ["outbound", "inbound"],
+    "priority_order": ["high", "normal", "low"],
+    "outbound_flow": "Agent calls send() → status=pending → Hub sync pulls via pollOutbound() → updateStatus(id, 'synced')",
+    "inbound_flow": "Hub writes via writeInbound() → status=pending → Agent polls via poll() → Agent calls ack() → status=delivered"
+  },
+
+  "important_notes": [
+    "UUIDv7 used for message IDs (time-ordered, ms-precision timestamps in bits 0-47)",
+    "PROXY_PROTOCOL_VERSION='0.1.0', SCHEMA_VERSION=1 exported from store.js",
+    "Default channel is 'evomap-hub'",
+    "ProxyHttpServer scans up to 100 ports starting from 19820 (or EVOMAP_PROXY_PORT env)",
+    "clearIfStale() on start prevents stale settings from dead proxy processes",
+    "mailboxTransport request timeout is 10 seconds",
+    "routes.js supports optional extension handlers: dmHandler, skillUpdater, sessionHandler, taskMonitor"
+  ],
+
+  "source_files_analyzed": [
+    "src/proxy/mailbox/store.js",
+    "src/proxy/server/settings.js",
+    "src/gep/mailboxTransport.js",
+    "src/proxy/server/routes.js",
+    "src/proxy/server/http.js"
+  ]
+}

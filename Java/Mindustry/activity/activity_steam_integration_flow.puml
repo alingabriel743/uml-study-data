@@ -1,0 +1,317 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 11
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #DEE2E6
+    TitleFontColor #212529
+    TitleFontSize 12
+}
+skinparam note {
+    BackgroundColor #FFF3CD
+    BorderColor #856404
+    FontColor #212529
+    FontSize 10
+}
+
+title Steam Integration Flow\n(App ID 1127400 — SNet · SStats · SWorkshop · SVars)
+
+' ═══════════════════════════════════════════════════
+'  INITIALIZATION
+' ═══════════════════════════════════════════════════
+|SVars|
+start
+:Register static refs\n<b>net</b> (SNet), <b>stats</b> (SStats),\n<b>workshop</b> (SWorkshop), <b>user</b> (SUser);
+
+|SStats|
+:stats.requestCurrentStats();
+:onUserStatsReceived() → service.init();
+:Schedule periodic dirty-flag timer\n(fires every <b>4 minutes</b>);
+
+|SWorkshop|
+:ugc.getSubscribedItems();
+:Resolve item install folders;
+:Classify items by extension / mod descriptor\ninto Map / Schematic / LoadedMod lists;
+if (Map items present?) then (yes)
+    :Achievement.downloadMapWorkshop\n.complete();
+endif
+
+|SNet|
+:Register event listeners\n(ClientLoadEvent, WaveEvent,\nnewGame, BanEvents);
+
+' ═══════════════════════════════════════════════════
+'  HOST SERVER
+' ═══════════════════════════════════════════════════
+|SNet|
+partition "Host Server" {
+    :hostServer(port);
+    :provider.hostServer(port);
+    :smat.createLobby\n(Public | FriendsOnly, playerLimit);
+    :onLobbyCreated(result, steamID);
+    if (result == OK?) then (yes)
+        :currentLobby = steamID;
+        :setLobbyData:\nname, mapname, version,\nversionType, wave, gamemode;
+        :updateBans(null) →\nsetLobbyData('banned', bannedSteamIDs);
+    else (no)
+        :Log error — ignore lobby;
+    endif
+}
+
+' ═══════════════════════════════════════════════════
+'  CLIENT CONNECT
+' ═══════════════════════════════════════════════════
+partition "Client Connect" {
+    :connectClient(address);
+    if (steam: prefix?) then (yes — P2P)
+        :Parse SteamID from 'steam:<handle>';
+        :joinCallback = success handler;
+        :smat.joinLobby(lobby);
+        :onLobbyEnter(steamIDLobby, response);
+        if (response != Success?) then (error)
+            :Show connection error;
+            stop
+        elseif (version mismatch?) then (mismatch)
+            :Show version error;
+            :smat.leaveLobby();
+            stop
+        else (ok)
+            :logic.reset(), net.reset();
+            :currentLobby = steamIDLobby\ncurrentServer = getLobbyOwner();
+            :joinCallback.run();
+            :net.setClientConnected()\nhandleClientReceived(Connect);
+        endif
+    else (no — TCP)
+        :provider.connectClient(ip, port, success);
+    endif
+}
+
+' ═══════════════════════════════════════════════════
+'  P2P PACKET SEND / RECEIVE
+' ═══════════════════════════════════════════════════
+partition "P2P Networking" {
+    fork
+        note right: <b>Server receive loop</b>
+        :snet.isP2PPacketAvailable(channel 0);
+        :snet.readP2PPacket(from, readBuffer)\n→ copy to readCopyBuffer;
+        :serializer.read(readCopyBuffer) → Packet;
+        if (net.server()?) then (yes)
+            :Find / create SteamConnection for sender;
+            :net.handleServerReceived(con, packet);
+        else (client)
+            if (from == currentServer?) then (yes)
+                :net.handleClientReceived(packet);
+            endif
+        endif
+    fork again
+        note right: <b>Client send</b>
+        :serializer.write(writeBuffer, object);
+        if (size >= 1000 bytes\nor flagged reliable?) then (yes)
+            :snet.sendP2PPacket\n(currentServer, buffer, <b>Reliable</b>);
+        else (no)
+            :snet.sendP2PPacket\n(currentServer, buffer, <b>Unreliable</b>);
+        endif
+    fork again
+        note right: <b>Session events</b>
+        :onP2PSessionRequest(remoteID);
+        if (net.server()?) then (yes)
+            :snet.acceptP2PSessionWithUser(remoteID);
+        endif
+        :onP2PSessionConnectFail(remoteID);
+        if (net.server()?) then (yes)
+            :disconnectSteamUser(remoteID);
+        else (client)
+            :net.handleClientReceived(Disconnect);
+        endif
+    end fork
+}
+
+' ═══════════════════════════════════════════════════
+'  LOBBY DISCOVERY
+' ═══════════════════════════════════════════════════
+partition "Lobby Discovery" {
+    :discoverServers();
+    :addRequestLobbyListResultCountFilter(32);
+    :addRequestLobbyListDistanceFilter(Worldwide);
+    :smat.requestLobbyList();
+    :onLobbyMatchList(matches);
+    repeat
+        :getLobbyData:\nhidden, version, gamemode,\nbanned, name, mapname, wave;
+        if (hidden == true?) then (skip)
+        elseif (version mismatch?) then (skip)
+        elseif (gamemode empty?) then (skip)
+        else (include)
+            :Check banned list vs\nSVars.user.getSteamID();
+            if (current user is banned?) then (yes)
+                note right: Skip this lobby
+            else (no)
+                :Build Host object;
+                :invoke lobbyCallback(host);
+            endif
+        endif
+    repeat while (more lobbies?) is (yes)
+    -> done;
+    :lobbyDoneCallback() →\nprovider.discoverServers() (LAN fallback);
+}
+
+' ═══════════════════════════════════════════════════
+'  LOBBY STATE UPDATES
+' ═══════════════════════════════════════════════════
+partition "Lobby State Updates" {
+    fork
+        :WaveEvent / Trigger.newGame\n→ updateWave();
+        if (currentLobby != null\n&& net.server()?) then (yes)
+            :smat.setLobbyData:\nmapname, wave, gamemode;
+        endif
+    fork again
+        :PlayerIpBanEvent / UnbanEvent\n→ updateBans(ip);
+        :Filter Steam IPs from ban list;
+        :Rebuild comma-separated ban string;
+        :smat.setLobbyData('banned', ...);
+    fork again
+        :updateLobby() →\nsetLobbyType()\nsetLobbyMemberLimit();
+        :showFriendInvites() →\nfriends.activateGameOverlay\nInviteDialog(currentLobby);
+    end fork
+}
+
+' ═══════════════════════════════════════════════════
+'  DISCONNECT
+' ═══════════════════════════════════════════════════
+partition "Disconnect" {
+    fork
+        note right: <b>Client disconnect</b>
+        :disconnectClient();
+        :smat.leaveLobby(currentLobby);
+        :snet.closeP2PSessionWithUser\n(currentServer);
+        :currentServer = null\ncurrentLobby = null;
+        :net.handleClientReceived(Disconnect);
+    fork again
+        note right: <b>Server close</b>
+        :closeServer();
+        :provider.closeServer();
+        :smat.leaveLobby(currentLobby);
+        :For each SteamConnection:\nclose() → disconnectSteamUser(sid);
+    fork again
+        note right: <b>Lobby chat update</b>
+        :onLobbyChatUpdate\n(member Disconnected / Left);
+        if (client && host left?) then (yes)
+            :net.disconnect();
+        else (server)
+            :disconnectSteamUser(who);
+        endif
+    end fork
+}
+
+' ═══════════════════════════════════════════════════
+'  WORKSHOP PUBLISH
+' ═══════════════════════════════════════════════════
+|SWorkshop|
+partition "Workshop Publish" {
+    :publish(p);
+    if (p.hasSteamID()?) then (yes — existing item)
+        :viewListing(p) → query UGC details;
+        if (current user is owner?) then (yes)
+            :Show owner management dialog;
+        else (no)
+            :activateGameOverlayToWebPage\n(item page);
+        endif
+    else (no — new item)
+        :p.prePublish() validation check;
+        if (prePublish OK?) then (yes)
+            :showPublish() → user reviews & confirms EULA;
+            :ugc.createItem(steamAppID, Community);
+            :ui.loadfrag.show('@publishing');
+            :onCreateItem(publishedFileID, result);
+            if (result == OK?) then (yes)
+                :itemHandlers.first()\n.get(publishedFileID);
+                :→ updateItem(p, id, null, <b>isNew=true</b>);
+            else (no)
+                :Show publish error;
+            endif
+        else (no)
+            :Reject — show prePublish failure;
+        endif
+    endif
+}
+
+' ═══════════════════════════════════════════════════
+'  WORKSHOP UPDATE
+' ═══════════════════════════════════════════════════
+partition "Workshop Update (updateItem)" {
+    :ugc.startItemUpdate(steamAppID, publishedFileID)\n→ SteamUGCUpdateHandle;
+    :Apply metadata via tagger:\nsetItemTitle · setItemDescription\nsetItemTags · setItemPreview · setItemContent;
+    if (changelog == null?) then (yes — new item)
+        :setItemVisibility(<b>Private</b>);
+        note right: changelog set to '<Created>'
+    endif
+    :ugc.submitItemUpdate(handle, changelog);
+    :Poll: ui.loadfrag.setProgress()\nshowing ItemUpdateStatus;
+    :onSubmitItemUpdate\n(publishedFileID, needsWLA, result);
+    if (result == OK?) then (yes)
+        :updatedHandlers.get(id).run()\n→ p.addSteamID(sid);
+        if (needsWLA?) then (yes)
+            :activateGameOverlayToWebPage\n(<b>EULA acceptance page</b>);
+        else (no)
+            :activateGameOverlayToWebPage\n(item page);
+        endif
+        if (item type is Map?) then (yes)
+            :Achievement.publishMap.complete();
+        endif
+    else (no)
+        :Show publish/update error;
+    endif
+}
+
+' ═══════════════════════════════════════════════════
+'  WORKSHOP DOWNLOAD CALLBACKS
+' ═══════════════════════════════════════════════════
+partition "Workshop Download Callbacks" {
+    fork
+        :onSubscribeItem callback;
+        :ugc.getItemInstallInfo() → log folder;
+        :Achievement.downloadMapWorkshop.complete();
+    fork again
+        :onDownloadItemResult callback;
+        :Achievement.downloadMapWorkshop.complete();
+        :ugc.getItemInstallInfo() → log folder;
+    fork again
+        :onUnsubscribeItem callback;
+        :ugc.getItemInstallInfo() → log folder;
+    fork again
+        :onDeleteItem callback;
+        :ugc.getItemInstallInfo() → log folder;
+    end fork
+}
+
+' ═══════════════════════════════════════════════════
+'  STATS SYNCHRONISATION
+' ═══════════════════════════════════════════════════
+|SStats|
+partition "Stats Synchronisation" {
+    :Game events call onUpdate()\n→ marks <b>updated = true</b>;
+    :Periodic timer fires (every 4 min);
+    if (updated == true?) then (yes)
+        :stats.storeStats();
+        :onUserStatsStored(gameID, result);
+        if (result == OK?) then (ok)
+            :Retain updated = true\n(flag kept until explicit reset);
+        else (fail)
+            :Log storage error;
+        endif
+    else (no)
+        :Skip — stats not dirty;
+    endif
+}
+
+stop
+@enduml

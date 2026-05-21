@@ -1,0 +1,202 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    GroupBackgroundColor #E9ECEF
+    GroupBorderColor #6C757D
+}
+
+title Composer Repository Package Loading
+
+participant "PoolBuilder" as pb
+participant "ComposerRepository" as cr
+participant "Cache" as cache
+participant "HttpDownloader" as http
+participant "EventDispatcher" as ed
+participant "Loop" as loop
+participant "MetadataMinifier" as mm
+participant "ArrayLoader" as al
+participant "Package" as pkg
+participant "Pool" as pool
+
+== Build Pool & Iterative Loading ==
+
+[-> pb: buildPool(repositories, request)
+activate pb
+
+pb -> pb: markPackageNameForLoading(initialRequirements)
+
+loop [while packagesToLoad > 0, batch size = 50]
+    pb -> pb: loadPackagesMarkedForLoading(request, repositories)
+    pb -> cr: loadPackages(packageNameMap, acceptableStabilities,\nstabilityFlags, alreadyLoaded)
+    activate cr
+
+    == Root File: packages.json ==
+
+    cr -> cr: hasProviders() → loadRootServerFile()
+    activate cr
+    cr -> cache: read('packages.json')
+    activate cache
+    cache --> cr: cachedData / null
+    deactivate cache
+
+    alt [cache miss or stale]
+        cr -> ed: dispatch(PRE_FILE_DOWNLOAD, 'packages.json')
+        activate ed
+        ed --> cr: (hooks executed)
+        deactivate ed
+
+        cr -> http: get(packagesJsonUrl, options)
+        activate http
+        http --> cr: Response
+        deactivate http
+
+        cr -> cr: decodeJson(response) → rootData
+        cr -> cache: write('packages.json', json)
+        cr -> ed: dispatch(POST_FILE_DOWNLOAD)
+        activate ed
+        ed --> cr: (hooks executed)
+        deactivate ed
+    else [cache hit with last-modified]
+        cr -> http: get(url, {If-Modified-Since: lastModified})
+        activate http
+        http --> cr: 304 Not Modified OR new data
+        deactivate http
+    end
+
+    cr -> cr: parse rootData → set lazyProvidersUrl (metadata-url),\navailablePackages, hasAvailablePackageList
+    deactivate cr
+
+    == V2 Protocol: Async Package Metadata Fetch ==
+
+    cr -> cr: loadAsyncPackages(packageNameMap,\nacceptableStabilities, stabilityFlags, alreadyLoaded)
+    activate cr
+
+    loop [for each packageName in packageNameMap]
+        cr -> cr: startCachedAsyncDownload(name, realName) → Promise
+        cr -> cache: read('provider-{name}~dev.json') → lastModified
+        activate cache
+        cache --> cr: lastModified / null
+        deactivate cache
+
+        cr -> ed: dispatch(PRE_FILE_DOWNLOAD, metadataUrl/%package%)
+        activate ed
+        ed --> cr: (hooks executed)
+        deactivate ed
+
+        cr -> http: addCopy async GET(metadataUrl/%package%, options) → Promise
+        activate http
+        note right of http: Requests fire\nconcurrently as\nReact promises
+        http --> cr: Promise<Response>
+        deactivate http
+    end
+
+    cr -> loop: wait(promises) [resolve all async downloads]
+    activate loop
+    loop --> cr: resolved responses[]
+    deactivate loop
+
+    == Process Resolved Responses ==
+
+    loop [for each resolved package response]
+        cr -> cache: write('provider-{name}~dev.json', json)
+        activate cache
+        cache --> cr: ok
+        deactivate cache
+
+        cr -> mm: expand(minifiedVersions) [V2 minified data]
+        activate mm
+        mm --> cr: expandedVersionData[]
+        deactivate mm
+
+        cr -> cr: isVersionAcceptable(constraint, name,\nversionData, acceptableStabilities)
+        cr -> al: createPackages(versionsToLoad, packagesSource)
+        activate al
+        al --> cr: BasePackage[]
+        deactivate al
+
+        cr -> pkg: setRepository(this)
+        activate pkg
+        pkg --> cr: ok
+        deactivate pkg
+    end
+
+    deactivate cr
+
+    cr --> pb: {namesFound: string[], packages: BasePackage[]}
+    deactivate cr
+
+    pb -> pb: markPackageNameForLoading(newDependenciesFound)
+end
+
+== V1 Protocol: Synchronous Provider Fetch (if applicable) ==
+
+opt [V1 providers-url repository]
+    pb -> cr: loadPackages(packageNameMap, ...)
+    activate cr
+    cr -> cr: whatProvides(name) → fetchFile(providerUrl, cacheKey, sha256)
+    cr -> cache: read('provider-{vendor}${pkg}.json') + verify sha256
+    activate cache
+    cache --> cr: data / null
+    deactivate cache
+
+    alt [cache miss]
+        cr -> http: get(providerUrl, options) [up to 3 retries]
+        activate http
+        http --> cr: Response
+        deactivate http
+        cr -> cache: write(cacheKey, json)
+    else [V1 lazy-providers: conditional fetch]
+        cr -> http: get(url, {If-Modified-Since: lastModified})
+        activate http
+        http --> cr: 304 Not Modified OR new data
+        deactivate http
+    end
+
+    cr -> al: createPackages(versionsToLoad, packagesSource)
+    activate al
+    al --> cr: BasePackage[]
+    deactivate al
+
+    cr --> pb: packages[]
+    deactivate cr
+end
+
+== Finalize Pool ==
+
+pb -> pb: runSecurityAdvisoryFilter(pool, repositories, request)
+pb -> pb: runFilterListFilter(pool, repositories, request)
+pb -> pb: runOptimizer(request, pool)
+
+pb -> pool: new Pool(packages, unacceptableFixedOrLockedPackages)
+activate pool
+pool --> pb: Pool instance
+deactivate pool
+
+[<-- pb: return Pool
+deactivate pb
+
+@enduml

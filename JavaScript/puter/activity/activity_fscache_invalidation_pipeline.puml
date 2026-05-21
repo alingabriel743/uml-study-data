@@ -1,0 +1,145 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 12
+}
+skinparam ArrowColor #495057
+skinparam ArrowFontColor #212529
+skinparam NoteBackgroundColor #FFF9C4
+skinparam NoteBorderColor #F9A825
+
+title File System Cache Invalidation Pipeline
+
+|#DBEAFE|Extension Event Bus|
+start
+:FS Entry Mutation Fires Extension Event;
+note right
+  Events registered:
+  • outer.gui.item.added
+  • outer.gui.item.updated
+  • outer.gui.item.moved
+  • fs.remove.node
+end note
+
+|#FEF3C7|FSEntryCacheInvalidationEventHandler|
+:#registerHandlers() — subscribe to all four events;
+:#runSafely() wraps each handler\ncatches and logs any thrown error;
+
+if (Event type?) then (outer.gui.item.\nadded / updated / moved)
+  :Extract user_id_list\nfrom event payload;
+  :Extract path, old_path, uid/uuid/id\nfrom event response object;
+  note right
+    uid resolved as:
+    response.uid ?? response.uuid ?? response.id
+  end note
+  :For each userId in user_id_list;
+  if (path present?) then (yes)
+    :Add task:\ninvalidateByPath(userId, path);
+  endif
+  if (oldPath present AND oldPath != path?) then (yes)
+    :Add task:\ninvalidateByPath(userId, oldPath);
+  endif
+  if (uid present?) then (yes)
+    :Add task:\ninvalidateByUuid(uid);
+  endif
+else (fs.remove.node)
+  if (target.get() available?) then (no)
+    :Return — target is invalid;
+    stop
+  else (yes)
+    :Read user_id via target.get("user_id");
+    :Read path via target.get("path");
+    :Resolve uid:\ntarget.get("uid") → target.get("uuid")\n→ fallback: entry.uid / entry.uuid;
+    note right
+      #isUnrecognizedTargetKeyError() skips
+      unknown keys and tries the next one
+    end note
+    if (valid userId AND path?) then (yes)
+      :Add task:\ninvalidateByPath(userId, path);
+    endif
+    if (uuid resolved?) then (yes)
+      :Add task:\ninvalidateByUuid(uuid);
+    endif
+  endif
+endif
+
+:await Promise.all(tasks) — run all\ninvalidation tasks in parallel;
+
+|#DCFCE7|FSEntryRepository|
+
+if (Task: Invalidate by Path?) then (yes)
+  :invalidateEntryCacheByPathForUser\n(userId, path);
+  :Normalize path — trim whitespace,\nvalidate non-empty;
+
+  |#FEE2E2|Database (fsentries)|
+  :SELECT * FROM fsentries\nWHERE user_id=? AND path=? LIMIT 1;
+
+  |#DCFCE7|FSEntryRepository|
+  if (DB row found?) then (yes)
+    :Map FSEntryRow → FSEntry object;
+    :Compute all 4 cache keys\nfrom FSEntry fields;
+    |#EDE9FE|Redis Cache (Cluster)|
+    :DEL id-key, uuid-key,\npath:userId-key, path:any-key\n(best-effort — errors swallowed);
+  else (no)
+    :Build path-only cache keys:\n• prodfsv2:fsentry:path:<userId>:<path>\n• prodfsv2:fsentry:path:any:<path>;
+    |#EDE9FE|Redis Cache (Cluster)|
+    :DEL path-scoped keys\n(best-effort fallback);
+  endif
+  |#DCFCE7|FSEntryRepository|
+endif
+
+if (Task: Invalidate by UUID?) then (yes)
+  :invalidateEntryCacheByUuid(uuid);
+  :Validate uuid is a non-empty string;
+
+  |#FEE2E2|Database (fsentries)|
+  :SELECT * FROM fsentries\nWHERE uuid=? LIMIT 1;
+
+  |#DCFCE7|FSEntryRepository|
+  if (DB row found?) then (yes)
+    :Map FSEntryRow → FSEntry object;
+    :Compute all 4 cache keys;
+    |#EDE9FE|Redis Cache (Cluster)|
+    :DEL id-key, uuid-key,\npath:userId-key, path:any-key\n(best-effort);
+  else (no)
+    :Check Redis for cached entry;
+    |#EDE9FE|Redis Cache (Cluster)|
+    :GET prodfsv2:fsentry:uuid:<uuid>;
+    |#DCFCE7|FSEntryRepository|
+    if (Cached entry found?) then (yes)
+      :Deserialize FSEntry from JSON;
+      :Compute all 4 cache keys;
+      |#EDE9FE|Redis Cache (Cluster)|
+      :DEL all 4 keys\n(best-effort);
+    else (no)
+      |#EDE9FE|Redis Cache (Cluster)|
+      :DEL uuid-key only\n(last-resort fallback);
+    endif
+  endif
+endif
+
+|#FEF3C7|FSEntryCacheInvalidationEventHandler|
+if (Error thrown during handler?) then (yes)
+  :console.error:\n"prodfsv2 cache invalidation\nfailed for <eventName>";
+  note right: Errors are non-fatal —\nfilesystem ops continue
+else (no)
+  :Cache invalidation complete —\nstale FS entries evicted from Redis;
+endif
+
+stop
+
+@enduml

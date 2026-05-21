@@ -1,0 +1,192 @@
+{
+  "scope": "wp_rest_attachments_upload",
+  "title": "WordPress REST Attachments Upload & Processing",
+  "diagram_type": "activity",
+  "class": "WP_REST_Attachments_Controller",
+  "extends": "WP_REST_Posts_Controller",
+  "source_file": "tests/Frameworks/WordPress/Version_6_1/wp-includes/rest-api/endpoints/class-wp-rest-attachments-controller.php",
+  "since": "WordPress 4.7.0",
+
+  "entry_points": [
+    "POST /wp/v2/media → create_item($request)",
+    "POST /wp/v2/media/{id}/post-process → post_process_item($request)"
+  ],
+
+  "activity_flow_create_item": [
+    "START: Client sends POST /wp/v2/media",
+    "GUARD: create_item_permissions_check($request)",
+    "  CHECK: parent::create_item_permissions_check() → user logged in, has caps",
+    "  CHECK: current_user_can('upload_files') → else WP_Error(rest_cannot_create, 400)",
+    "  CHECK: if request['post'] set → current_user_can('edit_post', post_id) → else WP_Error(rest_cannot_edit, 403)",
+    "GUARD: validate parent post type not 'revision' or 'attachment' → else WP_Error(rest_invalid_param, 400)",
+    "CALL: insert_attachment($request) → returns {attachment_id, file} or WP_Error",
+    "  [insert_attachment flow — see below]",
+    "IF WP_Error → return error",
+    "IF request['alt_text'] → update_post_meta(attachment_id, '_wp_attachment_image_alt', ...)",
+    "IF schema has 'meta' && request['meta'] → meta->update_value(request['meta'], attachment_id)",
+    "CALL: update_additional_fields_for_object(attachment, request)",
+    "FIRE: do_action('rest_after_insert_attachment', attachment, request, true)",
+    "CALL: wp_after_insert_post(attachment, false, null)",
+    "IF REST_REQUEST defined → set header X-WP-Upload-Attachment-ID",
+    "INCLUDE: wp-admin/includes/media.php, image.php",
+    "CALL: wp_generate_attachment_metadata(attachment_id, file)",
+    "CALL: wp_update_attachment_metadata(attachment_id, metadata)",
+    "CALL: prepare_item_for_response(attachment, request)",
+    "CALL: rest_ensure_response(response)",
+    "SET: response status 201, Location header",
+    "END: return WP_REST_Response (201 Created)"
+  ],
+
+  "activity_flow_insert_attachment": [
+    "START: insert_attachment($request) called from create_item",
+    "CALL: $request->get_file_params() → $files",
+    "CALL: $request->get_headers() → $headers",
+    "BRANCH: if $files not empty",
+    "  YES → CALL: upload_from_file($files, $headers)",
+    "  NO  → CALL: upload_from_data($request->get_body(), $headers)",
+    "IF WP_Error → return error",
+    "CALL: wp_basename(file['file']) → extract $name",
+    "CALL: pathinfo($name) → $name_parts",
+    "EXTRACT: $url, $type, $file from upload result",
+    "INCLUDE: wp-admin/includes/image.php",
+    "CALL: wp_read_image_metadata($file) → $image_meta",
+    "IF $image_meta → populate request['title'] and request['caption'] from EXIF/IPTC if empty",
+    "CALL: prepare_item_for_database($request) → $attachment stdClass",
+    "SET: $attachment->post_mime_type = $type",
+    "SET: $attachment->guid = $url",
+    "IF empty post_title → derive from filename via preg_replace",
+    "CALL: wp_insert_attachment(wp_slash($attachment), $file, 0, true, false) → $id",
+    "IF WP_Error(db_update_error) → status 500 | other → status 400",
+    "CALL: get_post($id) → $attachment",
+    "FIRE: do_action('rest_insert_attachment', attachment, request, true)",
+    "RETURN: {attachment_id: $id, file: $file}"
+  ],
+
+  "activity_flow_upload_from_data": [
+    "START: upload_from_data($data, $headers)",
+    "CHECK: empty($data) → WP_Error(rest_upload_no_data, 400)",
+    "CHECK: empty($headers['content_type']) → WP_Error(rest_upload_no_content_type, 400)",
+    "CHECK: empty($headers['content_disposition']) → WP_Error(rest_upload_no_content_disposition, 400)",
+    "CALL: self::get_filename_from_disposition($headers['content_disposition']) → $filename",
+    "CHECK: empty($filename) → WP_Error(rest_upload_invalid_disposition, 400)",
+    "IF content_md5 header present → md5($data) compare → WP_Error(rest_upload_hash_mismatch, 412)",
+    "EXTRACT: $type from content_type header",
+    "INCLUDE: wp-admin/includes/file.php",
+    "CALL: wp_tempnam($filename) → $tmpfname",
+    "CALL: fopen($tmpfname, 'w+') → $fp | fail → WP_Error(rest_upload_file_error, 500)",
+    "CALL: fwrite($fp, $data); fclose($fp)",
+    "BUILD: $file_data = {error: null, tmp_name: $tmpfname, name: $filename, type: $type}",
+    "CALL: self::check_upload_size($file_data) → WP_Error if exceeds quota",
+    "CALL: wp_handle_sideload($file_data, {test_form: false})",
+    "IF sideload error → unlink tmpfname, WP_Error(rest_upload_sideload_error, 500)",
+    "RETURN: $sideloaded {file, url, type}"
+  ],
+
+  "activity_flow_upload_from_file": [
+    "START: upload_from_file($files, $headers)",
+    "CHECK: empty($files) → WP_Error(rest_upload_no_data, 400)",
+    "IF content_md5 header → md5_file($files['file']['tmp_name']) compare → WP_Error(rest_upload_hash_mismatch, 412)",
+    "BUILD: $overrides = {test_form: false}",
+    "IF DIR_TESTDATA defined → overrides['action'] = 'wp_handle_mock_upload'",
+    "CALL: self::check_upload_size($files['file']) → WP_Error if exceeds quota",
+    "INCLUDE: wp-admin/includes/file.php",
+    "CALL: wp_handle_upload($files['file'], $overrides)",
+    "IF file['error'] set → WP_Error(rest_upload_unknown_error, 500)",
+    "RETURN: $file {file, url, type}"
+  ],
+
+  "activity_flow_post_process_item": [
+    "START: Client sends POST /wp/v2/media/{id}/post-process",
+    "GUARD: post_process_item_permissions_check → delegates to update_item_permissions_check",
+    "SWITCH request['action']:",
+    "  CASE 'create-image-subsizes':",
+    "    INCLUDE: wp-admin/includes/image.php",
+    "    CALL: wp_update_image_subsizes(request['id'])",
+    "SET: request['context'] = 'edit'",
+    "CALL: prepare_item_for_response(get_post(request['id']), request)",
+    "END: return WP_REST_Response"
+  ],
+
+  "activity_flow_get_filename_from_disposition": [
+    "START: get_filename_from_disposition($disposition_header) — static method",
+    "LOOP: each value in $disposition_header",
+    "  SKIP: if no semicolon in value",
+    "  SPLIT: on ';' → type + attr_parts",
+    "  PARSE: attr_parts into key=value attributes map",
+    "  IF attributes['filename'] empty → continue",
+    "  EXTRACT: filename, unquote if wrapped in double quotes",
+    "RETURN: $filename (string) or null"
+  ],
+
+  "key_relationships": [
+    "WP_REST_Attachments_Controller extends WP_REST_Posts_Controller",
+    "create_item calls insert_attachment",
+    "insert_attachment calls upload_from_file OR upload_from_data (branching on $_FILES)",
+    "upload_from_data calls get_filename_from_disposition (static)",
+    "upload_from_data calls wp_handle_sideload (WP core)",
+    "upload_from_file calls wp_handle_upload (WP core)",
+    "both upload paths call check_upload_size (multisite quota check)",
+    "create_item calls wp_generate_attachment_metadata + wp_update_attachment_metadata",
+    "post_process_item calls wp_update_image_subsizes",
+    "insert_attachment fires do_action('rest_insert_attachment')",
+    "create_item fires do_action('rest_after_insert_attachment')"
+  ],
+
+  "error_states": [
+    "WP_Error: rest_cannot_create (400) — no upload_files capability",
+    "WP_Error: rest_cannot_edit (403) — cannot edit parent post",
+    "WP_Error: rest_invalid_param (400) — parent is revision/attachment type",
+    "WP_Error: rest_upload_no_data (400) — empty body/files",
+    "WP_Error: rest_upload_no_content_type (400) — missing Content-Type",
+    "WP_Error: rest_upload_no_content_disposition (400) — missing Content-Disposition",
+    "WP_Error: rest_upload_invalid_disposition (400) — cannot extract filename",
+    "WP_Error: rest_upload_hash_mismatch (412) — MD5 mismatch",
+    "WP_Error: rest_upload_file_error (500) — cannot open temp file handle",
+    "WP_Error: rest_upload_sideload_error (500) — wp_handle_sideload failure",
+    "WP_Error: rest_upload_unknown_error (500) — wp_handle_upload failure",
+    "WP_Error: db_update_error (500) — database insert failure"
+  ],
+
+  "wp_core_functions_called": [
+    "wp_handle_upload($files, $overrides) — multipart upload",
+    "wp_handle_sideload($file_data, $overrides) — raw data upload",
+    "wp_tempnam($filename) — create temp file",
+    "wp_insert_attachment($attachment, $file, $parent, $wp_error, $fire_after_hooks)",
+    "wp_generate_attachment_metadata($attachment_id, $file)",
+    "wp_update_attachment_metadata($attachment_id, $metadata)",
+    "wp_update_image_subsizes($attachment_id) — for post-process",
+    "wp_read_image_metadata($file) — EXIF/IPTC extraction",
+    "wp_basename($file) — sanitized basename",
+    "get_allowed_mime_types() — for media type filtering",
+    "current_user_can('upload_files'), current_user_can('edit_post', id)",
+    "update_post_meta($id, '_wp_attachment_image_alt', $value)"
+  ],
+
+  "response_shape": {
+    "success_create": "WP_REST_Response status=201, Location header, body=attachment data",
+    "success_post_process": "WP_REST_Response with attachment data in edit context",
+    "custom_header": "X-WP-Upload-Attachment-ID: {id} — used to resume image sub-size creation after PHP fatal"
+  },
+
+  "allow_batch": false,
+  "routes": [
+    "POST /wp/v2/media — create_item (permission: create_item_permissions_check)",
+    "POST /wp/v2/media/{id}/post-process — post_process_item (action enum: create-image-subsizes)",
+    "POST /wp/v2/media/{id}/edit — edit_media_item (since 5.5.0)"
+  ],
+
+  "important_notes": [
+    "upload_from_data handles raw body uploads (Content-Disposition filename required per RFC6266)",
+    "upload_from_file handles multipart/form-data ($_FILES superglobal)",
+    "MD5 integrity check is optional via Content-MD5 header",
+    "Image metadata (EXIF/IPTC) is read and used to auto-populate title/caption fields",
+    "Post-processing (image sub-sizes, PDF thumbnails) runs synchronously in create_item but can be retried via post_process_item endpoint",
+    "check_upload_size enforces multisite storage quota",
+    "X-WP-Upload-Attachment-ID header allows client-side recovery from fatal errors during sub-size generation"
+  ],
+
+  "source_files_analyzed": [
+    "tests/Frameworks/WordPress/Version_6_1/wp-includes/rest-api/endpoints/class-wp-rest-attachments-controller.php",
+    "ir_postprocessed.json (lines 121026-121286)"
+  ]
+}

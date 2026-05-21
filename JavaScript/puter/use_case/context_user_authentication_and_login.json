@@ -1,0 +1,208 @@
+{
+  "scope": "user_authentication_and_login",
+  "title": "User Authentication and Login",
+  "diagram_type": "use_case",
+  "description": "Login, logout, session creation, token validation, and CSRF protection for the Puter platform",
+
+  "actors": [
+    {
+      "name": "UnauthenticatedUser",
+      "description": "Guest browser client with no session"
+    },
+    {
+      "name": "AuthenticatedUser",
+      "description": "Browser client holding a valid session token (HttpOnly cookie)"
+    },
+    {
+      "name": "APIClient",
+      "description": "External client using Bearer token or access token"
+    },
+    {
+      "name": "OIDCProvider",
+      "description": "External identity provider (e.g. Google) for OIDC revalidation"
+    },
+    {
+      "name": "System",
+      "description": "Internal backend services: AuthService, SessionService, TokenService"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC01",
+      "name": "Authenticate via Token",
+      "actor": "AuthenticatedUser / APIClient",
+      "description": "Submit auth token (body auth_token, Authorization Bearer header, or cookie) to gain access",
+      "handler": "configurable_auth middleware → AuthService.authenticate_from_token(token)",
+      "token_types": ["session", "app-under-user", "access-token"],
+      "errors": ["token_missing (401)", "token_auth_failed (401)", "user_not_found (401)", "token_expired (401)", "account_suspended (403)"]
+    },
+    {
+      "id": "UC02",
+      "name": "Validate Session Token",
+      "actor": "System",
+      "description": "Decode JWT, retrieve session from SessionService, fetch user by uuid",
+      "handler": "AuthService.authenticate_from_token → tokenService.verify('auth', token) → sessionService.getSession(uuid) → get_user(uuid)",
+      "result": "Returns UserActorType actor with hasHttpOnlyCookie flag"
+    },
+    {
+      "id": "UC03",
+      "name": "Get CSRF Token",
+      "actor": "AuthenticatedUser",
+      "description": "Authenticated user requests a new anti-CSRF token for state-changing operations",
+      "endpoint": "GET /get-anticsrf-token (auth2: true, allowedMethods: ['GET'])",
+      "handler": "AntiCSRFService.__on_install.routes → AntiCSRFService.create_token(user.uuid)",
+      "constraint": "Blocked on api. subdomain (relaxed CORS); requires req.user",
+      "implementation": "create_token stores token in CircularQueue(10) keyed by session/user uuid; token = crypto.randomBytes(32).hex()",
+      "errors": ["403 if no req.user", "404 on api subdomain"]
+    },
+    {
+      "id": "UC04",
+      "name": "Consume / Validate CSRF Token",
+      "actor": "System",
+      "description": "Validate and one-time-consume a CSRF token before processing a state-changing request",
+      "handler": "AntiCSRFService.consume_token(session, token) → CircularQueue.maybe_consume(token)",
+      "result": "true (valid, consumed) or false (invalid/missing)",
+      "error_code": "anti-csrf-incorrect (400)"
+    },
+    {
+      "id": "UC05",
+      "name": "Request CSRF Token (Frontend)",
+      "actor": "AuthenticatedUser (GUI)",
+      "description": "Frontend GUI calls /get-anticsrf-token with Bearer token",
+      "handler": "gui/AntiCSRFService.token() → fetch(gui_origin/get-anticsrf-token, {Authorization: Bearer window.auth_token})"
+    },
+    {
+      "id": "UC06",
+      "name": "Access User-Protected Endpoint",
+      "actor": "AuthenticatedUser",
+      "description": "Access /user-protected/* routes gated by full session + password or OIDC revalidation",
+      "endpoint": "POST /user-protected/{action}",
+      "middleware_chain": [
+        "Edge rate-limit check (edge-rate-limit service)",
+        "configurable_auth({ no_options_auth: true, allow_cached_user: false })",
+        "Actor type check: must be UserActorType with hasHttpOnlyCookie=true",
+        "Force-refresh user from DB (bypass cache)",
+        "Temporary account check (password===null && email===null → blocked except delete-own-user)",
+        "Identity revalidation: bcrypt.compare(password, user.password) OR jwt.verify(puter_revalidation cookie)"
+      ],
+      "errors": [
+        "too_many_requests (429)",
+        "user_tokens_only (403)",
+        "session_required (403)",
+        "temporary_account (403)",
+        "password_required (400)",
+        "password_mismatch (403)",
+        "oidc_revalidation_required (403) with revalidate_url"
+      ]
+    },
+    {
+      "id": "UC07",
+      "name": "Change Password",
+      "actor": "AuthenticatedUser",
+      "description": "Protected endpoint to change account password",
+      "endpoint": "POST /user-protected/change-password",
+      "precondition": "UC06 middleware passed"
+    },
+    {
+      "id": "UC08",
+      "name": "Change Email",
+      "actor": "AuthenticatedUser",
+      "description": "Protected endpoint to change account email",
+      "endpoint": "POST /user-protected/change-email",
+      "precondition": "UC06 middleware passed"
+    },
+    {
+      "id": "UC09",
+      "name": "Change Username",
+      "actor": "AuthenticatedUser",
+      "description": "Protected endpoint to change username",
+      "endpoint": "POST /user-protected/change-username",
+      "precondition": "UC06 middleware passed"
+    },
+    {
+      "id": "UC10",
+      "name": "Disable 2FA",
+      "actor": "AuthenticatedUser",
+      "description": "Protected endpoint to disable two-factor authentication",
+      "endpoint": "POST /user-protected/disable-2fa",
+      "precondition": "UC06 middleware passed"
+    },
+    {
+      "id": "UC11",
+      "name": "Delete Own Account",
+      "actor": "AuthenticatedUser",
+      "description": "Protected endpoint to delete own user account; allows temporary accounts",
+      "endpoint": "POST /user-protected/delete-own-user",
+      "note": "Bypasses temporary_account middleware check"
+    },
+    {
+      "id": "UC12",
+      "name": "OIDC Revalidation",
+      "actor": "AuthenticatedUser + OIDCProvider",
+      "description": "For OIDC-only accounts (no password), revalidate identity via external provider",
+      "flow": "UserProtectedEndpointsService.#revalidateUrlFields → svc_oidc.getEnabledProviderIds() → redirect to /auth/oidc/{provider}/start?flow=revalidate&user_id={id}",
+      "result": "Sets puter_revalidation JWT cookie (purpose='revalidate', user_id) verified by jwt.verify(cookie, config.jwt_secret)"
+    },
+    {
+      "id": "UC13",
+      "name": "Handle API Error Response",
+      "actor": "System",
+      "description": "Standardized error creation and HTTP response writing",
+      "handler": "APIError.create(code, source, fields) → APIError.write(res)",
+      "key_auth_codes": [
+        "token_missing (401)", "token_auth_failed (401)", "user_not_found (401)",
+        "token_expired (401)", "token_unsupported (401)", "account_suspended (403)",
+        "permission_denied (403)", "session_required (403)", "user_tokens_only (403)",
+        "password_required (400)", "password_mismatch (403)",
+        "oidc_revalidation_required (403)", "anti-csrf-incorrect (400)",
+        "too_many_requests (429)"
+      ]
+    }
+  ],
+
+  "key_relationships": [
+    "AntiCSRFService extends BaseService (backend)",
+    "AntiCSRFService (frontend) extends Service — wraps /get-anticsrf-token HTTP call",
+    "UserProtectedEndpointsService extends BaseService",
+    "AuthService extends BaseService",
+    "APIErrorService extends BaseService — wraps APIError.codes for dynamic registration",
+    "configurable_auth depends_on AuthService.authenticate_from_token",
+    "UserProtectedEndpointsService depends_on APIError, configurable_auth, UserActorType, OIDCService",
+    "UserProtectedEndpointsService mounts at /user-protected on web-server app",
+    "AntiCSRFService mounts at /get-anticsrf-token on web-server app",
+    "AntiCSRFService uses CircularQueue(capacity=10) per session for token storage"
+  ],
+
+  "include_extend_relationships": [
+    "UC06 <<includes>> UC01 (auth middleware)",
+    "UC06 <<includes>> UC12 (when OIDC-only account)",
+    "UC07 <<extends>> UC06",
+    "UC08 <<extends>> UC06",
+    "UC09 <<extends>> UC06",
+    "UC10 <<extends>> UC06",
+    "UC11 <<extends>> UC06",
+    "UC03 <<includes>> UC01 (auth2: true)",
+    "UC04 <<includes>> UC03 (token must exist to consume)"
+  ],
+
+  "important_notes": [
+    "Token extraction order in configurable_auth: body.auth_token > Authorization header (Bearer) > cookie (config.cookie_name)",
+    "UserProtectedEndpointsService blocks api. subdomain cookies via UserActorType.hasHttpOnlyCookie check",
+    "CSRF CircularQueue holds last 10 tokens per session; oldest evicted on overflow",
+    "Revalidation cookie name: 'puter_revalidation'; verified with config.jwt_secret",
+    "Temporary accounts (password===null, email===null) allowed only for delete-own-user",
+    "OIDC-only accounts (password===null, email set) cannot use password revalidation; must use OIDC"
+  ],
+
+  "source_files_analyzed": [
+    "src/backend/src/services/auth/AntiCSRFService.js",
+    "src/gui/src/services/AntiCSRFService.js",
+    "src/backend/src/services/web/UserProtectedEndpointsService.js",
+    "src/backend/src/api/APIError.js",
+    "src/backend/src/modules/web/APIErrorService.js",
+    "src/backend/src/services/auth/AuthService.js (partial)",
+    "src/backend/src/middleware/configurable_auth.js (partial)",
+    "src/backend/src/services/auth/Actor.js (partial)"
+  ]
+}

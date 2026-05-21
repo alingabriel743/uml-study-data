@@ -1,0 +1,160 @@
+{
+  "scope": "text_to_world_generation",
+  "title": "Text-to-World Generation",
+  "diagram_type": "use_case",
+  "description": "User submits multi-view text prompts; the pipeline encodes them, runs diffusion-based denoising, and decodes latents into a multi-camera world video.",
+
+  "actors": [
+    "User/CLI",
+    "DiffusionText2WorldMultiviewGenerationPipeline",
+    "BaseWorldGenerationPipeline",
+    "DiffusionMultiviewT2WModel",
+    "MultiviewGeneralDIT",
+    "CosmosT5TextEncoder",
+    "Tokenizer_CV8x8x8",
+    "GuardrailSystem",
+    "PromptUpsampler",
+    "inference_utils",
+    "FileSystem"
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Submit Multi-View Text Prompts",
+      "actor": "User/CLI",
+      "description": "User provides 6 per-camera text prompts: prompt (front), prompt_left, prompt_right, prompt_back, prompt_back_left, prompt_back_right. Single prompt or batch file supported.",
+      "entry_point": "demo(args) in text2world_multiview.py",
+      "key_params": "height=480, width=848, num_video_frames=57, guidance, num_steps, seed"
+    },
+    {
+      "id": "UC2",
+      "name": "Initialize Pipeline",
+      "actor": "DiffusionText2WorldMultiviewGenerationPipeline",
+      "description": "Instantiate pipeline: load DiffusionMultiviewT2WModel via load_model_by_config(), load network weights (model.pt), load tokenizer (Cosmos-Tokenize1-CV8x8x8-720p), load T5 text encoder, set up guardrail models.",
+      "methods": [
+        "_load_model() -> load_model_by_config(model_class=DiffusionMultiviewT2WModel)",
+        "_load_network() -> load_network_model(model, checkpoint_path/model.pt)",
+        "_load_tokenizer() -> load_tokenizer_model(model, Cosmos-Tokenize1-CV8x8x8-720p)"
+      ]
+    },
+    {
+      "id": "UC3",
+      "name": "Validate Prompt with Guardrail",
+      "actor": "GuardrailSystem",
+      "description": "Run text safety check on input prompt before generation. Blocks generation if unsafe.",
+      "method": "BaseWorldGenerationPipeline._run_guardrail_on_prompt_with_offload(prompt) -> bool",
+      "outcome": "Returns None / logs critical if guardrail blocks"
+    },
+    {
+      "id": "UC4",
+      "name": "Encode Text Prompts",
+      "actor": "CosmosT5TextEncoder",
+      "description": "Convert all 6 per-camera text strings to T5 embeddings. Returns list of (embedding, mask) tensors.",
+      "method": "BaseWorldGenerationPipeline._run_text_embedding_on_prompt_with_offload(prompts: list[str]) -> (list[Tensor], list[Tensor])",
+      "called_from": "DiffusionText2WorldMultiviewGenerationPipeline.generate()"
+    },
+    {
+      "id": "UC5",
+      "name": "Build Multi-View Video Batch",
+      "actor": "inference_utils",
+      "description": "Assemble data_batch dict and state_shape tuple for the multiview model, including frame_repeat_negative_condition for CFG.",
+      "method": "get_video_batch_for_multiview_model(model, prompt_embedding, height, width, fps, num_video_frames*n_views, frame_repeat_negative_condition) -> (data_batch, state_shape)"
+    },
+    {
+      "id": "UC6",
+      "name": "Run Diffusion Denoising (Generate Latents)",
+      "actor": "DiffusionMultiviewT2WModel",
+      "description": "Iterative denoising loop over scheduler timesteps. Supports classifier-free guidance. Handles context-parallel (multi-GPU) splitting/merging of views.",
+      "method": "generate_samples_from_batch(data_batch, guidance, seed, state_shape, n_sample, num_steps=35)",
+      "internal_flow": [
+        "_get_conditions(data_batch) -> (condition, uncondition)",
+        "scheduler.set_timesteps(num_steps)",
+        "init xt = randn * init_noise_sigma",
+        "for t in timesteps: net(x=xt_scaled, timesteps=t, **condition) -> net_output_cond",
+        "net_output = cond + guidance*(cond - uncond)",
+        "scheduler.step(net_output, t, xt) -> xt",
+        "returns xt (latent)"
+      ],
+      "net_class": "MultiviewGeneralDIT (self.net)"
+    },
+    {
+      "id": "UC7",
+      "name": "Decode Latents to Video Frames",
+      "actor": "Tokenizer_CV8x8x8",
+      "description": "Decode diffusion output latent back to pixel space. Multiview version rearranges B C (V T) H W -> per-view segments and assembles a 2x3 grid video.",
+      "method": "DiffusionMultiviewT2WModel.decode(latent) -> rearrange(B C (V T) H W -> (B V) C T H W) -> tokenizer.decode() -> rearrange back",
+      "called_from": "_run_tokenizer_decoding(sample) -> returns [grid_video, video] as uint8 np.ndarray"
+    },
+    {
+      "id": "UC8",
+      "name": "Validate Generated Video with Guardrail",
+      "actor": "GuardrailSystem",
+      "description": "Run video content safety check on generated video frames. Returns None if blocked.",
+      "method": "BaseWorldGenerationPipeline._run_guardrail_on_video_with_offload(video)"
+    },
+    {
+      "id": "UC9",
+      "name": "Save Generated Videos",
+      "actor": "FileSystem",
+      "description": "Save two video files: individual camera video (H x W) and multi-view grid video (2H x 3W). Also save prompts as .txt.",
+      "method": "save_video(video, fps, H, W, video_save_quality, video_save_path)"
+    }
+  ],
+
+  "class_hierarchy": [
+    "BaseWorldGenerationPipeline (ABC) <- DiffusionText2WorldGenerationPipeline <- DiffusionText2WorldMultiviewGenerationPipeline",
+    "DiffusionText2WorldMultiviewGenerationPipeline <- DiffusionVideo2WorldMultiviewGenerationPipeline",
+    "DiffusionT2WModel <- DiffusionMultiviewT2WModel",
+    "GeneralDIT <- MultiviewGeneralDIT"
+  ],
+
+  "key_relationships": [
+    "DiffusionText2WorldMultiviewGenerationPipeline composes DiffusionMultiviewT2WModel (self.model)",
+    "DiffusionMultiviewT2WModel composes MultiviewGeneralDIT (self.net)",
+    "DiffusionMultiviewT2WModel composes Tokenizer_CV8x8x8 (self.tokenizer)",
+    "BaseWorldGenerationPipeline composes CosmosT5TextEncoder (self.text_encoder)",
+    "BaseWorldGenerationPipeline composes GuardrailSystem (self.text_guardrail, self.video_guardrail)",
+    "DiffusionText2WorldMultiviewGenerationPipeline uses inference_utils (generate_world_from_text, get_video_batch_for_multiview_model)"
+  ],
+
+  "main_flow_summary": [
+    "User/CLI -> demo(args): parse 6-view prompts + config",
+    "demo -> DiffusionText2WorldMultiviewGenerationPipeline.__init__(): load model/tokenizer/encoder/guardrails",
+    "demo -> pipeline.generate(prompt_dict)",
+    "generate -> _run_text_embedding_on_prompt_with_offload([6 prompts]) -> 6 embeddings via T5",
+    "generate -> _run_model_with_offload(embeddings)",
+    "_run_model_with_offload -> _run_model(embedding)",
+    "_run_model -> get_video_batch_for_multiview_model() -> data_batch, state_shape",
+    "_run_model -> generate_world_from_text(model, state_shape, data_batch, guidance, steps, seed)",
+    "generate_world_from_text -> model.generate_samples_from_batch() -> diffusion loop over MultiviewGeneralDIT",
+    "_run_model_with_offload -> _run_tokenizer_decoding(sample) -> model.decode() -> [grid_video, video]",
+    "demo -> save_video(video_mp4) + save_video(grid_mp4) + save prompt.txt"
+  ],
+
+  "multiview_specifics": {
+    "n_views": 6,
+    "view_labels": ["front", "left", "right", "back", "back_left", "back_right"],
+    "grid_arrangement": "2x3 grid (order: left, front, right, back_right, back, back_left)",
+    "latent_shape": "B C (V*T) H W — views interleaved in temporal dimension",
+    "model_name": "Cosmos-Predict1-7B-Text2World-Sample-AV-Multiview",
+    "context_parallel": "Optional multi-GPU via megatron context parallel (split/cat along temporal dim)"
+  },
+
+  "important_notes": [
+    "Prompt upsampler is DISABLED for multiview pipeline (enable_prompt_upsampler=False in super().__init__)",
+    "Guardrail safety checks on both input text and output video; blocks generation if triggered",
+    "Offload flags allow CPU/GPU memory management: offload_network, offload_tokenizer, offload_text_encoder_model",
+    "CFG (classifier-free guidance) uses frame_repeat_negative_condition as unconditional signal, default=10",
+    "MultiviewGeneralDIT uses MultiviewVideoRopePosition3DEmb and MultiviewSinCosPosEmbAxis for view-aware positional encoding",
+    "Default output: 57 frames per view @ 480x848, fps=24"
+  ],
+
+  "source_files_analyzed": [
+    "Lyra-1/cosmos_predict1/diffusion/inference/world_generation_pipeline.py",
+    "Lyra-1/cosmos_predict1/diffusion/model/model_t2w_multiview.py",
+    "Lyra-1/cosmos_predict1/diffusion/inference/text2world_multiview.py",
+    "Lyra-1/cosmos_predict1/diffusion/networks/general_dit_multiview.py",
+    "Lyra-1/cosmos_predict1/utils/base_world_generation_pipeline.py"
+  ]
+}

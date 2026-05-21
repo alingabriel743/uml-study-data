@@ -1,0 +1,175 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipantBackgroundColor #F8F9FA
+skinparam sequenceParticipantBorderColor #495057
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceGroupBackgroundColor #E9ECEF
+skinparam sequenceGroupBorderColor #6C757D
+skinparam noteFontSize 11
+skinparam noteBackgroundColor #FFF9C4
+skinparam noteBorderColor #F9A825
+
+title File Download and Archive Transfer Flow
+
+actor User as user
+participant "ContextMenu /\nOpenItem" as ctx
+participant "trigger_download" as td
+participant "AntiCSRF\nEndpoint" as csrf
+participant "downloadFile" as df
+participant "tarItems /\nuntarItem" as tar
+participant "createTar /\nparseTar" as tarlib
+participant "UIWindowProgress" as prog
+participant "puter.fs" as fs
+participant "undo_last_action /\nundo_upload" as undo
+participant "delete_item_with_path" as delitem
+participant "Browser" as browser
+
+== Flow 1: Single File Download ==
+
+user -> ctx : clicks "Download" on a file
+activate ctx
+ctx -> td : trigger_download([fsentry.path])
+activate td
+td -> csrf : GET /get-anticsrf-token\n(Bearer auth_token)
+activate csrf
+csrf --> td : { token: anti_csrf }
+deactivate csrf
+td -> df : downloadFile(url, { anti_csrf, auth_token })
+activate df
+df -> browser : createElement('iframe')\n+ createElement('form')\nform.action = '/down?path=...'\nmethod = POST
+df -> browser : append hidden inputs\n(anti_csrf, auth_token)\nform.submit()
+activate browser
+browser --> user : triggers native file download\n(via iframe form POST)
+deactivate browser
+df -> browser : setTimeout(500ms) →\nremoveChild(iframe)
+deactivate df
+deactivate td
+deactivate ctx
+
+== Flow 2: Directory Download (Tar Creation) ==
+
+user -> ctx : clicks "Download" on a directory
+activate ctx
+ctx -> tar : tarItems(el_item, dirPath, download=true)
+activate tar
+tar -> prog : setTimeout(500ms) →\nUIWindowProgress({ title: 'tar',\nshow_progress: true })
+activate prog
+tar -> fs : readDirectoryRecursive(targetPath)
+activate fs
+fs --> tar : children[]
+deactivate fs
+loop for each file in children
+    tar -> fs : puter.fs.read(targetPath)
+    activate fs
+    fs --> tar : blob
+    deactivate fs
+    tar -> tar : blobToUint8Array(blob) → Uint8Array\nbuilds files[] = [{name, content, isDir}]
+end
+tar -> tarlib : createTar(files[])
+activate tarlib
+note right of tarlib
+  Pure sync function.
+  Builds POSIX tar with
+  512-byte headers, octal
+  size, and checksum fields.
+end note
+tarlib --> tar : Uint8Array (tar contents)
+deactivate tarlib
+tar -> tar : new Blob([tarContents]) → tarBlob
+
+alt download = true
+    tar -> browser : URL.createObjectURL(tarBlob)\ncreateElement('a')\na.click() → triggers download
+    activate browser
+    browser --> user : file download dialog
+    deactivate browser
+else download = false
+    tar -> fs : puter.fs.write(targetDir/name.tar,\ntarBlob, { overwrite:false, dedupeName:true })
+    activate fs
+    fs --> tar : saved
+    deactivate fs
+end
+
+prog --> user : progress window shown\n(if operation > 500ms)
+deactivate prog
+deactivate tar
+deactivate ctx
+
+== Flow 3: Tar Extraction (Untar) ==
+
+user -> tar : untarItem(itemPath)\n(e.g. from context menu "Extract")
+activate tar
+tar -> prog : setTimeout(500ms) →\nUIWindowProgress({ title: 'untar',\nshow_progress: true })
+activate prog
+tar -> fs : puter.fs.read(filePath)
+activate fs
+fs --> tar : blob
+deactivate fs
+tar -> tar : blobToUint8Array(blob) → Uint8Array
+tar -> tarlib : parseTar(Uint8Array)
+activate tarlib
+note right of tarlib
+  Pure sync function.
+  Reads 512-byte headers,
+  validates checksum (256=EOF),
+  extracts name/size/type.
+end note
+tarlib --> tar : files[] = [{name, content, isDir}]
+deactivate tarlib
+tar -> fs : puter.fs.mkdir(dirname/basename_no_ext,\n{ dedupeName: true })
+activate fs
+fs --> tar : rootdir
+deactivate fs
+tar -> tar : builds queuedFileWrites[]\n= [new File([blob], name)]\nfor non-dir entries
+tar -> fs : puter.fs.upload(queuedFileWrites,\nrootdir.path+'/',\n{ createFileParent:true,\ngenerateThumbnails:true })
+activate fs
+fs -> tar : progress callback →\nprogwin.set_progress(op_progress)
+prog --> user : progress updated
+fs -> tar : success callback →\nprogwin.set_progress(100)\n+ progwin.close() after delay
+deactivate fs
+deactivate prog
+deactivate tar
+
+== Flow 4: Undo Upload ==
+
+user -> undo : Ctrl+Z (triggers undo)
+activate undo
+undo -> undo : pops last_action from\nwindow.actions_history\nreads { operation, data }
+note right of undo
+  window.actions_history stack
+  drives all undo operations.
+  operation types: create_file,
+  create_folder, upload, copy,
+  move, delete, rename
+end note
+
+alt operation === 'upload'
+    undo -> undo : undo_upload(data)\nwhere data = [filePaths...]
+    loop for each file path
+        undo -> delitem : delete_item_with_path(file)
+        activate delitem
+        delitem -> fs : puter.fs.delete({\npaths: path,\ndescendantsOnly: false,\nrecursive: true })
+        activate fs
+        fs --> delitem : deleted
+        deactivate fs
+        deactivate delitem
+    end
+end
+deactivate undo
+
+@enduml

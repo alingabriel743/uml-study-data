@@ -1,0 +1,133 @@
+{
+  "scope": "transformer_block_composition",
+  "title": "Transformer Block Composition",
+  "diagram_type": "use_case",
+  "description": "System assembles transformer blocks with MLP, drop-path, and cross-attention for DIT networks",
+
+  "actors": [
+    "DIT Network Builder (MultiviewGeneralDIT / GeneralDIT)",
+    "Inference Runtime",
+    "Training Runtime"
+  ],
+
+  "use_cases": [
+    "Configure block sequence via block_config string (e.g. 'FA-CA-MLP')",
+    "Assemble GeneralDITTransformerBlock from ordered DITBuildingBlocks",
+    "Apply full self-attention (FA) with AdaLN modulation",
+    "Apply cross-attention (CA) with context embedding and optional mask",
+    "Apply MLP feedforward block (FF/MLP) with AdaLN modulation",
+    "Apply stochastic depth regularization via DropPath",
+    "Apply adaptive layer normalization (AdaLN) with shift/scale/gate from timestep embedding",
+    "Inject rotary positional embedding (RoPE) into attention blocks",
+    "Inject per-block absolute positional embedding",
+    "Support AdaLN-LoRA for parameter-efficient modulation",
+    "Process multi-view inputs with n_views parameter",
+    "Run forward pass through sequenced blocks"
+  ],
+
+  "key_classes": [
+    {
+      "name": "Block",
+      "file": "Lyra-1/src/models/utils/attention.py:346",
+      "parent": "nn.Module",
+      "components": ["norm1 (LayerNorm)", "attn (MemEffAttentionFlash | MemEffAttentionFlex)", "drop_path (DropPath | Identity)", "norm2 (LayerNorm)", "mlp (Mlp)"],
+      "forward": "x = x + drop_path(attn(norm1(x))); x = x + drop_path(mlp(norm2(x)))",
+      "init_params": "dim, num_heads, mlp_ratio=4, qkv_bias, drop, attn_drop, drop_path, act_layer, norm_layer, use_flex_attention, use_qk_norm"
+    },
+    {
+      "name": "CrossAttentionBlock",
+      "file": "Lyra-1/src/models/utils/attention.py:386",
+      "parent": "nn.Module",
+      "components": ["norm1 (LayerNorm)", "norm_y (LayerNorm)", "attn (MemEffCrossAttentionFlash)", "drop_path (DropPath | Identity)", "norm2 (LayerNorm)", "mlp (Mlp)"],
+      "forward": "y = norm_y(y); x = x + drop_path(attn(norm1(x), y, y)); x = x + drop_path(mlp(norm2(x)))",
+      "init_params": "dim, num_heads, mlp_ratio=4, qkv_bias, drop, attn_drop, drop_path, act_layer, norm_layer, use_qk_norm"
+    },
+    {
+      "name": "Mlp",
+      "file": "Lyra-1/src/models/utils/attention.py:73",
+      "parent": "nn.Module",
+      "components": ["fc1 (Linear)", "act (GELU)", "drop1 (Dropout)", "fc2 (Linear)", "drop2 (Dropout)"],
+      "forward": "x = fc1(x) → act → drop1 → fc2 → drop2",
+      "init_params": "in_features, hidden_features=None, out_features=None, act_layer=GELU, bias=True, drop=0"
+    },
+    {
+      "name": "DropPath",
+      "file": "Lyra-1/src/models/utils/attention.py:59",
+      "parent": "nn.Module",
+      "forward": "drop_path(x, drop_prob, training, scale_by_keep)",
+      "init_params": "drop_prob=0.0, scale_by_keep=True",
+      "note": "Stochastic Depth per-sample regularization; replaced by nn.Identity when drop_prob=0"
+    },
+    {
+      "name": "DITBuildingBlock",
+      "file": "Lyra-1/cosmos_predict1/diffusion/module/blocks.py:344",
+      "parent": "nn.Module",
+      "block_types": {
+        "ca / cross_attn": "VideoAttn(x_dim, context_dim, num_heads, n_views=n_views)",
+        "fa / full_attn": "VideoAttn(x_dim, None, num_heads)",
+        "mlp / ff": "GPT2FeedForward(x_dim, x_dim*mlp_ratio)"
+      },
+      "adaln": "adaLN_modulation → (shift, scale, gate) chunks from emb_B_D; optionally +adaln_lora_B_3D",
+      "forward": "shift/scale/gate = adaLN_modulation(emb_B_D); x = x + gate * block(adaln_norm_state(norm_state, x, scale, shift))",
+      "init_params": "block_type, x_dim, context_dim, num_heads, mlp_ratio, bias, mlp_dropout, qkv_norm_mode, x_format, use_adaln_lora, adaln_lora_dim, n_views"
+    },
+    {
+      "name": "GeneralDITTransformerBlock",
+      "file": "Lyra-1/cosmos_predict1/diffusion/module/blocks.py:478",
+      "parent": "nn.Module",
+      "description": "Wraps ordered sequence of DITBuildingBlocks parsed from block_config string",
+      "construction": "for block_type in block_config.split('-'): blocks.append(DITBuildingBlock(...))",
+      "forward_inputs": "x, emb_B_D, crossattn_emb, crossattn_mask, rope_emb_L_1_1_D, adaln_lora_B_3D, extra_per_block_pos_emb",
+      "forward": "if extra_pos_emb: x += extra_pos_emb; for block in blocks: x = block(x, emb_B_D, crossattn_emb, ...)",
+      "init_params": "x_dim, context_dim, num_heads, block_config, mlp_ratio, x_format, use_adaln_lora, adaln_lora_dim, n_views"
+    },
+    {
+      "name": "MultiviewGeneralDIT",
+      "file": "Lyra-1/cosmos_predict1/diffusion/networks/general_dit_multiview.py:34",
+      "parent": "GeneralDIT",
+      "description": "Extends GeneralDIT; reinitializes self.blocks as nn.ModuleDict of GeneralDITTransformerBlock with n_views",
+      "default_block_config": "FA-CA-MLP",
+      "block_dict_key": "block{idx} for idx in range(num_blocks)",
+      "extra_modules": ["view_embeddings (Embedding: n_views × view_condition_dim)", "traj_embeddings (Linear, optional)", "repeat_frame_embedding (Linear, optional)"],
+      "init_params": "max_img_h, max_img_w, max_frames, in_channels, out_channels, patch_spatial, patch_temporal, block_config, model_channels, num_blocks, num_heads, mlp_ratio, n_views, view_condition_dim, ..."
+    }
+  ],
+
+  "key_relationships": [
+    "MultiviewGeneralDIT extends GeneralDIT",
+    "MultiviewGeneralDIT composes GeneralDITTransformerBlock (num_blocks instances, nn.ModuleDict)",
+    "GeneralDITTransformerBlock composes DITBuildingBlock (nn.ModuleList, 1 per block_config token)",
+    "DITBuildingBlock composes VideoAttn (for FA or CA) or GPT2FeedForward (for MLP)",
+    "DITBuildingBlock uses AdaLN modulation (nn.Sequential SiLU + Linear)",
+    "Block composes Mlp + DropPath + MemEffAttentionFlash/Flex (simpler standalone variant)",
+    "CrossAttentionBlock composes Mlp + DropPath + MemEffCrossAttentionFlash (simpler standalone variant)",
+    "MemEffAttentionFlash extends Attention",
+    "MemEffCrossAttentionFlash extends CrossAttention",
+    "DropPath used in both Block and CrossAttentionBlock for stochastic depth"
+  ],
+
+  "block_config_parsing": {
+    "format": "hyphen-separated tokens, e.g. 'FA-CA-MLP'",
+    "tokens": {
+      "FA / full_attn": "Full self-attention via VideoAttn(context=None)",
+      "CA / cross_attn": "Cross-attention via VideoAttn(context=crossattn_emb)",
+      "MLP / ff": "Feedforward via GPT2FeedForward"
+    },
+    "default_multiview": "FA-CA-MLP"
+  },
+
+  "important_notes": [
+    "Two parallel block hierarchies: (1) Block/CrossAttentionBlock in src/models/utils/attention.py — simpler, used for Lyra-style nets; (2) DITBuildingBlock/GeneralDITTransformerBlock in cosmos_predict1/diffusion/module/blocks.py — config-driven, used for DIT/MultiviewGeneralDIT",
+    "AdaLN (adaptive layer normalization) is central: timestep embedding → shift/scale/gate applied around every block operation",
+    "DropPath is conditioned on drop_prob: if 0, replaced by nn.Identity (no stochastic depth)",
+    "n_views param threads through MultiviewGeneralDIT → GeneralDITTransformerBlock → DITBuildingBlock → VideoAttn for multi-view attention masking",
+    "RoPE (rotary position embeddings) injected at attention level via rope_emb_L_1_1_D",
+    "Cross-attention block normalizes both query (norm1) and context (norm_y) before attention"
+  ],
+
+  "source_files_analyzed": [
+    "Lyra-1/src/models/utils/attention.py (lines 59-421)",
+    "Lyra-1/cosmos_predict1/diffusion/module/blocks.py (lines 344-558)",
+    "Lyra-1/cosmos_predict1/diffusion/networks/general_dit_multiview.py (lines 1-200)"
+  ]
+}

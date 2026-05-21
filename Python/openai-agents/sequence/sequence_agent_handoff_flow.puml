@@ -1,0 +1,169 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #E9ECEF
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Agent Handoff Flow
+
+participant "RunLoop" as RunLoop
+participant "execute_tools_and_side_effects" as ExecTools
+participant "execute_handoffs" as ExecHandoffs
+participant "Tracer\n(handoff_span)" as Tracer
+participant "Handoff\n(on_invoke_handoff)" as Handoff
+participant "RunHooks /\nAgentHooks" as Hooks
+participant "_resolve_server_managed\n_handoff_behavior" as ResolveSMH
+participant "HandoffInputFilter /\nnest_handoff_history" as InputFilter
+participant "SourceAgent" as SrcAgent
+participant "TargetAgent" as TgtAgent
+
+== Agent Turn Produces Handoff Tool Call ==
+
+RunLoop -> ExecTools : execute_tools_and_side_effects(\n  bindings: AgentBindings,\n  processed_response,\n  context_wrapper,\n  run_config)
+activate ExecTools
+
+ExecTools -> ExecTools : check processed_response.handoffs\n→ run_handoffs list
+
+alt Multiple handoffs in same turn
+    ExecTools -> ExecTools : emit ToolCallOutputItem(\n  "Multiple handoffs detected,\n   ignoring this one")\n  for each handoff after first
+    note right of ExecTools
+        Only the **first** handoff
+        in a turn is executed.
+        The rest are silently discarded
+        with an explanatory tool output.
+    end note
+end
+
+ExecTools -> ExecHandoffs : execute_handoffs(\n  actual_handoff = run_handoffs[0],\n  context_wrapper, run_config, ...)
+activate ExecHandoffs
+
+== Open Tracing Span ==
+
+ExecHandoffs -> Tracer : handoff_span(\n  from_agent = public_agent.name)
+activate Tracer
+
+== Invoke the Handoff ==
+
+ExecHandoffs -> Handoff : on_invoke_handoff(\n  context_wrapper,\n  tool_call.arguments)
+activate Handoff
+
+alt input_type is set
+    Handoff -> Handoff : TypeAdapter.validate_json(args)\n→ parsed_input
+    Handoff -> Handoff : on_handoff(ctx, parsed_input)\n[user callback — side-effects only]
+else no input_type but on_handoff set
+    Handoff -> Handoff : on_handoff(ctx)\n[user callback — no parsed input]
+end
+
+Handoff --> ExecHandoffs : new_agent: Agent\n(the captured target agent)
+deactivate Handoff
+
+note right of Handoff
+    The **handoff()** factory always
+    returns the fixed target agent.
+    **on_handoff** is for side-effects
+    (logging, data fetching, etc.)
+    and cannot change the destination.
+end note
+
+== Update Span & Emit Output Item ==
+
+ExecHandoffs -> Tracer : span_data.to_agent = new_agent.name
+ExecHandoffs -> ExecHandoffs : append HandoffOutputItem(\n  source_agent = public_agent,\n  target_agent = new_agent)\nto new_step_items
+
+== Fire Lifecycle Hooks (concurrent) ==
+
+ExecHandoffs -> Hooks : [parallel]\nRunHooks.on_handoff(context, from_agent, to_agent)\nAgentHooks.on_handoff(ctx, agent=new_agent, source=public_agent)
+activate Hooks
+Hooks --> ExecHandoffs : (hooks complete)
+deactivate Hooks
+
+== Resolve Conversation History Policy ==
+
+ExecHandoffs -> ExecHandoffs : input_filter = handoff.input_filter\n  OR run_config.handoff_input_filter\nshould_nest_history = handoff.nest_handoff_history\n  OR run_config.nest_handoff_history
+
+ExecHandoffs -> ResolveSMH : _resolve_server_managed_handoff_behavior(\n  handoff, from_agent, to_agent,\n  run_config, server_manages_conversation,\n  input_filter, should_nest_history)
+activate ResolveSMH
+
+alt server_manages_conversation is False
+    ResolveSMH --> ExecHandoffs : (input_filter, should_nest_history) unchanged
+else server_manages_conversation AND input_filter set
+    ResolveSMH --> ExecHandoffs : raise UserError\n(incompatible combination)
+else server_manages_conversation AND should_nest_history
+    ResolveSMH --> ExecHandoffs : log warning;\nreturn (input_filter, False)\n[nest_history disabled]
+end
+
+deactivate ResolveSMH
+
+== Apply Input Filter or Nest History ==
+
+alt input_filter is set  [takes precedence]
+    ExecHandoffs -> ExecHandoffs : build HandoffInputData(\n  input_history,\n  pre_handoff_items,\n  new_items,\n  run_context)
+    ExecHandoffs -> InputFilter : input_filter(handoff_input_data)\n[sync or async callable]
+    activate InputFilter
+    InputFilter --> ExecHandoffs : filtered: HandoffInputData
+    deactivate InputFilter
+    ExecHandoffs -> ExecHandoffs : apply filtered.input_history,\n  pre_handoff_items, new_items\nif filtered.input_items set →\n  session_step_items = new_items,\n  new_step_items = input_items
+else should_nest_history is True  [opt-in beta]
+    ExecHandoffs -> InputFilter : nest_handoff_history(\n  handoff_input_data,\n  run_config.handoff_history_mapper)
+    activate InputFilter
+    note right of InputFilter
+        Collapses prior transcript into
+        a single **<CONVERSATION HISTORY>**
+        assistant summary block.
+        Custom **handoff_history_mapper**
+        replaces the generated message.
+    end note
+    InputFilter --> ExecHandoffs : nested: HandoffInputData\n(with collapsed transcript)
+    deactivate InputFilter
+end
+
+== Close Span & Return Result ==
+
+ExecHandoffs -> Tracer : close handoff_span
+deactivate Tracer
+
+ExecHandoffs --> ExecTools : SingleStepResult(\n  original_input,\n  model_response,\n  pre_step_items,\n  new_step_items,\n  next_step = NextStepHandoff(new_agent),\n  session_step_items)
+deactivate ExecHandoffs
+
+ExecTools --> RunLoop : SingleStepResult
+deactivate ExecTools
+
+== RunLoop Switches to Target Agent ==
+
+RunLoop -> RunLoop : inspect next_step\n→ NextStepHandoff(new_agent)
+
+RunLoop -> TgtAgent : begin new agent turn\n(new_agent sees filtered/nested history)
+
+note over SrcAgent, TgtAgent
+    **Handoffs stay within a single Runner.run() call.**
+    Input guardrails apply only to the first agent.
+    Output guardrails apply only to the final agent.
+    The handoff tool is named **transfer_to_<agent_name>**.
+end note
+
+@enduml

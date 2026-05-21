@@ -1,0 +1,245 @@
+{
+  "scope": "sampling_and_generation",
+  "title": "Sampling & Generation",
+  "diagram_type": "use_case",
+  "description": "User triggers inference sampling to produce world video outputs from trained models",
+
+  "actors": [
+    "User (CLI operator)",
+    "LatentRecon (3DGS transformer model)",
+    "VAE (video autoencoder)",
+    "DiffusionText2WorldGenerationPipeline",
+    "DiffusionVideo2WorldGenerationPipeline",
+    "DiffusionText2WorldMultiviewGenerationPipeline",
+    "DiffusionVideo2WorldMultiviewGenerationPipeline",
+    "DiffusionWorldInterpolatorGenerationPipeline",
+    "BaseWorldGenerationPipeline (ABC)",
+    "MultiviewDiffusionModel",
+    "GuardrailSystem",
+    "PromptUpsampler (T5/VLM)",
+    "T5TextEncoder"
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Run 3DGS Latent Reconstruction Sampling (sample.py)",
+      "actor": "User",
+      "entry_point": "sample.py::main(config)",
+      "description": "User invokes sample.py with a config. For dynamic scenes, loops over target_index_manual values and calls main_single() per bullet-time index.",
+      "steps": [
+        "Parse CLI args and load/merge OmegaConf configs",
+        "Resolve checkpoint path (latest or specified)",
+        "Instantiate data loader via get_multi_dataloader(main_config)",
+        "Load LatentRecon transformer + VAE via load_model(ckpt_path, config, dtype)",
+        "Loop over test_dataloader batches",
+        "Encode input video with encode_multi_view_video(vae, video, n_views, backbone)",
+        "Optionally encode plucker embedding and time VAE",
+        "Run forward pass: transformer(batch_test) → model_output",
+        "Post-process: pred_images, pred_depths, gaussians",
+        "Optionally decode latents with decode_multi_view_latents()",
+        "Generate wave visualization via generate_wave_video()",
+        "Save outputs: save_video(), save_ply(), write_dict_to_json()"
+      ],
+      "key_outputs": ["MP4 video per view", "PLY gaussians", "JSON metadata", "grid videos"]
+    },
+    {
+      "id": "UC2",
+      "name": "Generate World Video from Text Prompt (Text2World)",
+      "actor": "User",
+      "pipeline_class": "DiffusionText2WorldGenerationPipeline",
+      "entry_method": "generate(prompt, negative_prompt, word_limit_to_skip_upsampler)",
+      "steps": [
+        "Guardrail check on raw prompt via _run_guardrail_on_prompt_with_offload()",
+        "Optionally enhance prompt via _run_prompt_upsampler_on_prompt_with_offload() → run_chat_completion()",
+        "Guardrail check on upsampled prompt",
+        "Encode prompt(s) via _run_text_embedding_on_prompt_with_offload() → T5TextEncoder",
+        "Call _run_model_with_offload(prompt_embedding, negative_prompt_embedding)",
+        "  └─ Optionally load network/tokenizer",
+        "  └─ get_video_batch(model, embedding, height, width, fps, num_frames)",
+        "  └─ generate_world_from_text(model, state_shape, data_batch, guidance, num_steps, seed)",
+        "  └─ _run_tokenizer_decoding(sample) → model.decode(latent) → uint8 numpy [T,H,W,C]",
+        "Guardrail check on generated video via _run_guardrail_on_video_with_offload()",
+        "Return (video_frames, final_prompt)"
+      ],
+      "model_loaded": "DiffusionT2WModel",
+      "tokenizer": "Cosmos-Tokenize1-CV8x8x8-720p"
+    },
+    {
+      "id": "UC3",
+      "name": "Generate World Video from Input Video (Video2World)",
+      "actor": "User",
+      "pipeline_class": "DiffusionVideo2WorldGenerationPipeline",
+      "entry_method": "generate(prompt, image_or_video_path, negative_prompt)",
+      "extends": "UC2",
+      "additional_steps": [
+        "Prompt upsampler uses VLM: prepare_dialog(image_or_video_path) + run_chat_completion_vlm()",
+        "_run_model_with_offload also calls _run_tokenizer_encoding(image_or_video_path)",
+        "  └─ get_condition_latent(model, input_path, num_input_frames, state_shape)",
+        "_run_model receives condition_latent → generate_world_from_video()"
+      ],
+      "model_loaded": "DiffusionV2WModel",
+      "extra_param": "num_input_frames: int = 1"
+    },
+    {
+      "id": "UC4",
+      "name": "Generate Multi-View World from Text (Text2World Multiview)",
+      "actor": "User",
+      "pipeline_class": "DiffusionText2WorldMultiviewGenerationPipeline",
+      "entry_method": "generate(prompt: dict)",
+      "extends": "UC2",
+      "description": "Generates 6-view simultaneous video. Prompt is a dict with keys: prompt, prompt_left, prompt_right, prompt_back, prompt_back_left, prompt_back_right.",
+      "steps": [
+        "Embed all 6 per-view prompts via _run_text_embedding_on_prompt_with_offload()",
+        "_run_model_with_offload(prompt_embeddings)",
+        "  └─ get_video_batch_for_multiview_model(model, embeddings, frame_repeat_negative_condition)",
+        "  └─ generate_world_from_text() on n_views * num_video_frames",
+        "_run_tokenizer_decoding rearranges output to 6-view grid via einops",
+        "Returns [grid_video, raw_video]"
+      ],
+      "model_loaded": "DiffusionMultiviewT2WModel",
+      "extra_params": "n_views=6, frame_repeat_negative_condition=10",
+      "prompt_upsampler": "disabled (enable_prompt_upsampler=False)"
+    },
+    {
+      "id": "UC5",
+      "name": "Generate Multi-View World from Input Video (Video2World Multiview)",
+      "actor": "User",
+      "pipeline_class": "DiffusionVideo2WorldMultiviewGenerationPipeline",
+      "entry_method": "generate(prompt: dict, image_or_video_path: str)",
+      "extends": "UC4",
+      "additional_steps": [
+        "_run_model_with_offload also calls get_video_batch_for_multiview_model() to get state_shape",
+        "_run_tokenizer_encoding(image_or_video_path, state_shape) → get_condition_latent_multiview()",
+        "_run_model(embedding, condition_latent, data_batch, state_shape) → generate_world_from_video()"
+      ],
+      "model_loaded": "DiffusionMultiviewV2WModel",
+      "extra_param": "num_input_frames: int = 1"
+    },
+    {
+      "id": "UC6",
+      "name": "Interpolate World Video (WorldInterpolator)",
+      "actor": "User",
+      "pipeline_class": "DiffusionWorldInterpolatorGenerationPipeline",
+      "entry_method": "generate(...)",
+      "extends": "UC3",
+      "description": "Generates interpolated video between frame pairs using looped chunk processing.",
+      "model_loaded": "DiffusionWorldInterpolatorWModel",
+      "key_call": "generate_video_from_batch_with_loop(model, data_batch, condition_latent, num_of_loops, ...)",
+      "extra_params": "num_frame_pairs, frame_index_start, frame_stride, augment_sigma_list"
+    }
+  ],
+
+  "class_hierarchy": [
+    "BaseWorldGenerationPipeline (ABC)",
+    "  └─ DiffusionText2WorldGenerationPipeline",
+    "       └─ DiffusionVideo2WorldGenerationPipeline",
+    "       └─ DiffusionText2WorldMultiviewGenerationPipeline",
+    "            └─ DiffusionVideo2WorldMultiviewGenerationPipeline",
+    "       └─ DiffusionWorldInterpolatorGenerationPipeline (extends V2W)",
+    "MultiviewDiffusionModel extends DiffusionModel (training side, n_views attr)"
+  ],
+
+  "key_relationships": [
+    "DiffusionText2WorldGenerationPipeline depends_on DiffusionT2WModel",
+    "DiffusionVideo2WorldGenerationPipeline depends_on DiffusionV2WModel",
+    "DiffusionText2WorldMultiviewGenerationPipeline depends_on DiffusionMultiviewT2WModel",
+    "DiffusionVideo2WorldMultiviewGenerationPipeline depends_on DiffusionMultiviewV2WModel",
+    "DiffusionWorldInterpolatorGenerationPipeline depends_on DiffusionWorldInterpolatorWModel",
+    "All pipelines use T5TextEncoder for prompt embedding",
+    "All pipelines optionally use GuardrailSystem (text + video safety checks)",
+    "Text2World uses PromptUpsampler (LLM-based chat completion)",
+    "Video2World uses VLM PromptUpsampler (visual language model, VLM dialog)",
+    "sample.py depends_on LatentRecon (3DGS model), VAE, get_multi_dataloader"
+  ],
+
+  "key_methods": {
+    "BaseWorldGenerationPipeline": [
+      "_load_model() [abstract]",
+      "_load_network()",
+      "_load_tokenizer()",
+      "_load_text_encoder_model()",
+      "_load_text_guardrail()",
+      "_load_video_guardrail()",
+      "_run_text_embedding_on_prompt_with_offload(prompts)",
+      "_run_guardrail_on_prompt_with_offload(prompt)",
+      "_run_guardrail_on_video_with_offload(video)",
+      "_offload_network()",
+      "_offload_tokenizer()"
+    ],
+    "DiffusionText2WorldGenerationPipeline": [
+      "generate(prompt, negative_prompt, word_limit_to_skip_upsampler) → (np.ndarray, str)|None",
+      "_run_model(embedding, negative_prompt_embedding) → torch.Tensor",
+      "_run_model_with_offload(prompt_embedding, negative_prompt_embedding) → np.ndarray",
+      "_run_tokenizer_decoding(sample) → np.ndarray",
+      "_run_prompt_upsampler_on_prompt(prompt) → str",
+      "_run_prompt_upsampler_on_prompt_with_offload(*args) → str"
+    ],
+    "DiffusionVideo2WorldGenerationPipeline": [
+      "generate(prompt, image_or_video_path, negative_prompt) → (np.ndarray, str)|None",
+      "_run_model(embedding, condition_latent, negative_prompt_embedding) → torch.Tensor",
+      "_run_tokenizer_encoding(image_or_video_path) → torch.Tensor",
+      "_run_model_with_offload(prompt_embedding, image_or_video_path, negative_prompt_embedding) → np.ndarray",
+      "_run_prompt_upsampler_on_prompt(image_or_video_path) → str [uses VLM]"
+    ],
+    "DiffusionText2WorldMultiviewGenerationPipeline": [
+      "generate(prompt: dict) → ([grid_video, raw_video], prompt)",
+      "_run_model(embedding, negative_prompt_embedding) → torch.Tensor",
+      "_run_tokenizer_decoding(sample) → [grid_video, raw_video]"
+    ],
+    "DiffusionVideo2WorldMultiviewGenerationPipeline": [
+      "generate(prompt: dict, image_or_video_path: str) → (video, prompt)",
+      "_run_model(embedding, condition_latent, negative_prompt_embedding, data_batch, state_shape)",
+      "_run_tokenizer_encoding(image_or_video_path, state_shape) → (condition_latent, condition_frames)",
+      "_run_model_with_offload(prompt_embedding, image_or_video_path, negative_prompt_embedding)"
+    ],
+    "sample.py": [
+      "main(config) → loops over bullet-time indices",
+      "main_single(config, seed, transformer, vae, distributed_state, ckpt_path) → (transformer, vae, distributed_state, ckpt_path)",
+      "load_model(ckpt_path, config, weight_dtype) → (transformer, vae, distributed_state)"
+    ]
+  },
+
+  "inference_utils_used": [
+    "generate_world_from_text(model, state_shape, is_negative_prompt, data_batch, guidance, num_steps, seed)",
+    "generate_world_from_video(model, state_shape, is_negative_prompt, data_batch, guidance, num_steps, seed, condition_latent, num_input_frames)",
+    "get_condition_latent(model, input_image_or_video_path, num_input_frames, state_shape)",
+    "get_condition_latent_multiview(model, input_image_or_video_path, num_input_frames, state_shape)",
+    "get_video_batch(model, prompt_embedding, negative_prompt_embedding, height, width, fps, num_video_frames)",
+    "get_video_batch_for_multiview_model(..., frame_repeat_negative_condition)",
+    "load_model_by_config(config_job_name, config_file, model_class)",
+    "load_network_model(model, path)",
+    "load_tokenizer_model(model, path)",
+    "read_video_or_image_into_frames_BCTHW(path)"
+  ],
+
+  "model_name_dict_keys": [
+    "Cosmos-Predict1-7B-Text2World",
+    "Cosmos-Predict1-14B-Text2World",
+    "Cosmos-Predict1-7B-Video2World",
+    "Cosmos-Predict1-14B-Video2World",
+    "Cosmos-Predict1-7B-Text2World-Sample-AV-Multiview",
+    "Cosmos-Predict1-7B-Video2World-Sample-AV-Multiview",
+    "Cosmos-Predict1-7B-WorldInterpolator",
+    "Gen3C-Cosmos-7B"
+  ],
+
+  "important_notes": [
+    "sample.py is for 3DGS-based novel view synthesis (LatentRecon + VAE), NOT the diffusion pipelines",
+    "world_generation_pipeline.py covers all diffusion-based world generation use cases",
+    "Guardrail can be disabled via disable_guardrail=True; prompt encoder via disable_prompt_encoder=True",
+    "All pipeline classes support GPU memory offloading of submodels (offload_network/tokenizer/text_encoder/guardrail/prompt_upsampler)",
+    "Multiview pipelines take 6-view prompt dicts and output [grid_video, raw_video]",
+    "Default generation params: guidance=7.0, num_steps=35, height=704, width=1280, fps=24, num_video_frames=121",
+    "Tokenizer used: Cosmos-Tokenize1-CV8x8x8-720p",
+    "Text encoder: CosmosT5TextEncoder or DummyT5TextEncoder",
+    "Text2World upsampler: LLM chat completion; Video2World upsampler: VLM (visual dialog)"
+  ],
+
+  "source_files_analyzed": [
+    "Lyra-1/sample.py",
+    "Lyra-1/cosmos_predict1/diffusion/inference/world_generation_pipeline.py",
+    "Lyra-1/cosmos_predict1/utils/base_world_generation_pipeline.py",
+    "Lyra-1/cosmos_predict1/diffusion/training/models/model_multiview.py (partial)"
+  ]
+}

@@ -1,0 +1,94 @@
+{
+  "scope": "wisp_networking_protocol",
+  "title": "WISP Networking Protocol Flow",
+  "diagram_type": "activity",
+  "key_participants": ["PWispHandler", "WebSocket", "streamMap", "WispPacketParser", "WispPacketCreator"],
+
+  "class_summary": {
+    "PWispHandler": {
+      "file": "src/puter-js/src/modules/networking/PWispHandler.js",
+      "fields": [
+        "_ws: WebSocket",
+        "_nextStreamID: number (starts at 1)",
+        "_bufferMax: number",
+        "onReady: function | undefined",
+        "streamMap: Map<streamID, {queue, streamID, buffer, dataCallBack, closeCallBack}>"
+      ],
+      "methods": ["constructor(wispURL, puterAuth)", "register(host, port, callbacks)", "_continue(streamID)", "write(streamID, data)", "close(streamID)"]
+    }
+  },
+
+  "activity_flows": [
+    {
+      "flow": "Constructor / WebSocket Setup",
+      "steps": [
+        "Call setup() → create new WebSocket(wispURL), set binaryType='arraybuffer'",
+        "Register ws.onmessage handler",
+        "On incoming packet: parse with parseIncomingPacket(Uint8Array(event.data))",
+        "Switch on packetType:",
+        "  [DATA] → lookup stream in streamMap, call stream.dataCallBack(payload.slice(0))",
+        "  [CONTINUE, streamID=0] → set this._bufferMax = remainingBuffer; register ws.onclose → setTimeout(setup, 1000); call this.onReady() if set",
+        "  [CONTINUE, streamID>0] → update stream.buffer = remainingBuffer; call this._continue(streamID)",
+        "  [CLOSE, streamID!=0] → call stream.closeCallBack(reason)",
+        "  [INFO] → if puterAuth, send INFO packet with streamID=0 and puterAuth token"
+      ]
+    },
+    {
+      "flow": "register(host, port, callbacks)",
+      "steps": [
+        "Allocate streamID = this._nextStreamID++",
+        "Store in streamMap: { queue:[], streamID, buffer: _bufferMax, dataCallBack, closeCallBack }",
+        "Send CONNECT packet via ws.send(createWispPacket({ CONNECT, TCP, streamID, hostname: host, port }))",
+        "Return streamID to caller"
+      ]
+    },
+    {
+      "flow": "write(streamID, data)",
+      "steps": [
+        "Lookup streamData from streamMap",
+        "[DECISION] streamData.buffer > 0?",
+        "  YES → decrement buffer; send DATA packet via ws.send(createWispPacket({ DATA, streamID, payload: data }))",
+        "  NO  → push data onto streamData.queue (backpressure)"
+      ]
+    },
+    {
+      "flow": "_continue(streamID)",
+      "steps": [
+        "Get stream's queue from streamMap",
+        "Loop over queued payloads: call this.write(streamID, queue.shift()) for each",
+        "Drains buffered writes now that buffer space has been replenished (triggered by CONTINUE packet)"
+      ]
+    },
+    {
+      "flow": "close(streamID)",
+      "steps": [
+        "Send CLOSE packet via ws.send(createWispPacket({ CLOSE, streamID, reason: 0x02 }))",
+        "No local cleanup of streamMap entry (stream entry persists until server sends CLOSE back)"
+      ]
+    }
+  ],
+
+  "packet_types": ["CONNECT", "DATA", "CONTINUE", "CLOSE", "INFO"],
+  "stream_types": ["TCP", "UDP"],
+
+  "key_conditions": [
+    "CONTINUE with streamID=0 → initial handshake, sets global _bufferMax, fires onReady callback",
+    "CONTINUE with streamID>0 → per-stream flow control, drains queue via _continue()",
+    "CLOSE with streamID=0 → ignored (no handler)",
+    "write() buffer==0 → data queued instead of sent (backpressure)",
+    "WebSocket close → reconnect after 1000ms via setup()"
+  ],
+
+  "dependencies": [
+    "parsers.js: parseIncomingPacket, createWispPacket, CLOSE, CONNECT, DATA, CONTINUE, INFO, TCP, UDP, textde",
+    "WispRelayService (backend): spawns relay process with PORT and WISP_AUTH_SERVER env vars",
+    "WispService (backend): separate backend service for WISP"
+  ],
+
+  "important_notes": "PWispHandler is the client-side (puter-js) WISP protocol driver over a WebSocket. It manages multiple multiplexed streams via streamMap, each with its own buffer counter for flow control. The CONTINUE packet (streamID=0) is the initial ready signal; per-stream CONTINUE replenishes buffer and drains queued payloads. INFO packet triggers authentication by sending puterAuth token back to server. Reconnect logic uses setTimeout(setup, 1000) on ws close.",
+
+  "source_files_analyzed": [
+    "src/puter-js/src/modules/networking/PWispHandler.js",
+    "src/backend/src/modules/internet/WispRelayService.js"
+  ]
+}

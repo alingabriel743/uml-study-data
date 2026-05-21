@@ -1,0 +1,207 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+
+title Vector Store Management Flow
+
+|#E8F4FD|Client|
+|#EAF7EA|Stores Facade|
+|#FFF8E1|Ai / StoreProvider|
+|#F3E5F5|ManagesStores Trait|
+|#FCE4EC|StoreGateway (Gemini / OpenAI)|
+
+' ──────────────────────────────────────────────
+' SECTION 1 — Facade Operations: create / get / delete
+' ──────────────────────────────────────────────
+
+|Client|
+start
+:Invoke Stores static method;
+
+|Stores Facade|
+:Delegate to Ai::fakeableStoreProvider(provider?);
+
+|Ai / StoreProvider|
+:Resolve concrete StoreProvider\n(GeminiProvider / OpenAiProvider);
+
+if (Operation?) then (create)
+
+  |ManagesStores Trait|
+  :Generate invocationId (UUID7);
+  if (faked provider?) then (yes)
+    :Ai::recordStoreCreation\n(name, description, fileIds, expiresWhenIdleFor);
+  endif
+  :dispatch event: CreatingStore\n(invocationId, provider, params);
+
+  |StoreGateway (Gemini / OpenAI)|
+  if (provider?) then (Gemini)
+    :POST /fileSearchStores\n→ receive storeId;
+    if (fileIds not empty?) then (yes)
+      :loop: addFile(storeId, fileId)\nfor each fileId in Collection;
+    endif
+    :GET /fileSearchStores/{storeId};
+    :Build StoreFileCounts\n(activeDocuments, pending, failed);
+  else (OpenAI)
+    :POST /vector_stores\n(with optional expires_after in days);
+    :GET /vector_stores/{id};
+    :Build StoreFileCounts\n(completed, in_progress, failed);
+  endif
+
+  |ManagesStores Trait|
+  :Construct Store entity\n(provider, id, name, StoreFileCounts, ready);
+  :dispatch event: StoreCreated\n(invocationId, provider, params, store);
+
+  |Stores Facade|
+  :Return Store entity;
+
+elseif (get) then (get)
+
+  |ManagesStores Trait|
+  :StoreGateway::getStore(provider, storeId);
+
+  |StoreGateway (Gemini / OpenAI)|
+  if (provider?) then (Gemini)
+    :normalize storeId\nGET /fileSearchStores/{id};
+    :Build StoreFileCounts\n(activeDocuments, pending, failed);
+  else (OpenAI)
+    :GET /vector_stores/{id};
+    :Build StoreFileCounts\n(completed, in_progress, failed);
+  endif
+
+  |ManagesStores Trait|
+  :Construct Store entity\n(provider, id, name, StoreFileCounts, ready);
+
+  |Stores Facade|
+  :Return Store entity;
+
+else (delete)
+
+  |ManagesStores Trait|
+  if (faked provider?) then (yes)
+    :Ai::recordStoreDeletion(storeId);
+  endif
+
+  |StoreGateway (Gemini / OpenAI)|
+  if (provider?) then (Gemini)
+    :normalize storeId\nDELETE /fileSearchStores/{id};
+    :return true;
+  else (OpenAI)
+    :DELETE /vector_stores/{id};
+    :return response.deleted;
+  endif
+
+  |ManagesStores Trait|
+  :dispatch event: StoreDeleted\n(invocationId, provider, storeId);
+
+  |Stores Facade|
+  :Return bool result;
+
+endif
+
+' ──────────────────────────────────────────────
+' SECTION 2 — Store Instance Operations: add / remove / refresh / delete
+' ──────────────────────────────────────────────
+
+|Client|
+:Invoke Store instance method\n(add / remove / refresh / delete);
+
+if (Store method?) then (add)
+
+  :Provide file argument;
+  if (file type?) then (UploadedFile)
+    :Convert to Base64Document\nvia Base64Document::fromUpload(file)\n.as(originalName);
+  elseif (StorableFile) then (StorableFile)
+    :Store::storeFile(file)\n→ Files::put(file, provider)\n[PreparesStorableFiles: extract content/mimeType/name]\n→ HasProviderId;
+  else (HasProviderId / string / ProviderDocument)
+    :Use file reference as-is;
+  endif
+
+  if (faked provider?) then (yes)
+    :Ai::recordFileAddition\n(storeId, fileId, originalFile);
+  endif
+
+  |ManagesStores Trait|
+  :Generate invocationId (UUID7);
+  :dispatch event: AddingFileToStore\n(invocationId, provider, storeId, fileId);
+
+  |StoreGateway (Gemini / OpenAI)|
+  if (provider?) then (Gemini)
+    :normalize storeId + fileId\nPOST /{storeId}:importFile;
+    :return basename(name) as documentId;
+  else (OpenAI)
+    :POST /vector_stores/{storeId}/files;
+    :return response.id as documentId;
+  endif
+
+  |ManagesStores Trait|
+  :dispatch event: FileAddedToStore\n(invocationId, provider, storeId, fileId, documentId);
+
+  |Client|
+  :Return AddedDocumentResponse\n(documentId, fileId);
+
+elseif (remove) then (remove)
+
+  |ManagesStores Trait|
+  if (faked provider?) then (yes)
+    :Ai::recordFileRemoval\n(storeId, documentId);
+  endif
+  :dispatch event: RemovingFileFromStore\n(invocationId, provider, storeId, documentId);
+
+  |StoreGateway (Gemini / OpenAI)|
+  if (provider?) then (Gemini)
+    :normalize storeId + documentId\nDELETE /{storeId}/documents/{documentId};
+    :return true;
+  else (OpenAI)
+    :DELETE /vector_stores/{storeId}/files/{documentId};
+    :return response.deleted;
+  endif
+
+  |ManagesStores Trait|
+  :dispatch event: FileRemovedFromStore\n(invocationId, provider, storeId, documentId);
+
+  |Client|
+  if (deleteFile=true AND removed?) then (yes)
+    :Files::delete(documentId, provider)\nRemove underlying file from provider;
+  endif
+  :Return bool result;
+
+elseif (refresh) then (refresh)
+
+  |ManagesStores Trait|
+  :StoreProvider::getStore(store.id)\n[delegates to ManagesStores → StoreGateway::getStore];
+
+  |StoreGateway (Gemini / OpenAI)|
+  :GET store endpoint (provider-specific);
+  :Build fresh StoreFileCounts;
+
+  |Client|
+  :Return new Store instance\nwith updated data;
+
+else (delete instance)
+
+  |ManagesStores Trait|
+  :StoreProvider::deleteStore(store.id)\n[full ManagesStores delete flow\nincl. faked check + event dispatch];
+
+  |Client|
+  :Return bool result;
+
+endif
+
+stop
+@enduml

@@ -1,0 +1,255 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #DEE2E6
+    GroupFontColor #212529
+    DividerBackgroundColor #E9ECEF
+    DividerBorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF3CD
+    BorderColor #856404
+    FontColor #212529
+}
+
+title Perforce VCS Driver: Initialize and Execute
+
+actor Caller as caller
+
+participant "PerforceDriver" as driver
+participant "Cache" as cache
+participant "Perforce" as p4
+participant "Filesystem" as fs
+participant "ProcessExecutor" as executor
+participant "Process\n(Symfony)" as proc
+participant "IOInterface" as io
+
+== Initialization ==
+
+caller -> driver : initialize(repoConfig)
+activate driver
+
+driver -> driver : reads repoConfig['depot'] & repoConfig['branch']
+driver -> driver : initPerforce(repoConfig)
+activate driver
+
+driver -> cache : isUsable(cache-vcs-dir)
+activate cache
+alt cache not usable
+    cache --> driver : throws RuntimeException
+end
+cache --> driver : true
+deactivate cache
+
+driver -> p4 : create(repoConfig, url, repoDir, process, io)  [static factory]
+activate p4
+note right of p4 : new Perforce(repoConfig, port, path, process, isWindows, io)
+
+p4 -> fs : ensureDirectoryExists(path)
+activate fs
+fs --> p4 : directory ready
+deactivate fs
+
+p4 -> p4 : generateUniquePerforceClientName()\n= composer_perforce_<hostname>_<time>_<streamName>
+
+p4 -> executor : execute("p4 set") [getP4variable('P4USER'), Windows only]
+activate executor
+executor --> p4 : P4USER value
+deactivate executor
+
+p4 --> driver : perforce instance
+deactivate p4
+
+deactivate driver
+
+== Authentication: p4Login ==
+
+driver -> p4 : p4Login()
+activate p4
+
+p4 -> p4 : queryP4User()
+p4 -> executor : execute("p4 -u <user> -p <port> login -s")
+activate executor
+executor --> p4 : exit code (isLoggedIn check)
+deactivate executor
+
+alt not logged in
+    p4 -> p4 : queryP4Password()
+    p4 -> io : getP4variable('P4PASSWD') or askAndHideAnswer('Enter P4 Password:')
+    activate io
+    io --> p4 : password
+    deactivate io
+
+    alt Windows
+        p4 -> proc : new Process(['p4 login -a'], stdin=password)
+        activate proc
+        proc --> p4 : run() result
+        deactivate proc
+    else Linux / Mac
+        p4 -> proc : new Process(['p4 login -a'], stdin=password)
+        activate proc
+        proc --> p4 : run() result
+        deactivate proc
+    end
+end
+
+p4 --> driver : login complete
+deactivate p4
+
+== Stream Detection: checkStream ==
+
+driver -> p4 : checkStream()
+activate p4
+
+p4 -> p4 : generateP4Command(['depots'], useClient=false)
+p4 -> executor : execute("p4 -p <port> depots")
+activate executor
+executor --> p4 : depot listing output
+deactivate executor
+
+p4 -> p4 : parse output → set p4DepotType ('stream' or other)
+p4 --> driver : isStream() result
+deactivate p4
+
+== Client Spec: writeP4ClientSpec + connectClient ==
+
+driver -> p4 : writeP4ClientSpec()
+activate p4
+
+p4 -> p4 : getP4ClientSpec()\n→ <cache-vcs-dir>/<depot>/<client>.p4.spec
+p4 -> fs : fopen(clientSpec, 'w')
+activate fs
+fs --> p4 : file handle
+deactivate fs
+
+p4 -> p4 : writeClientSpecToFile(spec)\n[Client, Owner, Root, Stream/View fields]
+p4 --> driver : spec written
+deactivate p4
+
+driver -> p4 : connectClient()
+activate p4
+
+p4 -> p4 : generateP4Command(['client', '-i'])
+p4 -> proc : new Process(command, stdin=file_get_contents(clientSpec))
+activate proc
+proc --> p4 : run() → "Client <name> saved."
+deactivate proc
+
+p4 --> driver : client connected
+deactivate p4
+
+deactivate driver
+
+== Normal Operations ==
+
+caller -> driver : getBranches()
+activate driver
+
+driver -> p4 : getBranches()
+activate p4
+
+alt stream depot
+    p4 -> executor : execute("p4 -u <user> -c <client> -p <port> streams //<depot>/...")
+    activate executor
+    executor --> p4 : stream listing
+    deactivate executor
+end
+
+p4 -> executor : execute("p4 -u <user> -p <port> changes <stream>/...")
+activate executor
+executor --> p4 : latest changelist number
+deactivate executor
+
+p4 --> driver : branches map [name => changelist]
+deactivate p4
+driver --> caller : branches
+deactivate driver
+
+caller -> driver : getTags()
+activate driver
+
+driver -> p4 : getTags()
+activate p4
+p4 -> executor : execute("p4 -u <user> -c <client> -p <port> labels")
+activate executor
+executor --> p4 : label listing
+deactivate executor
+p4 -> p4 : parse Label lines
+p4 --> driver : tags map [name => changelist]
+deactivate p4
+driver --> caller : tags
+deactivate driver
+
+caller -> driver : getFileContent(file, identifier)
+activate driver
+
+driver -> p4 : getFileContent(file, identifier)
+activate p4
+
+p4 -> p4 : getFilePath(file, identifier)
+p4 -> executor : execute("p4 -u <user> -p <port> files <path>")
+activate executor
+executor --> p4 : depot file path
+deactivate executor
+
+p4 -> executor : execute("p4 -u <user> -c <client> -p <port> print <path>")
+activate executor
+executor --> p4 : file content
+deactivate executor
+
+p4 --> driver : commandResult (file content)
+deactivate p4
+driver --> caller : file content
+deactivate driver
+
+== Cleanup ==
+
+caller -> driver : cleanup()
+activate driver
+
+driver -> p4 : cleanupClientSpec()
+activate p4
+
+p4 -> executor : execute("p4 -u <user> -p <port> client -d <client>")
+activate executor
+executor --> p4 : client deleted
+deactivate executor
+
+p4 -> p4 : getP4ClientSpec()
+p4 -> fs : remove(clientSpec)
+activate fs
+fs --> p4 : file removed
+deactivate fs
+
+p4 --> driver : cleanup complete
+deactivate p4
+
+driver -> driver : perforce = null
+driver --> caller : done
+deactivate driver
+
+@enduml

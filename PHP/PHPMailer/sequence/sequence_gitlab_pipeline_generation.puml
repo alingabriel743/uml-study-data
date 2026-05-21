@@ -1,0 +1,222 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #6C757D
+    GroupBackgroundColor #F1F3F5
+    GroupBorderColor #6C757D
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title GitLab CI Pipeline Generation Flow
+
+actor "CI Operator /\nMakefile" as Operator
+participant "PHP CLI" as PHPCli
+participant "generate-package.php" as GenPackage
+participant "generate-appsec.php" as GenAppsec
+participant "generate-shared.php" as GenShared
+participant "generate-profiler.php" as GenProfiler
+participant "generate-tracer.php" as GenTracer
+participant "generate-common.php" as GenCommon
+collections "YAML Output\n(.gitlab/*.yml)" as YAMLOut
+
+note over GenCommon
+  Shared library:
+  • $arch_targets, $php_versions_to_abi
+  • $all_minor_major_targets (7.0–8.5)
+  • $asan / $profiler / $windows targets
+  • YAML anchors & .services template
+  • unset_dd_runner_env_vars()
+  • dockerhub_login()
+  • windows_git_setup[_with_packages]()
+  • default_retry policy
+end note
+
+== Bootstrap: Shared Data Initialisation ==
+
+Operator -> PHPCli : invoke generators\n(make generate)
+
+group generate-package.php → .gitlab/package.yml
+    PHPCli -> GenPackage : php generate-package.php\n> .gitlab/package.yml
+    activate GenPackage
+
+    GenPackage -> GenCommon : include 'generate-common.php'
+    activate GenCommon
+    GenCommon --> GenPackage : $arch_targets, $php_versions_to_abi\n$all/windows_minor_major_targets\nYAML anchors & .services template
+    deactivate GenCommon
+
+    GenPackage -> GenCommon : windows_git_setup()\n[Windows build before_script]
+    activate GenCommon
+    GenCommon --> GenPackage : PowerShell: kill containers,\nclean workspace, git clone\n--longpaths, checkout CI_COMMIT_SHA
+    deactivate GenCommon
+
+    GenPackage -> GenCommon : windows_git_setup_with_packages()\n[restore packages/ artifact]
+    activate GenCommon
+    note right of GenCommon
+      Preserves packages/ to $TEMP,
+      calls windows_git_setup(),
+      then restores packages/
+    end note
+    GenCommon --> GenPackage : combined setup steps
+    deactivate GenCommon
+
+    GenPackage -> YAMLOut : emit stages:\nprepare → profiler → appsec → tracing\n→ packaging → benchmarks → gate\n→ notify → verify → shared-pipeline\n→ pre-release → release
+    GenPackage -> YAMLOut : emit 'prepare code' job\n(composer install + make generate)
+    GenPackage -> YAMLOut : foreach $build_platforms:\n  emit compile/package jobs\n  [linux/amd64, linux/arm64,\n   asan/amd64, asan/arm64,\n   windows/amd64]
+    deactivate GenPackage
+end
+
+== AppSec Pipeline ==
+
+group generate-appsec.php → .gitlab/appsec.yml
+    PHPCli -> GenAppsec : php generate-appsec.php\n> .gitlab/appsec.yml
+    activate GenAppsec
+
+    GenAppsec -> GenCommon : include 'generate-common.php'
+    activate GenCommon
+    GenCommon --> GenAppsec : shared vars, anchors, templates
+    deactivate GenCommon
+
+    GenAppsec -> GenCommon : unset_dd_runner_env_vars()\n[.appsec_test before_script]
+    activate GenCommon
+    note right of GenCommon
+      Unsets: DD_SERVICE, DD_ENV,
+      DD_TAGS,
+      DD_TRACE_REMOVE_INTEGRATION_
+      SERVICE_NAMES_ENABLED
+      (removes runner auto-injection)
+    end note
+    GenCommon --> GenAppsec : shell unset steps
+    deactivate GenCommon
+
+    GenAppsec -> GenCommon : dockerhub_login()\n[.docker_push_job before_script]
+    activate GenCommon
+    GenCommon --> GenAppsec : if command -v docker; then\n  .gitlab/dockerhub-login.sh; fi
+    deactivate GenCommon
+
+    GenAppsec -> YAMLOut : emit $ecrLoginSnippet\n(AWS STS assume-role → account 669783387624\nexternal-id: ddbuild-dd-trace-php-ci\n+ ECR docker login)
+    GenAppsec -> YAMLOut : emit jobs:\n• test appsec extension\n• appsec integration tests\n• push appsec images\n• helper-rust build/test/coverage\n• appsec code coverage
+    deactivate GenAppsec
+end
+
+== Shared Components Pipeline ==
+
+group generate-shared.php → .gitlab/shared.yml
+    PHPCli -> GenShared : php generate-shared.php\n> .gitlab/shared.yml
+    activate GenShared
+
+    GenShared -> GenCommon : include 'generate-common.php'
+    activate GenCommon
+    GenCommon --> GenShared : shared vars, anchors, templates
+    deactivate GenCommon
+
+    GenShared -> YAMLOut : foreach $all_minor_major_targets (7.0–8.5)\n  emit ZAI tests\n  emit Extension Tea Tests
+    GenShared -> YAMLOut : emit C components ASAN/UBSAN jobs
+    GenShared -> YAMLOut : emit Build & Test Tea jobs
+    GenShared -> YAMLOut : emit Configuration Consistency jobs
+    deactivate GenShared
+end
+
+== Profiler Pipeline ==
+
+group generate-profiler.php → .gitlab/profiler.yml
+    PHPCli -> GenProfiler : php generate-profiler.php\n> .gitlab/profiler.yml
+    activate GenProfiler
+
+    GenProfiler -> GenCommon : include 'generate-common.php'
+    activate GenCommon
+    GenCommon --> GenProfiler : $profiler_minor_major_targets (>=7.1)\n$arch_targets, shared templates
+    deactivate GenCommon
+
+    GenProfiler -> YAMLOut : foreach $profiler_minor_major_targets\n  × $arch_targets × image variants:\n  emit profiling test jobs
+    GenProfiler -> YAMLOut : emit clippy NTS job
+    GenProfiler -> YAMLOut : emit Cargo test job
+    deactivate GenProfiler
+end
+
+== Tracer Pipeline ==
+
+group generate-tracer.php → .gitlab/tracer.yml
+    PHPCli -> GenTracer : php generate-tracer.php\n> .gitlab/tracer.yml
+    activate GenTracer
+
+    GenTracer -> GenCommon : include 'generate-common.php'
+    activate GenCommon
+    GenCommon --> GenTracer : shared vars, $asan_minor_major_targets (>=7.4)\nanchors & .services template
+    deactivate GenCommon
+
+    GenTracer -> GenCommon : file_get_contents('generate-common.php')\n+ regex to enumerate service names
+    activate GenCommon
+    note right of GenCommon
+      Tracer dynamically reads
+      generate-common.php at runtime
+      to extract .services names
+      (test-agent, request-replayer,
+       httpbin, mysql, kafka, redis…)
+    end note
+    GenCommon --> GenTracer : service names array
+    deactivate GenCommon
+
+    GenTracer -> GenCommon : before_script_steps(with_docker_auth=true)\n→ dockerhub_login() + unset_dd_runner_env_vars()\n  + switch-php + git safe.directory\n  + mkdir build dirs + move ddtrace.so
+    activate GenCommon
+    GenCommon --> GenTracer : combined before_script steps
+    deactivate GenCommon
+
+    GenTracer -> GenCommon : after_script($execute_dir, $has_test_agent)\n→ check_test_agent.sh + collect_artifacts.sh\n  + silent-upload-junit-to-datadog.sh
+    activate GenCommon
+    GenCommon --> GenTracer : artifacts/after_script block
+    deactivate GenCommon
+
+    GenTracer -> GenCommon : sidecar_logs()\n[_DD_DEBUG_SIDECAR_LOG_LEVEL/METHOD]
+    activate GenCommon
+    GenCommon --> GenTracer : debug sidecar variables
+    deactivate GenCommon
+
+    GenTracer -> YAMLOut : emit compile extension jobs\n(debug / NTS / ZTS / ASAN variants)
+    GenTracer -> YAMLOut : emit test jobs
+    GenTracer -> YAMLOut : emit integrations test jobs
+    GenTracer -> YAMLOut : emit web test jobs
+    GenTracer -> YAMLOut : emit aggregate versions jobs
+    deactivate GenTracer
+end
+
+== Pipeline YAML Artefacts Ready ==
+
+YAMLOut --> Operator : .gitlab/package.yml\n.gitlab/appsec.yml\n.gitlab/shared.yml\n.gitlab/profiler.yml\n.gitlab/tracer.yml
+
+note over Operator, YAMLOut
+  All generator scripts output GitLab CI YAML to stdout via PHP template tags (<?php ?> / <?= ?>).
+  generate-common.php is included by every generator and defines all shared functions,
+  YAML anchors, and PHP version/architecture matrices used across all pipeline files.
+  Retry policy: max 2 retries on unknown_failure, data_integrity_failure,
+  runner_system_failure, scheduler_failure, api_failure, stuck_or_timeout_failure,
+  job_execution_timeout.
+end note
+
+@enduml

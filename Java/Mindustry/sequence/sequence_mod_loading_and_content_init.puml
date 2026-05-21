@@ -1,0 +1,241 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipantBackgroundColor #F8F9FA
+skinparam sequenceParticipantBorderColor #495057
+skinparam sequenceGroupBorderColor #6C757D
+skinparam sequenceGroupBackgroundColor #E9ECEF
+skinparam sequenceGroupFontColor #212529
+skinparam sequenceGroupFontStyle bold
+skinparam noteBorderColor #ADB5BD
+skinparam noteBackgroundColor #FFF3CD
+skinparam sequenceLifeLineBorderColor #868E96
+skinparam sequenceBoxBorderColor #6C757D
+skinparam sequenceBoxBackgroundColor #F1F3F5
+
+title Mod Loading and Content Initialization
+
+participant "ClientLauncher" as CL
+participant "AssetManager" as AM
+participant "Vars" as Vars
+participant "Mods" as Mods
+participant "LoadedMod" as LM
+participant "ContentLoader" as Content
+participant "ContentParser" as Parser
+participant "Scripts" as Scripts
+participant "MultiPacker" as Packer
+
+== Phase 1: Mod Discovery & Loading ==
+
+CL -> Mods : new Mods()
+activate Mods
+
+CL -> AM : load(new Vars())
+activate AM
+AM -> Vars : load()
+activate Vars
+
+Vars -> Mods : load()
+note right of Mods : Scans modDirectory\nfor .jar / .zip / folders
+
+loop for each mod candidate
+    Mods -> Mods : findMeta(zip)
+    note right : Reads mod.json / mod.hjson\nreturns ModMeta
+end
+
+Mods -> Mods : resolveDependencies(metas)
+note right : Topologically sorts mods\nreturns OrderedMap<name, ModState>
+
+loop for each resolved mod
+    Mods -> Mods : loadMod(file, false, enabled)
+    activate Mods
+    Mods -> Mods : findMeta(zip)
+    opt Java mod
+        Mods -> Mods : platform.loadJar(sourceFile, mainLoader)
+        note right : Returns ClassLoader\nfor .jar mods only
+        Mods -> Mods : Class.forName(mainClass)\nnewInstance()
+        note right : Instantiates the\nmod's main class
+    end
+    Mods -> LM** : new LoadedMod(file, root, main, loader, meta)
+    Mods --> Mods : LoadedMod [state=enabled/disabled]
+    deactivate Mods
+end
+
+Mods -> Mods : updateDependencies(mod)
+Mods -> Mods : sortMods()
+Mods -> Mods : buildFiles()
+
+Vars --> AM : (mods loaded)
+deactivate Vars
+AM --> CL : (Vars asset ready)
+deactivate AM
+
+== Phase 2: Base Content + Mod Content Creation ==
+
+CL -> AM : loadRun("contentcreate")
+activate AM
+
+group async (background thread)
+    AM -> Content : createBaseContent()
+    activate Content
+    note right of Content : Registers all vanilla\nItems, Bullets, UnitTypes, Blocks
+    Content --> AM : (base content registered)
+    deactivate Content
+
+    AM -> Content : loadColors()
+    activate Content
+    note right : Reads block_colors.png pixmap
+    Content --> AM : (colors loaded)
+    deactivate Content
+end
+
+group sync-complete (main thread)
+    AM -> Mods : loadScripts()
+    activate Mods
+    loop for each mod with scripts/
+        Mods -> Content : setCurrentMod(mod)
+        Mods -> Scripts : run(mod, "main.js")
+        activate Scripts
+        Scripts --> Mods : (JS mod executed)
+        deactivate Scripts
+    end
+    Mods --> AM : (scripts loaded)
+    deactivate Mods
+
+    AM -> Content : createModContent()
+    activate Content
+    Content -> Mods : loadContent()
+    activate Mods
+
+    loop Java class mods (ordered by dependency)
+        Mods -> Content : setCurrentMod(mod)
+        Mods -> LM : mod.main.loadContent()
+        activate LM
+        note right of LM : Java mod registers\nUnitType/Floor/BulletType objects
+        LM --> Mods : (content objects created)
+        deactivate LM
+    end
+
+    loop for each content JSON file in content/ dirs
+        Mods -> Parser : parse(mod, name, json, file, type)
+        activate Parser
+        Parser -> Content : handleContent(content)
+        note right : Assigns id,\nadds to contentMap
+        Parser -> Content : handleMappableContent(content)
+        note right : Registers name→content\nin nameMap
+        Parser --> Mods : (content item registered)
+        deactivate Parser
+    end
+
+    Mods --> Content : (mod content loaded)
+    deactivate Mods
+    Content --> AM : (mod content created)
+    deactivate Content
+end
+
+AM --> CL : ("contentcreate" done)
+deactivate AM
+
+== Phase 3: Sprite Packing & Icon Loading ==
+
+CL -> AM : load(mods) [Loadable]
+activate AM
+
+group loadAsync (background thread)
+    AM -> Mods : loadAsync()
+    activate Mods
+    loop for each enabled mod
+        Mods -> Mods : packSprites(packer, sprites, mod)
+        Mods -> Packer : submit(→ Pixmap.read, Pixmaps.bleed)
+        activate Packer
+        note right of Packer : Parallel pixmap loading\nvia mainExecutor futures
+        Packer --> Mods : (pixmap tasks resolved)
+        deactivate Packer
+        Mods -> Packer : add(page, name, region)
+        activate Packer
+        Packer --> Mods : (region packed)
+        deactivate Packer
+    end
+    Mods -> AM : fire(AtlasPackEvent)
+    note right : Atlas pages generated\n& atlas updated
+    Mods --> AM : (loadAsync complete)
+    deactivate Mods
+end
+
+group loadSync (main / GL thread)
+    AM -> Mods : loadSync()
+    activate Mods
+    Mods -> Mods : loadIcons()
+    loop for each mod with icon.png
+        Mods -> Mods : loadIcon(mod)
+        note right : new Texture(icon.png)\nper mod
+    end
+    Mods --> AM : (icons loaded)
+    deactivate Mods
+end
+
+AM --> CL : (mods Loadable done)
+deactivate AM
+
+== Phase 4: Content Init & Load ==
+
+CL -> AM : loadRun("contentinit")
+activate AM
+
+group async (background thread)
+    AM -> Content : init()
+    activate Content
+    Content -> Content : initialize(Content::init)
+    note right : Calls init() on\nevery registered Content
+    Content -> Content : initialize(Content::postInit)
+    note right : Calls postInit() on all\n(e.g. UnitType builds unit example,\nresolves weapons)
+    Content -> AM : Events.fire(ContentInitEvent)
+    Content --> AM : (init complete)
+    deactivate Content
+end
+
+group sync-complete (main thread)
+    AM -> Content : load()
+    activate Content
+    Content -> Content : initialize(Content::loadIcon)
+    note right : Loads sprite regions\nfrom atlas
+    Content -> Content : initialize(Content::load)
+    note right : Loads detailed texture data\n(e.g. UnitType parts/weapons)
+    Content --> AM : (load complete)
+    deactivate Content
+end
+
+AM --> CL : ("contentinit" done)
+deactivate AM
+
+== Post-Load Mod Init ==
+
+loop ClientLauncher.update() — asset manager finishes
+    CL -> Mods : eachClass(Mod::init)
+    activate Mods
+    note right of Mods : Final per-mod init\ncalled once on main thread
+    Mods --> CL : (all mod inits run)
+    deactivate Mods
+end
+
+CL -> CL : Events.fire(ClientLoadEvent)
+note right of CL : Signals full load\ncomplete to listeners
+
+deactivate Mods
+
+@enduml

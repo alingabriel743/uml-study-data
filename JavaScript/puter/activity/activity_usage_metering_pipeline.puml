@@ -1,0 +1,220 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam swimlane {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleBackgroundColor #DEE2E6
+}
+
+title Usage Metering Pipeline
+
+' ──────────────────────────────────────────────────────────────────
+' LANE 1 — Client
+' ──────────────────────────────────────────────────────────────────
+|Client|
+start
+:Send HTTP GET request\nto /metering endpoint;
+
+' ──────────────────────────────────────────────────────────────────
+' LANE 2 — UsageController  (route dispatch)
+' ──────────────────────────────────────────────────────────────────
+|UsageController|
+
+if (Which endpoint?) then (GET /metering/usage)
+
+  ' ════════════════════════════════════════
+  '  Flow A — getUsage()
+  ' ════════════════════════════════════════
+  :getUsage();
+
+  if (req.actor present?) then (no)
+    #FFB3B3:throw Error('actor not found in context');
+    |Client|
+    :Receive 500 error;
+    stop
+  else (yes)
+  endif
+
+  ' Parallel: usage details + allowance info
+  fork
+    ' ── branch 1: current-month usage details ──
+    :getActorCurrentMonthUsageDetails(actor);
+
+    |MeteringService|
+    :Validate actor.type.user.uuid;
+    :Compute currentMonth string (YYYY-MM);
+
+    |DynamoKVStore|
+    :sudo kvStore.get(\n  [actorUsageKey, actorAppTotalsKey]);
+
+    |MeteringService|
+    if (actor is app-scoped?) then (yes)
+      :Filter appTotals to own app;
+      :Aggregate remaining apps as "others";
+    else (no)
+    endif
+    :Return \{ usage, appTotals \};
+
+    |UsageController|
+  fork again
+    ' ── branch 2: allowance info ──
+    :getAllowedUsage(actor);
+
+    |MeteringService|
+    fork
+      :getActorSubscription(actor);
+    fork again
+      :getActorAddons(actor);
+    fork again
+      :getActorCurrentMonthUsageDetails(actor);
+    end fork
+
+    :Compute remaining =\nmax(0, monthAllowance + purchasedCredits\n       - totalUsed - consumedCredits);
+    :Return \{ remaining, monthUsageAllowance, addons \};
+
+    |UsageController|
+  end fork
+
+  :Await Promise.all(\n  [actorUsageDetails, allowanceInfo]);
+  :Return 200 JSON\n\{ ...actorUsage, allowanceInfo \};
+
+  |Client|
+  :Receive aggregated usage\n+ allowance response;
+  stop
+
+elseif (GET /metering/usage/:appIdOrName) then
+
+  ' ════════════════════════════════════════
+  '  Flow B — getUsageByApp()
+  ' ════════════════════════════════════════
+  |UsageController|
+  :getUsageByApp();
+
+  if (req.actor present?) then (no)
+    #FFB3B3:throw Error('actor not found');
+    |Client|
+    :Receive 500 error;
+    stop
+  else (yes)
+  endif
+
+  if (appIdOrName param provided?) then (no)
+    :Return 400\n\{ error: 'appId parameter is required' \};
+    |Client|
+    :Receive 400 Bad Request;
+    stop
+  else (yes)
+  endif
+
+  if (appIdOrName is a string?) then (no)
+    |UsageController|
+    :Return 400\n\{ error: 'appId parameter must be a string' \};
+    |Client|
+    :Receive 400 Bad Request;
+    stop
+  else (yes)
+  endif
+
+  |UsageController|
+  if (starts with 'app-'\nAND valid v4 UUID suffix?) then (yes)
+    :Use appIdOrName directly as appId;
+  else (no)
+    ' DB lookup by app name
+    |SQL Database|
+    :SELECT uid FROM apps\nWHERE name = ? LIMIT 1;
+
+    |UsageController|
+    if (row found?) then (yes)
+      :appId = rows[0].uid;
+    else (no)
+      :Return 404\n\{ error: 'App not found' \};
+      |Client|
+      :Receive 404 Not Found;
+      stop
+    endif
+  endif
+
+  |UsageController|
+  :getActorCurrentMonthAppUsageDetails\n(actor, appId);
+
+  |MeteringService|
+  :Validate actor.type.user.uuid;
+  :Resolve final appId\n(param → actor.app → GLOBAL_APP_KEY);
+
+  |DynamoKVStore|
+  :sudo kvStore.get(actorAppUsageKey);
+
+  |MeteringService|
+  if (actorAppId differs from requested appId\nAND not GLOBAL_APP_KEY?) then (yes)
+    #FFB3B3:throw Error\n(app scope mismatch);
+    stop
+  else (no)
+    :Return usage record\nor \{ total: 0 \};
+  endif
+
+  |UsageController|
+  :Return 200 JSON appUsage;
+
+  |Client|
+  :Receive per-app usage response;
+  stop
+
+else (GET /metering/globalUsage)
+
+  ' ════════════════════════════════════════
+  '  Flow C — getGlobalUsage()
+  ' ════════════════════════════════════════
+  |UsageController|
+  :getGlobalUsage();
+
+  if (actor in allowedGlobalUsageUsers\nwhitelist?) then (no)
+    #FFB3B3:Reject — Unauthorized;
+    |Client|
+    :Receive 403 Forbidden;
+    stop
+  else (yes)
+  endif
+
+  if (req.actor present?) then (no)
+    #FFB3B3:throw Error('actor not found');
+    |Client|
+    :Receive 500 error;
+    stop
+  else (yes)
+  endif
+
+  :meteringService.getGlobalUsage();
+
+  |MeteringService|
+  :Compute currentMonth string (YYYY-MM);
+  :Build keys for all 10,000 shards\n(murmurhash mod 10000)\n+ legacy unsharded key;
+
+  |DynamoKVStore|
+  :sudo kvStore.get(allShardKeys)\n→ array of UsageByType records;
+
+  |MeteringService|
+  :Aggregate totals and per-type\nrecords across all shards;
+  :Return aggregatedGlobalUsage;
+
+  |UsageController|
+  :Return 200 JSON globalUsage;
+
+  |Client|
+  :Receive global usage response;
+  stop
+
+endif
+
+@enduml

@@ -1,0 +1,354 @@
+{
+  "scope": "extensions_memory_backends",
+  "title": "Extensions – Memory Backends",
+  "diagram_type": "class",
+  "description": "Extended memory/session backends implementing SessionABC for production use. Covers async SQLite, advanced SQLite with branching, Redis, MongoDB, SQLAlchemy (multi-DB), Dapr state store, and an encryption wrapper.",
+
+  "base_classes": [
+    {
+      "name": "SessionABC",
+      "module": "agents.memory.session",
+      "type": "abstract",
+      "abstract_methods": [
+        "get_items(limit: int | None) -> list[TResponseInputItem]",
+        "add_items(items: list[TResponseInputItem]) -> None",
+        "pop_item() -> TResponseInputItem | None",
+        "clear_session() -> None"
+      ],
+      "attributes": ["session_id: str", "session_settings: SessionSettings | None"]
+    },
+    {
+      "name": "SQLiteSession",
+      "module": "agents.memory.sqlite_session",
+      "type": "concrete",
+      "inherits": "SessionABC",
+      "note": "Synchronous SQLite backend; base for AdvancedSQLiteSession"
+    }
+  ],
+
+  "classes": [
+    {
+      "name": "AsyncSQLiteSession",
+      "inherits": "SessionABC",
+      "module": "agents.extensions.memory.async_sqlite_session",
+      "description": "Async SQLite session via aiosqlite with WAL mode and asyncio.Lock concurrency.",
+      "attributes": [
+        "session_id: str",
+        "db_path: str | Path = ':memory:'",
+        "sessions_table: str = 'agent_sessions'",
+        "messages_table: str = 'agent_messages'",
+        "_connection: aiosqlite.Connection | None",
+        "_lock: asyncio.Lock",
+        "_init_lock: asyncio.Lock",
+        "session_settings: SessionSettings | None"
+      ],
+      "methods": [
+        "__init__(session_id, db_path, sessions_table, messages_table)",
+        "_init_db_for_connection(conn) -> None",
+        "_get_connection() -> aiosqlite.Connection",
+        "_locked_connection() -> AsyncIterator[aiosqlite.Connection]  [asynccontextmanager]",
+        "get_items(limit) -> list[TResponseInputItem]",
+        "add_items(items) -> None",
+        "pop_item() -> TResponseInputItem | None",
+        "clear_session() -> None",
+        "close() -> None"
+      ],
+      "db_tables": ["agent_sessions (session_id PK, created_at, updated_at)", "agent_messages (id PK AUTOINCREMENT, session_id FK, message_data TEXT, created_at)"],
+      "external_deps": ["aiosqlite"]
+    },
+    {
+      "name": "AdvancedSQLiteSession",
+      "inherits": "SQLiteSession",
+      "module": "agents.extensions.memory.advanced_sqlite_session",
+      "description": "Enhanced SQLite session with conversation branching and per-turn usage analytics.",
+      "attributes": [
+        "session_id: str",
+        "db_path: str | Path",
+        "_current_branch_id: str = 'main'",
+        "_logger: logging.Logger",
+        "session_settings: SessionSettings | None"
+      ],
+      "methods": [
+        "__init__(session_id, db_path, create_tables, logger, session_settings)",
+        "_init_structure_tables() -> None",
+        "add_items(items) -> None  [overrides SQLiteSession]",
+        "get_items(limit, branch_id) -> list[TResponseInputItem]  [overrides, branch-aware]",
+        "store_run_usage(result: RunResult) -> None",
+        "create_branch_from_turn(turn_number, branch_name) -> str",
+        "create_branch_from_content(search_term, branch_name) -> str",
+        "switch_to_branch(branch_id) -> None",
+        "delete_branch(branch_id, force) -> None",
+        "list_branches() -> list[dict]",
+        "get_conversation_turns(branch_id) -> list[dict]",
+        "find_turns_by_content(search_term, branch_id) -> list[dict]",
+        "get_conversation_by_turns(branch_id) -> dict",
+        "get_tool_usage(branch_id) -> list[tuple[str,int,int]]",
+        "get_session_usage(branch_id) -> dict[str,int] | None",
+        "get_turn_usage(user_turn_number, branch_id) -> dict | list",
+        "_update_turn_usage_internal(user_turn_number, usage_data: Usage) -> None",
+        "_add_structure_metadata(items) -> None",
+        "_copy_messages_to_new_branch(new_branch_id, from_turn_number) -> None",
+        "_classify_message_type(item) -> str",
+        "_extract_tool_name(item) -> str | None",
+        "_get_next_turn_number(branch_id) -> int",
+        "_get_current_turn_number() -> int",
+        "_cleanup_orphaned_messages() -> int"
+      ],
+      "db_tables": [
+        "message_structure (message_id, session_id, branch_id, message_type, sequence_number, user_turn_number, branch_turn_number, tool_name)",
+        "turn_usage (session_id, branch_id, user_turn_number, requests, input_tokens, output_tokens, total_tokens, input_details_json, output_details_json)"
+      ],
+      "extra_deps": ["agents.result.RunResult", "agents.usage.Usage"]
+    },
+    {
+      "name": "RedisSession",
+      "inherits": "SessionABC",
+      "module": "agents.extensions.memory.redis_session",
+      "description": "Redis async implementation. Messages stored in a Redis list (RPUSH/RPOP). Supports TTL and owns-client lifecycle.",
+      "attributes": [
+        "session_id: str",
+        "session_settings: SessionSettings | None",
+        "_redis: Redis",
+        "_key_prefix: str = 'agents:session'",
+        "_ttl: int | None",
+        "_lock: asyncio.Lock",
+        "_owns_client: bool",
+        "_session_key: str  [prefix:session_id]",
+        "_messages_key: str  [session_key:messages]",
+        "_counter_key: str  [session_key:counter]"
+      ],
+      "methods": [
+        "__init__(session_id, redis_client, key_prefix, ttl, session_settings)",
+        "from_url(session_id, url, redis_kwargs, session_settings, **kwargs) -> RedisSession  [classmethod]",
+        "_serialize_item(item) -> str",
+        "_deserialize_item(item) -> TResponseInputItem",
+        "_get_next_id() -> int  [Redis INCR]",
+        "_set_ttl_if_configured(*keys) -> None",
+        "get_items(limit) -> list[TResponseInputItem]",
+        "add_items(items) -> None",
+        "pop_item() -> TResponseInputItem | None  [RPOP]",
+        "clear_session() -> None",
+        "close() -> None",
+        "ping() -> bool"
+      ],
+      "external_deps": ["redis.asyncio (redis package)"],
+      "install": "pip install redis"
+    },
+    {
+      "name": "MongoDBSession",
+      "inherits": "SessionABC",
+      "module": "agents.extensions.memory.mongodb_session",
+      "description": "MongoDB async session. Uses seq counter for strict insertion order. Class-level index registry prevents duplicate index creation across instances.",
+      "class_attributes": [
+        "_init_state: dict[int, dict[tuple,bool]]  [client_id -> (db,sess_coll,msg_coll) -> done]",
+        "_init_guard: threading.Lock"
+      ],
+      "attributes": [
+        "session_id: str",
+        "session_settings: SessionSettings | None",
+        "_client: AsyncMongoClient",
+        "_owns_client: bool",
+        "_sessions: AsyncCollection  [session metadata]",
+        "_messages: AsyncCollection  [message documents with seq field]",
+        "_client_id: int",
+        "_init_sub_key: tuple[str,str,str]"
+      ],
+      "methods": [
+        "__init__(session_id, client, database, sessions_collection, messages_collection, session_settings)",
+        "from_uri(session_id, uri, database, client_kwargs, session_settings) -> MongoDBSession  [classmethod]",
+        "_is_init_done() -> bool",
+        "_mark_init_done() -> None",
+        "_ensure_indexes() -> None  [idempotent, once per client/db/collection combo]",
+        "_serialize_item(item) -> str",
+        "_deserialize_item(raw) -> TResponseInputItem",
+        "get_items(limit) -> list[TResponseInputItem]",
+        "add_items(items) -> None  [atomic seq block via $inc + find_one_and_update]",
+        "pop_item() -> TResponseInputItem | None  [find_one_and_delete sort by seq DESC]",
+        "clear_session() -> None",
+        "close() -> None",
+        "ping() -> bool"
+      ],
+      "external_deps": ["pymongo>=4.14 (AsyncMongoClient)"],
+      "install": "pip install openai-agents[mongodb]"
+    },
+    {
+      "name": "SQLAlchemySession",
+      "inherits": "SessionABC",
+      "module": "agents.extensions.memory.sqlalchemy_session",
+      "description": "SQLAlchemy async session. Supports PostgreSQL+asyncpg, MySQL+aiomysql, SQLite+aiosqlite. Handles SQLite WAL mode, busy_timeout, and lock retry.",
+      "class_attributes": [
+        "_table_init_locks: dict[tuple,threading.Lock]",
+        "_table_init_locks_guard: threading.Lock",
+        "_sqlite_configured_engines: set[int]",
+        "_sqlite_configured_engines_guard: threading.Lock",
+        "_SQLITE_BUSY_TIMEOUT_MS: int = 5000",
+        "_SQLITE_LOCK_RETRY_DELAYS: tuple = (0.05, 0.1, 0.2, 0.4, 0.8)"
+      ],
+      "attributes": [
+        "session_id: str",
+        "session_settings: SessionSettings | None",
+        "_engine: AsyncEngine",
+        "_metadata: MetaData",
+        "_sessions: Table",
+        "_messages: Table",
+        "_session_factory: async_sessionmaker",
+        "_create_tables: bool",
+        "_init_lock: threading.Lock | None"
+      ],
+      "methods": [
+        "__init__(session_id, engine, create_tables, sessions_table, messages_table, session_settings)",
+        "from_url(session_id, url, engine_kwargs, session_settings, **kwargs) -> SQLAlchemySession  [classmethod]",
+        "_get_table_init_lock(engine, sessions_table, messages_table) -> threading.Lock  [classmethod]",
+        "_configure_sqlite_engine(engine) -> None  [classmethod, sets WAL+busy_timeout via event listener]",
+        "_is_sqlite_lock_error(exc) -> bool  [staticmethod]",
+        "_run_sqlite_write_with_retry(operation) -> None  [bounded backoff for SQLite lock]",
+        "_ensure_tables() -> None",
+        "_serialize_item(item) -> str",
+        "_deserialize_item(item) -> TResponseInputItem",
+        "get_items(limit) -> list[TResponseInputItem]",
+        "add_items(items) -> None",
+        "pop_item() -> TResponseInputItem | None",
+        "clear_session() -> None",
+        "engine: AsyncEngine  [property]"
+      ],
+      "external_deps": ["sqlalchemy[asyncio] (AsyncEngine, async_sessionmaker)"],
+      "install": "pip install openai-agents[sqlalchemy]"
+    },
+    {
+      "name": "DaprSession",
+      "inherits": "SessionABC",
+      "module": "agents.extensions.memory.dapr_session",
+      "description": "Dapr state store session. Uses etag-based optimistic concurrency (first-write-wins CAS) with exponential backoff + jitter for conflict retry.",
+      "attributes": [
+        "session_id: str",
+        "session_settings: SessionSettings | None",
+        "_dapr_client: DaprClient",
+        "_state_store_name: str",
+        "_ttl: int | None",
+        "_consistency: ConsistencyLevel  ['eventual'|'strong']",
+        "_lock: asyncio.Lock",
+        "_owns_client: bool",
+        "_messages_key: str  [session_id:messages]",
+        "_metadata_key: str  [session_id:metadata]"
+      ],
+      "methods": [
+        "__init__(session_id, state_store_name, dapr_client, ttl, consistency, session_settings)",
+        "from_address(session_id, state_store_name, dapr_address, session_settings, **kwargs) -> DaprSession  [classmethod]",
+        "_get_read_metadata() -> dict",
+        "_get_state_options(concurrency) -> StateOptions | None",
+        "_get_metadata() -> dict  [includes ttlInSeconds if set]",
+        "_serialize_item(item) -> str",
+        "_deserialize_item(item) -> TResponseInputItem",
+        "_decode_messages(data: bytes | None) -> list",
+        "_calculate_retry_delay(attempt) -> float  [exponential + 10% jitter]",
+        "_is_concurrency_conflict(error) -> bool  [ABORTED/FAILED_PRECONDITION/etag mismatch]",
+        "_handle_concurrency_conflict(error, attempt) -> bool",
+        "get_items(limit) -> list[TResponseInputItem]",
+        "add_items(items) -> None  [CAS loop with etag, max 5 attempts]",
+        "pop_item() -> TResponseInputItem | None  [CAS loop]",
+        "clear_session() -> None",
+        "close() -> None",
+        "ping() -> bool",
+        "__aenter__() -> DaprSession",
+        "__aexit__(exc_type, exc_val, exc_tb) -> None"
+      ],
+      "external_deps": ["dapr (DaprClient, StateOptions, Concurrency, Consistency)"],
+      "install": "pip install dapr"
+    },
+    {
+      "name": "EncryptedSession",
+      "inherits": "SessionABC",
+      "module": "agents.extensions.memory.encrypt_session",
+      "description": "Decorator/wrapper that adds transparent Fernet encryption and TTL-based expiration to any SessionABC. Wraps all stored items in EncryptedEnvelope dicts. HKDF key derivation per session_id.",
+      "attributes": [
+        "session_id: str",
+        "underlying_session: SessionABC  [composition - required]",
+        "ttl: int = 600  [10 min, used for Fernet token TTL]",
+        "cipher: Fernet  [derived via HKDF from master_key + session_id]",
+        "_kid: str = 'hkdf-v1'",
+        "_ver: int = 1"
+      ],
+      "methods": [
+        "__init__(session_id, underlying_session: SessionABC, encryption_key, ttl=600)",
+        "__getattr__(name)  [proxies unknown attrs to underlying_session]",
+        "session_settings: SessionSettings | None  [property, proxies to underlying]",
+        "_wrap(item: TResponseInputItem) -> EncryptedEnvelope",
+        "_unwrap(item) -> TResponseInputItem | None  [returns None on InvalidToken/expired]",
+        "get_items(limit) -> list[TResponseInputItem]  [delegates then unwraps, skips expired]",
+        "add_items(items) -> None  [wraps then delegates]",
+        "pop_item() -> TResponseInputItem | None  [loop: pop + unwrap, skips expired]",
+        "clear_session() -> None  [delegates]"
+      ],
+      "external_deps": ["cryptography (Fernet, HKDF, SHA256)"],
+      "install": "pip install openai-agents[encrypt]"
+    }
+  ],
+
+  "supporting_types": [
+    {
+      "name": "EncryptedEnvelope",
+      "type": "TypedDict",
+      "module": "agents.extensions.memory.encrypt_session",
+      "fields": ["__enc__: Literal[1]", "v: int", "kid: str", "payload: str  [Fernet token]"]
+    },
+    {
+      "name": "SessionSettings",
+      "module": "agents.memory.session_settings",
+      "note": "Configuration object with default item limit; used by all backends"
+    },
+    {
+      "name": "TResponseInputItem",
+      "module": "agents.items",
+      "note": "Type alias for conversation message items (user/assistant/tool messages)"
+    }
+  ],
+
+  "key_relationships": [
+    "AsyncSQLiteSession extends SessionABC",
+    "AdvancedSQLiteSession extends SQLiteSession extends SessionABC",
+    "RedisSession extends SessionABC",
+    "MongoDBSession extends SessionABC",
+    "SQLAlchemySession extends SessionABC",
+    "DaprSession extends SessionABC",
+    "EncryptedSession extends SessionABC",
+    "EncryptedSession COMPOSES underlying_session: SessionABC  [wraps any backend]",
+    "EncryptedSession USES Fernet (cryptography) for encrypt/decrypt",
+    "MongoDBSession USES AsyncMongoClient (pymongo)",
+    "RedisSession USES Redis (redis.asyncio)",
+    "DaprSession USES DaprClient (dapr)",
+    "SQLAlchemySession USES AsyncEngine (sqlalchemy.ext.asyncio)",
+    "AsyncSQLiteSession USES aiosqlite.Connection",
+    "AdvancedSQLiteSession USES RunResult + Usage (from agents core)"
+  ],
+
+  "common_protocol": {
+    "interface_methods": ["get_items(limit)", "add_items(items)", "pop_item()", "clear_session()"],
+    "common_optional": ["close()", "ping()"],
+    "factory_patterns": ["RedisSession.from_url()", "MongoDBSession.from_uri()", "SQLAlchemySession.from_url()", "DaprSession.from_address()"],
+    "overridable_hooks": ["_serialize_item()", "_deserialize_item()  [Redis, MongoDB, SQLAlchemy, Dapr]"]
+  },
+
+  "important_notes": [
+    "All backends are drop-in replacements for agents.memory.SQLiteSession; conform to SessionABC protocol",
+    "EncryptedSession is a pure wrapper/decorator pattern - can stack on top of any other backend",
+    "AdvancedSQLiteSession adds multi-branch conversation tree + per-turn token usage analytics",
+    "DaprSession uses optimistic concurrency (etag/CAS) with up to 5 retry attempts and jitter",
+    "MongoDBSession uses class-level init registry (threading.Lock + weakref.finalize) to run create_index once per client/db/collection combo",
+    "SQLAlchemySession applies SQLite WAL+busy_timeout automatically when engine dialect is sqlite",
+    "All backends with external clients support 'owns_client' pattern: only close client if created internally (via factory classmethod)",
+    "EncryptedSession uses HKDF(SHA256, salt=session_id) to derive per-session Fernet key from master key",
+    "Expired EncryptedEnvelope items (InvalidToken) are silently skipped during get_items/pop_item",
+    "Session extras: redis, mongodb, sqlalchemy, dapr, encrypt (cryptography)"
+  ],
+
+  "source_files_analyzed": [
+    "src/agents/extensions/memory/__init__.py",
+    "src/agents/extensions/memory/advanced_sqlite_session.py",
+    "src/agents/extensions/memory/async_sqlite_session.py",
+    "src/agents/extensions/memory/redis_session.py",
+    "src/agents/extensions/memory/mongodb_session.py",
+    "src/agents/extensions/memory/sqlalchemy_session.py",
+    "src/agents/extensions/memory/dapr_session.py",
+    "src/agents/extensions/memory/encrypt_session.py"
+  ]
+}

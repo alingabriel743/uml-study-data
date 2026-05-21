@@ -1,0 +1,153 @@
+{
+  "scope": "proxy_node_registration_and_lifecycle",
+  "title": "Proxy Node Registration & Lifecycle",
+  "diagram_type": "use_case",
+  "source_files_analyzed": ["src/proxy/lifecycle/manager.js"],
+
+  "actors": [
+    {
+      "name": "Proxy Agent",
+      "type": "primary",
+      "description": "The proxy node running LifecycleManager; initiates all lifecycle interactions"
+    },
+    {
+      "name": "Hub",
+      "type": "external_system",
+      "description": "Remote A2A Hub server (A2A_HUB_URL). Endpoints: POST /a2a/hello, POST /a2a/heartbeat"
+    },
+    {
+      "name": "Store",
+      "type": "external_system",
+      "description": "Mailbox store — persists node_id, node_secret, last_heartbeat_at; counts pending messages"
+    },
+    {
+      "name": "EnvFingerprint",
+      "type": "external_system",
+      "description": "captureEnvFingerprint() from gep/envFingerprint — supplies platform/arch/version metadata"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Register with Hub",
+      "actor": "Proxy Agent",
+      "method": "hello({ rotateSecret = false })",
+      "description": "POST /a2a/hello with node_id, protocol='gep-a2a', env_fingerprint, capabilities. Hub returns node_secret which is stored. Generates node_id if none exists.",
+      "timeout": "15,000 ms",
+      "outcomes": ["ok: true — node_id & node_secret stored", "ok: false — no hub URL, rejected, or network error"]
+    },
+    {
+      "id": "UC2",
+      "name": "Rotate Secret",
+      "actor": "Proxy Agent",
+      "method": "hello({ rotateSecret: true })",
+      "description": "Calls hello() with rotate_secret=true payload flag. Hub issues new node_secret. Used during re-authentication flow.",
+      "extends": "UC1"
+    },
+    {
+      "id": "UC3",
+      "name": "Send Heartbeat",
+      "actor": "Proxy Agent",
+      "method": "heartbeat({ _skipReauth = false })",
+      "description": "POST /a2a/heartbeat with node_id, evolver_version, env_fingerprint, pending message counts, and optional task metadata. Updates last_heartbeat_at on success.",
+      "timeout": "10,000 ms",
+      "precondition": "If nodeId is missing, calls hello() first (auto-registration)",
+      "outcomes": [
+        "200 OK — stores last_heartbeat_at, processes events/upgrade signals",
+        "401/403 — triggers reAuthenticate() unless _skipReauth=true",
+        "Other HTTP error — increments consecutive failure counter",
+        "Network error — increments consecutive failure counter"
+      ]
+    },
+    {
+      "id": "UC4",
+      "name": "Re-authenticate",
+      "actor": "Proxy Agent",
+      "method": "reAuthenticate()",
+      "description": "Up to MAX_REAUTH_ATTEMPTS (2): calls hello(rotateSecret=true), validates new secret returned, then calls heartbeat(_skipReauth=true) to confirm. Returns true if auth restored.",
+      "guard": "Mutex: _reauthInProgress flag prevents concurrent re-auth",
+      "includes": ["UC2 (Rotate Secret via hello)", "UC3 (Verify with heartbeat, _skipReauth=true)"]
+    },
+    {
+      "id": "UC5",
+      "name": "Start Heartbeat Loop",
+      "actor": "Proxy Agent",
+      "method": "startHeartbeatLoop(intervalMs)",
+      "description": "Starts recurring heartbeat timer. Default interval: 360,000 ms (min: 30,000 ms). Uses exponential backoff on consecutive failures: min(interval * 2^failures, 30 min). Timer is unref'd so it won't keep the process alive.",
+      "includes": ["UC3 (Send Heartbeat on each tick)"]
+    },
+    {
+      "id": "UC6",
+      "name": "Stop Heartbeat Loop",
+      "actor": "Proxy Agent",
+      "method": "stopHeartbeatLoop()",
+      "description": "Sets _running=false, clears the heartbeat timer."
+    },
+    {
+      "id": "UC7",
+      "name": "Handle Hub Events",
+      "actor": "Hub",
+      "method": "Triggered inside heartbeat() response handling",
+      "description": "If heartbeat response contains data.events[], writes them as inbound batch to store with channel='evomap-hub'.",
+      "extends": "UC3"
+    },
+    {
+      "id": "UC8",
+      "name": "Handle Upgrade Required",
+      "actor": "Hub",
+      "method": "Triggered inside heartbeat() response handling",
+      "description": "If data.min_proxy_version is higher than PROXY_PROTOCOL_VERSION (_shouldUpgrade check), writes a system inbound message with action='proxy_upgrade_required', priority='high', including upgrade_url and upgrade_message.",
+      "extends": "UC3"
+    },
+    {
+      "id": "UC9",
+      "name": "Re-register Unknown Node",
+      "actor": "Hub",
+      "method": "Triggered inside heartbeat() response handling",
+      "description": "If heartbeat response has status='unknown_node', calls hello() to re-register the node silently.",
+      "extends": "UC3",
+      "includes": ["UC1 (Register with Hub)"]
+    }
+  ],
+
+  "relationships": [
+    "UC3 <<include>> UC1 — heartbeat auto-calls hello() if no nodeId",
+    "UC3 <<include>> UC4 — heartbeat triggers reAuthenticate() on 401/403 (unless _skipReauth)",
+    "UC4 <<include>> UC2 — reAuthenticate calls hello(rotateSecret=true)",
+    "UC4 <<include>> UC3 — reAuthenticate calls heartbeat(_skipReauth=true) to verify",
+    "UC5 <<include>> UC3 — startHeartbeatLoop repeatedly calls heartbeat()",
+    "UC7 <<extend>> UC3 — hub events written to store when present in heartbeat response",
+    "UC8 <<extend>> UC3 — upgrade signal written to store when version is behind",
+    "UC9 <<extend>> UC3 — re-registration triggered on unknown_node status",
+    "UC9 <<include>> UC1 — re-registration calls hello()"
+  ],
+
+  "key_constants": {
+    "DEFAULT_HEARTBEAT_INTERVAL": "360,000 ms (6 min)",
+    "HELLO_TIMEOUT": "15,000 ms",
+    "HEARTBEAT_TIMEOUT": "10,000 ms",
+    "MAX_REAUTH_ATTEMPTS": 2,
+    "BACKOFF_MAX": "30 min"
+  },
+
+  "key_state": [
+    "_running: boolean — heartbeat loop active",
+    "_heartbeatTimer: Timeout — current scheduled tick",
+    "_consecutiveFailures: int — drives exponential backoff",
+    "_reauthInProgress: boolean — mutex for re-auth",
+    "store.node_id — persisted node identity",
+    "store.node_secret — persisted auth credential (64-char hex)",
+    "store.last_heartbeat_at — ISO timestamp of last successful heartbeat"
+  ],
+
+  "dependencies": [
+    "LifecycleManager depends_on Store (state persistence, message queuing)",
+    "LifecycleManager depends_on Hub HTTP API (/a2a/hello, /a2a/heartbeat)",
+    "LifecycleManager depends_on envFingerprint (platform metadata)",
+    "LifecycleManager depends_on PROXY_PROTOCOL_VERSION from mailbox/store",
+    "LifecycleManager uses AuthError (custom error class with statusCode)"
+  ],
+
+  "important_notes": "Authorization via Bearer token (node_secret) in all requests + x-correlation-id UUID header. Secret validated as 64-char hex before storing. node_id generated as 'node_<12hex>' if not present. Heartbeat payload includes outbound/inbound pending counts from store."
+}

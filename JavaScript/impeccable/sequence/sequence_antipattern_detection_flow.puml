@@ -1,0 +1,209 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ParticipantFontColor #212529
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    NoteBackgroundColor #FFF9E6
+    NoteBorderColor #CCA300
+}
+
+title Anti-Pattern Detection Flow
+
+actor "Browser / DOM" as browser
+participant "scan()" as scan
+participant "checkElementBordersDOM" as bordersDOM
+participant "checkElementColorsDOM" as colorsDOM
+participant "checkElementMotionDOM" as motionDOM
+participant "checkElementGlowDOM" as glowDOM
+participant "checkElementAIPaletteDOM" as aiDOM
+participant "checkElementIconTileDOM" as iconDOM
+participant "checkElementQualityDOM" as qualityDOM
+participant "Pure Detectors\n(checkBorders / checkColors /\ncheckMotion / checkGlow /\ncheckIconTile / checkQuality)" as pure
+participant "Color Helpers\n(parseRgb / relativeLuminance /\ncontrastRatio / resolveBackground /\nparseGradientColors / getHue)" as colorHelpers
+participant "Page Checkers\n(checkTypography / checkLayout /\ncheckPageQualityDOM / checkHtmlPatterns)" as pageCheckers
+participant "Overlay / Reporter" as reporter
+
+' ── Entry Point ──────────────────────────────────────────────
+browser -> scan : DOMContentLoaded → setTimeout(scan, 100)\nor window.addEventListener('message') {action: 'scan'}
+activate scan
+
+scan -> scan : clear overlays[]\nreset visibilityObserver\noverlayIndex = 0
+
+scan -> browser : document.querySelectorAll('*')
+browser --> scan : NodeList (all page elements)
+
+' ── Per-Element Loop ─────────────────────────────────────────
+loop for each el in NodeList (skip .impeccable-*, html / body)
+
+  ' -- Border Check --
+  scan -> bordersDOM : checkElementBordersDOM(el)
+  activate bordersDOM
+  bordersDOM -> browser : getComputedStyle(el)\ngetBoundingClientRect()
+  browser --> bordersDOM : style (border widths / colors / radius), rect
+  bordersDOM -> pure : checkBorders(tag, widths{Top/Right/Bottom/Left},\ncolors{sides}, radius)
+  activate pure
+  pure -> colorHelpers : isNeutralColor(color)
+  colorHelpers --> pure : bool (transparent / achromatic?)
+  pure --> bordersDOM : [{id: 'side-tab'|'border-accent-on-rounded', snippet}]
+  deactivate pure
+  bordersDOM --> scan : findings[]
+  deactivate bordersDOM
+
+  ' -- Color Check --
+  scan -> colorsDOM : checkElementColorsDOM(el)
+  activate colorsDOM
+  colorsDOM -> browser : getComputedStyle(el)
+  browser --> colorsDOM : textColor, bgColor, bgImage, bgClip, fontSize, fontWeight
+  colorsDOM -> colorHelpers : resolveBackground(el)\n(walk parentElement chain for solid bg)
+  colorHelpers --> colorsDOM : {r,g,b,a} solid bg or null (gradient/url)
+  colorsDOM -> colorHelpers : resolveGradientStops(el)\n(walk parents → parseGradientColors(bgImage))
+  colorHelpers --> colorsDOM : [{r,g,b,a}] gradient stops
+  colorsDOM -> pure : checkColors({tag, textColor, bgColor,\neffectiveBg, effectiveBgStops,\nfontSize, fontWeight, hasDirectText,\nisEmojiOnly, bgClip, bgImage, classList})
+  activate pure
+  pure -> colorHelpers : parseRgb(color)
+  colorHelpers --> pure : {r,g,b,a}
+  pure -> colorHelpers : relativeLuminance({r,g,b})
+  colorHelpers --> pure : float (WCAG luminance)
+  pure -> colorHelpers : contrastRatio(foreground, background)
+  colorHelpers --> pure : float ratio (e.g. 4.5 = AA threshold)
+  pure -> colorHelpers : hasChroma(c, threshold=30)
+  colorHelpers --> pure : bool (max − min channel diff)
+  pure --> colorsDOM : [{id: 'low-contrast'|'gray-on-color'|\n'pure-black-white'|'gradient-text'|'ai-color-palette', snippet}]
+  deactivate pure
+  colorsDOM --> scan : findings[]
+  deactivate colorsDOM
+
+  ' -- Motion Check --
+  scan -> motionDOM : checkElementMotionDOM(el)
+  activate motionDOM
+  motionDOM -> browser : getComputedStyle(el)
+  browser --> motionDOM : transitionProperty, animationName, timingFunctions
+  motionDOM -> pure : checkMotion({tag, transitionProperty,\nanimationName, timingFunctions, classList})
+  activate pure
+  note right of pure : Regex: /bounce|elastic|wobble|\njiggle|spring/ on animationName\nor animate-bounce CSS class
+  pure --> motionDOM : [{id: 'bounce-easing', snippet}]
+  deactivate pure
+  motionDOM --> scan : findings[]
+  deactivate motionDOM
+
+  ' -- Glow Check --
+  scan -> glowDOM : checkElementGlowDOM(el)
+  activate glowDOM
+  glowDOM -> browser : getComputedStyle(el)
+  browser --> glowDOM : boxShadow, bgImage
+  glowDOM -> colorHelpers : parseGradientColors(bgImage)\n+ walk ancestor chain for effective bg
+  colorHelpers --> glowDOM : averaged background color {r,g,b,a}
+  glowDOM -> pure : checkGlow({tag, boxShadow, effectiveBg})
+  activate pure
+  note right of pure : Dark-glow: boxShadow present\nand relativeLuminance(bg) < 0.1
+  pure --> glowDOM : [{id: 'dark-glow', snippet}]
+  deactivate pure
+  glowDOM --> scan : findings[]
+  deactivate glowDOM
+
+  ' -- AI Palette Check --
+  scan -> aiDOM : checkElementAIPaletteDOM(el)
+  activate aiDOM
+  aiDOM -> browser : getComputedStyle(el)
+  browser --> aiDOM : bgImage, backgroundColor, color
+  aiDOM -> colorHelpers : parseGradientColors(bgImage)
+  colorHelpers --> aiDOM : [{r,g,b,a}] gradient stops
+  aiDOM -> colorHelpers : getHue(c) + relativeLuminance()
+  colorHelpers --> aiDOM : hue (0–360), luminance
+  note right of aiDOM : Flags purple hue 260–310\nor cyan hue 160–200
+  aiDOM --> scan : findings[]
+  deactivate aiDOM
+
+  ' -- Icon Tile Check --
+  scan -> iconDOM : checkElementIconTileDOM(el)
+  activate iconDOM
+  iconDOM -> browser : el.previousElementSibling\ngetBoundingClientRect() × 2\ngetComputedStyle(sibling)
+  browser --> iconDOM : sibling geometry (width/height) + style
+  iconDOM -> pure : checkIconTile({headingTag, headingText,\nsiblingWidth, siblingHeight,\nsiblingBorderRadius, hasIconChild, ...})
+  activate pure
+  note right of pure : Square sibling 32–128px\nbefore heading with icon/emoji,\nvisible bg or border, not circular
+  pure --> iconDOM : [{id: 'icon-tile', snippet}]
+  deactivate pure
+  iconDOM --> scan : findings[]
+  deactivate iconDOM
+
+  ' -- Quality Check --
+  scan -> qualityDOM : checkElementQualityDOM(el)
+  activate qualityDOM
+  qualityDOM -> browser : getComputedStyle(el)\ngetBoundingClientRect()\nresolveFontSizePx(el)
+  browser --> qualityDOM : style, rect, computed fontSize
+  qualityDOM -> pure : checkQuality({el, tag, style, hasDirectText,\ntextLen, fontSize, lineHeightPx,\nletterSpacingPx, rect, lineMax})
+  activate pure
+  pure --> qualityDOM : [{id: 'skipped-heading'|quality findings, snippet}]
+  deactivate pure
+  qualityDOM --> scan : findings[]
+  deactivate qualityDOM
+
+  ' -- Merge & Overlay --
+  scan -> scan : merge all findings[]\nfilter via _ruleOk(id)\n(window.__IMPECCABLE_CONFIG__.disabledRules[])
+
+  opt findings.length > 0
+    scan -> reporter : highlight(el, findings)
+    activate reporter
+    reporter -> browser : create DOM overlay element (.impeccable-overlay)
+    browser --> reporter : overlayEl injected into page
+    reporter --> scan : push overlayEl to overlays[]
+    deactivate reporter
+  end
+
+  scan -> scan : allFindings.push({ el, findings })
+
+end
+
+' ── Page-Level Checks ────────────────────────────────────────
+== Page-Level Checks ==
+
+scan -> pageCheckers : checkTypography()
+pageCheckers --> scan : pageLevelFindings\n[overused-font, single-font, flat-type-hierarchy]
+
+scan -> pageCheckers : checkLayout()
+pageCheckers --> scan : layoutFindings\n[nested-cards, everything-centered, monotonous-spacing]
+
+scan -> pageCheckers : checkPageQualityDOM()
+pageCheckers --> scan : skipped-heading page-level findings
+
+scan -> pageCheckers : checkHtmlPatterns(document.documentElement.outerHTML)
+pageCheckers --> scan : regex-based HTML pattern findings
+
+scan -> reporter : showPageBanner(pageLevelFindings)
+activate reporter
+reporter -> browser : inject top-of-page banner if page-level issues exist
+deactivate reporter
+
+' ── Results Reporting ────────────────────────────────────────
+== Results Reporting ==
+
+alt EXTENSION_MODE (window.postMessage channel)
+  scan -> reporter : serializeFindings(allFindings)
+  activate reporter
+  reporter -> reporter : ANTIPATTERNS.find(a => a.id === type)\nenrich with { name, description, category }
+  reporter -> reporter : generateSelector(el) → CSS selector for DevTools\nisElementHidden(el) → el.checkVisibility() / offsetWidth/offsetHeight
+  reporter --> scan : serializedFindings[{ type, category, detail, name, description }]
+  deactivate reporter
+  scan -> browser : window.postMessage({\n  source: 'impeccable-results',\n  findings: serializedFindings,\n  count\n})
+else CONSOLE_MODE (script tag / bookmarklet)
+  scan -> reporter : printSummary(allFindings)
+  activate reporter
+  reporter -> browser : console.group with styled output per finding
+  deactivate reporter
+end
+
+scan --> browser : window.impeccableScan() exposed\nfor manual re-scan trigger
+deactivate scan
+
+@enduml

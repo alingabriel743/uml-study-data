@@ -1,0 +1,120 @@
+{
+  "scope": "tool_approval_flow",
+  "title": "Tool Approval Flow",
+  "diagram_type": "activity",
+  "description": "Human-in-the-loop approval gating: request approval, await decision, approve or reject tool call, handle interruptions",
+
+  "key_actors": [
+    "_FunctionToolBatchExecutor",
+    "function_needs_approval()",
+    "resolve_approval_status()",
+    "resolve_approval_interruption()",
+    "context_wrapper (RunContextWrapper)",
+    "ToolApprovalItem",
+    "RunState",
+    "User / External Approver"
+  ],
+
+  "activity_flow": [
+    "START: Model emits tool call (ResponseFunctionToolCall)",
+    "_FunctionToolBatchExecutor.execute() → creates async task per tool via _create_tool_task()",
+    "_run_single_tool() → calls _maybe_execute_tool_approval(func_tool, tool_call)",
+    "_maybe_execute_tool_approval() → calls function_needs_approval(func_tool, ctx, tool_call)",
+    "function_needs_approval() → evaluates func_tool.needs_approval (bool OR async callable(ctx, params, call_id))",
+    "BRANCH: needs_approval == False → return None (skip approval, proceed to execute tool body)",
+    "BRANCH: needs_approval == True → check context_wrapper.get_approval_status(tool_name, call_id)",
+    "BRANCH approval_status == True (already approved) → return None (proceed to execute)",
+    "BRANCH approval_status == False (already rejected) → resolve_approval_rejection_message() → return FunctionToolResult with rejection",
+    "BRANCH approval_status == None (no decision yet) → create ToolApprovalItem → return FunctionToolResult(run_item=approval_item) — INTERRUPT",
+    "_build_function_tool_results() → collects results; ToolApprovalItems become interruptions",
+    "RunResult.interruptions populated with ToolApprovalItem list — run PAUSES",
+    "Caller: result.to_state() → RunState serialized (supports to_string()/to_json())",
+    "User iterates result.interruptions → inspects ToolApprovalItem (agent.name, tool_name, arguments)",
+    "BRANCH: User approves → state.approve(interruption, always_approve=False|True)",
+    "BRANCH: User rejects → state.reject(interruption, always_reject=False|True, rejection_message=None|str)",
+    "Caller: Runner.run(agent, state) → run RESUMES",
+    "_maybe_execute_tool_approval() re-evaluates → approval_status now True or False",
+    "BRANCH approved → tool body executes normally → FunctionToolResult with output",
+    "BRANCH rejected → rejection message resolved → FunctionToolResult with rejection string",
+    "If new approval needed (nested or new tool call) → re-enter interruption loop",
+    "END: No more interruptions → RunResult.final_output returned"
+  ],
+
+  "branching_conditions": [
+    "needs_approval (bool | async callable) on FunctionTool / ShellTool / ApplyPatchTool / Agent.as_tool / HostedMCPTool",
+    "approval_status: None = no decision yet → interrupt; True = approved → proceed; False = rejected → reject message",
+    "always_approve=True: stores sticky approval for all future calls to that tool in this run",
+    "always_reject=True: stores sticky rejection for all future calls to that tool in this run",
+    "on_approval callback present (ShellTool / ApplyPatchTool / CustomTool): auto-approve/reject without surfacing interruption",
+    "Partial resolution: not all interruptions need to be resolved in one pass; unresolved ones re-surface"
+  ],
+
+  "key_classes_and_methods": [
+    "_FunctionToolBatchExecutor.__init__(bindings, tool_runs, hooks, context_wrapper, config, isolate_parallel_failures)",
+    "_FunctionToolBatchExecutor.execute() -> (list[FunctionToolResult], list[ToolInputGuardrailResult], list[ToolOutputGuardrailResult])",
+    "_FunctionToolBatchExecutor._run_single_tool(task_state, func_tool, tool_call) -> Any",
+    "_FunctionToolBatchExecutor._maybe_execute_tool_approval(func_tool, tool_call, raw_tool_call, span_fn) -> Any | None",
+    "_FunctionToolBatchExecutor._build_function_tool_results() -> list[FunctionToolResult]",
+    "function_needs_approval(function_tool, context_wrapper, tool_call) -> bool",
+    "resolve_approval_status(tool_name, call_id, raw_item, agent, context_wrapper, ..., on_approval) -> tuple[bool|None, ToolApprovalItem]",
+    "resolve_approval_interruption(approval_status, approval_item, rejection_factory) -> RunItem | ToolApprovalItem | None",
+    "resolve_approval_rejection_message(context_wrapper, run_config, tool_type, tool_name, call_id, ...) -> str",
+    "context_wrapper.get_approval_status(tool_name, call_id, ...) -> bool | None",
+    "context_wrapper.approve_tool(approval_item, always_approve=False)",
+    "context_wrapper.reject_tool(approval_item, always_reject=False, rejection_message=None)",
+    "RunState.approve(interruption, always_approve=bool)",
+    "RunState.reject(interruption, always_reject=bool, rejection_message=str|None)",
+    "RunResult.to_state() -> RunState",
+    "RunState.to_string() / RunState.from_string()",
+    "RunState.to_json() / RunState.from_json()",
+    "execute_approved_tools(agent, interruptions, context_wrapper, generated_items, run_config, hooks)"
+  ],
+
+  "data_objects": [
+    "ToolApprovalItem: agent, raw_item, tool_name, tool_namespace, tool_origin, tool_lookup_key — surfaced in RunResult.interruptions",
+    "FunctionToolResult: tool, output, run_item (ToolApprovalItem when pending), interruptions (nested), agent_run_result",
+    "RunState: serializable; holds approval decisions, usage, trace metadata, nested agent-as-tool resumptions",
+    "RunConfig.tool_error_formatter: run-wide rejection message formatter (ToolErrorFormatterArgs.kind == 'approval_rejected')"
+  ],
+
+  "nested_agent_approval": [
+    "Agent.as_tool() can have its own needs_approval at the tool level (outer interruption) AND nested tools inside may raise their own approvals",
+    "_get_nested_tool_interruptions(nested_run_result) extracts interruptions from nested RunResult",
+    "_resolve_nested_tool_run_result(): peek stored result, if unresolved interruptions exist keep pending; else consume",
+    "Nested interruptions surface on the outer run; resume the original top-level agent, not the nested one"
+  ],
+
+  "automatic_approval_path": [
+    "ShellTool.on_approval / ApplyPatchTool.on_approval / CustomTool.on_approval callback:",
+    "resolve_approval_status() → if approval_status is None AND on_approval provided → call on_approval(ctx, approval_item)",
+    "on_approval returns {approve: bool, reason?: str} → context_wrapper.approve_tool() or reject_tool()",
+    "Re-query approval_status → run continues without surfacing interruption to caller"
+  ],
+
+  "hosted_mcp_approval": [
+    "process_hosted_mcp_approvals(): filters McpApprovalRequest items, checks context_wrapper approval status",
+    "If approved/rejected → emit MCPApprovalResponseItem with approve bool and optional reason",
+    "If no decision → append ToolApprovalItem to pending list → surfaces as interruption"
+  ],
+
+  "serialization_durability": [
+    "RunState.to_string() / to_json(): persist paused state to disk/DB; includes sticky approvals",
+    "RunState.from_string() / from_json(): restore state in any process, resume with Runner.run(agent, state)",
+    "context_serializer / context_deserializer / strict_context / context_override options for non-mapping contexts"
+  ],
+
+  "important_notes": [
+    "Approval is run-wide; same flow for current agent, handoff targets, and Agent.as_tool() nesting",
+    "Sticky always_approve/always_reject survive serialization/deserialization",
+    "Partial approval resolution allowed: unresolved interruptions re-surface on next Runner.run()",
+    "Custom rejection messages: per-call rejection_message on state.reject() overrides run-wide tool_error_formatter",
+    "Streaming: same flow via Runner.run_streamed(); drain stream_events() before inspecting interruptions"
+  ],
+
+  "source_files_analyzed": [
+    "src/agents/run_internal/tool_execution.py",
+    "src/agents/tool.py",
+    "examples/tools/shell_human_in_the_loop.py",
+    "docs/human_in_the_loop.md"
+  ]
+}

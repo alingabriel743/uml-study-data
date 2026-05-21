@@ -1,0 +1,279 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipant underline
+skinparam sequenceBoxBackgroundColor #E9ECEF
+skinparam sequenceBoxBorderColor #6C757D
+skinparam sequenceLifeLineBorderColor #495057
+skinparam sequenceGroupBackgroundColor #F0F4FF
+skinparam sequenceGroupBorderColor #7B8FC2
+skinparam noteBackgroundColor #FFF8E1
+skinparam noteBorderColor #E6B800
+
+title Sandbox Session Lifecycle
+
+actor "Caller" as caller
+
+box "SandboxSession (Decorator)" #EFF3FB
+    participant "SandboxSession\n@instrumented_op" as session
+    participant "Instrumentation" as instr
+end box
+
+box "BaseSandboxSession (Core)" #F0FAF0
+    participant "BaseSandboxSession" as base
+    participant "SandboxSessionState" as state
+end box
+
+box "Workspace & Snapshot" #FFF7F0
+    participant "Snapshot" as snapshot
+    participant "ManifestApplier" as manifest
+end box
+
+== Session Startup ==
+
+caller -> session : start()  [or async with __aenter__]
+activate session
+
+session -> instr : emit SandboxSessionStartEvent(op='start', session_id, seq)
+activate instr
+instr --> session : event emitted
+deactivate instr
+
+session -> base : _inner.start()
+activate base
+
+base -> base : _ensure_backend_started()\n[provider hook — default no-op]
+
+base -> state : read workspace_root_ready
+activate state
+state --> base : workspace_root_ready (bool)
+deactivate state
+
+base -> base : _start_workspace_root_ready =\nstate.workspace_root_ready
+
+note over base
+  **State Preservation Flags**
+  _start_workspace_state_preserved — set by provider
+  _start_system_state_preserved — controls OS re-provisioning
+  _start_workspace_root_ready — captured at start-time
+end note
+
+group Workspace Root Probe [workspace_state_preserved AND NOT workspace_root_ready]
+    base -> base : _probe_workspace_root_for_preserved_resume()
+    base -> base : exec('test -d <workspace_root>', timeout=10s)
+    alt probe succeeds
+        base -> state : workspace_root_ready = True\n[_mark_workspace_root_ready_from_probe()]
+    end
+end
+
+base -> base : _prepare_backend_workspace()\n[provider hook — default no-op]
+base -> base : _ensure_runtime_helpers()\n[install each RuntimeHelperScript]
+
+base -> base : _start_workspace()
+activate base
+
+alt snapshot.restorable(dependencies) == True
+
+    alt _can_reuse_restorable_snapshot_workspace()\n[workspace_state_preserved AND fingerprint matches]
+        note over base, snapshot
+          **Skip-Restore Optimisation**
+          Snapshot fingerprint (sha256 of workspace tar)
+          matches prior run → skip full restore
+        end note
+        base -> manifest : apply_manifest(only_ephemeral=True)\n[_reapply_ephemeral_manifest_on_resume]
+        activate manifest
+        manifest --> base : ephemeral entries applied
+        deactivate manifest
+
+    else workspace drifted or fresh start
+        base -> base : _clear_workspace_root_on_resume()
+        base -> snapshot : restore(dependencies)
+        activate snapshot
+        snapshot --> base : workspace_archive (io.IOBase)
+        deactivate snapshot
+        base -> base : hydrate_workspace(workspace_archive)
+
+        opt NOT system_state_preserved
+            base -> manifest : provision_manifest_accounts()
+            activate manifest
+            manifest --> base : OS users/groups provisioned
+            deactivate manifest
+        end
+
+        base -> manifest : apply_manifest(only_ephemeral=True)\n[_reapply_ephemeral_manifest_on_resume]
+        activate manifest
+        manifest --> base : ephemeral entries applied
+        deactivate manifest
+    end
+
+else snapshot NOT restorable
+
+    alt _can_reuse_preserved_workspace_on_resume()\n[workspace_state_preserved AND workspace_root_ready]
+        base -> manifest : apply_manifest(only_ephemeral=True)\n[_reapply_ephemeral_manifest_on_resume]
+        activate manifest
+        manifest --> base : ephemeral entries applied
+        deactivate manifest
+
+    else fresh workspace — full materialisation
+        note over base, manifest
+          **Concurrency Limits**
+          _max_manifest_entry_concurrency → ManifestApplier
+          _max_local_dir_file_concurrency → LocalDir file staging
+          (sourced from SandboxRunConfig → _set_concurrency_limits)
+        end note
+        base -> manifest : _apply_manifest(provision_accounts=True)
+        activate manifest
+        manifest --> base : full manifest materialised
+        deactivate manifest
+    end
+
+end
+
+deactivate base
+
+alt start() raises exception
+    base -> base : _after_start_failed()
+    base -> base : _wrap_start_error(e)
+    base --> session : raise StartError
+end
+
+base -> base : _after_start()\n[provider bookkeeping hook]
+base -> state : workspace_root_ready = True
+activate state
+state --> base
+deactivate state
+
+base --> session : started successfully
+deactivate base
+
+session -> instr : emit SandboxSessionFinishEvent\n(op='start', ok=True, duration_ms=…)
+activate instr
+instr --> session : event emitted
+deactivate instr
+
+session --> caller : session ready
+deactivate session
+
+== Session Stop — Snapshot Persistence ==
+
+caller -> session : stop()  [or via aclose()]
+activate session
+
+session -> instr : emit SandboxSessionStartEvent(op='stop')
+activate instr
+instr --> session
+deactivate instr
+
+session -> base : _inner.stop()
+activate base
+
+base -> base : _before_stop()\n→ pty_terminate_all()
+
+base -> base : _persist_snapshot()
+activate base
+
+alt NoopSnapshot
+    note over base : Skip — no snapshot configured
+else real snapshot
+    base -> base : _compute_and_cache_snapshot_fingerprint()\n[sha256 of workspace tar]
+    base -> base : persist_workspace() → workspace_archive
+    base -> snapshot : persist(workspace_archive, dependencies)
+    activate snapshot
+    snapshot --> base : snapshot stored
+    deactivate snapshot
+    base -> state : snapshot_fingerprint =\nsha256_digest\nsnapshot_fingerprint_version = version
+    activate state
+    state --> base
+    deactivate state
+end
+
+deactivate base
+
+alt stop() raises exception
+    base -> base : _wrap_stop_error(e)
+end
+
+base -> base : (finally) _after_stop()
+base --> session : stopped
+deactivate base
+
+session -> instr : emit SandboxSessionFinishEvent(op='stop', ok=…)
+activate instr
+instr --> session
+deactivate instr
+
+session --> caller : stop complete
+deactivate session
+
+== Session Shutdown — Backend Teardown ==
+
+caller -> session : shutdown()
+activate session
+
+session -> instr : emit SandboxSessionStartEvent(op='shutdown')
+activate instr
+instr --> session
+deactivate instr
+
+session -> base : _inner.shutdown()
+activate base
+
+base -> base : _before_shutdown()\n→ pty_terminate_all()
+base -> base : _shutdown_backend()\n[provider-specific teardown — default no-op]
+base -> base : _after_shutdown()
+
+base --> session : shutdown complete
+deactivate base
+
+session -> instr : emit SandboxSessionFinishEvent(op='shutdown', ok=…)
+activate instr
+instr --> session
+deactivate instr
+
+session --> caller : shutdown complete
+deactivate session
+
+== Full Lifecycle via aclose() [async with / __aexit__] ==
+
+caller -> session : aclose()  [or __aexit__]
+activate session
+
+note over session, base
+  aclose() = run_pre_stop_hooks → stop → shutdown → _aclose_dependencies
+end note
+
+session -> base : super().aclose()  [BaseSandboxSession.aclose()]
+activate base
+
+base -> base : run_pre_stop_hooks()\n[user-registered async hooks, run-once guard]
+base -> base : stop()  [persist snapshot — see above]
+base -> base : shutdown()  [teardown backend — see above]
+base -> base : (finally) _aclose_dependencies()
+
+base --> session : base aclose complete
+deactivate base
+
+session -> instr : (finally) flush()\n[drain all instrumentation sinks]
+activate instr
+instr --> session : flushed
+deactivate instr
+
+session --> caller : session fully closed
+deactivate session
+
+@enduml

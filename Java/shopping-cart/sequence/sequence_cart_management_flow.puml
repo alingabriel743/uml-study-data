@@ -1,0 +1,237 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam actor {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #DEE2E6
+    GroupBodyBackgroundColor #F8F9FA
+    DividerBackgroundColor #CED4DA
+    DividerBorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF3CD
+    BorderColor #856404
+    FontColor #212529
+}
+
+title Shopping Cart Management Flow
+
+actor "Customer\n(Browser)" as Customer
+
+participant "AddtoCart\n<<HttpServlet>>\n/AddtoCart" as AddtoCart
+participant "UpdateToCart\n<<HttpServlet>>\n/UpdateToCart" as UpdateToCart
+participant "CartServiceImpl" as CartSvc
+participant "ProductServiceImpl" as ProdSvc
+participant "DemandServiceImpl" as DemandSvc
+participant "DBUtil" as DBUtil
+database "Database\n(usercart)" as DB
+
+' ─────────────────────────────────────────────────
+== ADD TO CART FLOW ==
+' ─────────────────────────────────────────────────
+
+Customer -> AddtoCart : GET /AddtoCart?pid={prodId}&pqty={qty}
+activate AddtoCart
+
+AddtoCart -> AddtoCart : session.getAttribute(\n  "username", "password", "usertype")
+
+alt session invalid or usertype != "customer"
+    AddtoCart --> Customer : redirect → login.jsp
+else session valid
+    AddtoCart -> ProdSvc : getProductDetails(prodId)
+    activate ProdSvc
+    ProdSvc -> DBUtil : provideConnection()
+    activate DBUtil
+    DBUtil --> ProdSvc : Connection
+    deactivate DBUtil
+    ProdSvc -> DB : SELECT * FROM products\nWHERE prodid=?
+    DB --> ProdSvc : ProductBean
+    ProdSvc -> DBUtil : closeConnection()
+    ProdSvc --> AddtoCart : ProductBean
+    deactivate ProdSvc
+
+    AddtoCart -> CartSvc : getProductCount(userId, prodId)
+    activate CartSvc
+    CartSvc -> DBUtil : provideConnection()
+    activate DBUtil
+    DBUtil --> CartSvc : Connection
+    deactivate DBUtil
+    CartSvc -> DB : SELECT sum(quantity)\nFROM usercart\nWHERE username=? AND prodid=?
+    DB --> CartSvc : cartQty (int)
+    CartSvc -> DBUtil : closeConnection()
+    CartSvc --> AddtoCart : cartQty
+    deactivate CartSvc
+
+    AddtoCart -> AddtoCart : pQty = requestedQty + cartQty
+
+    alt pQty == cartQty (requested qty was 0 → toggle removal)
+        AddtoCart -> CartSvc : removeProductFromCart(userId, prodId)
+        activate CartSvc
+        CartSvc -> DBUtil : provideConnection()
+        activate DBUtil
+        DBUtil --> CartSvc : Connection
+        deactivate DBUtil
+        CartSvc -> DB : SELECT * FROM usercart\nWHERE username=? AND prodid=?
+        DB --> CartSvc : current row (prodQuantity)
+        alt prodQuantity - 1 > 0
+            CartSvc -> DB : UPDATE usercart SET quantity=?\nWHERE username=? AND prodid=?
+        else prodQuantity - 1 <= 0
+            CartSvc -> DB : DELETE FROM usercart\nWHERE username=? AND prodid=?
+        end
+        CartSvc -> DBUtil : closeConnection()
+        CartSvc --> AddtoCart : status message
+        deactivate CartSvc
+        AddtoCart --> Customer : include userHome.jsp + status
+
+    else availableQty < pQty (insufficient stock)
+        alt availableQty == 0
+            AddtoCart -> AddtoCart : status = "Out of Stock"
+            AddtoCart --> Customer : include cartDetails.jsp + "Out of Stock"
+        else availableQty > 0 (partial stock)
+            AddtoCart -> CartSvc : updateProductToCart(\n  userId, prodId, availableQty)
+            activate CartSvc
+            CartSvc -> DBUtil : provideConnection()
+            activate DBUtil
+            DBUtil --> CartSvc : Connection
+            deactivate DBUtil
+            CartSvc -> DB : SELECT * FROM usercart\nWHERE username=? AND prodid=?
+            DB --> CartSvc : row exists?
+            alt row exists
+                CartSvc -> DB : UPDATE usercart SET quantity=?\nWHERE username=? AND prodid=?
+            else row not found
+                CartSvc -> DB : INSERT INTO usercart VALUES(?,?,?)
+            end
+            CartSvc -> DBUtil : closeConnection()
+            CartSvc --> AddtoCart : status
+            deactivate CartSvc
+
+            AddtoCart -> DemandSvc : addProduct(\n  new DemandBean(userId, prodId, pQty-availableQty))
+            activate DemandSvc
+            DemandSvc -> DB : INSERT demand record
+            DemandSvc --> AddtoCart : recorded
+            deactivate DemandSvc
+
+            AddtoCart --> Customer : include cartDetails.jsp + partial-stock notice
+        end
+
+    else pQty <= availableQty (normal add)
+        AddtoCart -> CartSvc : updateProductToCart(userId, prodId, pQty)
+        activate CartSvc
+        CartSvc -> DBUtil : provideConnection()
+        activate DBUtil
+        DBUtil --> CartSvc : Connection
+        deactivate DBUtil
+        CartSvc -> DB : UPDATE or INSERT usercart\n(upsert with pQty)
+        DB --> CartSvc : ok
+        CartSvc -> DBUtil : closeConnection()
+        CartSvc --> AddtoCart : status
+        deactivate CartSvc
+        AddtoCart --> Customer : include userHome.jsp + status
+    end
+end
+
+deactivate AddtoCart
+
+' ─────────────────────────────────────────────────
+== UPDATE CART FLOW ==
+' ─────────────────────────────────────────────────
+
+Customer -> UpdateToCart : GET /UpdateToCart?pid={prodId}&pqty={qty}
+activate UpdateToCart
+
+UpdateToCart -> UpdateToCart : session.getAttribute(\n  "username", "password")
+
+alt session invalid
+    UpdateToCart --> Customer : redirect → login.jsp
+else session valid
+    UpdateToCart -> ProdSvc : getProductDetails(prodId)
+    activate ProdSvc
+    ProdSvc -> DB : SELECT product details
+    DB --> ProdSvc : ProductBean (with availableQty)
+    ProdSvc --> UpdateToCart : ProductBean
+    deactivate ProdSvc
+
+    alt availableQty < requestedQty (insufficient stock)
+        UpdateToCart -> CartSvc : updateProductToCart(\n  userId, prodId, availableQty)
+        activate CartSvc
+        CartSvc -> DBUtil : provideConnection()
+        activate DBUtil
+        DBUtil --> CartSvc : Connection
+        deactivate DBUtil
+        CartSvc -> DB : UPDATE or INSERT usercart\nWHERE username=? AND prodid=?\n(qty capped to availableQty)
+        DB --> CartSvc : ok
+        CartSvc -> DBUtil : closeConnection()
+        CartSvc --> UpdateToCart : status
+        deactivate CartSvc
+
+        UpdateToCart -> DemandSvc : addProduct(\n  new DemandBean(userId, prodId, pQty-availableQty))
+        activate DemandSvc
+        DemandSvc -> DB : INSERT demand record
+        DemandSvc --> UpdateToCart : recorded
+        deactivate DemandSvc
+
+        UpdateToCart --> Customer : include cartDetails.jsp + partial-stock notice
+
+    else availableQty >= requestedQty (normal update)
+        UpdateToCart -> CartSvc : updateProductToCart(userId, prodId, pQty)
+        activate CartSvc
+        CartSvc -> DBUtil : provideConnection()
+        activate DBUtil
+        DBUtil --> CartSvc : Connection
+        deactivate DBUtil
+        CartSvc -> DB : SELECT * FROM usercart WHERE username=? AND prodid=?
+        DB --> CartSvc : row exists?
+        alt qty == 0 and row exists
+            CartSvc -> DB : DELETE FROM usercart\nWHERE username=? AND prodid=?
+        else row exists and qty > 0
+            CartSvc -> DB : UPDATE usercart SET quantity=?\nWHERE username=? AND prodid=?
+        else row not found
+            CartSvc -> DB : INSERT INTO usercart VALUES(?,?,?)
+        end
+        CartSvc -> DBUtil : closeConnection()
+        CartSvc --> UpdateToCart : status
+        deactivate CartSvc
+
+        UpdateToCart --> Customer : include cartDetails.jsp + status
+    end
+end
+
+deactivate UpdateToCart
+
+note over CartSvc, DB
+  <b>CartServiceImpl — usercart operations</b>
+  updateProductToCart(): upsert (INSERT/UPDATE/DELETE)
+  removeProductFromCart(): decrement by 1, DELETE when reaches 0
+  removeAProduct(): hard DELETE row
+  DBUtil uses a singleton JDBC Connection
+end note
+
+@enduml

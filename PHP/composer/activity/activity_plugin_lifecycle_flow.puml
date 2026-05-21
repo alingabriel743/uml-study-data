@@ -1,0 +1,354 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title Plugin Lifecycle Flow\n<size:10>(Composer\\Plugin\\PluginManager)</size>
+
+|PluginManager|
+start
+
+:loadInstalledPlugins();
+
+fork
+    :Check local plugins not disabled;
+    if (arePluginsDisabled('local')?) then (disabled)
+        :Skip local repository;
+    else (enabled)
+        :getLocalRepository();
+        :loadRepository(localRepo, isGlobal=false);
+    endif
+fork again
+    :Check global plugins not disabled;
+    if (globalComposer === null\nOR arePluginsDisabled('global')?) then (skip)
+        :Skip global repository;
+    else (enabled)
+        :loadRepository(globalRepo, isGlobal=true);
+    endif
+end fork
+
+|PluginManager|
+note right
+  **loadRepository** processes
+  one repo at a time
+end note
+
+:repo->getPackages();
+:Assign weights:\n  composer/installers → -10000\n  plugin-modifies-install-path → -10000;
+:PackageSorter::sortPackages()\n(dependency order, installers first);
+
+if (isGlobalRepo?) then (no — local)
+    :RepositoryUtils::filterRequiredPackages()\n→ requiredPackages set;
+endif
+
+|PluginManager|
+:Iterate sorted packages;
+
+repeat
+    if (Package is CompletePackage?) then (no)
+        :Skip package;
+    elseif (type is composer-plugin\nor composer-installer?) then (no)
+        :Skip package;
+    elseif (!isGlobalRepo AND\nnot in requiredPackages?) then (yes — optional)
+        |SecurityGate|
+        :isPluginAllowed(optional=true, prompt=false);
+        if (Allowed?) then (no)
+            :WARN: optional plugin not in\nallow-plugins, skipping;
+            |PluginManager|
+            :Skip package;
+        else (yes)
+            |PluginManager|
+            :registerPackage(package, failOnMissing=false, isGlobal);
+        endif
+    else (required / global)
+        :registerPackage(package, failOnMissing=false, isGlobal);
+    endif
+repeat while (more packages?) is (yes)
+-> no;
+
+|PluginManager|
+:== Registration Phase Complete ==;
+
+stop
+
+|PluginManager|
+partition "registerPackage()" {
+
+    start
+
+    if (arePluginsDisabled\n(local or global)?) then (yes)
+        :WARN: plugins disabled, skipping;
+        stop
+    endif
+
+    if (type === 'composer-plugin'?) then (yes)
+        if (composer-plugin-api\nrequire link missing?) then (yes)
+            :throw RuntimeException;
+            stop
+        endif
+        if (API version constraint\nmismatch?) then (yes)
+            :WARN: incompatible plugin API version, skip;
+            stop
+        endif
+        if (symfony/flex < 1.9.8?) then (yes)
+            :WARN: old symfony/flex, skip;
+            stop
+        endif
+    endif
+
+    |SecurityGate|
+    :isPluginAllowed(name, isGlobal, optional, prompt);
+
+    if (rules === null\n(legacy pre-2.2 lock)?) then (yes)
+        if (io->isInteractive()?) then (no)
+            :throw RuntimeException\n(run composer update --lock);
+            stop
+        else (yes)
+            :Set rules = [] (will prompt);
+        endif
+    endif
+
+    :Match package name against allow-plugins rules;
+
+    if (Matched rule found?) then (yes)
+        if (Rule allows?) then (yes)
+            :Return allowed = true;
+        else (no)
+            :Return allowed = false;
+        endif
+    elseif (package ===\ncomposer/package-versions-deprecated?) then (yes)
+        :Return allowed = false;
+    elseif (io->isInteractive()\nAND prompt=true?) then (yes)
+        :Prompt user: allow plugin y/n/d/?;
+        if (User answers y or n?) then (yes)
+            :Persist to rules[]\nAND composer.json allow-plugins;
+        elseif (User answers d?) then (yes)
+            :Persist to rules[] only\n(discard from json);
+            :Return false;
+        else (? or 5 attempts)
+            :Print help, increment attempts;
+        endif
+    elseif (optional?) then (yes)
+        :Return false;
+    else (non-interactive, not optional)
+        :throw PluginBlockedException;
+        stop
+    endif
+
+    |PluginManager|
+    if (Plugin not allowed?) then (yes)
+        :DEBUG log: plugin not allowed, skip;
+        stop
+    endif
+
+    if (registeredPlugins[name]\nalready set?) then (yes)
+        :return — already registered;
+        stop
+    endif
+
+    :Read extra['class']\n(throw UnexpectedValueException if empty);
+
+    |AutoloadGenerator|
+    :Build installedRepo =\nlocalRepo + RootPackageRepository\n(files autoloads cleared);
+    :collectDependencies(installedRepo, {package})\n→ autoloadPackages map;
+
+    :Build autoloads list:;
+    :shouldAutoloadPackage(rootPackage, '') → add if true;
+
+    repeat
+        :For each autoloadPackage:;
+        :getInstallPath() → shouldAutoloadPackage(pkg, path)\nOR pkg === pluginPackage;
+        if (shouldAutoloadPackage?) then (yes)
+            :Add to autoloads list;
+        endif
+    repeat while (more deps?) is (yes)
+    -> no;
+
+    if (autoloads list empty?) then (yes)
+        :throw LogicException;
+        stop
+    endif
+
+    :generator->parseAutoloads(autoloads, rootPackage) → map;
+    :generator->createLoader(map, vendor-dir);
+    :classLoader->register(prepend=false);
+    :Require each file in map['files']\n(skip laminas bridge hack);
+
+    |PluginManager|
+    :Iterate plugin classes from extra['class'];
+
+    repeat
+        if (class_exists — already loaded?) then (yes)
+            :Rename existing class via eval\n→ _composer_tmpN suffix\n(avoids PHP redeclaration error);
+        endif
+
+        if (type === 'composer-installer'\n(legacy InstallerInterface)?) then (yes)
+            if (class implements InstallerInterface?) then (no)
+                :throw RuntimeException;
+                stop
+            endif
+            :new $class(io, composer) → installer;
+            :installationManager->addInstaller(installer);
+            :registeredPlugins[name][] = installer;
+        elseif (class_exists?) then (yes)
+            if (class implements PluginInterface?) then (no)
+                :throw RuntimeException;
+                stop
+            endif
+            :new $class() → plugin;
+            :addPlugin(plugin, isGlobal, package);
+            :registeredPlugins[name][] = plugin;
+        elseif (failOnMissingClasses?) then (yes)
+            :throw UnexpectedValueException;
+            stop
+        else (skip silently)
+        endif
+    repeat while (more classes?) is (yes)
+    -> no;
+
+    stop
+}
+
+|PluginManager|
+partition "addPlugin()" {
+
+    start
+
+    if (arePluginsDisabled?) then (yes)
+        :return silently;
+        stop
+    endif
+
+    if (sourcePackage === null?) then (yes)
+        :trigger E_USER_DEPRECATED\n(no source package provided);
+    else (package given)
+        |SecurityGate|
+        :isPluginAllowed(sourcePackage->getName(), ...);
+        if (Not allowed?) then (yes)
+            :DEBUG log: not loading plugin;
+            |PluginManager|
+            stop
+        endif
+    endif
+
+    |PluginManager|
+    :io->writeError DEBUG:\n"Loading plugin ClassName\n(from pkg, [installed globally])";
+    :plugins[] = plugin;
+
+    |Plugin / Installer|
+    :plugin->activate(composer, io);
+
+    |PluginManager|
+    if (plugin instanceof\nEventSubscriberInterface?) then (yes)
+        :eventDispatcher->addSubscriber(plugin);
+    endif
+
+    stop
+}
+
+|PluginManager|
+partition "removePlugin()" {
+
+    start
+
+    :array_search plugin in plugins[];
+
+    if (Plugin not found?) then (yes)
+        :return — not tracked;
+        stop
+    endif
+
+    :io->writeError DEBUG:\n"Unloading plugin ClassName";
+    :unset plugins[index];
+
+    |Plugin / Installer|
+    :plugin->deactivate(composer, io);
+
+    |PluginManager|
+    :eventDispatcher->removeListener(plugin);
+
+    stop
+}
+
+|PluginManager|
+partition "deactivatePackage()" {
+
+    start
+
+    if (registeredPlugins[name]\nexists?) then (no)
+        :return — nothing to deactivate;
+        stop
+    endif
+
+    :FOREACH plugins in registeredPlugins[name]:;
+
+    repeat
+        if (plugin instanceof InstallerInterface?) then (yes)
+            :installationManager->removeInstaller(plugin);
+        else (PluginInterface)
+            :removePlugin(plugin)\n→ deactivate + removeListener;
+        endif
+    repeat while (more plugins for package?) is (yes)
+    -> no;
+
+    :unset registeredPlugins[name];
+
+    stop
+}
+
+|PluginManager|
+partition "deactivateInstalledPlugins()" {
+
+    start
+
+    fork
+        if (arePluginsDisabled('local')?) then (disabled)
+            :Skip local repo;
+        else (enabled)
+            :deactivateRepository(localRepo, isGlobal=false);
+            :repo->getPackages();
+            :array_reverse(\n  PackageSorter::sortPackages(packages)\n) → reverse dependency order\n(dependents unloaded before deps);
+            :FOREACH sorted packages (reversed):;
+            if (type in [composer-plugin,\ncomposer-installer]?) then (yes)
+                :deactivatePackage(package);
+            endif
+        endif
+    fork again
+        if (globalComposer === null\nOR arePluginsDisabled('global')?) then (skip)
+            :Skip global repo;
+        else (enabled)
+            :deactivateRepository(globalRepo, isGlobal=true);
+        endif
+    end fork
+
+    stop
+}
+
+@enduml

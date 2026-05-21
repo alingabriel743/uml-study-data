@@ -1,0 +1,245 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipantBackgroundColor #F8F9FA
+skinparam sequenceParticipantBorderColor #495057
+skinparam sequenceLifeLineBorderColor #ADB5BD
+skinparam sequenceGroupBackgroundColor #E9ECEF
+skinparam sequenceGroupBorderColor #6C757D
+skinparam noteBorderColor #6C757D
+skinparam noteBackgroundColor #FFF3CD
+
+title Async Concurrency Primitives Flow
+
+participant "Caller" as caller
+participant "TeePromise" as tee
+participant "native Promise" as np
+participant "Lock" as lock
+participant "RWLock" as rwlock
+participant "LockService" as ls
+participant "FSLockService" as fsls
+participant "asyncSafeSetInterval" as interval
+
+== TeePromise Fan-Out ==
+
+caller -> tee : new TeePromise()
+activate tee
+tee -> np : new Promise((resolve, reject) => {\l  doneResolve = resolve\l  doneReject  = reject })
+activate np
+np --> tee : donePromise handle
+deactivate np
+tee --> caller : teePromise instance
+deactivate tee
+
+caller -> tee : awaitDone()  [Subscriber A]
+activate tee
+note right of tee : returns donePromise\l(native Promise)
+tee --> caller : <suspends — awaiting>
+deactivate tee
+
+caller -> tee : .then(fn)  [Subscriber B]
+activate tee
+tee --> caller : <suspends — awaiting>
+deactivate tee
+
+caller -> tee : resolve(value)
+activate tee
+tee -> tee : status_ = STATUS_DONE
+tee -> np : doneResolve(value)
+activate np
+note right of np : All subscribers\lunblock simultaneously\n(fan-out)
+np --> tee : settled
+deactivate np
+tee --> caller : —
+deactivate tee
+
+note over caller, np : Both Subscriber A (.awaitDone()) and Subscriber B (.then()) receive value concurrently
+
+== Lock: Acquire / Release (FIFO Mutex) ==
+
+caller -> lock : acquire()   [Caller A — no contention]
+activate lock
+lock -> lock : _locked = false →\nset _locked = true
+lock --> caller : <granted immediately>
+deactivate lock
+
+caller -> lock : acquire()   [Caller B — contention]
+activate lock
+lock -> lock : _locked = true →\npush {resolve} to _waiting
+note right of lock : Caller B suspends
+lock --> caller : <suspended in queue>
+deactivate lock
+
+caller -> lock : release()   [Caller A releases]
+activate lock
+alt _waiting.length > 0
+    lock -> lock : shift().resolve()\n→ Caller B unblocks
+else queue empty
+    lock -> lock : _locked = false
+end
+lock --> caller : —
+deactivate lock
+
+note over caller, lock : Optional callback path:\nacquire(callback) → await callback() in try/finally → auto-release()
+
+== RWLock: rlock() — Concurrent Readers ==
+
+caller -> rwlock : rlock()
+activate rwlock
+rwlock -> tee : new TeePromise()  [p_read]
+activate tee
+tee --> rwlock : p_read
+deactivate tee
+rwlock -> tee : new TeePromise()  [p_unlock]
+activate tee
+tee --> rwlock : p_unlock
+deactivate tee
+rwlock -> rwlock : push_({TYPE_READ, p_read, p_unlock})
+rwlock -> rwlock : check_queue_():\nmode=TYPE_READ →\nreaders_++\nstart async watcher on p_unlock
+rwlock -> tee : p_read.resolve()
+activate tee
+tee --> rwlock : unblocked
+deactivate tee
+rwlock --> caller : handle { unlock: () => p_unlock.resolve() }
+deactivate rwlock
+
+note right of caller : Multiple rlock() callers\nare granted concurrently;\nall increment readers_
+
+caller -> rwlock : handle.unlock()
+activate rwlock
+rwlock -> tee : p_unlock.resolve()
+activate tee
+tee --> rwlock : settled
+deactivate tee
+rwlock -> rwlock : [async watcher] p_unlock resolved\n→ readers_--\n→ check_queue_()\n→ on_empty_() if no holders
+rwlock --> caller : —
+deactivate rwlock
+
+== RWLock: wlock() — Exclusive Writer ==
+
+caller -> rwlock : wlock()
+activate rwlock
+rwlock -> tee : new TeePromise()  [p_write]
+activate tee
+tee --> rwlock : p_write
+deactivate tee
+rwlock -> tee : new TeePromise()  [p_unlock]
+activate tee
+tee --> rwlock : p_unlock
+deactivate tee
+rwlock -> rwlock : push_({TYPE_WRITE, p_write, p_unlock})
+rwlock -> rwlock : check_queue_():\nwriter_=false, no conflict\n→ writer_=true\nstart async watcher on p_unlock
+rwlock -> tee : p_write.resolve()
+activate tee
+tee --> rwlock : unblocked
+deactivate tee
+rwlock --> caller : handle { unlock: () => p_unlock.resolve() }
+deactivate rwlock
+
+note right of rwlock : While writer_=true,\ncheck_queue_() returns immediately\n— no new readers or writers start
+
+caller -> rwlock : handle.unlock()
+activate rwlock
+rwlock -> tee : p_unlock.resolve()
+activate tee
+tee --> rwlock : settled
+deactivate tee
+rwlock -> rwlock : [async watcher] p_unlock resolved\n→ writer_=false\n→ check_queue_()
+rwlock --> caller : —
+deactivate rwlock
+
+== LockService: Named Write Lock ==
+
+caller -> ls : lock(name, opts?, callback)
+activate ls
+alt name is Array
+    ls -> ls : reduce() → nested lock chain\ncall outermost section()
+end
+ls -> rwlock : wlock()  [creates RWLock if !locks[name]]
+activate rwlock
+rwlock --> ls : handle
+deactivate rwlock
+opt opts.timeout set
+    ls -> ls : setTimeout(() => handle.unlock(), timeout)
+end
+ls -> caller : await callback()
+activate caller
+caller --> ls : result
+deactivate caller
+ls -> ls : [finally] clearTimeout if set
+ls -> rwlock : handle.unlock()
+activate rwlock
+rwlock --> ls : —
+deactivate rwlock
+ls --> caller : result
+deactivate ls
+
+== FSLockService: Path-Scoped RW Lock ==
+
+caller -> fsls : lock_child(path, name, mode)
+activate fsls
+fsls -> fsls : lock_path(`${path}/${name}`, mode)
+alt !locks[path]
+    fsls -> rwlock : new RWLock()
+    activate rwlock
+    rwlock --> fsls : rwlock
+    deactivate rwlock
+    fsls -> rwlock : on_empty_ = () => delete locks[path]
+    fsls -> fsls : locks[path] = rwlock
+end
+alt mode = MODE_READ
+    fsls -> rwlock : rlock()
+    activate rwlock
+    rwlock --> fsls : handle
+    deactivate rwlock
+else mode = MODE_WRITE
+    fsls -> rwlock : wlock()
+    activate rwlock
+    rwlock --> fsls : handle
+    deactivate rwlock
+end
+fsls --> caller : handle
+deactivate fsls
+
+== asyncSafeSetInterval: Drift-Aware Async Loop ==
+
+caller -> interval : asyncSafeSetInterval(callback, delay, args?, options?)
+activate interval
+note right of interval : Runs a for(;;) loop —\nNOT native setInterval.\nGuarantees no overlapping calls.
+
+loop forever
+    interval -> interval : await sleep(delay)  [initial wait]
+    interval -> interval : ts_start = Date.now()
+    interval -> caller : await callback(...args)
+    activate caller
+    caller --> interval : —
+    deactivate caller
+    interval -> interval : ts_end = Date.now()\nruntime = ts_end - ts_start\nsleep_time = delay - runtime
+    alt sleep_time < 0  (behind schedule)
+        interval -> interval : await onBehindSchedule(-sleep_time)
+        alt onBehindSchedule returns true
+            interval --> caller : return  [cancelled]
+        end
+    else on schedule
+        interval -> interval : await sleep(sleep_time)
+    end
+end
+
+deactivate interval
+
+@enduml

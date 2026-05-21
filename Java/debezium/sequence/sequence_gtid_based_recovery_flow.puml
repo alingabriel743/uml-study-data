@@ -1,0 +1,221 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #F1F3F5
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #6C757D
+    GroupBorderColor #ADB5BD
+    GroupBackgroundColor #F8F9FA
+}
+
+title GTID-Based Binlog Recovery Flow
+
+participant "Caller\n(ConnectorTask)" as Caller
+participant "BinlogStreaming\nChangeEventSource" as BSCES
+participant "BinlogConnector\nConnection" as BCC
+participant "BinlogConnector\nConfig" as BCConf
+participant "BinlogOffset\nContext" as BOC
+participant "BinaryLogClient" as BLC
+participant "BinlogStreaming\nMetrics" as Metrics
+
+== Initialization & GTID Mode Detection ==
+
+Caller -> BSCES: execute(context, partition, offsetContext)
+activate BSCES
+
+BSCES -> BSCES: register event handlers\n(STOP, HEARTBEAT, ROTATE,\nTABLE_MAP, QUERY, GTID, DML, XID)
+
+BSCES -> BCC: isGtidModeEnabled()
+activate BCC
+BCC --> BSCES: isGtidModeEnabled: boolean
+deactivate BCC
+
+BSCES -> Metrics: setIsGtidModeEnabled(isGtidModeEnabled)
+activate Metrics
+Metrics --> BSCES: ok
+deactivate Metrics
+
+BSCES -> BCConf: shouldIgnoreGtidOnRecovery()
+activate BCConf
+BCConf --> BSCES: ignoreGtidOnRecovery: boolean
+deactivate BCConf
+
+BSCES -> BSCES: shouldRecoverUsingGtid()\n= isGtidModeEnabled && !ignoreGtidOnRecovery
+
+== GTID Recovery Path ==
+
+alt isGtidModeEnabled AND shouldRecoverUsingGtid()
+
+    BSCES -> BSCES: register handleGtidEvent handler\nfor GTID EventType
+
+    BSCES -> BCC: knownGtidSet()
+    activate BCC
+    BCC --> BSCES: availableServerGtidSet: GtidSet
+    deactivate BCC
+
+    BSCES -> BCC: purgedGtidSet()
+    activate BCC
+    BCC --> BSCES: purgedServerGtidSet: GtidSet
+    deactivate BCC
+
+    BSCES -> BOC: gtidSet()
+    activate BOC
+    BOC --> BSCES: offsetGtids: String\n(restartGtidSet from stored offset)
+    deactivate BOC
+
+    BSCES -> BCC: filterGtidSet(gtidSourceFilter, offsetGtids,\navailableServerGtidSet, purgedServerGtidSet)
+    activate BCC
+    BCC --> BSCES: filteredGtidSet: GtidSet
+    deactivate BCC
+
+    alt filteredGtidSet != null  [prior GTIDs exist in offset]
+        BSCES -> BLC: setGtidSet(filteredGtidSetStr)
+        activate BLC
+        BLC --> BSCES: ok
+        deactivate BLC
+
+        BSCES -> BOC: setCompletedGtidSet(filteredGtidSetStr)\n[sets currentGtidSet and restartGtidSet]
+        activate BOC
+        BOC --> BSCES: ok
+        deactivate BOC
+
+        BSCES -> BSCES: initializeGtidSet(filteredGtidSetStr)\n[abstract — MySQL/MariaDB impl]
+
+    else filteredGtidSet == null AND purgedServerGtidSet is empty  [no prior GTIDs, no purged]
+        BSCES -> BLC: setBinlogFilename(offsetContext.binlogFilename())
+        activate BLC
+        BLC --> BSCES: ok
+        deactivate BLC
+
+        BSCES -> BLC: setBinlogPosition(offsetContext.binlogPosition())
+        activate BLC
+        BLC --> BSCES: ok
+        deactivate BLC
+
+        BSCES -> BLC: setGtidSet("")
+        activate BLC
+        BLC --> BSCES: ok
+        deactivate BLC
+
+        BSCES -> BSCES: initializeGtidSet("")\n[abstract — start from empty]
+
+    else filteredGtidSet == null AND purgedServerGtidSet non-empty  [no prior GTIDs, purged exist]
+        BSCES -> BLC: setBinlogFilename(offsetContext.binlogFilename())
+        activate BLC
+        BLC --> BSCES: ok
+        deactivate BLC
+
+        BSCES -> BLC: setBinlogPosition(offsetContext.binlogPosition())
+        activate BLC
+        BLC --> BSCES: ok
+        deactivate BLC
+
+        BSCES -> BLC: setGtidSet(purgedServerGtidSet.toString())\n[client uses purged set; connector starts from empty]
+        activate BLC
+        BLC --> BSCES: ok
+        deactivate BLC
+
+        BSCES -> BSCES: initializeGtidSet("")\n[abstract — start from empty]
+    end
+
+else NOT isGtidModeEnabled OR shouldIgnoreGtidOnRecovery  [Binlog position fallback]
+
+    BSCES -> BLC: setBinlogFilename(offsetContext.binlogFilename())
+    activate BLC
+    BLC --> BSCES: ok
+    deactivate BLC
+
+    BSCES -> BLC: setBinlogPosition(offsetContext.binlogPosition())
+    activate BLC
+    BLC --> BSCES: ok
+    deactivate BLC
+
+    opt isGtidModeEnabled but shouldIgnoreGtidOnRecovery  [reset GTID state]
+        BSCES -> BSCES: initializeGtidSet("")\n[reset client GTID state]
+        BSCES -> BSCES: prepareOffsetContextForBinlogRecovery(offsetContext)
+        BSCES -> BOC: resetGtidSet()\n[clears currentGtidSet and restartGtidSet]
+        activate BOC
+        BOC --> BSCES: ok
+        deactivate BOC
+    end
+
+end
+
+== Skip Already-Processed Events ==
+
+BSCES -> BOC: eventsToSkipUponRestart()
+activate BOC
+BOC --> BSCES: initialEventsToSkip: long
+deactivate BOC
+
+BSCES -> BOC: rowsToSkipUponRestart()
+activate BOC
+BOC --> BSCES: startingRowNumber: int
+deactivate BOC
+
+== Connect and Begin Streaming ==
+
+BSCES -> BLC: connect(timeoutMs)
+activate BLC
+
+== GTID Event Handling During Streaming ==
+
+BLC -> BSCES: [fires GTID event via EventListener]
+BLC --> BSCES: handleGtidEvent(partition, offsetContext,\nevent, gtidDmlSourceFilter) [abstract]
+
+BSCES -> BOC: startGtid(gtid, gtidSet)\n[restartGtidSet = prev currentGtidSet;\ncurrentGtidSet = new trimmed set]
+activate BOC
+BOC --> BSCES: ok
+deactivate BOC
+
+BSCES -> BSCES: setGtidChanged(gtid)\n→ metrics.onGtidChange(gtid)
+
+BLC -> BSCES: [fires QUERY/BEGIN event]
+BLC --> BSCES: handleQueryEvent / BEGIN → startNextTransaction()
+
+BSCES -> BOC: startNextTransaction()\n[saves binlogFilename+position as restart point;\nsets transactionId via GTID or file+pos]
+activate BOC
+BOC --> BSCES: ok
+deactivate BOC
+
+BLC -> BSCES: [fires XID event]
+BLC --> BSCES: handleTransactionCompletion / XID → commitTransaction()
+deactivate BLC
+
+BSCES -> BOC: commitTransaction()\n[restartGtidSet = currentGtidSet;\nupdates restartBinlogPosition]
+activate BOC
+BOC --> BSCES: ok
+deactivate BOC
+
+BSCES -> BOC: getOffset()
+activate BOC
+BOC --> BSCES: offsetUsingPosition()\n[serializes restartGtidSet under 'gtids' key\n+ binlog filename/position]
+deactivate BOC
+
+BSCES --> Caller: [streaming active — events dispatched]
+deactivate BSCES
+
+@enduml

@@ -1,0 +1,83 @@
+{
+  "scope": "autonomous_operation_and_scheduling",
+  "title": "Autonomous Operation and Scheduling",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "ReflectLoop (agentmain --reflect)",
+    "scheduler.check()",
+    "autonomous.check()",
+    "GeneraticAgent",
+    "agent_runner_loop",
+    "helper (autonomous_operation_sop)",
+    "compress_session (L4)",
+    "FileSystem"
+  ],
+  "interaction_flow": [
+    "ReflectLoop → ReflectLoop: time.sleep(INTERVAL) [scheduler=120s, autonomous=1800s]",
+    "ReflectLoop → scheduler.check(): call check() every loop tick",
+    "scheduler.check() → compress_session.batch_process(): [every 12h] L4 cron — batch_process(raw_dir, dry_run=False)",
+    "compress_session.batch_process() → FileSystem: glob model_responses_*.txt, skip files <2h old",
+    "compress_session.batch_process() → compress_session.compress_session(): per file — strip sys prompt/assistant echo, rename MMDD_HHMM-MMDD_HHMM.txt",
+    "compress_session.batch_process() → FileSystem: append session blocks to all_histories.txt",
+    "compress_session.batch_process() → FileSystem: archive compressed files to YYYY-MM.zip",
+    "compress_session.batch_process() → FileSystem: delete processed raw files",
+    "compress_session.batch_process() → scheduler.check(): return stats dict",
+    "scheduler.check() → FileSystem: scan sche_tasks/*.json, filter enabled+schedule+cooldown",
+    "scheduler.check() → scheduler._parse_cooldown(repeat): compute cooldown timedelta",
+    "scheduler.check() → scheduler._last_run(tid, done_files): find latest done/{ts}_{tid}.md",
+    "scheduler.check() → ReflectLoop: return task prompt string (or None if no task due)",
+    "ReflectLoop → GeneraticAgent.put_task(task, source='reflect'): enqueue task, get display_queue",
+    "GeneraticAgent.run() → agent_runner_loop(llmclient, sys_prompt, user_input, handler, TOOLS_SCHEMA, max_turns=40): stream execution",
+    "agent_runner_loop → GeneraticAgent.run(): yield chunks → display_queue.put({'done': full_resp})",
+    "GeneraticAgent.run() → ReflectLoop: display_queue result consumed",
+    "ReflectLoop → FileSystem: write reflect_logs/{script}_{date}.log",
+    "ReflectLoop → mod.on_done(result): [optional] post-run callback",
+    "--- Autonomous path (user absent >30min) ---",
+    "ReflectLoop → autonomous.check(): call check() every 1800s",
+    "autonomous.check() → ReflectLoop: return '[AUTO]🤖 用户已离开超过30分钟...' prompt",
+    "ReflectLoop → GeneraticAgent.put_task(task, source='reflect'): enqueue autonomous prompt",
+    "--- Agent task execution (inside agent_runner_loop) ---",
+    "agent_runner_loop → FileSystem: read scheduled_task_sop / autonomous_operation_sop",
+    "agent_runner_loop → helper.get_todo(): read temp/TODO.txt",
+    "agent_runner_loop → helper.get_history(n): read temp/autonomous_reports/history.txt (first n lines)",
+    "agent_runner_loop → helper.complete_task(taskname, historyline, report_path): atomic task completion",
+    "helper.complete_task() → FileSystem: move report → autonomous_reports/R{N}_{taskname}.md",
+    "helper.complete_task() → FileSystem: prepend 'R{N} | {date} | {line}' to history.txt",
+    "helper.complete_task() → agent_runner_loop: return '✅ 报告已保存 + 改TODO指令'",
+    "agent_runner_loop → FileSystem: agent updates TODO.txt marking task [x] R{N}"
+  ],
+  "key_relationships": [
+    "agentmain --reflect loads scheduler.py (or autonomous.py) via importlib.util, hot-reloads on mtime change",
+    "ReflectLoop calls mod.check() then GeneraticAgent.put_task() — decoupled via queue",
+    "scheduler.check() imports compress_session dynamically (sys.path.insert) for L4 cron",
+    "GeneraticAgent.run() owns agent_runner_loop as a generator, streams chunks to display_queue",
+    "helper.complete_task() performs atomic 3-step: move report + prepend history + return TODO instruction",
+    "compress_session.batch_process() is 4-phase: compress→history append→zip archive→raw delete"
+  ],
+  "key_methods": {
+    "scheduler.check()": "Returns triggered task prompt string or None. Checks L4 cron (12h), scans sche_tasks/*.json, validates schedule time window (max_delay_hours=6), cooldown via done/ filenames.",
+    "autonomous.check()": "Returns fixed '[AUTO]🤖...' string unconditionally. INTERVAL=1800s, ONCE=False.",
+    "GeneraticAgent.put_task(query, source, images)": "Enqueues {'query','source','images','output':Queue} to task_queue. Returns display_queue.",
+    "GeneraticAgent.run()": "Dequeues tasks, builds GenericAgentHandler, calls agent_runner_loop generator, streams to display_queue.",
+    "helper.complete_task(taskname, historyline, report_path)": "1) mv report→R{N}_{taskname}.md 2) prepend formatted line to history.txt 3) return TODO update instruction string.",
+    "helper.get_history(n=20)": "Returns first n lines of history.txt (newest-first).",
+    "compress_session.compress_session(src, dst_dir)": "Detect format (json/raw), strip noise, rename by timestamps, write to dst_dir. Returns (dst_path, stats_dict) or (None, reason).",
+    "compress_session.batch_process(src, l4_dir, dry_run=True)": "4-phase pipeline. Skips files <2h old. Returns {processed, skipped, errors, new_sessions, deleted_raw}."
+  },
+  "important_notes": [
+    "scheduler.py uses a port-lock (127.0.0.1:45762) to prevent duplicate instances — bind failure causes agentmain crash.",
+    "Reflect loop hot-reloads script on file mtime change (no restart needed).",
+    "scheduler.check() triggers at most one task per call (first matching task returned, loop exits).",
+    "compress_session L4 cron is silent (only prints to stdout, errors logged to scheduler.log).",
+    "helper.complete_task() rolls back report move if history write fails.",
+    "autonomous.check() INTERVAL=1800s (30 min); scheduler.check() INTERVAL=120s (2 min).",
+    "ONCE=False on both scripts → infinite reflect loop."
+  ],
+  "source_files_analyzed": [
+    "reflect/autonomous.py",
+    "reflect/scheduler.py",
+    "agentmain.py (reflect loop, GeneraticAgent.put_task, GeneraticAgent.run)",
+    "memory/autonomous_operation_sop/helper.py",
+    "memory/L4_raw_sessions/compress_session.py"
+  ]
+}

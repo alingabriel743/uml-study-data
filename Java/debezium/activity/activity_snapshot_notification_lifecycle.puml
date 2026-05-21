@@ -1,0 +1,198 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #212529
+    EndColor #212529
+    BarColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontSize 13
+    TitleFontStyle bold
+}
+skinparam ArrowColor #495057
+skinparam NoteBackgroundColor #E9ECEF
+skinparam NoteBorderColor #6C757D
+
+title Snapshot Notification Lifecycle\n<size:11>(Debezium — Initial & Incremental Snapshot Notification Events)</size>
+
+|#E8F4FD|Snapshot Process|
+|#EAF6EA|InitialSnapshotNotificationService|
+|#FDF6E3|IncrementalSnapshotNotificationService|
+|#F3E8FD|NotificationService & Channels|
+
+|Snapshot Process|
+start
+
+fork
+  :Trigger **Initial Snapshot**;
+  note right: aggregateType = "Initial Snapshot"
+|InitialSnapshotNotificationService|
+  :notifyStarted()\n**status = STARTED**;
+  note right
+    Payload: connector_name,
+    status = STARTED
+  end note
+
+  |Snapshot Process|
+  :Iterate over each **table**;
+  repeat
+    |InitialSnapshotNotificationService|
+    :notifyTableInProgress()\n**status = IN_PROGRESS**\ncurrent_collection_in_progress = <table>;
+
+    |Snapshot Process|
+    if (Table split into chunks?) then (yes)
+      repeat
+        |InitialSnapshotNotificationService|
+        :notifyTableChunkInProgress()\n**status = TABLE_CHUNK_IN_PROGRESS**\nchunk_index, total_chunks, total_rows_scanned;
+
+        |Snapshot Process|
+        :Scan chunk rows;
+
+        |InitialSnapshotNotificationService|
+        :notifyCompletedTableChunkSuccessfully()\n**status = TABLE_CHUNK_COMPLETED**\nscanned_collection, chunk_index, total_chunks;
+      repeat while (More chunks?) is (yes)
+      ->no;
+    else (no)
+      |Snapshot Process|
+      :Scan full table;
+    endif
+
+    |Snapshot Process|
+    if (Table scan outcome?) then (SUCCEEDED)
+      |InitialSnapshotNotificationService|
+      :notifyCompletedTableSuccessfully()\n**status = TABLE_SCAN_COMPLETED**\nTableScanCompletionStatus = SUCCEEDED;
+    else (SQL_EXCEPTION)
+      |InitialSnapshotNotificationService|
+      :notifyCompletedTableWithError()\n**status = TABLE_SCAN_COMPLETED**\nTableScanCompletionStatus = SQL_EXCEPTION;
+    endif
+
+  |Snapshot Process|
+  repeat while (More tables?) is (yes)
+  ->no;
+
+  if (Snapshot needed?) then (not needed)
+    |InitialSnapshotNotificationService|
+    :notifySkipped()\n**status = SKIPPED**;
+    detach
+  else (yes)
+    |InitialSnapshotNotificationService|
+    :notifyCompleted()\n**status = COMPLETED**;
+  endif
+
+fork again
+  :Trigger **Incremental Snapshot**\n(ad-hoc or signal);
+  note right: aggregateType = "Incremental Snapshot"\nid = correlationId (or random UUID)
+|IncrementalSnapshotNotificationService|
+  :notifyStarted()\n**status = STARTED**\ndata_collections = <csv list>;
+  note right
+    Payload: connector_name,
+    data_collections
+  end note
+
+  |Snapshot Process|
+  :Iterate over each **data collection**;
+  repeat
+    |IncrementalSnapshotNotificationService|
+    :notifyInProgress()\n**status = IN_PROGRESS**\ncurrent_collection_in_progress\nmaximum_key, last_processed_key\ndata_collections;
+
+    |Snapshot Process|
+    if (External signal received?) then (pause signal / DDL)
+      |IncrementalSnapshotNotificationService|
+      :notifyPaused()\n**status = PAUSED**\ndata_collections;
+
+      |Snapshot Process|
+      :Wait for resume signal;
+
+      |IncrementalSnapshotNotificationService|
+      :notifyResumed()\n**status = RESUMED**\ndata_collections;
+    else (continue)
+    endif
+
+    |Snapshot Process|
+    :Process collection rows;
+
+    |IncrementalSnapshotNotificationService|
+    if (Collection scan outcome?) then (SUCCEEDED)
+      :notifyTableScanCompleted()\n**status = TABLE_SCAN_COMPLETED**\nTableScanCompletionStatus = SUCCEEDED\nscanned_collection, total_rows_scanned;
+    elseif (EMPTY) then
+      :notifyTableScanCompleted()\n**status = TABLE_SCAN_COMPLETED**\nTableScanCompletionStatus = EMPTY;
+    elseif (NO_PRIMARY_KEY) then
+      :notifyTableScanCompleted()\n**status = TABLE_SCAN_COMPLETED**\nTableScanCompletionStatus = NO_PRIMARY_KEY;
+    elseif (UNKNOWN_SCHEMA) then
+      :notifyTableScanCompleted()\n**status = TABLE_SCAN_COMPLETED**\nTableScanCompletionStatus = UNKNOWN_SCHEMA;
+    else (SQL_EXCEPTION / SKIPPED)
+      :notifyTableScanCompleted()\n**status = TABLE_SCAN_COMPLETED**\nTableScanCompletionStatus = SQL_EXCEPTION | SKIPPED;
+    endif
+
+  |Snapshot Process|
+  repeat while (More collections?) is (yes)
+  ->no;
+
+  |IncrementalSnapshotNotificationService|
+  :notifyCompleted()\n**status = COMPLETED**;
+
+end fork
+
+note
+  Both flows converge
+  at COMPLETED
+end note
+
+|NotificationService & Channels|
+
+:Receive notify(notification [, offsets]);
+note right
+  Notification built via Notification.Builder:
+  id, aggregateType, type(status),
+  additionalData, timestamp
+end note
+
+:Filter by **enabledChannels** list;
+
+if (Abort condition?) then (yes — any point)
+  :notifyAborted()\n**status = ABORTED**\n[data_collections = <csv> if targeted];
+  note right
+    Initial: full abort
+    Incremental: all collections
+    or specific subset
+  end note
+  |NotificationService & Channels|
+  :Receive ABORTED notification;
+endif
+
+repeat : For each enabled channel
+  if (Is ConnectChannel?) then (yes)
+    :channel.send(notification, offsets)\n//includes Partition + Offset\nin SourceRecord//;
+  else (no — plain NotificationChannel)
+    :channel.send(notification)\n//e.g. LogNotificationChannel//;
+  endif
+repeat while (More enabled channels?) is (yes)
+->no;
+
+:Notification delivered to all\nenabled channels;
+
+stop
+
+@enduml

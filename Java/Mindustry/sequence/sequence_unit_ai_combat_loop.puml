@@ -1,0 +1,229 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #6C757D
+    NoteBackgroundColor #FFF9DB
+    NoteBorderColor #CCA000
+}
+
+title Unit AI Combat Decision Loop
+
+participant "GameLoop" as game
+participant "UnitComp" as unit
+participant "WeaponsComp" as weapons
+participant "AIController\n(FlyingAI)" as ai
+participant "Units\n(static)" as units_static
+participant "Predict" as predict
+participant "WeaponMount" as mount
+participant "Weapon" as weapon
+participant "BulletType" as bullet
+
+== Per-Tick Entity Update ==
+
+game -> unit : update()
+activate unit
+
+note right of unit
+  Annotation-processor generated
+  entity merges UnitComp +
+  WeaponsComp update() calls
+end note
+
+unit -> unit : type.update(self())\n[UnitType tick hook]
+
+== AI Controller Phase ==
+
+unit -> ai : controller.updateUnit()
+activate ai
+
+note right of ai
+  Guard: !net.client()
+  && !dead
+  && shouldUpdateController()
+end note
+
+alt useFallback() && fallback != null
+    ai -> ai : fallback.updateUnit()
+    note right of ai: Fully delegates — rest of\nupdateUnit() is skipped
+else normal execution
+    ai -> ai : updateVisuals()\n[wobble, lookAt(prefRotation())]
+
+    == Targeting Sub-phase ==
+
+    ai -> ai : updateTargeting()
+    activate ai
+
+    ai -> ai : updateWeapons()\n[only if unit.hasWeapons()]
+
+    note right of ai
+      retarget() timer:
+      • every 40 ticks — no target
+      • every 90 ticks — has target
+    end note
+
+    ai -> units_static : findMainTarget(x, y, range,\ntargetAir, targetGround)
+    activate units_static
+    units_static --> ai : closestTarget
+    deactivate units_static
+
+    ai -> units_static : invalid(target) →\ninvalidateTarget(target, team, x, y)
+    activate units_static
+    units_static --> ai : isInvalid (nulls stale target)
+    deactivate units_static
+
+    loop for each WeaponMount in mounts[]
+        ai -> weapon : weapon.range() → bullet.range
+        activate weapon
+        weapon --> ai : wrange
+        deactivate weapon
+
+        alt singleTarget == true
+            ai -> mount : mount.target = target\n[shared target for all mounts]
+        else singleTarget == false
+            ai -> units_static : findTarget(mountX, mountY,\nwrange, collidesAir, collidesGround)
+            activate units_static
+            units_static --> ai : perMountTarget
+            deactivate units_static
+        end
+
+        ai -> predict : intercept(unit, mount.target, weapon.bullet)
+        activate predict
+        predict --> ai : Vec2 aim [lead-compensated]
+        deactivate predict
+
+        ai -> mount : mount.aimX = aim.x\nmount.aimY = aim.y\nmount.shoot = true\nmount.rotate = true
+        activate mount
+        mount --> ai : ok
+        deactivate mount
+
+        ai -> unit : unit.isShooting |= mount.shoot
+    end
+
+    deactivate ai
+
+    == Movement Sub-phase ==
+
+    ai -> ai : updateMovement()\n[FlyingAI override]
+    activate ai
+
+    alt target != null && unit.hasWeapons()
+        alt type.circleTarget == true
+            ai -> ai : circleAttack(type.circleTargetRadius)\nvec.set(target).sub(unit)\nadjust angle, setLength(prefSpeed())
+        else
+            ai -> ai : moveTo(target, type.range * 0.8f)\nvec.set(target).sub(unit)\nsetLength(speed * length)
+            ai -> unit : unit.lookAt(target)
+        end
+    else target == null && waves
+        ai -> ai : moveTo(getClosestSpawner(),\ndropZoneRadius + 130f)
+    end
+
+    ai -> unit : unit.movePref(vec)
+    activate unit
+
+    alt omniMovement == true
+        unit -> unit : moveAt(vec, accel)\ntmp1=vec; delta=tmp1−vel\nlimited to accel*len*dt\nvel.add(delta)
+    else omniMovement == false
+        unit -> unit : rotateMove(vec)\nmoveAt(trns(rotation, vec.len()))\nrotation = moveToward(rotation,\nvec.angle(), rotateSpeed*dt)
+    end
+
+    deactivate unit
+    deactivate ai
+end
+
+deactivate ai
+
+== Weapons / Firing Phase ==
+
+unit -> weapons : update()\n[WeaponsComp per-tick]
+activate weapons
+
+loop for each WeaponMount in mounts[]
+    weapons -> weapon : update(unit, mount)
+    activate weapon
+
+    weapon -> weapon : mount.reload -= Time.delta\n* unit.reloadMultiplier
+
+    weapon -> weapon : warmup = lerpDelta(warmup,\nwarmupTarget, shootWarmupSpeed)\nwarmupTarget = mount.shoot ? 1 : 0
+
+    opt !controllable && autoTarget
+        weapon -> weapon : findTarget()\n[self-targets, bypassing AIController]
+        weapon -> mount : mount.shoot = true\nmount.aimX/Y = selfAim
+        activate mount
+        mount --> weapon : ok
+        deactivate mount
+    end
+
+    opt rotate && (mount.rotate || mount.shoot)
+        weapon -> mount : mount.rotation = moveToward(\nrotation, targetRotation, rotateSpeed*dt)
+        activate mount
+        mount --> weapon : ok
+        deactivate mount
+    end
+
+    note right of weapon
+      Fire condition:
+      mount.shoot && canShoot()
+      && reload <= 0
+      && warmup >= minWarmup
+      && Angles.within(rotation,
+         targetRotation, shootCone)
+    end note
+
+    alt fire conditions met
+        weapon -> weapon : shoot(unit, mount, bulletX,\nbulletY, shootAngle)
+        activate weapon
+
+        weapon -> unit : unit.apply(shootStatus,\nshootStatusDuration)
+
+        note right of weapon
+          ShootPattern iterates shots;
+          delay > 0 → Time.run(delay, bullet())
+          delay == 0 → immediate bullet()
+        end note
+
+        weapon -> bullet : BulletType.create(unit, team,\nbulletX, bulletY, angle, velocity, ...)
+        activate bullet
+        bullet --> weapon : Bullet entity spawned
+        deactivate bullet
+
+        weapon -> weapon : ejectEffect.at()\nbullet.shootEffect.at()\nbullet.smokeEffect.at()
+
+        weapon -> unit : vel.add(recoil knockback)
+        weapon -> mount : mount.recoil = 1f\nmount.heat = 1f\nmount.reload = reload [reset]
+        activate mount
+        mount --> weapon : ok
+        deactivate mount
+
+        deactivate weapon
+    end
+
+    deactivate weapon
+end
+
+deactivate weapons
+deactivate unit
+
+@enduml

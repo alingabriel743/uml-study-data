@@ -1,0 +1,220 @@
+{
+  "scope": "schema_registry_integration",
+  "title": "Schema Registry Integration",
+  "diagram_type": "use_case",
+  "description": "Connector publishes and validates Avro/JSON schemas against Apicurio or Confluent Schema Registry",
+
+  "actors": [
+    {
+      "name": "Developer/Tester",
+      "type": "primary",
+      "notes": "Runs integration tests via ApicurioRegistryTestIT"
+    },
+    {
+      "name": "QuarkusTestFramework",
+      "type": "primary",
+      "notes": "Invokes lifecycle managers for Quarkus-based tests"
+    },
+    {
+      "name": "DebeziumConnector",
+      "type": "system",
+      "notes": "Kafka Connect connector inside DebeziumContainer; uses converters to serialize CDC events"
+    },
+    {
+      "name": "ApicurioRegistry",
+      "type": "external_system",
+      "notes": "quay.io/apicurio/apicurio-registry-mem; REST API at /apis/registry/v2; port 8080"
+    },
+    {
+      "name": "ConfluentSchemaRegistry",
+      "type": "external_system",
+      "notes": "confluentinc/cp-schema-registry; port 8081; requires Kafka bootstrap"
+    },
+    {
+      "name": "KafkaBroker",
+      "type": "external_system",
+      "notes": "StrimziKafkaCluster or KafkaContainer; message bus for CDC events"
+    },
+    {
+      "name": "PostgreSQLDatabase",
+      "type": "external_system",
+      "notes": "Source database producing CDC change events"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Start Apicurio Registry Container",
+      "actor": "Developer/Tester",
+      "description": "Instantiate and start ApicurioRegistryContainer (in-memory registry); waits for log 'apicurio-registry-app.*started in'",
+      "class": "ApicurioRegistryContainer",
+      "key_methods": ["ApicurioRegistryContainer()", "getApicurioVersion()"]
+    },
+    {
+      "id": "UC2",
+      "name": "Manage Apicurio Registry Lifecycle (Quarkus)",
+      "actor": "QuarkusTestFramework",
+      "description": "ApicurioTestResourceLifeCycleManager starts the registry container and injects config params into Quarkus test context",
+      "class": "ApicurioTestResourceLifeCycleManager",
+      "key_methods": [
+        "start() -> Map{debezium.format.apicurio.registry.url, auto-register, find-latest}",
+        "stop()",
+        "getApicurioUrl() -> 'http://host:mappedPort/apis/registry/v2'"
+      ]
+    },
+    {
+      "id": "UC3",
+      "name": "Manage Confluent Schema Registry Lifecycle (Quarkus)",
+      "actor": "QuarkusTestFramework",
+      "description": "SchemaRegistryTestResourceLifecycleManager starts Kafka + SchemaRegistryContainer, injects debezium.format.schema.registry.url",
+      "class": "SchemaRegistryTestResourceLifecycleManager",
+      "key_methods": [
+        "start() -> Map{debezium.format.schema.registry.url}",
+        "stop()",
+        "getSchemaRegistryUrl() -> 'http://host:mappedPort'"
+      ]
+    },
+    {
+      "id": "UC4",
+      "name": "Start Confluent Schema Registry Container",
+      "actor": "Developer/Tester",
+      "description": "SchemaRegistryContainer wires to Kafka via network and env vars; exposes port 8081",
+      "class": "SchemaRegistryContainer",
+      "key_methods": [
+        "withKafka(KafkaContainer) -> self",
+        "withKafka(Network, bootstrapServers) -> sets SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS"
+      ]
+    },
+    {
+      "id": "UC5",
+      "name": "Convert CDC Events to JSON with Schema",
+      "actor": "DebeziumConnector",
+      "description": "Connector uses ExtJsonConverter; registers schema in Apicurio; events contain schemaId in payload",
+      "test_method": "shouldConvertToJson()",
+      "converter": "io.apicurio.registry.utils.converter.ExtJsonConverter",
+      "assertions": ["key.payload.id present", "key.schemaId not null", "value.payload.op = 'r'|'u'"]
+    },
+    {
+      "id": "UC6",
+      "name": "Convert CDC Events to Avro with Schema",
+      "actor": "DebeziumConnector",
+      "description": "Connector uses AvroConverter; registers Avro schema in Apicurio; Avro magic byte (0x00) verified",
+      "test_method": "shouldConvertToAvro()",
+      "converter": "io.apicurio.registry.utils.converter.AvroConverter",
+      "extra_config": "schema.name.adjustment.mode=avro, key.converter.apicurio.registry.headers.enabled=false",
+      "assertions": ["key[0] == 0 (magic byte)", "value[0] == 0 (magic byte)"]
+    },
+    {
+      "id": "UC7",
+      "name": "Convert CDC Events to CloudEvents with Avro Data",
+      "actor": "DebeziumConnector",
+      "description": "Value converter is CloudEventsConverter with avro data serializer; Avro payload base64-encoded in 'data' field",
+      "test_method": "shouldConvertToCloudEventWithDataAsAvro()",
+      "converter": "io.debezium.converters.CloudEventsConverter",
+      "extra_config": "value.converter.data.serializer.type=avro, avro.apicurio.registry.url, auto-register, find-latest",
+      "assertions": [
+        "value.iodebeziumop = 'r'",
+        "value.datacontenttype = 'application/avro'",
+        "decoded data[0] == 0 (Avro magic byte)"
+      ]
+    },
+    {
+      "id": "UC8",
+      "name": "Auto-Register Schema",
+      "actor": "DebeziumConnector",
+      "description": "Connector config sets apicurio.registry.auto-register=true so schemas are published on first use",
+      "config_key": "key.converter.apicurio.registry.auto-register / value.converter.apicurio.registry.auto-register"
+    },
+    {
+      "id": "UC9",
+      "name": "Retrieve Latest Schema",
+      "actor": "DebeziumConnector",
+      "description": "Connector config sets apicurio.registry.find-latest=true to resolve existing schemas before registering",
+      "config_key": "key.converter.apicurio.registry.find-latest / value.converter.apicurio.registry.find-latest"
+    },
+    {
+      "id": "UC10",
+      "name": "Validate Connector Behavior with Invalid Config (Bad Header)",
+      "actor": "Developer/Tester",
+      "description": "Test verifies connector task transitions to FAILED state when registry SSL config is malformed (TroubleMaker); asserts no invalid-header-name error",
+      "test_method": "shouldNotErrorWithBadHeader()",
+      "assertions": [
+        "connectorTask state == FAILED",
+        "capturedLogs contain TROUBLE_MAKER_LOG",
+        "capturedLogs do not contain INVALID_HEADER_NAME_LOG"
+      ]
+    },
+    {
+      "id": "UC11",
+      "name": "Register Kafka Connector with Schema Registry Config",
+      "actor": "Developer/Tester",
+      "description": "debeziumContainer.registerConnector(name, ConnectorConfiguration) sends connector config including apicurio.registry.url to Kafka Connect REST API",
+      "class": "DebeziumContainer",
+      "key_methods": ["registerConnector(String name, ConnectorConfiguration config)", "ensureConnectorTaskState(String, int, State)"]
+    }
+  ],
+
+  "key_classes": [
+    {
+      "name": "ApicurioRegistryContainer",
+      "extends": "GenericContainer<ApicurioRegistryContainer>",
+      "image": "quay.io/apicurio/apicurio-registry-mem:{version}",
+      "port": 8080,
+      "wait_strategy": "LogMessageWaitStrategy: 'apicurio-registry-app.*started in'",
+      "version_source": "system property 'debezium.test.apicurio.version' or ContainerImageVersions.getStableVersion()"
+    },
+    {
+      "name": "SchemaRegistryContainer",
+      "extends": "GenericContainer<SchemaRegistryContainer>",
+      "image": "quay.io/debezium/confluentinc-cp-schema-registry:6.0.2",
+      "port": 8081,
+      "key_env": ["SCHEMA_REGISTRY_HOST_NAME", "SCHEMA_REGISTRY_LISTENERS", "SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS"]
+    },
+    {
+      "name": "ApicurioTestResourceLifeCycleManager",
+      "implements": "QuarkusTestResourceLifecycleManager",
+      "manages": "ApicurioRegistryContainer",
+      "config_params_injected": ["debezium.format.apicurio.registry.url", "debezium.format.apicurio.registry.auto-register", "debezium.format.apicurio.registry.find-latest"]
+    },
+    {
+      "name": "SchemaRegistryTestResourceLifecycleManager",
+      "implements": "QuarkusTestResourceLifecycleManager",
+      "manages": ["KafkaContainer", "SchemaRegistryContainer"],
+      "config_params_injected": ["debezium.format.schema.registry.url"],
+      "kafka_image": "quay.io/debezium/confluentinc-cp-kafka:7.2.10",
+      "startup_timeout": "90s"
+    },
+    {
+      "name": "ApicurioRegistryTestIT",
+      "type": "integration_test",
+      "containers": ["ApicurioRegistryContainer", "PostgreSQLContainer", "DebeziumContainer", "StrimziKafkaCluster"],
+      "network": "Network.SHARED",
+      "test_methods": ["shouldConvertToJson", "shouldConvertToAvro", "shouldConvertToCloudEventWithDataAsAvro", "shouldNotErrorWithBadHeader"]
+    }
+  ],
+
+  "key_relationships": [
+    "ApicurioRegistryContainer extends GenericContainer",
+    "SchemaRegistryContainer extends GenericContainer",
+    "ApicurioTestResourceLifeCycleManager implements QuarkusTestResourceLifecycleManager",
+    "SchemaRegistryTestResourceLifecycleManager implements QuarkusTestResourceLifecycleManager",
+    "ApicurioTestResourceLifeCycleManager creates ApicurioRegistryContainer",
+    "SchemaRegistryTestResourceLifecycleManager creates SchemaRegistryContainer",
+    "SchemaRegistryTestResourceLifecycleManager creates KafkaContainer",
+    "SchemaRegistryContainer depends_on KafkaContainer (network + bootstrap servers)",
+    "ApicurioRegistryTestIT uses ApicurioRegistryContainer",
+    "ApicurioRegistryTestIT uses DebeziumContainer.enableApicurioConverters()",
+    "DebeziumContainer uses ConnectorConfiguration with apicurio.registry.url"
+  ],
+
+  "important_notes": "Two registry integrations: (1) Apicurio (open-source) at port 8080, REST API v2, supports ExtJsonConverter and AvroConverter; (2) Confluent Schema Registry at port 8081, requires Kafka bootstrap. Both managed via QuarkusTestResourceLifecycleManager. Connector config uses auto-register+find-latest pattern. CloudEvents format wraps Avro payload as base64 data field with datacontenttype=application/avro.",
+
+  "source_files_analyzed": [
+    "debezium-testing/debezium-testing-testcontainers/src/test/java/io/debezium/testing/testcontainers/ApicurioRegistryTestIT.java",
+    "debezium-testing/debezium-testing-testcontainers/src/main/java/io/debezium/testing/testcontainers/ApicurioRegistryContainer.java",
+    "debezium-testing/debezium-testing-testcontainers/src/main/java/io/debezium/testing/testcontainers/ApicurioTestResourceLifeCycleManager.java",
+    "debezium-testing/debezium-testing-testcontainers/src/main/java/io/debezium/testing/testcontainers/SchemaRegistryContainer.java",
+    "debezium-testing/debezium-testing-testcontainers/src/main/java/io/debezium/testing/testcontainers/SchemaRegistryTestResourceLifecycleManager.java"
+  ]
+}

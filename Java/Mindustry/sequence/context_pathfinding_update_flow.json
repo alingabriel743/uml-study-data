@@ -1,0 +1,137 @@
+{
+  "scope": "pathfinding_update_flow",
+  "title": "Pathfinding Update and Cluster Management",
+  "diagram_type": "sequence",
+
+  "key_participants": [
+    "Tile",
+    "Events (arc EventBus)",
+    "Pathfinder (flow-field, main thread)",
+    "ControlPathfinder (HPA* thread)",
+    "TaskQueue",
+    "Cluster",
+    "FieldCache",
+    "PathRequest",
+    "AIController / GroundAI",
+    "CommandAI",
+    "Unit"
+  ],
+
+  "system_overview": "Two parallel pathfinding systems: (1) Pathfinder – Dijkstra/flow-field, used by AIController.pathfind() for wave AI. (2) ControlPathfinder – HPA* cluster-based, runs on a background thread at 30 fps, used by CommandAI.getPathPosition() for player-commanded units. Both are updated when tiles change.",
+
+  "interaction_flow": [
+    "--- TILE CHANGE TRIGGER ---",
+    "Tile.setBlock(type, team, rotation) → Tile.fireChanged() → Events.fire(TileChangeEvent)",
+    "Tile.setFloor(type) → [direct] pathfinder.updateTile(this)  [also fires TileFloorChangeEvent]",
+    "Pathfinder.updateTile(tile) → [direct] controlPath.updateTile(tile)  [line 316 in Pathfinder.java]",
+
+    "--- CONTROL PATHFINDER EVENT REGISTRATION (checkEvents, done once) ---",
+    "Events.on(TileChangeEvent) → controlPath.updateTile(e.tile)",
+    "Events.on(WorldLoadEvent) → controlPath.stop(); controlPath = new ControlPathfinder(); controlPath.start()",
+    "Events.run(Trigger.update) → invalidate stale PathRequests (lastUpdateId <= updateId-10) → queue.post(threadPathRequests.remove(req))",
+
+    "--- CONTROL PATHFINDER updateTile() ---",
+    "ControlPathfinder.updateTile(tile) → tile.getLinkedTiles(this::updateSingleTile)",
+    "ControlPathfinder.updateSingleTile(t) → compute cx/cy/cluster from tile coords",
+    "  [IF tile on cluster edge] → queueClusterUpdate(cx±1, cy) and/or queueClusterUpdate(cx, cy±1) + queueClusterUpdate(cx,cy)",
+    "  [IF tile interior] → queue.post(() -> clustersToInnerUpdate.add(cluster))",
+    "ControlPathfinder.queueClusterUpdate(cx,cy) → queue.post(() -> clustersToUpdate.add(cx + cy*cwidth))",
+
+    "--- BACKGROUND THREAD LOOP (run(), ~30 fps) ---",
+    "ControlPathfinder.run() [Thread 'Control Pathfinder', MIN_PRIORITY] loop:",
+    "  1. queue.run()  // drains TaskQueue lambdas (populates clustersToUpdate / clustersToInnerUpdate)",
+    "  2. clustersToUpdate.each(cluster → updateClustersComplete(cluster)); clustersToInnerUpdate.remove(cluster)",
+    "  3. clustersToInnerUpdate.each(cluster → updateClustersInner(cluster))",
+    "  4. clustersToUpdate.clear(); clustersToInnerUpdate.clear()",
+    "  5. [every 1000 ms] iterate invalidRequests → if field.frontier.isEmpty(): fields.remove(field.mapKey); queue.post(recalculatePath(request))",
+    "  6. fields.eachValue(cache → updateFields(cache, maxUpdate=12ms))",
+    "  7. Thread.sleep(updateInterval = 33ms)",
+
+    "--- CLUSTER RECALCULATION ---",
+    "updateClustersComplete(clusterIndex) → for each [team][costType]: updateCluster(team, pathCost, cx, cy)",
+    "updateCluster(team, pathCost, cx, cy):",
+    "  → create/reset Cluster in clusters[team][pathCost][cx+cy*cwidth]",
+    "  → for each of 4 directions: scan border tiles, detect passable spans → create/share portals (IntSeq) with neighbor cluster",
+    "  → updateInnerEdges(team, cost, cx, cy, cluster)",
+    "updateInnerEdges(team, cost, cx, cy, cluster):",
+    "  → for each pair of portals in cluster: run innerAstar(minX,minY,maxX,maxY, portalA, portalB) → connectionCost",
+    "  → if reachable: add IntraEdge to cluster.portalConnections[dir][i] (bidirectional)",
+    "updateClustersInner(clusterIndex) → for each [team][pathCost]: updateInnerEdges only (portals unchanged)",
+
+    "--- CLUSTER LAZY CREATION ---",
+    "ControlPathfinder.getCreateCluster(team, pathCost, cx, cy) → getCluster() → if null: updateCluster(team, pathCost, cx, cy)",
+
+    "--- FLOW FIELD UPDATES (ControlPathfinder) ---",
+    "updateFields(FieldCache, nsToRun) → BFS from goalPos outward through cluster graph, populating FieldCache.fields (clusterIndex→int[]) with cost values, time-bounded by nsToRun",
+
+    "--- PATH QUERY: CommandAI (uses ControlPathfinder) ---",
+    "CommandAI.updateUnit() → controlPath.getPathPosition(unit, vecMovePos, vecOut, noFound)",
+    "ControlPathfinder.getPathPosition(unit, destination, out, noResultFound):",
+    "  → costId = unit.type.pathCostId; tileOn = unit.tileOn()",
+    "  → raycast(team, cost, tileX, tileY, destX, destY): if LOS clear → out.set(destination); return true",
+    "  → request = unitRequests.get(unit)  [create PathRequest if missing: new PathRequest(unit,team,costId,destPos)]",
+    "  → fieldCache = fields.get(FieldIndex.get(destPos, costId, team))",
+    "  → traverse fieldCache to find next tile (lowest cost neighbor, up to 30 iterations)",
+    "  → out.set(nextTile.worldx, nextTile.worldy); return true/false",
+
+    "--- PATH QUERY: GroundAI/AIController (uses Pathfinder flow-field) ---",
+    "GroundAI.updateMovement() → pathfind(Pathfinder.fieldCore, true, stuckTime >= stuckThreshold)",
+    "AIController.pathfind(pathTarget, stopAtTargetTile, avoidance):",
+    "  → costType = unit.type.flowfieldPathType",
+    "  → tile = unit.tileOn()",
+    "  → targetTile = pathfinder.getField(unit.team, costType, pathTarget).getNextTile(tile, avoidanceId)",
+    "  → unit.movePref(vec.trns(unit.angleTo(targetTile.worldx, worldy), prefSpeed()))",
+    "Pathfinder.getField(team, costType, fieldType) → if cache miss: create Flowfield, queue.post(registerPath(field)); return field",
+    "Flowfield.getNextTile(tile, unitAvoidanceId) → scan d4/d8 neighbors; return tile with lowest weights[] value"
+  ],
+
+  "key_data_structures": [
+    "Cluster: portals[4] (IntSeq[] of packed [from,to] ranges), portalConnections[4][] (LongSeq of IntraEdge)",
+    "FieldCache: fields (IntMap<int[]> clusterIdx→costArray), frontier (IntQueue for BFS), goalPos/costId/team, mapKey (FieldIndex long)",
+    "PathRequest: unit, destination (packed tile pos), costId, team, resultPath (IntSeq), costs/cameFrom/frontier for A*, lastRaycastTile/Result",
+    "FieldIndex (long): packed (pos|costId|team) – key into ControlPathfinder.fields map",
+    "NodeIndex (int): packed (cluster|dir|portal) – node in HPA* abstract graph",
+    "IntraEdge (long): packed (dir|portal|cost) – intra-cluster connection"
+  ],
+
+  "key_relationships": [
+    "Tile fires TileChangeEvent → ControlPathfinder.updateTile() (via Events listener)",
+    "Tile.setFloor() → Pathfinder.updateTile() (direct) → ControlPathfinder.updateTile() (direct)",
+    "ControlPathfinder implements Runnable; background thread at MIN_PRIORITY, 30fps",
+    "ControlPathfinder owns clusters[256][numCosts][cwidth*cheight] (Cluster objects)",
+    "ControlPathfinder owns unitRequests (Unit→PathRequest, MAIN THREAD ONLY)",
+    "ControlPathfinder owns fields (long→FieldCache, written on pathfinding thread)",
+    "ControlPathfinder.queue (TaskQueue) bridges main thread → pathfinding thread",
+    "AIController.pathfind() uses Pathfinder (old flow-field) NOT ControlPathfinder",
+    "CommandAI.updateUnit() uses controlPath.getPathPosition() (HPA*)",
+    "GroundAI extends AIController; calls pathfind(Pathfinder.fieldCore) for wave enemy movement",
+    "UnitType.pathCost / pathCostId set from ControlPathfinder.costGround/Hover/Legs/Naval constants"
+  ],
+
+  "cost_types": [
+    "costGround (id=0): avoids deep tiles, liquid-penalty, enemy walls cost 1M",
+    "costHover (id=1): same as ground but ignores liquids/deep",
+    "costLegs (id=2): avoids legSolid tiles",
+    "costNaval (id=3): prefers liquid tiles, avoids non-liquid (cost 6000)"
+  ],
+
+  "threading_notes": [
+    "clustersToUpdate / clustersToInnerUpdate: ONLY modified on pathfinding thread (posted via TaskQueue)",
+    "unitRequests: MAIN THREAD ONLY",
+    "fields (LongMap<FieldCache>): written on pathfinding thread, READ on main thread (marked 'very dangerous')",
+    "PathRequest.notFound / invalidated: volatile booleans (cross-thread flags)",
+    "PathRequest.oldCache: volatile reference used to avoid unit stuttering during recalculation",
+    "maxUpdate = 12ms per iteration for updateFields; thread sleeps 33ms between iterations"
+  ],
+
+  "important_notes": "ControlPathfinder is HPA* (Hierarchical Pathfinding A*) with 12x12 tile clusters. Each cluster has portals (passable spans on borders) and intra-edges (A* costs between portal pairs). Flow fields are computed per (goalPos, costId, team) triplet via BFS outward from goal. The old Pathfinder (Dijkstra flow field, resolution-based) co-exists and is used by wave/basic AI. ControlPathfinder is used by CommandAI (player-commanded units) and LogicAI.",
+
+  "source_files_analyzed": [
+    "core/src/mindustry/ai/ControlPathfinder.java",
+    "core/src/mindustry/ai/Pathfinder.java",
+    "core/src/mindustry/ai/types/GroundAI.java",
+    "core/src/mindustry/entities/units/AIController.java",
+    "core/src/mindustry/world/Tile.java",
+    "core/src/mindustry/Vars.java"
+  ]
+}

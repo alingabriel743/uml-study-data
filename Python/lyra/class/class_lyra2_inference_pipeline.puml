@@ -1,0 +1,427 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+title Lyra-2 Inference Pipeline
+
+' ─────────────────────────────────────────────
+' INFERENCE PIPELINE
+' ─────────────────────────────────────────────
+package "inference" {
+
+    class Lyra2InferencePipeline {
+        +model: Lyra2Model
+        +args
+        +cp_group
+        +frames_per_latent: int
+        +tokens_per_step: int
+        +T_hist: int
+        +history_frames: Tensor
+        +history_latents: Tensor
+        +enc_feat_cache: list
+        +dec_feat_cache: list
+        +vae_wrap: WanVAE
+        +vae_core: WanVAE_
+        +first_latent: Tensor
+        +last_hist_frame: Tensor
+        +cam_w2c: Tensor
+        +intrinsics: Tensor
+        +retrieval_cache: Optional[Sparse3DCache]
+        +buffer_depth_latest: Optional[Tensor]
+        +depth_backend: str
+        +local_da3_model
+        +use_pose: bool
+        +use_plucker: bool
+        +warp_video_collect: List[Tensor]
+        +base_t5_text_embeddings: Optional[Tensor]
+        +base_neg_t5_text_embeddings: Optional[Tensor]
+        --
+        +__init__(model, args, first_frame, first_depth, first_cam_w2c, first_intrinsics, ...)
+        +save_snapshot(): None
+        +revert_to_snapshot(): bool
+        +autoregressive_step(...): dict
+        +build_outputs(da3_gs_export_stem, log_prefix): dict
+        #_append_cameras(cam_w2c_chunk, intrinsics_chunk): None
+        #_prepare_text_embeddings(t5_text_embeddings, neg_t5_text_embeddings)
+        #_restore_model_to_gpu(): None
+        #_update_depth_cache(end_px_idx): None
+    }
+
+    class VIPEWrapper <<dynamic>> {
+        +cfg: DictConfig
+        +pipeline: VIPEPipeline
+        +device: torch.device
+        --
+        +__init__(overrides, config_dir, config_name, device, fast_mode)
+        +infer_frames(frames: Tensor, fps: float, name: str): VIPEOutputs
+    }
+
+    class VIPEOutputs <<dataclass>> {
+        +intrinsics: Tensor
+        +extrinsics_c2w: Tensor
+        +depth: Tensor
+        +frame_ids: Tensor
+    }
+
+    class InMemoryVideoStream <<dynamic>> {
+        +frames_rgb_0_1_thwc: Tensor
+        +fps_value: float
+        +stream_name: str
+        +device: torch.device
+        --
+        +__init__(frames_rgb_0_1_thwc, fps_value, stream_name, device)
+        +frame_size(): tuple
+        +name(): str
+        +fps(): float
+        +__len__(): int
+        +__getitem__(idx: int): VideoFrame
+        +__iter__()
+    }
+
+    class UMT5EncoderModel {
+        +text_len: int
+        +dtype: torch.dtype
+        +device
+        +model: T5Encoder
+        +tokenizer: HuggingfaceTokenizer
+        --
+        +__init__(text_len, dtype, device, checkpoint_path, tokenizer_path, ...)
+        +__call__(texts, device): Tensor
+    }
+
+    class HuggingfaceTokenizer {
+        +name: str
+        +seq_len: Optional[int]
+        +clean: Optional[str]
+        +tokenizer: AutoTokenizer
+        +vocab_size: int
+        --
+        +__init__(name, seq_len, clean, **kwargs)
+        +__call__(sequence, **kwargs): Tensor
+        #_clean(text: str): str
+    }
+
+    class T5Encoder {
+        +token_embedding: nn.Embedding
+        +pos_embedding: T5RelativeEmbedding
+        +dropout: nn.Dropout
+        +blocks: nn.ModuleList
+        +norm: T5LayerNorm
+        --
+        +forward(ids: Tensor, mask): Tensor
+    }
+
+}
+
+' ─────────────────────────────────────────────
+' MODEL
+' ─────────────────────────────────────────────
+package "models" {
+
+    class Lyra2Model {
+        +config: Lyra2T2VConfig
+        +tokenizer: Wan2pt1VAEInterface
+        +net: WanT2VModel
+        +tensor_kwargs: dict
+        +framepack_num_frames_per_latent: int
+        +framepack_num_new_latent_frames: int
+        +framepack_total_max_num_latent_frames: int
+        --
+        +__init__(config: Lyra2T2VConfig)
+        +eval(): self
+        +load_lora_weights(path): str
+        +set_weights_and_activate_adapters(names, weights)
+        #_vae_encode_range_stream(video, start, end, skip_first_frame): Tensor
+        #_clone_vae_cache(cache): list
+        #_encoder_feats_to_normalized_latents(feats): Tensor
+    }
+
+    class Sparse3DCache {
+        +downsample: int
+        -_store_device: str
+        -_store_values: bool
+        -_world_points: list
+        -_latent_indices: list
+        -_frame_ids: list
+        -_depths: list
+        -_w2cs: list
+        -_Ks: list
+        -_rgbs: dict
+        --
+        +__init__(downsample, store_device, store_values)
+        +add(depth_B_1_H_W, w2c_B_4_4, K_B_3_3, latent_index, frame_id): None
+        +store_rgb(frame_id, rgb): None
+        +{static} _scale_intrinsics(intrinsic, scale): Tensor
+    }
+
+    class WANDiffusionModel {
+        +__init__(config: T2VModelConfig)
+        +load_lora_weights(lora_path, ...)
+        +add_lora_to_model(...)
+        +set_weights_and_activate_adapters(...)
+    }
+
+}
+
+' ─────────────────────────────────────────────
+' TOKENIZERS
+' ─────────────────────────────────────────────
+package "tokenizers" {
+
+    abstract class VideoTokenizerInterface {
+        +backend_args
+        +is_chunk_overlap: bool = False
+        +is_causal: bool = True
+        --
+        +{abstract} reset_dtype()
+        +{abstract} encode(state: Tensor): Tensor
+        +{abstract} decode(latent: Tensor): Tensor
+        +{abstract} get_latent_num_frames(num_pixel_frames: int): int
+        +{abstract} get_pixel_num_frames(num_latent_frames: int): int
+        +{abstract} spatial_compression_factor
+        +{abstract} temporal_compression_factor
+        +{abstract} spatial_resolution
+        +{abstract} latent_ch: int
+    }
+
+    class Wan2pt1VAEInterface {
+        +model: WanVAE
+        +chunk_duration: int
+        +spatial_compression_factor = 8
+        +temporal_compression_factor = 4
+        +latent_ch = 16
+        +spatial_resolution = 512
+        --
+        +__init__(chunk_duration, load_mean_std, **kwargs)
+        +encode(state: Tensor): Tensor
+        +decode(latent: Tensor): Tensor
+        +get_latent_num_frames(num_pixel_frames): int
+        +get_pixel_num_frames(num_latent_frames): int
+    }
+
+    class WanVAE {
+        +dtype: torch.dtype
+        +device: str
+        +model: WanVAE_
+        +mean: Tensor
+        +std: Tensor
+        +img_mean: Tensor
+        +img_std: Tensor
+        +video_mean: Tensor
+        +video_std: Tensor
+        +is_amp: bool
+        +temporal_window: int
+        --
+        +__init__(z_dim, vae_pth, load_mean_std, dtype, device, is_amp, temporal_window)
+        +encode(videos: Tensor): Tensor
+        +decode(zs: Tensor): Tensor
+        +count_param(): int
+    }
+
+    class WanVAE_ {
+        +dim: int
+        +z_dim: int
+        +encoder: Encoder3d
+        +conv1: CausalConv3d
+        +conv2: CausalConv3d
+        +decoder: Decoder3d
+        +temporal_window: int
+        -_enc_feat_map: list
+        -_feat_map: list
+        --
+        +encode(x: Tensor, scale): Tensor
+        +decode(z: Tensor, scale): Tensor
+        +clear_cache(): None
+        +reparameterize(mu, log_var): Tensor
+        +forward(x): Tuple
+    }
+
+    class Encoder3d {
+        +conv1: CausalConv3d
+        +downsamples: nn.Sequential
+        +middle: nn.Sequential
+        +head: nn.Sequential
+        --
+        +forward(x, feat_cache, feat_idx): Tensor
+    }
+
+    class Decoder3d {
+        +conv1: CausalConv3d
+        +middle: nn.Sequential
+        +upsamples: nn.Sequential
+        +head: nn.Sequential
+        --
+        +forward(x, feat_cache, feat_idx): Tensor
+    }
+
+    class CausalConv3d {
+        --
+        +forward(x, cache_x=None): Tensor
+    }
+
+    class ResidualBlock {
+        +residual: nn.Sequential
+        +shortcut: CausalConv3d
+        --
+        +forward(x, feat_cache, feat_idx): Tensor
+    }
+
+    class AttentionBlock {
+        --
+        +forward(x): Tensor
+    }
+
+    class Resample {
+        --
+        +forward(x, feat_cache, feat_idx): Tensor
+    }
+
+    abstract class BaseVAE {
+        +channel: int
+        +name: str
+        --
+        +{abstract} encode(state: Tensor): Tensor
+        +{abstract} decode(latent: Tensor): Tensor
+        +{abstract} latent_ch: int
+        +{abstract} spatial_compression_factor: int
+    }
+
+    class BasePretrainedImageVAE {
+        +dtype: torch.dtype
+        +is_image: bool
+        +mean_std_fp: str
+        +load_mean_std: bool
+        +latent_mean: Tensor
+        +latent_std: Tensor
+        --
+        +__init__(name, mean_std_fp, latent_ch, is_image, is_bf16, load_mean_std)
+        +register_mean_std(mean_std_fp): None
+        +encode(state: Tensor): Tensor
+        +decode(latent: Tensor): Tensor
+        +reset_dtype(*args, **kwargs)
+    }
+
+    class JITVAE {
+        +encoder: TorchScriptModule
+        +decoder: TorchScriptModule
+        --
+        +__init__(enc_fp, dec_fp, name, ...)
+        +load_encoder(enc_fp): None
+        +load_decoder(dec_fp): None
+    }
+
+    class StateDictVAE {
+        +vae: nn.Module
+        +encoder: callable
+        +decoder: callable
+        --
+        +__init__(enc_fp, dec_fp, vae, name, ...)
+        +load_encoder_and_decoder(enc_fp, dec_fp, vae): None
+        +reset_dtype(*args, **kwargs)
+    }
+
+    class SDVAE {
+        +vae: AutoencoderKL
+        +scale: Tensor
+        +bias: Tensor
+        +batch_size: int
+        +dtype: torch.dtype
+        +spatial_compression_factor = 8
+        --
+        +__init__(batch_size, count_std, is_downsample)
+        +load_vae(): None
+        +encode(state: Tensor): Tensor
+        +decode(latent: Tensor): Tensor
+        +reset_dtype(*args, **kwargs)
+    }
+
+}
+
+' ─────────────────────────────────────────────
+' EXTERNAL (referenced types)
+' ─────────────────────────────────────────────
+package "external (nn)" {
+    class "nn.Module" as nnModule <<framework>>
+    class "nn.Conv3d" as nnConv3d <<framework>>
+}
+
+' ─────────────────────────────────────────────
+' RELATIONSHIPS — Inference Pipeline
+' ─────────────────────────────────────────────
+Lyra2InferencePipeline *-- Lyra2Model : model
+Lyra2InferencePipeline *-- Sparse3DCache : retrieval_cache
+Lyra2InferencePipeline ..> WanVAE : vae_wrap
+Lyra2InferencePipeline ..> WanVAE_ : vae_core
+Lyra2InferencePipeline ..> UMT5EncoderModel : get_umt5_embedding()
+
+VIPEWrapper ..> InMemoryVideoStream : creates
+VIPEWrapper ..> VIPEOutputs : returns
+
+UMT5EncoderModel *-- HuggingfaceTokenizer : tokenizer
+UMT5EncoderModel *-- T5Encoder : model
+
+' ─────────────────────────────────────────────
+' RELATIONSHIPS — Model
+' ─────────────────────────────────────────────
+Lyra2Model --|> WANDiffusionModel
+Lyra2Model *-- Wan2pt1VAEInterface : tokenizer
+
+' ─────────────────────────────────────────────
+' RELATIONSHIPS — Tokenizer hierarchy
+' ─────────────────────────────────────────────
+Wan2pt1VAEInterface ..|> VideoTokenizerInterface
+Wan2pt1VAEInterface *-- WanVAE : model
+
+WanVAE *-- WanVAE_ : model
+WanVAE_ *-- Encoder3d : encoder
+WanVAE_ *-- Decoder3d : decoder
+WanVAE_ *-- CausalConv3d : conv1/conv2
+
+Encoder3d *-- CausalConv3d : conv1
+Encoder3d o-- ResidualBlock
+Encoder3d o-- AttentionBlock
+Encoder3d o-- Resample
+
+Decoder3d *-- CausalConv3d : conv1
+Decoder3d o-- ResidualBlock
+Decoder3d o-- AttentionBlock
+Decoder3d o-- Resample
+
+ResidualBlock *-- CausalConv3d : shortcut
+Resample *-- CausalConv3d : time_conv
+
+' ─────────────────────────────────────────────
+' RELATIONSHIPS — Base VAE hierarchy
+' ─────────────────────────────────────────────
+BaseVAE --|> nnModule
+BasePretrainedImageVAE --|> BaseVAE
+JITVAE --|> BasePretrainedImageVAE
+StateDictVAE --|> BasePretrainedImageVAE
+SDVAE --|> BaseVAE
+
+WanVAE_ --|> nnModule
+Encoder3d --|> nnModule
+Decoder3d --|> nnModule
+ResidualBlock --|> nnModule
+AttentionBlock --|> nnModule
+Resample --|> nnModule
+T5Encoder --|> nnModule
+
+CausalConv3d --|> nnConv3d
+nnConv3d --|> nnModule
+
+@enduml

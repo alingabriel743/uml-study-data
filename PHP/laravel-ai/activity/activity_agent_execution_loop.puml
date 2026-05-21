@@ -1,0 +1,157 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #212529
+    EndColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam ArrowColor #495057
+skinparam NoteBackgroundColor #E8F4FD
+skinparam NoteBorderColor #5BA4CF
+
+title Agent Execution Loop
+
+|Caller|
+start
+:Call **agent**(instructions, messages, tools, ?schema);
+
+if (schema provided?) then (yes)
+    :Instantiate **StructuredAnonymousAgent**\n(implements HasStructuredOutput);
+else (no)
+    :Instantiate **AnonymousAgent**\n(implements Agent, Conversational, HasTools\nuses Promptable trait);
+endif
+
+:Call **agent->prompt**(prompt, attachments,\n?provider, ?model, ?timeout);
+
+|AnonymousAgent / Promptable|
+:Promptable::prompt() invoked;
+:Build **AgentPrompt**(agent, prompt,\nattachments, provider, model, timeout);
+:Call **withModelFailover**(callback, provider, model);
+:Resolve provider list via\n**getProvidersAndModels**() \n(checks method/attribute → falls back to config('ai.default'));
+
+|Provider (GeneratesText)|
+repeat
+    :Resolve **Provider** instance\nvia Ai::textProviderFor();
+    :Resolve model via **getDefaultModelFor**()\n(checks UseSmartestModel / UseCheapestModel / default);
+    note right
+        Failover loop iterates
+        through provider/model pairs
+    end note
+
+    :Call **Provider->prompt**(AgentPrompt)\ninside try/catch(FailoverableException);
+
+    :Generate **invocationId** (uuid7);
+    :Build **middleware pipeline**\n(gatherMiddlewareFor: checks RemembersConversations,\nHasMiddleware, adds RememberConversation if applicable);
+    :pipeline()->send(prompt)->through(middleware)->then(closure);
+
+    fork
+        :Dispatch **PromptingAgent** event;
+    fork again
+        :Collect messages\n(agent->messages() if Conversational)\nAppend new **UserMessage**(prompt, attachments);
+    fork again
+        :Register **onToolInvocation** callbacks\nvia listenForToolInvocations()\n(will dispatch InvokingTool / ToolInvoked events);
+    end fork
+
+    if (agent instanceof HasStructuredOutput?) then (yes)
+        :Extract JSON schema\nvia agent->schema(JsonSchemaTypeFactory);
+    else (no)
+    endif
+
+    |TextGateway|
+    :Call **textGateway()->generateText**()\n(provider, model, instructions, messages,\ntools, schema, options, timeout);
+    :Build HTTP request body via\n**buildTextRequestBody**();
+    :HTTP POST → Provider API\n('responses' endpoint);
+    :Validate response via\n**validateTextResponse**()\n(throw AiException on error);
+    :Delegate to **parseTextResponse**() →\nenter **processResponse**();
+
+    repeat
+        :Extract: text, toolCalls, reasonings,\ncitations, usage, finishReason\nfrom response output;
+        :Map tool calls via\n**mapToolCallsWithReasoning**()\n→ array<ToolCall(id, name, arguments,\nresultId, reasoningId, reasoningSummary)>;
+        :Create **Step**(text, toolCalls, [],\nfinishReason, usage, meta)\nPush to $steps collection;
+        :Append **AssistantMessage** to $messages;
+
+        if (finishReason == ToolCalls\nAND toolCalls not empty\nAND steps.count < maxSteps?) then (yes — continue tool loop)
+            note right
+                maxSteps defaults to
+                round(toolCount × 1.5)
+            end note
+
+            |Tool Execution|
+            :executeToolCalls()\nforeach ToolCall in toolCalls;
+            :findTool(name, tools);
+            :Dispatch **InvokingTool** event\n(via invokingToolCallback);
+            :Call **tool->handle**(new Request(arguments));
+            :Dispatch **ToolInvoked** event\n(via toolInvokedCallback);
+            :Collect result as string\n→ build **ToolResult**(id, name, arguments,\nresult, resultId);
+
+            |TextGateway|
+            :Update **Step** in $steps\nwith toolResults array;
+            :Append **ToolResultMessage**\nto $messages;
+            :Call **continueWithToolResults**()\nHTTP POST follow-up with\nprevious_response_id + tool results input;
+            :Validate follow-up response via\n**validateTextResponse**();
+            note right
+                Recurse into processResponse()
+                with new data and depth+1
+            end note
+        else (no — stop condition)
+        endif
+    repeat while (tool loop continues?) is (recurse)
+    ->stop condition reached\n(FinishReason: Stop / Length / Error\nor maxSteps exceeded);
+
+    :Aggregate allToolCalls + allToolResults\nfrom all steps;
+
+    if (structured output?) then (yes)
+        :Return **StructuredTextResponse**\n(structuredData, text, combinedUsage, meta);
+    else (no)
+        :Return **TextResponse**\n(text, usage, meta);
+    endif
+
+    :Attach .withMessages(messages)\n.withSteps(steps)\n.withToolCallsAndResults();
+
+    |Provider (GeneratesText)|
+    :Dispatch **AgentPrompted** event;
+
+    if (FailoverableException thrown?) then (yes)
+        :Dispatch **AgentFailedOver** event;
+        note right
+            Continue loop to
+            next provider/model pair
+        end note
+    else (no)
+        :Return **AgentResponse**\n(or StructuredAgentResponse)\nwith invocationId, text, usage, meta,\ntoolCalls, toolResults, steps, messages;
+    endif
+repeat while (try next provider?) is (failover)
+->success;
+
+|Caller|
+:Receive **AgentResponse**\n(or StructuredAgentResponse);
+stop
+
+@enduml

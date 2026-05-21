@@ -1,0 +1,108 @@
+{
+  "scope": "unit_ai_behavior",
+  "title": "Unit AI Behavior Update",
+  "diagram_type": "activity",
+  "key_participants": ["AsyncCore", "AIController", "PhysicsProcess", "AvoidanceProcess", "Unit", "UnitController"],
+
+  "main_entry_point": "AIController.updateUnit()",
+
+  "activity_flow": [
+    "START: AsyncCore.begin() — sync phase: calls PhysicsProcess.begin() + AvoidanceProcess.begin()",
+    "AsyncCore submits PhysicsProcess.process() and AvoidanceProcess.process() to thread pool (async)",
+    "--- (game tick) Unit.update() calls AIController.updateUnit() ---",
+    "DECISION: useFallback() && fallback != null?",
+    "  YES → assign fallback.unit(unit), call fallback.updateUnit(), RETURN",
+    "  NO → continue to main AI update",
+    "STEP 1: updateVisuals() — if flying: wobble (if type.wobble), then unit.lookAt(prefRotation())",
+    "STEP 2: updateTargeting() — if unit.hasWeapons(): call updateWeapons()",
+    "  STEP 2a: retarget() — timer-based: fires every 40t (no target) or 90t (has target)",
+    "  DECISION: retarget() == true?",
+    "    YES → target = findMainTarget(x, y, range, targetAir, targetGround) via Units.closestTarget()",
+    "  STEP 2b: noTargetTime += Time.delta",
+    "  DECISION: invalid(target)?",
+    "    YES + target is dead (Healthc.isValid() == false) → targetInvalidated() (reset timer), target = null",
+    "    YES → target = null",
+    "    NO → noTargetTime = 0",
+    "  STEP 2c: unit.isShooting = false",
+    "  FOR EACH weapon mount:",
+    "    SKIP if !weapon.controllable || weapon.noAttack",
+    "    SKIP rotation if !weapon.aiControllable",
+    "    DECISION: unit.type.singleTarget?",
+    "      YES → mount.target = main target",
+    "      NO → if retarget: mount.target = findTarget(mountX, mountY, wrange, collidesAir, collidesGround)",
+    "           if checkTarget invalid → mount.target = null",
+    "    DECISION: mount.target != null?",
+    "      YES → shoot = target.within(mountX, mountY, wrange) && shouldShoot()",
+    "           DECISION: unit.type.autoDropBombs && !shoot?",
+    "             YES → find bomberTarget (closestTarget ground) → shoot = bomberTarget != null",
+    "           Calculate aim: Predict.intercept(unit, mount.target, weapon.bullet) → mount.aimX/Y",
+    "    mount.shoot = mount.rotate = shoot",
+    "    if !shouldFire() → mount.shoot = false",
+    "    unit.isShooting |= mount.shoot",
+    "    DECISION: no target, no shoot, rotation drifted, noTargetTime >= 300s?",
+    "      YES → rotate mount back to baseRotation",
+    "STEP 3: updateMovement() — base impl is empty; overridden per AI type (e.g. pathfind, circle, moveTo)",
+    "--- After tick: AsyncCore.end() waits for futures, then calls PhysicsProcess.end() + AvoidanceProcess.end() ---",
+    "PhysicsProcess.end(): applies collision displacement via entity.move(dx, dy)",
+    "END"
+  ],
+
+  "key_methods": [
+    "AIController.updateUnit() — main dispatcher: fallback check → updateVisuals → updateTargeting → updateMovement",
+    "AIController.updateWeapons() — retarget timer, target validation, per-mount shoot/aim logic",
+    "AIController.retarget() — returns true every 40t (no target) or 90t (has target)",
+    "AIController.findMainTarget(x,y,range,air,ground) → findTarget → Units.closestTarget()",
+    "AIController.pathfind(pathTarget, stopAtTargetTile, avoidance) — uses flowfield + AvoidanceProcess buffer for ground units",
+    "AIController.moveTo(target, circleLength, smooth, keepDistance, offset, arrive) — movement with arrive/circle logic",
+    "AIController.circleAttack(circleLength) — orbit + turningAway avoidance for same-layer unit targets",
+    "AIController.circle(target, circleLength, speed) — orbit around position",
+    "AIController.faceTarget() — omni/mech units look at intercept point or velocity angle",
+    "AIController.targetInvalidated() — resets timerTarget to force immediate retarget",
+    "PhysicsProcess.begin() — snapshot unit positions, assign PhysicsBody for new units, set collision layer",
+    "PhysicsProcess.process() [async] — PhysicsWorld.update(): quadtree collision resolution, mass-weighted push",
+    "PhysicsProcess.end() — apply body delta to entity via entity.move(dx, dy)",
+    "AvoidanceProcess.begin() — collect ground unit positions/radii as packed int requests",
+    "AvoidanceProcess.process() [async] — double-buffer avoidance grid: stamp circular footprints per unit",
+    "AvoidanceProcess.getAvoidance() — lazy-init, returns current read buffer (used by pathfind)"
+  ],
+
+  "key_decisions": [
+    "useFallback() → delegate entire tick to fallback AIController",
+    "unit.hasWeapons() → skip weapon logic if unarmed",
+    "retarget() timer → acquire new target (40t no-target, 90t has-target interval)",
+    "invalid(target) → clear target; if dead → targetInvalidated() for immediate retry",
+    "unit.type.singleTarget → all mounts share main target vs per-mount targeting",
+    "shouldShoot() / shouldFire() → overridable hooks to suppress fire",
+    "unit.type.autoDropBombs → bomb-drop logic for close ground targets",
+    "avoidance param in pathfind() → only ground-layer units use avoidance buffer",
+    "AvoidanceProcess.shouldProcess() → only active when at least one request has been made",
+    "PhysicsProcess: client-side → only local body collides; server handles others"
+  ],
+
+  "key_relationships": [
+    "AIController implements UnitController",
+    "AIController has @Nullable AIController fallback (delegation pattern)",
+    "AIController references Unit (composition); Unit has weapon mounts",
+    "AsyncCore owns PhysicsProcess and AvoidanceProcess (sequential in Seq<AsyncProcess>)",
+    "AsyncProcess interface: init(), reset(), begin(), process(), end(), shouldProcess()",
+    "PhysicsProcess.end() writes back to Unit via Physicsc.move()",
+    "AIController.pathfind() reads AvoidanceProcess buffer via pathfinder.getField().getNextTile(unitId)",
+    "PhysicsWorld uses QuadTree per layer for O(n log n) collision detection"
+  ],
+
+  "async_lifecycle": {
+    "sync_begin": "AsyncCore.begin() → p.begin() for all processes (main thread)",
+    "async_process": "executor.submit(p::process) — PhysicsProcess + AvoidanceProcess run concurrently",
+    "ai_tick": "Unit.update() / AIController.updateUnit() runs on main thread during async phase",
+    "sync_end": "AsyncCore.end() → complete() (join futures) → p.end() (flush results to entities)"
+  },
+
+  "important_notes": "Fallback chain: AIController.useFallback() is false by default; subclasses override. updateMovement() is empty in base class — all movement logic is in subclasses (e.g. GroundAI, FlyingAI). Physics collision uses mass-ratio weighting (m2/ms for body1, m1/ms for body2) with scl=1.25 softening. Avoidance grid uses double buffering (buffer1/buffer2 + swap flag) to avoid read/write races. Ground units (collisionLayer==0) participate in both physics and avoidance; flying units only in physics. noTargetTime >= rotateBackTimer (300s) triggers weapon rotation back to baseRotation.",
+
+  "source_files_analyzed": [
+    "core/src/mindustry/entities/units/AIController.java",
+    "core/src/mindustry/async/PhysicsProcess.java",
+    "core/src/mindustry/async/AvoidanceProcess.java",
+    "core/src/mindustry/async/AsyncCore.java"
+  ]
+}

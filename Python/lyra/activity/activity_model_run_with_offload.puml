@@ -1,0 +1,184 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    DiamondFontColor #212529
+}
+skinparam swimlane {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title Model Inference with Offload Strategy
+
+|Pipeline Orchestrator|
+start
+:generate(prompt, negative_prompt,\nword_limit_to_skip_upsampler);
+
+|Safety Module|
+if (disable_guardrail?) then (false)
+    if (offload_guardrail_models?) then (true)
+        |GPU Memory|
+        :_load_text_guardrail() → GPU;
+        |Safety Module|
+    endif
+    :run_text_guardrail(prompt);
+    if (offload_guardrail_models?) then (true)
+        |GPU Memory|
+        :_offload_guardrail_models()\ndel + gc.collect() + cuda.empty_cache();
+        |Safety Module|
+    endif
+    if (prompt is_safe?) then (false)
+        |Pipeline Orchestrator|
+        #FFB3B3:return None  ← UNSAFE EXIT;
+        stop
+    endif
+else (true — skip)
+endif
+
+|Pipeline Orchestrator|
+if (enable_prompt_upsampler AND\nword_count ≤ limit?) then (true)
+    if (offload_prompt_upsampler?) then (true)
+        |GPU Memory|
+        :_load_prompt_upsampler_model() → GPU;
+        |Pipeline Orchestrator|
+    endif
+    :run_chat_completion(prompt)\n→ upsampled_prompt;
+    if (offload_prompt_upsampler?) then (true)
+        |GPU Memory|
+        :_offload_prompt_upsampler_model()\ndel + gc + cuda.empty_cache();
+        |Pipeline Orchestrator|
+    endif
+    if (disable_guardrail?) then (false)
+        |Safety Module|
+        :re-run text_guardrail(upsampled_prompt);
+        if (upsampled prompt is_safe?) then (false)
+            |Pipeline Orchestrator|
+            #FFB3B3:return None  ← UNSAFE EXIT;
+            stop
+        endif
+        |Pipeline Orchestrator|
+    endif
+else (false — skip)
+endif
+
+note right
+  **Text Embedding Step**
+  Encode prompt → dense vector
+  representation for diffusion guidance
+end note
+
+if (offload_text_encoder_model?) then (true)
+    |GPU Memory|
+    :_load_text_encoder_model()\n(T5 encoder → GPU);
+    |Pipeline Orchestrator|
+endif
+:text_encoder.encode_prompts(prompt)\n→ prompt_embedding, attention_mask;
+if (offload_text_encoder_model?) then (true)
+    |GPU Memory|
+    :_offload_text_encoder_model()\ndel encoder, gc.collect(), cuda.empty_cache();
+    |Pipeline Orchestrator|
+endif
+
+:_run_model_with_offload(\n  prompt_embedding,\n  negative_prompt_embedding);
+
+if (Pipeline variant?) then (Text-to-World  T2W)
+
+    if (offload_network?) then (true)
+        |GPU Memory|
+        :_load_network()\nload_network_model(model.pt → GPU);
+        |Pipeline Orchestrator|
+    endif
+    if (offload_tokenizer?) then (true)
+        |GPU Memory|
+        :_load_tokenizer()\nload_tokenizer_model(→ GPU);
+        |Pipeline Orchestrator|
+    endif
+    :_run_model(prompt_embedding)\nget_video_batch(model, embedding,\n  height, width, fps, num_frames)\n→ data_batch, state_shape;
+    :generate_world_from_text(\n  model, state_shape, data_batch,\n  guidance_scale, num_steps, seed)\n→ sample (latent Tensor);
+
+else (Video-to-World  V2W)
+
+    if (offload_tokenizer?) then (true)
+        |GPU Memory|
+        :_load_tokenizer()\nload_tokenizer_model(→ GPU);
+        |Pipeline Orchestrator|
+    endif
+    :_run_tokenizer_encoding(image_or_video_path)\nget_condition_latent(model, input_path,\n  num_input_frames, state_shape)\n→ condition_latent (Tensor);
+    if (offload_network?) then (true)
+        |GPU Memory|
+        :_load_network()\nload_network_model(model.pt → GPU);
+        |Pipeline Orchestrator|
+    endif
+    :_run_model(embedding, condition_latent)\nget_video_batch(model, embedding,\n  height, width, fps, num_frames)\n→ data_batch, state_shape;
+    :generate_world_from_video(\n  model, state_shape, data_batch,\n  guidance_scale, num_steps, seed,\n  condition_latent, num_input_frames)\n→ sample (latent Tensor);
+
+endif
+
+note right
+  **Offload Network**
+  Frees DiT weights from VRAM.
+  model.model is deleted (not the\n  full model object), then GC + cache clear.
+end note
+
+if (offload_network?) then (true)
+    |GPU Memory|
+    :_offload_network()\ndel model.model → None\ngc.collect() + cuda.empty_cache();
+    |Pipeline Orchestrator|
+endif
+
+:_run_tokenizer_decoding(sample)\nmodel.tokenizer.decode(sample)\n→ video np.ndarray [T, H, W, C];
+
+if (offload_tokenizer?) then (true)
+    |GPU Memory|
+    :_offload_tokenizer()\ndel model.tokenizer → None\ngc.collect() + cuda.empty_cache();
+    |Pipeline Orchestrator|
+endif
+
+|Safety Module|
+if (disable_guardrail?) then (false)
+    if (offload_guardrail_models?) then (true)
+        |GPU Memory|
+        :_load_video_guardrail() → GPU;
+        |Safety Module|
+    endif
+    :run_video_guardrail(video);
+    if (offload_guardrail_models?) then (true)
+        |GPU Memory|
+        :_offload_guardrail_models()\ndel + gc.collect() + cuda.empty_cache();
+        |Safety Module|
+    endif
+    if (video is_safe?) then (false)
+        |Pipeline Orchestrator|
+        #FFB3B3:return None  ← UNSAFE EXIT;
+        stop
+    endif
+else (true — skip)
+endif
+
+|Pipeline Orchestrator|
+#B3FFB3:return (video: np.ndarray, final_prompt: str);
+stop
+
+@enduml

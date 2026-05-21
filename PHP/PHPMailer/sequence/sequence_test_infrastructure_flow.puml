@@ -1,0 +1,247 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequenceArrowColor #495057
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceGroupBorderColor #6C757D
+skinparam sequenceGroupBackgroundColor #E9ECEF
+skinparam noteBackgroundColor #FFF9C4
+skinparam noteBorderColor #F9A825
+skinparam activationBorderColor #495057
+skinparam activationBackgroundColor #DEE2E6
+
+title Test Infrastructure Setup and Debug Flow
+
+actor "TestSuite" as test
+participant "WebServer" as ws
+participant "Sapi\n(CliServer | PhpCgi | PhpFpm\n| PhpApache | Roadrunner\n| Octane | Swoole | Frankenphp)" as sapi
+participant "NginxServer" as nginx
+participant "DebugTransport" as dt
+participant "Tracer\n(DDTrace internals)" as tracer
+participant "DebugLogger" as dl
+participant "AbstractLogger\n(DDTrace\\Log)" as al
+
+' ─────────────────────────────────────────────
+' 1. WebServer Bootstrap
+' ─────────────────────────────────────────────
+== WebServer Bootstrap ==
+
+test -> ws : new WebServer(indexFile, host, port, ddprofServiceName)
+activate ws
+ws -> ws : realpath(indexFile)\nset defaultInis[error_log]\nset defaultInis[datadog.trace.sources_path]
+note right of ws
+  Default envs injected:
+  DD_TRACE_AGENT_PORT=9126
+  DD_AGENT_HOST=test-agent
+  DD_TRACE_AGENT_FLUSH_AFTER_N_REQUESTS=1
+  DD_TRACE_AGENT_FLUSH_INTERVAL=111
+end note
+
+test -> ws : mergeEnvs(envs)
+activate ws
+ws -> ws : merge defaultEnvs + stored envs + caller envs
+deactivate ws
+
+test -> ws : mergeInis(inis)
+activate ws
+ws -> ws : merge defaultInis + stored inis + caller inis
+deactivate ws
+
+test -> ws : start()
+activate ws
+ws -> ws : set inis[datadog.trace.debug]=true\n(unless DD_TRACE_DEBUG already set)
+ws -> ws : snapshot errorLogSize = filesize(error_log)
+ws -> ws : resolve SAPI type\n(roadrunnerVersion / isOctane / isSwoole\n/ isFrankenphp / DD_TRACE_TEST_SAPI)
+
+alt roadrunnerVersion set
+    ws -> sapi : new RoadrunnerServer(version, indexFile, host, port, envs, inis)
+else isOctane
+    ws -> sapi : new OctaneServer(indexFile, host, port, envs, inis)
+else isSwoole
+    ws -> sapi : new SwooleServer(indexFile, port, envs, inis)
+else isFrankenphp
+    ws -> sapi : new FrankenphpServer(indexFile, host, port, envs, inis)
+else cgi-fcgi
+    ws -> sapi : new PhpCgi(FCGI_HOST:0.0.0.0, FCGI_PORT:9797, envs, inis, ddprofServiceName)
+else fpm-fcgi
+    ws -> sapi : new PhpFpm(dir, FCGI_HOST, FCGI_PORT, envs, inis, maxChildren, user, group, sudo, masterInis)
+else apache2handler
+    ws -> sapi : PhpApache::getInstance() + loadConfig(dir, host, port, envs, inis)
+    note right of sapi
+      PhpApache is a singleton —
+      persisted across the entire
+      test suite lifetime
+    end note
+else default
+    ws -> sapi : new CliServer(indexFile, host, port, envs, inis)
+end
+
+ws -> sapi : sapi.start()
+activate sapi
+sapi --> ws : (running)
+deactivate sapi
+
+opt sapi.isFastCgi() == true
+    ws -> nginx : new NginxServer(indexFile, host, port, FCGI_HOST, FCGI_PORT)
+    ws -> nginx : server.start()
+    activate nginx
+    ws -> nginx : waitUntilServerRunning()
+    nginx --> ws : (ready or Exception on timeout)
+    deactivate nginx
+end
+
+deactivate ws
+
+' ─────────────────────────────────────────────
+' 2. Test Execution — reload / checkErrors
+' ─────────────────────────────────────────────
+== Test Execution ==
+
+test -> ws : reload()
+activate ws
+ws -> sapi : sapi.reload()
+note right of ws
+  If reload not supported,
+  test is marked as skipped
+end note
+sapi --> ws : (reloaded)
+deactivate ws
+
+test -> ws : checkErrors()
+activate ws
+ws -> ws : read error_log diff\nfrom saved errorLogSize offset
+ws -> ws : filter lines tagged with\nddtrace error / warn / deprecation
+ws -> sapi : sapi.checkErrors()
+sapi --> ws : (SAPI-level errors)
+ws --> test : surfaced ddtrace errors/warnings
+deactivate ws
+
+' ─────────────────────────────────────────────
+' 3. Teardown
+' ─────────────────────────────────────────────
+== Teardown ==
+
+test -> ws : stop()
+activate ws
+ws -> ws : usleep(DD_TRACE_AGENT_FLUSH_INTERVAL × 2 × 1000)\n— wait for BGS (Background Sender) trace flush
+note right of ws
+  BGS flush wait ensures all
+  in-flight traces are dispatched
+  before the server shuts down
+end note
+ws -> sapi : sapi.stop()\n(skipped for PhpApache singleton)
+activate sapi
+sapi --> ws : (stopped)
+deactivate sapi
+opt FastCGI SAPI
+    ws -> nginx : server.stop()
+    activate nginx
+    nginx --> ws : (stopped)
+    deactivate nginx
+end
+deactivate ws
+
+' ─────────────────────────────────────────────
+' 4. DebugTransport — In-Memory Trace Capture
+' ─────────────────────────────────────────────
+== DebugTransport — In-Memory Trace Capture ==
+
+note over dt
+  DebugTransport implements DDTrace\\Transport.
+  Traces are captured in-memory — they never
+  leave the PHP process (no HTTP agent call).
+end note
+
+test -> dt : new DebugTransport()
+activate dt
+
+tracer -> dt : send(tracer)
+activate dt
+dt -> tracer : tracer.getTracesAsArray()
+activate tracer
+tracer --> dt : traces[]
+deactivate tracer
+dt -> dt : merge traces into internal $traces array
+deactivate dt
+
+dt -> dt : setHeader(key, value)\n— push {key:value} onto $headers array
+
+test -> dt : getTraces()
+dt --> test : $traces (captured spans)
+
+test -> dt : getHeaders()
+dt --> test : $headers (captured transport headers)
+deactivate dt
+
+' ─────────────────────────────────────────────
+' 5. DebugLogger — In-Memory Log Capture
+' ─────────────────────────────────────────────
+== DebugLogger — In-Memory Log Capture ==
+
+note over dl
+  DebugLogger extends DDTrace\\Log\\AbstractLogger,
+  uses InterpolateTrait for message templating.
+  Initialized at LogLevel::DEBUG — captures all levels.
+end note
+
+test -> dl : new DebugLogger()
+activate dl
+dl -> al : parent::__construct(LogLevel::DEBUG)
+activate al
+al --> dl : (logger ready)
+deactivate al
+
+tracer -> dl : debug(message, context)
+activate dl
+dl -> dl : interpolate(message, context)\nappend [DEBUG, interpolated_msg] to $records
+deactivate dl
+
+tracer -> dl : warning(message, context)
+activate dl
+dl -> dl : interpolate(message, context)\nappend [WARNING, interpolated_msg] to $records
+deactivate dl
+
+tracer -> dl : error(message, context)
+activate dl
+dl -> dl : interpolate(message, context)\nappend [ERROR, interpolated_msg] to $records
+deactivate dl
+
+test -> dl : has(level, message)
+activate dl
+dl -> dl : search $records for\nexact level + message match
+dl --> test : bool
+deactivate dl
+
+test -> dl : hasOnly(level, message)
+activate dl
+dl -> dl : assert exactly one record\nmatching level + message
+dl --> test : bool (fails if count != 1)
+deactivate dl
+
+test -> dl : all()
+activate dl
+dl --> test : full $records array
+deactivate dl
+
+deactivate dl
+
+@enduml

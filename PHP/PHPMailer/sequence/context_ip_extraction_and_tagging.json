@@ -1,0 +1,87 @@
+{
+  "scope": "ip_extraction_and_tagging",
+  "title": "IP Extraction and Header Tagging Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Caller (PHP Integration / SwooleIntegration)",
+    "DDTrace\\extract_ip_from_headers (PHP stub / C PHP_FUNCTION)",
+    "ddtrace_extract_ip_from_headers (C internal)",
+    "ddtrace_ip_extraction_find (C internal)",
+    "priority_header_map (header parsers)",
+    "SpanData / RootSpanData (active/root span)",
+    "add_global_tag (global tag store)"
+  ],
+  "interaction_flow": [
+    "Caller → DDTrace\\extract_ip_from_headers(array $headers): array  [PHP: ext/ddtrace.stub.php:695 / C: ddtrace.c:3910]",
+    "DDTrace\\extract_ip_from_headers → ddtrace_extract_ip_from_headers(zval *server, zend_array *meta)  [ip_extraction.c:214]",
+    "ddtrace_extract_ip_from_headers → ddtrace_ip_extraction_find(zval *server): zend_string*  [ip_extraction.c:133]",
+    "ddtrace_ip_extraction_find: IF DD_TRACE_CLIENT_IP_HEADER set → dd_fetch_arr_str(server, ipheader) → dd_parse_forwarded() or dd_parse_multiple_maybe_port()",
+    "ddtrace_ip_extraction_find: ELSE iterate priority_header_map (X-Forwarded-For, X-Real-IP, Forwarded, True-Client-IP, X-Client-IP, X-Forwarded, Forwarded-For, X-Cluster-Client-IP, Fastly-Client-IP, CF-Connecting-IP, CF-Connecting-IPv6)",
+    "priority_header_map → parse_fn(value, &out): returns extract_res{success, is_private}  [prefer first public IP; track first private]",
+    "ddtrace_ip_extraction_find: FALLBACK to REMOTE_ADDR via dd_parse_plain() if no public IP found",
+    "ddtrace_ip_extraction_find → dd_ipaddr_to_zstr(&out): returns normalized IP string",
+    "ddtrace_extract_ip_from_headers → zend_hash_str_update(meta, 'http.client_ip', val)  [sets tag in meta array]",
+    "DDTrace\\extract_ip_from_headers → Caller: return array ['http.client_ip' => '<ip>']",
+    "Caller → DDTrace\\active_span(): SpanData|null  [ddtrace.c:3229; calls ddtrace_active_span()]",
+    "Caller → DDTrace\\root_span(): RootSpanData|null  [ddtrace.c; calls ddtrace_root_span() on active stack]",
+    "Caller → $span->meta['http.client_ip'] = $ipResult['http.client_ip']  [direct property write on SpanData::$meta]",
+    "SwooleIntegration (alt path): $rootSpan->meta += $res  [SwooleIntegration.php:64; merges result directly onto root span meta]",
+    "serializer.c (auto path): ddtrace_extract_ip_from_headers(&server_zv, meta) called automatically during span serialization when DD_TRACE_CLIENT_IP_ENABLED=true  [serializer.c:678]",
+    "Caller → DDTrace\\add_global_tag(string $key, string $value): void  [ddtrace.c:2064; writes to DDTRACE_G(additional_global_tags) hash]",
+    "add_global_tag → Every new span created inherits global tags from additional_global_tags"
+  ],
+  "key_data_structures": {
+    "SpanData": "class; props: name, resource, service, type, meta(string[]), metrics(float[]), peerServiceSources, parent(SpanData|null), stack(SpanStack), links, events, id(readonly), baggage",
+    "RootSpanData": "extends SpanData; adds: origin, propagatedTags, samplingPriority, traceId, parentId, tracestate, tracestateTags, gitMetadata, inferredSpan",
+    "extract_res": "C struct {bool success, bool is_private}",
+    "ipaddr": "C struct {int af, union{in_addr v4, in6_addr v6}}",
+    "header_map_node": "C struct {zend_string *key (HTTP_ prefixed), zend_string *name (canonical), extract_func_t parse_fn}"
+  },
+  "priority_header_order": [
+    "X-Forwarded-For (dd_parse_multiple_maybe_port)",
+    "X-Real-IP (dd_parse_multiple_maybe_port)",
+    "Forwarded (dd_parse_forwarded — RFC 7239)",
+    "True-Client-IP (dd_parse_multiple_maybe_port)",
+    "X-Client-IP (dd_parse_multiple_maybe_port)",
+    "X-Forwarded (dd_parse_forwarded)",
+    "Forwarded-For (dd_parse_multiple_maybe_port)",
+    "X-Cluster-Client-IP (dd_parse_multiple_maybe_port)",
+    "Fastly-Client-IP (dd_parse_multiple_maybe_port)",
+    "CF-Connecting-IP (dd_parse_multiple_maybe_port)",
+    "CF-Connecting-IPv6 (dd_parse_multiple_maybe_port)",
+    "REMOTE_ADDR (fallback, dd_parse_plain)"
+  ],
+  "ip_selection_rules": [
+    "Custom header (DD_TRACE_CLIENT_IP_HEADER) takes precedence over all priority headers",
+    "First public (non-private) IP wins; private IPs are retained as fallback",
+    "IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) are normalized to IPv4",
+    "IPv4+port pairs (1.2.3.4:456) and IPv6+port ([2001::1]:1111) are stripped to IP only",
+    "Private ranges: 10/8, 172.16/12, 192.168/16, 127/8, 169.254/16, 100.64/10 (CGNAT/K8s)"
+  ],
+  "key_relationships": [
+    "DDTrace\\extract_ip_from_headers (PHP) wraps ddtrace_extract_ip_from_headers (C)",
+    "ddtrace_extract_ip_from_headers calls ddtrace_ip_extraction_find and writes 'http.client_ip' to meta hash",
+    "ddtrace_ip_extraction_find is exported (DDTRACE_PUBLIC) — also used by appsec extension (ddtrace.sym:12)",
+    "active_span() returns SpanData on top of SpanStack; root_span() returns RootSpanData at stack base",
+    "SpanData::$meta (string[]) is the direct write target for 'http.client_ip' tag",
+    "add_global_tag updates DDTRACE_G(additional_global_tags) — applied to all new spans globally",
+    "SwooleIntegration uses root_span()->meta += extract_ip_from_headers(...) pattern",
+    "serializer.c auto-calls ddtrace_extract_ip_from_headers during web span serialization (DD_TRACE_CLIENT_IP_ENABLED guard)"
+  ],
+  "configuration_flags": {
+    "DD_TRACE_CLIENT_IP_ENABLED": "bool — enables automatic IP extraction in serializer",
+    "DD_TRACE_CLIENT_IP_HEADER": "string — custom header name overriding priority header scan"
+  },
+  "output_tag": "http.client_ip",
+  "appsec_integration": "appsec/src/extension/tags.c defines DD_TAG_HTTP_CLIENT_IP='http.client_ip'; dd_tags_add_tags() writes client IP to span meta via dd_trace_span_add_tag()",
+  "important_notes": "extract_ip_from_headers returns an array (metadata format), not a raw string. The caller must read ['http.client_ip'] key. In automatic mode (serializer), this is written directly to the span's meta hash. In Swoole/manual mode, caller merges the result into $rootSpan->meta. ddtrace_ip_extraction_find is a public C symbol exported for use by the AppSec extension.",
+  "source_files_analyzed": [
+    "ext/ddtrace.stub.php",
+    "ext/ip_extraction.c",
+    "ext/ddtrace.c",
+    "ext/serializer.c",
+    "src/DDTrace/Integrations/Swoole/SwooleIntegration.php",
+    "appsec/src/extension/tags.c",
+    "tests/ext/extract_ip_addr.phpt"
+  ]
+}

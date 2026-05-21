@@ -1,0 +1,136 @@
+{
+  "scope": "agent_handoff_routing",
+  "title": "Agent Handoff Routing",
+  "diagram_type": "activity",
+  "description": "Activity flow for multi-agent handoff: LLM detects transfer tool call, Runner identifies target agent, context/history is filtered, active agent is switched, execution resumes in new agent.",
+
+  "key_participants": [
+    "Runner (run.py / run_loop.py)",
+    "Agent (agent.py)",
+    "Handoff (handoffs/__init__.py)",
+    "HandoffInputFilter (type alias)",
+    "HandoffInputData (dataclass)",
+    "ToolRunHandoff (run_steps.py)",
+    "ProcessedResponse (run_steps.py)",
+    "NextStepHandoff (run_steps.py)",
+    "RunContextWrapper (run_context.py)",
+    "RunHooks / AgentHooks (lifecycle.py)"
+  ],
+
+  "activity_flow": [
+    "START: Runner.run(starting_agent, input, context, run_config, max_turns)",
+    "INIT: Set current_agent = starting_agent; initialize RunContextWrapper; set should_run_agent_start_hooks=True",
+    "LOOP: Increment current_turn; check current_turn > max_turns → raise MaxTurnsExceeded",
+    "AGENT TURN: Call get_all_tools(current_agent, context_wrapper); get_handoffs(current_agent, context_wrapper)",
+    "RENDER HANDOFFS AS TOOLS: Build handoff_map = {handoff.tool_name: Handoff}; each Handoff exposed to LLM as function tool named 'transfer_to_<agent_name>'",
+    "LLM INFERENCE: Model generates response with possible function_call outputs",
+    "PROCESS RESPONSE: process_model_response() iterates response.output items",
+    "CLASSIFY OUTPUT: For each function_tool output, check if output.name in handoff_map",
+    "BRANCH: If output.name matches a handoff → create ToolRunHandoff(handoff, tool_call); else treat as regular FunctionTool",
+    "ProcessedResponse: Collects run_handoffs: list[ToolRunHandoff], functions, computer_actions, etc.",
+    "DECISION: Does ProcessedResponse.handoffs have entries?",
+    "NO → execute normal tool calls, check for final output, loop back",
+    "YES → enter execute_handoffs() path",
+    "MULTIPLE HANDOFFS CHECK: If len(run_handoffs) > 1 → append 'Multiple handoffs detected, ignoring this one.' ToolCallOutputItem for all but first; record span error",
+    "SELECT FIRST HANDOFF: actual_handoff = run_handoffs[0]",
+    "INVOKE HANDOFF: new_agent = await handoff.on_invoke_handoff(context_wrapper, tool_call.arguments)",
+    "  on_invoke_handoff internally: if input_type set → validate JSON via TypeAdapter, call on_handoff(ctx, validated_input); else call on_handoff(ctx) if provided",
+    "  on_invoke_handoff always returns the captured agent instance",
+    "CREATE HandoffOutputItem: raw_item = tool_call_output_item(tool_call, '{\"assistant\": new_agent.name}'); append to new_step_items",
+    "FIRE HOOKS (parallel): hooks.on_handoff(context, from_agent, to_agent) + agent.hooks.on_handoff(context, agent=new_agent, source=from_agent)",
+    "RESOLVE INPUT FILTER: input_filter = handoff.input_filter OR run_config.handoff_input_filter (handoff-level takes precedence)",
+    "RESOLVE NEST HISTORY: should_nest_history = handoff.nest_handoff_history if set, else run_config.nest_handoff_history",
+    "SERVER-MANAGED CHECK: If server-managed conversation (conversation_id/previous_response_id) and input_filter set → raise UserError; if nest_history set → warn and disable",
+    "DECISION: input_filter or should_nest_history?",
+    "  IF input_filter set:",
+    "    Build HandoffInputData(input_history, pre_handoff_items, new_items, run_context)",
+    "    filtered = await input_filter(handoff_input_data)",
+    "    Extract: original_input=filtered.input_history, pre_step_items=filtered.pre_handoff_items, new_step_items=filtered.new_items",
+    "    If filtered.input_items set: session_step_items=filtered.new_items, new_step_items=filtered.input_items (split session vs model input)",
+    "  ELIF should_nest_history:",
+    "    Build HandoffInputData, call nest_handoff_history(data, run_config.handoff_history_mapper)",
+    "    Collapses prior transcript into <CONVERSATION HISTORY> summary block",
+    "    session_step_items = full new_items; new_step_items = filtered input_items if available",
+    "  ELSE: No filtering; pass full history to new agent",
+    "RETURN SingleStepResult(next_step=NextStepHandoff(new_agent), original_input, model_response, new_step_items, session_step_items)",
+    "RUNNER RECEIVES NextStepHandoff:",
+    "  current_agent = turn_result.next_step.new_agent",
+    "  run_state._current_agent = current_agent",
+    "  Finish current tracing span (reset_current=True); current_span = None",
+    "  should_run_agent_start_hooks = True",
+    "  (Streaming only): emit AgentUpdatedStreamEvent(new_agent=current_agent) to event queue",
+    "  run_state._current_step = NextStepRunAgain()",
+    "  continue → back to LOOP top",
+    "NEW AGENT LOOP: New agent runs with filtered/nested history; process continues until FinalOutput or MaxTurns",
+    "END: Return RunResult with last_agent = final current_agent"
+  ],
+
+  "key_data_structures": {
+    "Handoff": "tool_name: str, tool_description: str, input_json_schema: dict, on_invoke_handoff: Callable[[RunContextWrapper, str], Awaitable[Agent]], agent_name: str, input_filter: HandoffInputFilter|None, nest_handoff_history: bool|None, strict_json_schema: bool=True, is_enabled: bool|Callable",
+    "HandoffInputData": "input_history: str|tuple[TResponseInputItem,...], pre_handoff_items: tuple[RunItem,...], new_items: tuple[RunItem,...], run_context: RunContextWrapper|None, input_items: tuple[RunItem,...]|None",
+    "HandoffInputFilter": "TypeAlias = Callable[[HandoffInputData], MaybeAwaitable[HandoffInputData]]",
+    "ToolRunHandoff": "handoff: Handoff, tool_call: ResponseFunctionToolCall",
+    "ProcessedResponse": "new_items, handoffs: list[ToolRunHandoff], functions, computer_actions, tools_used, interruptions",
+    "NextStepHandoff": "new_agent: Agent",
+    "SingleStepResult": "original_input, model_response, pre_step_items, new_step_items, next_step: NextStepHandoff|NextStepFinalOutput|NextStepRunAgain|NextStepInterruption, session_step_items: list|None"
+  },
+
+  "key_methods": [
+    "Runner.run(starting_agent, input, context, run_config, max_turns) -> RunResult",
+    "process_model_response(agent, all_tools, response, output_schema, handoffs) -> ProcessedResponse",
+    "execute_handoffs(public_agent, original_input, pre_step_items, new_step_items, run_handoffs, hooks, context_wrapper, run_config) -> SingleStepResult",
+    "handoff.on_invoke_handoff(context_wrapper, input_json) -> Agent",
+    "_invoke_handoff(ctx, input_json) [internal closure]: validates input, calls on_handoff callback, returns captured agent",
+    "Handoff.default_tool_name(agent) -> 'transfer_to_<agent_name>'",
+    "Handoff.default_tool_description(agent) -> description string",
+    "Handoff.get_transfer_message(agent) -> json '{\"assistant\": agent.name}'",
+    "nest_handoff_history(data, history_mapper) -> HandoffInputData",
+    "handoff(agent, tool_name_override, tool_description_override, on_handoff, input_type, input_filter, nest_handoff_history, is_enabled) -> Handoff"
+  ],
+
+  "decision_branches": [
+    "Multiple handoffs in one turn? → Only first processed; rest get 'Multiple handoffs detected' output + span error",
+    "input_type set? → Validate JSON payload via TypeAdapter; call on_handoff(ctx, validated_input)",
+    "on_handoff without input_type? → Call on_handoff(ctx) for side effects only",
+    "input_filter set (handoff or run_config)? → Filter HandoffInputData before passing to new agent",
+    "nest_handoff_history enabled? → Collapse prior transcript into summary block",
+    "input_items in filtered result? → Split: session sees full new_items; model sees filtered input_items",
+    "Server-managed conversation + input_filter? → UserError raised",
+    "Server-managed conversation + nest_history? → Warning, history nesting disabled",
+    "is_enabled=False (bool or callable returns false)? → Handoff hidden from LLM tool list at runtime",
+    "current_turn > max_turns? → Raise MaxTurnsExceeded"
+  ],
+
+  "lifecycle_hooks": [
+    "RunHooks.on_handoff(context, from_agent, to_agent) — global hooks",
+    "AgentHooks.on_handoff(context, agent=new_agent, source=from_agent) — per-agent hooks",
+    "Both fire in parallel (asyncio.gather) after new_agent is resolved"
+  ],
+
+  "tracing": [
+    "handoff_span(from_agent=public_agent.name) wraps execute_handoffs; span_data.to_agent = new_agent.name set after resolution",
+    "Multiple handoffs attach SpanError(message='Multiple handoffs requested', data={'requested_agents': [...]})",
+    "Current agent_span finished and reset to None on handoff; new span created for new agent in next loop iteration",
+    "Streaming emits AgentUpdatedStreamEvent(new_agent) on handoff"
+  ],
+
+  "business_rules": [
+    "Handoffs stay within a single run — they do NOT start a new Runner.run() call",
+    "Input guardrails apply only to the first agent; output guardrails only to the agent producing final output",
+    "New agent sees full conversation history by default unless input_filter or nest_handoff_history is set",
+    "Handoff tool name convention: 'transfer_to_<agent_name>' (snake_case transformed)",
+    "handoff() helper always transfers to the specific agent captured — use on_handoff for side effects, not dynamic routing",
+    "For dynamic destination selection at invocation time, use a custom Handoff subclass with custom on_invoke_handoff",
+    "Disabled handoffs (is_enabled=False) are hidden from LLM tool list at runtime"
+  ],
+
+  "source_files_analyzed": [
+    "src/agents/handoffs/__init__.py",
+    "src/agents/agent.py",
+    "src/agents/run.py",
+    "src/agents/run_internal/turn_resolution.py",
+    "src/agents/run_internal/run_steps.py",
+    "src/agents/run_internal/run_loop.py",
+    "docs/handoffs.md"
+  ]
+}

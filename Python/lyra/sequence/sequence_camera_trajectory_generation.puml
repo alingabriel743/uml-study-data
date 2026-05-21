@@ -1,0 +1,200 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #DEE2E6
+    GroupBorderColor #495057
+    GroupBackgroundColor #F1F3F5
+    DividerBorderColor #6C757D
+    DividerBackgroundColor #DEE2E6
+    NoteBackgroundColor #FFF3CD
+    NoteBorderColor #856404
+}
+
+title Camera Trajectory Generation
+
+actor Caller as caller
+
+box "Lyra-2  (_src/inference/)" #E8F4FD
+    participant "build_camera_trajectory\n(camera_traj_utils.py)" as bct
+    participant "create_spiral_trajectory" as spiral
+    participant "create_orbit_trajectory" as orbit
+    participant "create_horizontal_trajectory" as horiz
+    participant "create_dolly_zoom_trajectory" as dolly
+    participant "create_back_trajectory" as back
+    participant "create_rotate_then_zoom_trajectory" as rotzoom
+end box
+
+box "Lyra-1  (diffusion/inference/)" #FFF0E6
+    participant "generate_camera_trajectory\n(camera_utils.py)" as gct
+end box
+
+box "Shared Math Utilities\n(camera_utils.py)" #EDF7ED
+    participant "look_at_matrix" as lat
+    participant "apply_transformation" as at
+end box
+
+' ─── Lyra-2 entry point ───────────────────────────────────────────────────────
+caller -> bct : build_camera_trajectory(\n  initial_w2c_44:[4,4], K_33:[3,3],\n  center_depth:float, video_len:int,\n  trajectory:str, direction:str, strength:float)
+activate bct
+
+' --- 'original' fast-path ---
+alt trajectory == "original"
+    bct -> bct : repeat initial_w2c_44 × video_len
+    note right : No pose math needed;\n returns constant sequence
+
+' --- spiral variants ---
+else trajectory in {spiral, spiral_center, spiral_outwards}
+    bct -> spiral : create_spiral_trajectory(\n  initial_w2c_44, center_depth, n_steps,\n  radius_x, radius_y, right, inwards,\n  num_circles)
+    activate spiral
+    loop for each frame i in [0, n_steps)
+        spiral -> lat : look_at_matrix(camera_pos_i, look_at=[0,0,center_depth])
+        activate lat
+        lat --> spiral : view_matrix:[4,4]
+        deactivate lat
+    end
+    spiral -> at : apply_transformation(\n  trajectory:[n_steps,4,4], initial_w2c_44)
+    activate at
+    at --> spiral : transformed:[n_steps,4,4]
+    deactivate at
+    spiral --> bct : w2cs:[n_steps,4,4]
+    deactivate spiral
+
+' --- orbit variants ---
+else trajectory in {orbit_horizontal, orbit_vertical}
+    bct -> orbit : create_orbit_trajectory(\n  initial_w2c_44, center_depth,\n  n_steps, angle, axis, direction)
+    activate orbit
+    loop for each frame i in [0, n_steps)
+        orbit -> lat : look_at_matrix(arc_pos_i, look_at)
+        activate lat
+        lat --> orbit : view_matrix:[4,4]
+        deactivate lat
+    end
+    orbit -> at : apply_transformation(\n  trajectory:[n_steps,4,4], initial_w2c_44)
+    activate at
+    at --> orbit : transformed:[n_steps,4,4]
+    deactivate at
+    orbit --> bct : w2cs:[n_steps,4,4]
+    deactivate orbit
+
+' --- horizontal / zoom / noise / bend variants ---
+else trajectory in {horizontal, horizontal_lift, horizontal_zoom, …}
+    bct -> horiz : create_horizontal_trajectory(\n  initial_w2c_44, center_depth, n_steps,\n  right, axis, distance, outwards)
+    activate horiz
+    loop for each frame i in [0, n_steps)
+        horiz -> lat : look_at_matrix(offset_pos_i, look_at)
+        activate lat
+        lat --> horiz : view_matrix:[4,4]
+        deactivate lat
+    end
+    horiz -> at : apply_transformation(\n  trajectory:[n_steps,4,4], initial_w2c_44)
+    activate at
+    at --> horiz : transformed:[n_steps,4,4]
+    deactivate at
+    horiz --> bct : w2cs:[n_steps,4,4]
+    deactivate horiz
+
+' --- dolly zoom (modifies intrinsics too) ---
+else trajectory == "dolly_zoom"
+    bct -> dolly : create_dolly_zoom_trajectory(\n  initial_w2c_44, K_33, center_depth,\n  n_steps, shift_z)
+    activate dolly
+    loop for each frame i in [0, n_steps)
+        dolly -> lat : look_at_matrix(camera_pos_i, look_at)
+        activate lat
+        lat --> dolly : view_matrix:[4,4]
+        deactivate lat
+        dolly -> dolly : scale focal_length ∝ D0 / D_i
+    end
+    dolly -> at : apply_transformation(\n  trajectory:[n_steps,4,4], initial_w2c_44)
+    activate at
+    at --> dolly : transformed:[n_steps,4,4]
+    deactivate at
+    dolly --> bct : (w2cs:[n_steps,4,4], Ks:[n_steps,3,3])
+    deactivate dolly
+    note over bct : dolly_zoom is the only trajectory\nthat also updates intrinsic matrices
+
+' --- back / back_simple (forward + reversed spiral) ---
+else trajectory in {back, back_simple}
+    bct -> spiral : create_spiral_trajectory(…)\n[build forward leg first]
+    activate spiral
+    spiral --> bct : forward_traj:[T,4,4]
+    deactivate spiral
+    bct -> back : create_back_trajectory(\n  forward_trajectory:[T,4,4], center_depth,\n  radius_x, radius_y, right, invert_pos)
+    activate back
+    loop for each of (n_steps-1) backward frames
+        back -> lat : look_at_matrix(spiral_pos_i, look_at)
+        activate lat
+        lat --> back : view_matrix:[4,4]
+        deactivate lat
+    end
+    back -> at : apply_transformation(\n  backward:[T-1,4,4],\n  forward_trajectory.flip(0))
+    activate at
+    at --> back : backward_transformed:[T-1,4,4]
+    deactivate at
+    back -> back : cat([forward_traj, backward_transformed])
+    back --> bct : w2cs:[2T-1,4,4]
+    deactivate back
+
+' --- rotate-then-zoom ---
+else trajectory in {rotate_zoom_in, rotate_zoom_out}
+    bct -> rotzoom : create_rotate_then_zoom_trajectory(\n  initial_w2c_44, center_depth, n_steps,\n  rotate_direction, zoom_direction,\n  rotation_angle, zoom_distance)
+    activate rotzoom
+    rotzoom -> rotzoom : first half — rotate Y-axis in-place\n(quaternion slerp per frame)
+    rotzoom -> rotzoom : second half — translate along\nrotated_forward direction
+    rotzoom -> at : apply_transformation(\n  trajectory:[n_steps,4,4], initial_w2c_44)
+    activate at
+    at --> rotzoom : transformed:[n_steps,4,4]
+    deactivate at
+    rotzoom --> bct : w2cs:[n_steps,4,4]
+    deactivate rotzoom
+end
+
+bct --> caller : (w2cs:[T,4,4], Ks:[T,3,3])
+deactivate bct
+
+' ─── Lyra-1 alternative entry point ──────────────────────────────────────────
+|||
+caller -> gct : generate_camera_trajectory(\n  trajectory_type:str, initial_w2c:[4,4],\n  initial_intrinsics:[3,3], num_frames:int,\n  movement_distance:float, camera_rotation:bool,\n  center_depth:float, device, num_circles,\n  radius_x_factor, radius_y_factor)
+activate gct
+
+alt trajectory_type in {clockwise, counterclockwise}
+    gct -> spiral : create_spiral_trajectory(\n  world_to_camera_matrix, center_depth,\n  n_steps, positive, camera_rotation,\n  radius_x, radius_y, num_circles)
+    activate spiral
+    spiral --> gct : w2cs:[T,4,4]
+    deactivate spiral
+
+else trajectory_type in {left, right, up, down, zoom_in, zoom_out}
+    gct -> horiz : create_horizontal_trajectory(\n  world_to_camera_matrix, center_depth,\n  n_steps, positive, axis, distance,\n  camera_rotation)
+    activate horiz
+    horiz --> gct : w2cs:[T,4,4]
+    deactivate horiz
+end
+
+gct -> gct : unsqueeze(0) on w2cs and intrinsics
+gct --> caller : (generated_w2cs:[1,T,4,4],\n generated_intrinsics:[1,T,3,3])
+deactivate gct
+
+@enduml

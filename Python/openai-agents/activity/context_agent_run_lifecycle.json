@@ -1,0 +1,146 @@
+{
+  "scope": "agent_run_lifecycle",
+  "title": "Agent Run Lifecycle",
+  "diagram_type": "activity",
+  "description": "Core agent run loop from invocation through turn execution to final output, including max-turns guard and early exit conditions.",
+
+  "key_actors": [
+    "Runner (public facade: run, run_sync, run_streamed class methods)",
+    "AgentRunner (implementation; Runner delegates to DEFAULT_AGENT_RUNNER)",
+    "Agent (starting_agent / current_agent; can change on handoff)",
+    "RunContextWrapper (wraps user context + usage + tool-approval state)",
+    "RunConfig (global settings: max_turns, guardrails, model, session, tracing)",
+    "RunState (serializable checkpoint for pause/resume flows)",
+    "run_single_turn() (LLM call + tool execution; returns SingleStepResult)",
+    "NextStep variants (FinalOutput | Handoff | RunAgain | Interruption)"
+  ],
+
+  "entry_points": [
+    "Runner.run(starting_agent, input, *, context, max_turns=DEFAULT_MAX_TURNS, hooks, run_config, error_handlers, previous_response_id, conversation_id, session) -> RunResult",
+    "Runner.run_sync(...) -> RunResult  [wraps asyncio.run(Runner.run(...))]",
+    "Runner.run_streamed(...) -> RunResultStreaming"
+  ],
+
+  "activity_flow": [
+    "START: caller invokes Runner.run(starting_agent, input, ...)",
+    "Delegate to AgentRunner.run()",
+    "BRANCH is_resumed_state = isinstance(input, RunState)?",
+
+    "[YES - resumed] Restore: current_turn, original_input, generated_items, context_wrapper from RunState; apply saved conversation_id/previous_response_id",
+    "[NO  - fresh]  Cast input to str|list; validate session vs. server-conversation exclusivity; call prepare_input_with_session() to merge session history",
+
+    "Resolve reasoning_item_id_policy and server_conversation_tracker (OpenAIServerConversationTracker or None)",
+    "Initialize: AgentToolUseTracker, SandboxRuntime, PromptCacheKeyResolver",
+    "Create/reattach TraceCtxManager (workflow trace span)",
+    "Initialize: current_turn=0, current_agent=starting_agent, generated_items=[], model_responses=[], session_items=[]",
+    "Create task_span; optionally pre-save session input items",
+
+    "=== MAIN LOOP (while True) ===",
+
+    "TURN 0 ONLY: collect all_input_guardrails (agent.input_guardrails + run_config.input_guardrails)",
+    "  Split guardrails into sequential (run_in_parallel=False) and parallel (run_in_parallel=True)",
+    "  Run sequential guardrails first (blocking). If InputGuardrailTripwireTriggered → persist session, RAISE",
+    "  Create model_task = asyncio.create_task(run_single_turn(...))",
+    "  BRANCH parallel_guardrails present?",
+    "    [YES] asyncio.gather(run_input_guardrails(parallel), model_task); if tripwire → cancel model_task, persist session, RAISE",
+    "    [NO]  turn_result = await model_task",
+    "SUBSEQUENT TURNS (>1): turn_result = await run_single_turn(...) directly",
+
+    "Attach usage delta to turn_span; finish turn_span",
+
+    "Increment current_turn += 1",
+    "GUARD: current_turn > max_turns?",
+    "  [YES] Attach SpanError to agent_span",
+    "    BRANCH error_handlers['max_turns'] defined?",
+    "      [YES] call handler → validate output → synthesize message item → run output guardrails → build RunResult → RETURN (graceful recovery)",
+    "      [NO]  raise MaxTurnsExceeded",
+
+    "Append turn_result.model_response to model_responses",
+    "Update generated_items = pre_step_items + new_step_items",
+    "Extend session_items with turn_session_items",
+    "Extend tool_input/output_guardrail_results",
+
+    "BRANCH on turn_result.next_step type:",
+
+    "  [NextStepFinalOutput]",
+    "    run_output_guardrails(agent.output_guardrails + run_config.output_guardrails, output)",
+    "    If OutputGuardrailTripwireTriggered → RAISE",
+    "    Persist session items if session_persistence_enabled",
+    "    Build RunResult(input, new_items, raw_responses, final_output, last_agent, guardrail_results)",
+    "    _finalize_result() → finalize_conversation_tracking, apply sandbox metadata",
+    "    RETURN RunResult ← END",
+
+    "  [NextStepInterruption]  (human-in-the-loop / tool approval needed)",
+    "    Persist session items (skip approval placeholders)",
+    "    update_run_state_for_interruption(run_state, ...)",
+    "    build_interruption_result() → RunResult with interruptions=[ToolApprovalItem, ...]",
+    "    RETURN RunResult (paused; caller resumes by passing RunState back)",
+
+    "  [NextStepHandoff]",
+    "    current_agent = turn_result.next_step.new_agent",
+    "    Update run_state._current_agent",
+    "    original_input = turn_result.original_input (filtered/nested transcript)",
+    "    Finish current agent_span; reset should_run_agent_start_hooks=True",
+    "    CONTINUE loop (re-enter with new agent)",
+
+    "  [NextStepRunAgain]  (tool calls were executed; loop for next LLM call)",
+    "    Persist session items if needed",
+    "    CONTINUE loop (same agent, appended tool results in generated_items)",
+
+    "=== EXCEPTION HANDLING ===",
+    "BaseException caught: attach RunErrorDetails to exc.run_data; re-raise",
+    "Specific catchable exceptions: MaxTurnsExceeded, InputGuardrailTripwireTriggered, OutputGuardrailTripwireTriggered, ModelBehaviorError, ToolTimeoutError, UserError"
+  ],
+
+  "next_step_types": {
+    "NextStepFinalOutput": "LLM produced text/typed output with no pending tool calls → terminal",
+    "NextStepHandoff": "LLM called a handoff tool → switch agent, continue loop",
+    "NextStepRunAgain": "LLM made function/tool calls → execute tools, append results, loop",
+    "NextStepInterruption": "Tool requires human approval (approval flow) → pause, return RunState checkpoint"
+  },
+
+  "guardrail_timing": {
+    "input_guardrails": "Turn 0 only; sequential run before model call; parallel run concurrently with model call",
+    "output_guardrails": "After every NextStepFinalOutput (including max_turns handler output)",
+    "tool_input_guardrails": "Inside run_single_turn per tool call",
+    "tool_output_guardrails": "Inside run_single_turn after tool execution"
+  },
+
+  "max_turns_behavior": {
+    "default": "DEFAULT_MAX_TURNS constant (imported from run_config)",
+    "check": "current_turn > max_turns BEFORE run_single_turn",
+    "no_handler": "raise MaxTurnsExceeded('Max turns (N) exceeded')",
+    "with_handler": "error_handlers['max_turns'](RunErrorHandlerInput) -> RunErrorHandlerResult; synthesize message item; run output guardrails; return RunResult gracefully"
+  },
+
+  "session_conversation_strategies": [
+    "result.to_input_list() – manual client-managed history",
+    "Session (SQLiteSession etc.) – auto client-managed persistence",
+    "conversation_id – OpenAI server-managed named conversation",
+    "previous_response_id / auto_previous_response_id – OpenAI response chaining"
+  ],
+
+  "key_data_objects": {
+    "RunConfig": "model, model_provider, model_settings, session_settings, input_guardrails, output_guardrails, handoff_input_filter, nest_handoff_history, call_model_input_filter, reasoning_item_id_policy, tracing_disabled, workflow_name, trace_id, group_id, tool_error_formatter",
+    "RunContextWrapper": "context: TContext, usage: Usage, turn_input: list, _approvals: dict[str, _ApprovalRecord], tool_input",
+    "RunResult": "input, new_items, raw_responses, final_output, _last_agent, input_guardrail_results, output_guardrail_results, interruptions, context_wrapper, max_turns",
+    "RunState": "checkpoint for pause/resume; holds current_agent, current_turn, generated_items, model_responses, session_items, _current_step (NextStep)"
+  },
+
+  "important_notes": [
+    "Runner is a stateless class-method facade; AgentRunner holds all logic.",
+    "Only the FIRST agent's input guardrails run (not on handoff agents).",
+    "A 'turn' = one LLM invocation; tool calls within that invocation do NOT count as extra turns.",
+    "Handoffs change current_agent but do NOT reset current_turn counter.",
+    "run_single_turn() handles: LLM call, tool execution, approval checks, hooks, and returns SingleStepResult with next_step.",
+    "Interruption (NextStepInterruption) returns RunResult with pending approvals; caller resumes by passing the RunState back as input.",
+    "Session persistence and server-managed conversation (conversation_id / previous_response_id) are mutually exclusive per run.",
+    "call_model_input_filter in RunConfig can trim/edit the input list immediately before each LLM call."
+  ],
+
+  "source_files_analyzed": [
+    "src/agents/run.py (AgentRunner.run core loop ~lines 427-1530)",
+    "src/agents/run_context.py (RunContextWrapper, AgentHookContext)",
+    "docs/running_agents.md"
+  ]
+}

@@ -1,0 +1,176 @@
+{
+  "scope": "ops_lifecycle_and_health",
+  "title": "Ops: Lifecycle & Health",
+  "diagram_type": "use_case",
+  "description": "Manage operational lifecycle events, run health checks, and handle trigger conditions for the Evolver loop process.",
+
+  "actors": [
+    {
+      "name": "Operator / CLI",
+      "description": "Human or automated caller invoking lifecycle commands via CLI (node lifecycle.js [action]) or programmatic API"
+    },
+    {
+      "name": "Evolver Loop Process",
+      "description": "The detached child node process spawned and managed by the lifecycle module (--loop flag)"
+    },
+    {
+      "name": "Wrapper / External Caller",
+      "description": "External wrapper script (feishu-evolver-wrapper) or ops/index consumer that calls trigger.send() to wake the loop"
+    },
+    {
+      "name": "Operating System",
+      "description": "Provides process signals (SIGTERM/SIGKILL), file system, disk/memory stats used by health checks"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Start Evolver Loop",
+      "actor": "Operator / CLI",
+      "module": "lifecycle.js",
+      "entry_point": "start(options)",
+      "description": "Checks for running PIDs; if none, resolves loop script path (env override → wrapper → core), spawns detached node process with --loop, writes PID file.",
+      "precondition": "No evolver loop currently running",
+      "postcondition": "Detached child process running; PID written to memory/evolver_loop.pid",
+      "includes": ["UC7 - Discover Running PIDs", "UC9 - Resolve Loop Script"]
+    },
+    {
+      "id": "UC2",
+      "name": "Stop Evolver Loop",
+      "actor": "Operator / CLI",
+      "module": "lifecycle.js",
+      "entry_point": "stop()",
+      "description": "Finds running PIDs, sends SIGTERM, polls for exit (up to 5s), escalates to SIGKILL if still running, removes PID file and evolver.pid lock.",
+      "precondition": "Evolver loop may or may not be running",
+      "postcondition": "All loop processes terminated; PID files removed",
+      "includes": ["UC7 - Discover Running PIDs"]
+    },
+    {
+      "id": "UC3",
+      "name": "Restart Evolver Loop",
+      "actor": "Operator / CLI",
+      "module": "lifecycle.js",
+      "entry_point": "restart(options)",
+      "description": "Calls stop() then start() with a 2000ms delay. Combines UC2 and UC1.",
+      "includes": ["UC2 - Stop Evolver Loop", "UC1 - Start Evolver Loop"]
+    },
+    {
+      "id": "UC4",
+      "name": "Query Loop Status",
+      "actor": "Operator / CLI",
+      "module": "lifecycle.js",
+      "entry_point": "status()",
+      "description": "Returns running state, list of PIDs with their command lines, and log file path.",
+      "includes": ["UC7 - Discover Running PIDs"]
+    },
+    {
+      "id": "UC5",
+      "name": "Tail Log Output",
+      "actor": "Operator / CLI",
+      "module": "lifecycle.js",
+      "entry_point": "tailLog(lines)",
+      "description": "Reads the last N lines (default 20) from the evolver log file and returns content."
+    },
+    {
+      "id": "UC6",
+      "name": "Check Process Health",
+      "actor": "Operator / CLI",
+      "module": "lifecycle.js",
+      "entry_point": "checkHealth()",
+      "description": "Verifies loop is running and log file has been updated within MAX_SILENCE_MS. Returns healthy/unhealthy with reason (not_running | stagnation).",
+      "includes": ["UC7 - Discover Running PIDs"],
+      "extension": "If unhealthy at CLI: auto-triggers UC3 - Restart Evolver Loop"
+    },
+    {
+      "id": "UC7",
+      "name": "Discover Running PIDs",
+      "actor": "Operating System",
+      "module": "lifecycle.js",
+      "entry_point": "getRunningPids()",
+      "description": "Scans `ps -e -o pid,args` output for node processes matching --loop + known wrapper paths; filters with isPidRunning(). Internal utility used by start/stop/status/checkHealth."
+    },
+    {
+      "id": "UC8",
+      "name": "Run System Health Check",
+      "actor": "Operator / CLI",
+      "module": "health_check.js",
+      "entry_point": "runHealthCheck()",
+      "description": "Aggregates multiple system checks and returns overall status (ok | warning | error) plus per-check results.",
+      "sub_checks": [
+        "env:FEISHU_APP_ID / FEISHU_APP_SECRET (warning if missing)",
+        "env:OPENAI_API_KEY (info if missing)",
+        "disk_space via getDiskUsage('/') — critical >90%, warning >80%",
+        "memory via os.freemem()/totalmem() — critical >95%",
+        "process_count via /proc readdir (Linux only, cached 60s) — warning >2000"
+      ]
+    },
+    {
+      "id": "UC9",
+      "name": "Resolve Loop Script Path",
+      "actor": "Operating System",
+      "module": "lifecycle.js",
+      "entry_point": "getLoopScript()",
+      "description": "Priority: EVOLVER_LOOP_SCRIPT env var → skills/feishu-evolver-wrapper/index.js if exists → repo root index.js."
+    },
+    {
+      "id": "UC10",
+      "name": "Send Wake Trigger",
+      "actor": "Wrapper / External Caller",
+      "module": "trigger.js",
+      "entry_point": "send()",
+      "description": "Writes 'WAKE' string to memory/evolver_wake.signal file to immediately wake a polling wrapper.",
+      "postcondition": "Signal file exists; wrapper will detect and act"
+    },
+    {
+      "id": "UC11",
+      "name": "Check Trigger Pending",
+      "actor": "Wrapper / External Caller",
+      "module": "trigger.js",
+      "entry_point": "isPending()",
+      "description": "Returns true if the wake signal file exists. Used by wrapper to poll for pending triggers."
+    },
+    {
+      "id": "UC12",
+      "name": "Clear Wake Trigger",
+      "actor": "Wrapper / External Caller",
+      "module": "trigger.js",
+      "entry_point": "clear()",
+      "description": "Removes the wake signal file after it has been consumed."
+    }
+  ],
+
+  "module_exports": {
+    "ops/index.js": ["lifecycle", "skillsMonitor", "cleanup", "trigger", "commentary", "selfRepair"],
+    "lifecycle.js": ["start", "stop", "restart", "status", "tailLog", "checkHealth", "getRunningPids"],
+    "health_check.js": ["runHealthCheck"],
+    "trigger.js": ["send", "clear", "isPending"]
+  },
+
+  "key_relationships": [
+    "lifecycle.js depends_on ../gep/paths (getRepoRoot, getWorkspaceRoot, getEvolverLogPath)",
+    "lifecycle.js depends_on ../config (MAX_SILENCE_MS)",
+    "trigger.js depends_on ../gep/paths (getWorkspaceRoot)",
+    "ops/index.js aggregates lifecycle, trigger, skillsMonitor, cleanup, commentary, selfRepair",
+    "checkHealth (lifecycle) extends to restart if unhealthy (CLI 'check' command)",
+    "start (lifecycle) uses getLoopScript for dynamic script resolution",
+    "stop (lifecycle) escalates SIGTERM → SIGKILL with polling"
+  ],
+
+  "important_notes": [
+    "MAX_SILENCE_MS from config controls stagnation detection threshold in checkHealth()",
+    "PID file: memory/evolver_loop.pid; lock file: <repoRoot>/evolver.pid — both cleaned on stop",
+    "Wake signal file: memory/evolver_wake.signal — written by trigger.send(), polled by wrapper",
+    "health_check.js is standalone (no lifecycle dependency); can be called independently",
+    "Process count check (/proc) is Linux-only and cached for 60 seconds to reduce overhead",
+    "FEISHU_APP_ID/SECRET missing is downgraded to 'warning' (not critical) to prevent restart loops",
+    "start() augments PATH with ~/.npm-global/bin for the spawned child environment"
+  ],
+
+  "source_files_analyzed": [
+    "src/ops/lifecycle.js",
+    "src/ops/health_check.js",
+    "src/ops/trigger.js",
+    "src/ops/index.js"
+  ]
+}

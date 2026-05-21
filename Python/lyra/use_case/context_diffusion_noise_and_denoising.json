@@ -1,0 +1,169 @@
+{
+  "scope": "diffusion_noise_and_denoising",
+  "title": "Diffusion Noise Scheduling & Denoising",
+  "diagram_type": "use_case",
+  "actors": [
+    "TrainingLoop",
+    "InferencePipeline",
+    "ContextParallelWorker"
+  ],
+  "key_classes": [
+    "MultiviewDiffusionModel (extends DiffusionModel)",
+    "MultiviewExtendDiffusionModel (extends ExtendDiffusionModel)",
+    "DiffusionMultiviewV2WModel (extends DiffusionV2WModel)",
+    "FSDPDiffusionModel (extends MultiviewDiffusionModel, via @diffusion_fsdp_class_decorator)",
+    "FSDPExtendDiffusionModel (extends MultiviewExtendDiffusionModel, via @diffusion_fsdp_class_decorator)"
+  ],
+  "use_cases": [
+    {
+      "name": "Encode Multiview Video to Latent",
+      "actor": "TrainingLoop / InferencePipeline",
+      "description": "Rearranges B C (V T) H W → (B V) C T H W, encodes via VAE/tokenizer, rescales by sigma_data",
+      "methods": [
+        "MultiviewDiffusionModel.encode(state) → vae.encode() * sigma_data",
+        "MultiviewExtendDiffusionModel.encode(state) → vae.encode() * sigma_data",
+        "DiffusionMultiviewV2WModel.encode(state) → tokenizer.encode() * sigma_data"
+      ]
+    },
+    {
+      "name": "Decode Latent to Multiview Video",
+      "actor": "InferencePipeline",
+      "description": "Inverse of encode: rearrange, decode via VAE/tokenizer, rescale by 1/sigma_data",
+      "methods": [
+        "MultiviewDiffusionModel.decode(latent) → vae.decode(latent / sigma_data)",
+        "MultiviewExtendDiffusionModel.decode(latent) → vae.decode(latent / sigma_data)",
+        "DiffusionMultiviewV2WModel.decode(latent) → tokenizer.decode(latent / sigma_data)"
+      ]
+    },
+    {
+      "name": "Compute Training Loss with Epsilon & Sigma",
+      "actor": "TrainingLoop",
+      "description": "Applies context parallel (CP) splitting to x0/epsilon across views, delegates to base class EDM loss",
+      "methods": [
+        "MultiviewDiffusionModel.compute_loss_with_epsilon_and_sigma(data_batch, x0_from_data_batch, x0, condition, epsilon, sigma)",
+        "MultiviewExtendDiffusionModel.compute_loss_with_epsilon_and_sigma(...)",
+        "→ CP enabled: rearrange (B V) + split_inputs_cp(seq_dim=2)",
+        "→ super(DiffusionModel).compute_loss_with_epsilon_and_sigma(...) → returns (output_batch, kendall_loss, pred_mse, edm_loss)",
+        "→ CP world_size > 1: kendall_loss *= cp_world_size if loss_reduce == 'sum'"
+      ]
+    },
+    {
+      "name": "Augment Conditional Latent Frames with Noise",
+      "actor": "TrainingLoop / InferencePipeline",
+      "description": "Adds noise at augment_sigma to condition frames, composes input: indicator * augmented_latent + (1-indicator) * noise_x",
+      "methods": [
+        "MultiviewExtendDiffusionModel.denoise() → augment_conditional_latent_frames(condition, cfg, condition_latent, sigma_inference, sigma)",
+        "DiffusionMultiviewV2WModel._augment_noise_with_latent(xt, sigma, condition, condition_augment_sigma, seed)",
+        "  → augment_latent = latent + noise * augment_sigma",
+        "  → scheduler.precondition_inputs(augment_latent, augment_sigma)",
+        "  → new_xt = indicator * augment_latent_unscaled + (1 - indicator) * xt"
+      ]
+    },
+    {
+      "name": "Set Condition Video Indicator (Noise Region Mask)",
+      "actor": "TrainingLoop / InferencePipeline",
+      "description": "Creates binary indicator tensor for which frames are condition vs generation regions",
+      "methods": [
+        "MultiviewExtendDiffusionModel.add_condition_video_indicator_and_video_input_mask(latent_state, condition, num_condition_t)",
+        "DiffusionMultiviewV2WModel.add_condition_video_indicator_and_video_input_mask(latent_state, condition, num_condition_t)",
+        "  Training: condition_location='first_random_n' → randint(0, max_n) frames set to 1",
+        "  Inference: condition_location='first_n' → first num_condition_t frames set to 1",
+        "  Sets condition.gt_latent, condition.condition_video_indicator, condition.condition_video_input_mask"
+      ]
+    },
+    {
+      "name": "Denoise Noisy Input (Epsilon Prediction)",
+      "actor": "InferencePipeline / TrainingLoop",
+      "description": "Core denoising: composites condition region with augmented latent, calls net for epsilon prediction, returns VideoDenoisePrediction",
+      "methods": [
+        "MultiviewExtendDiffusionModel.denoise(noise_x, sigma, condition, condition_video_augment_sigma_in_inference=0.001)",
+        "  → IMAGE path: super(DiffusionModel).denoise(noise_x, sigma, condition)",
+        "  → VIDEO path: augment_conditional_latent_frames() → compose new_noise_xt = indicator*augment + (1-indicator)*noise_x",
+        "  → super(DiffusionModel).denoise(new_noise_xt, sigma, condition) → net forward pass",
+        "  → x0_pred_replaced = indicator * gt_latent + (1-indicator) * denoise_pred.x0",
+        "  → returns VideoDenoisePrediction(x0, eps=batch_mul(noise_x - x0_pred, 1/sigma), logvar, net_in, net_x0_pred, xt, x0_pred_replaced)"
+      ]
+    },
+    {
+      "name": "Classifier-Free Guidance Denoising Step",
+      "actor": "InferencePipeline",
+      "description": "Applies CFG: raw_x0 = cond_x0 + guidance * (cond_x0 - uncond_x0), optionally dual-guidance with trajectory",
+      "methods": [
+        "MultiviewDiffusionModel.get_x0_fn_from_batch() → x0_fn(noise_x, sigma)",
+        "  → conditioner.get_condition_uncondition(data_batch)",
+        "  → cond_x0 = self.denoise(noise_x, sigma, condition).x0",
+        "  → uncond_x0 = self.denoise(noise_x, sigma, uncondition).x0",
+        "  → raw_x0 = cond_x0 + guidance * (cond_x0 - uncond_x0)",
+        "MultiviewExtendDiffusionModel.get_x0_fn_from_batch_with_condition_latent()",
+        "  → uses .x0_pred_replaced instead of .x0",
+        "DiffusionMultiviewV2WModel (in generate loop):",
+        "  → net_output = net_output_cond + guidance * (net_output_cond - net_output_uncond)",
+        "  → new_output = indicator * latent_unscaled + (1 - indicator) * net_output"
+      ]
+    },
+    {
+      "name": "Iterative Denoising Sampling Loop (Scheduler-Based)",
+      "actor": "InferencePipeline",
+      "description": "DiffusionMultiviewV2WModel uses scheduler.timesteps loop; others use sampler callable",
+      "methods": [
+        "DiffusionMultiviewV2WModel.generate_samples_from_batch()",
+        "  → _get_conditions(data_batch, ..., condition_latent, num_condition_t, add_input_frames_guidance)",
+        "  → scheduler.set_timesteps(num_steps)",
+        "  → xt = randn(...) * scheduler.init_noise_sigma",
+        "  → for t in scheduler.timesteps:",
+        "       sigma = scheduler.sigmas[step_index]",
+        "       _augment_noise_with_latent(xt, sigma, condition, condition_augment_sigma)",
+        "       new_xt_scaled = scheduler.scale_model_input(new_xt, t)",
+        "       net_output = net(x=new_xt_scaled, timesteps=t, **condition.to_dict()) [CFG applied]",
+        "       new_output = indicator * latent_unscaled + (1-indicator) * net_output",
+        "       xt = scheduler.step(new_output, t, new_xt).prev_sample"
+      ]
+    },
+    {
+      "name": "SDE Sampler-Based Generation (EDM-style)",
+      "actor": "InferencePipeline",
+      "description": "MultiviewDiffusionModel & MultiviewExtendDiffusionModel use SDE sampler with sigma_max initialization",
+      "methods": [
+        "MultiviewDiffusionModel.generate_samples_from_batch()",
+        "  → x_sigma_max = rand(...) * sde.sigma_max",
+        "  → sampler(x0_fn, x_sigma_max, num_steps=35, sigma_max=sde.sigma_max, solver_option='2ab')",
+        "MultiviewExtendDiffusionModel.generate_samples_from_batch()",
+        "  → x_sigma_max = randn(...) * sde.sigma_max",
+        "  → sampler(x0_fn, x_sigma_max, num_steps=35, sigma_max=sde.sigma_max)"
+      ]
+    },
+    {
+      "name": "Context Parallel Distribution of Noisy Tensors",
+      "actor": "ContextParallelWorker",
+      "description": "When CP world_size > 1, x0/epsilon/xt are split across context parallel group along temporal dimension",
+      "methods": [
+        "rearrange: B C (V T) H W → (B V) C T H W",
+        "split_inputs_cp(x, seq_dim=2, cp_group)",
+        "rearrange: (B V) C T H W → B C (V T) H W",
+        "After sampling: cat_outputs_cp(samples, seq_dim=2, cp_group)"
+      ]
+    }
+  ],
+  "key_relationships": [
+    "MultiviewDiffusionModel extends DiffusionModel",
+    "MultiviewExtendDiffusionModel extends ExtendDiffusionModel (which extends DiffusionModel)",
+    "DiffusionMultiviewV2WModel extends DiffusionV2WModel",
+    "FSDPDiffusionModel extends MultiviewDiffusionModel (FSDP decorator)",
+    "FSDPExtendDiffusionModel extends MultiviewExtendDiffusionModel (FSDP decorator)",
+    "All three models compose vae/tokenizer for encode/decode",
+    "All three models compose net (DiT network) for epsilon prediction",
+    "MultiviewExtendDiffusionModel & DiffusionMultiviewV2WModel compose VideoExtendCondition with gt_latent + condition_video_indicator",
+    "DiffusionMultiviewV2WModel uses scheduler (DDPM-style) vs sde.sampler (EDM-style) for the other two"
+  ],
+  "sigma_scheduling_notes": {
+    "EDM_models": "sigma_max from sde.sigma_max; sampler uses solver_option='2ab' (multistep); noise init: x = rand() * sigma_max",
+    "V2W_model": "scheduler.init_noise_sigma for init; scheduler.sigmas[step_index] per step; scheduler.scale_model_input() & scheduler.precondition_inputs()",
+    "condition_augmentation": "condition frames augmented with small sigma (default=0.001 in training, configurable in inference); if augment_sigma >= generation sigma, indicator zeroed out"
+  },
+  "important_notes": "All models rearrange multiview tensors B C (V T) H W ↔ (B V) C T H W for per-view VAE/tokenizer ops and CP splitting. MultiviewExtendDiffusionModel supports both 'first_n' (inference) and 'first_random_n' (training) condition region selection. DiffusionMultiviewV2WModel is inference-only (asserts num_condition_t != None, no random training mode).",
+  "source_files_analyzed": [
+    "Lyra-1/cosmos_predict1/diffusion/training/models/model_multiview.py",
+    "Lyra-1/cosmos_predict1/diffusion/training/models/extend_model_multiview.py",
+    "Lyra-1/cosmos_predict1/diffusion/model/model_v2w_multiview.py"
+  ]
+}

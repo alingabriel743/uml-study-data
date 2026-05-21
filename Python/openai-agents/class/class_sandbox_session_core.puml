@@ -1,0 +1,383 @@
+@startuml class_sandbox_session_core
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #F9A825
+}
+
+title Sandbox – Session Core
+
+' ─────────────────────────────────────────────
+'  External / referenced types (stubs)
+' ─────────────────────────────────────────────
+package "External References" <<Frame>> {
+    abstract class BaseSandboxClient {
+        +{abstract} create(): SandboxSession
+        +{abstract} delete(session): SandboxSession
+        +{abstract} resume(state): SandboxSession
+    }
+
+    abstract class BaseSandboxClientOptions {
+        +type: str
+    }
+
+    class Instrumentation <<external>> {
+    }
+
+    class Dependencies <<external>> {
+    }
+
+    class SnapshotBase <<external>> {
+    }
+
+    class Manifest <<external>> {
+    }
+}
+
+' ─────────────────────────────────────────────
+'  Session package
+' ─────────────────────────────────────────────
+package "agents.sandbox.session" {
+
+    abstract class BaseSandboxSession {
+        ' ── State ──
+        +state: SandboxSessionState
+        -_dependencies: Dependencies | None
+        -_pre_stop_hooks: list[Callable] | None
+        -_start_workspace_state_preserved: bool
+        -_start_system_state_preserved: bool
+        -_runtime_helpers_installed: set[Path] | None
+        ' ── Lifecycle (Template Method) ──
+        +async start(): None
+        +async stop(): None
+        +async shutdown(): None
+        +async aclose(): None
+        ' ── Hook points (overridden by subclasses) ──
+        #async _ensure_backend_started(): None
+        #async _prepare_backend_workspace(): None
+        #async _after_start(): None
+        #async _before_stop(): None
+        #async _shutdown_backend(): None
+        ' ── File system API ──
+        +async ls(path): list[FileEntry]
+        +async rm(path): None
+        +async mkdir(path): None
+        ' ── Execution API ──
+        +async exec(*command, timeout, shell, user): ExecResult
+        +{abstract} async _exec_internal(*command, timeout): ExecResult
+        ' ── I/O API ──
+        +{abstract} async read(path): IOBase
+        +{abstract} async write(path, data): None
+        ' ── Snapshot API ──
+        +{abstract} async persist_workspace(): IOBase
+        +{abstract} async hydrate_workspace(data): None
+        +async _start_workspace(): None
+        +async _persist_snapshot(): None
+        ' ── PTY API ──
+        +async pty_exec_start(*command): PtyExecUpdate
+        +async pty_write_stdin(session_id, chars): PtyExecUpdate
+        +async pty_terminate_all(): None
+        +async running(): bool
+        ' ── Capabilities ──
+        +supports_pty(): bool
+        +supports_docker_volume_mounts(): bool
+        +normalize_path(path): Path
+        ' ── Manifest ──
+        +async apply_manifest(only_ephemeral): MaterializationResult
+        +async provision_manifest_accounts(): None
+        ' ── Dependencies / hooks ──
+        +set_dependencies(dependencies): None
+        +register_pre_stop_hook(hook): None
+        +async run_pre_stop_hooks(): None
+        +async resolve_exposed_port(port): ExposedPortEndpoint
+    }
+
+    class SandboxSession {
+        ' ── Decorator fields ──
+        -_inner: BaseSandboxSession
+        -_instrumentation: Instrumentation
+        -_seq: int
+        ' ── Instrumented lifecycle ──
+        +async start(): None
+        +async stop(): None
+        +async shutdown(): None
+        ' ── Instrumented operations ──
+        +async exec(*command, timeout, shell, user): ExecResult
+        +async read(path, user): IOBase
+        +async write(path, data, user): None
+        +async running(): bool
+        +async persist_workspace(): IOBase
+        +async hydrate_workspace(data): None
+        +async resolve_exposed_port(port): ExposedPortEndpoint
+        ' ── Passthrough (not instrumented) ──
+        +async ls(path, user): list[FileEntry]
+        +async rm(path, recursive, user): None
+        +async mkdir(path, parents, user): None
+        +async pty_exec_start(*command): PtyExecUpdate
+        +async pty_write_stdin(session_id, chars): PtyExecUpdate
+        +async pty_terminate_all(): None
+        ' ── Proxied properties ──
+        +{property} state: SandboxSessionState
+        +{property} dependencies: Dependencies
+        +normalize_path(path): Path
+        +supports_pty(): bool
+        ' ── Internal ──
+        -async _annotate(op, start_data, run, finish_data, ok, outputs): T
+        -async _emit_start_event(...): None
+        -async _emit_finish_event(...): None
+        -_next_seq(): int
+    }
+
+    class SandboxSessionState <<pydantic.BaseModel>> {
+        ' ── Discriminator ──
+        +type: str
+        ' ── Identity ──
+        +session_id: UUID
+        ' ── Content ──
+        +snapshot: SnapshotBase
+        +manifest: Manifest
+        +exposed_ports: tuple[int, ...]
+        ' ── Fingerprint ──
+        +snapshot_fingerprint: str | None
+        +snapshot_fingerprint_version: str | None
+        +workspace_root_ready: bool
+        ' ── Registry ──
+        -{static} _subclass_registry: dict[str, SessionStateClass]
+        ' ── Methods ──
+        +{classmethod} parse(payload): SandboxSessionState
+        +{classmethod} __pydantic_init_subclass__(**kwargs): None
+    }
+
+}
+
+' ─────────────────────────────────────────────
+'  Docker backend package
+' ─────────────────────────────────────────────
+package "agents.sandbox.sandboxes.docker" {
+
+    class DockerSandboxSessionState <<pydantic.BaseModel>> {
+        +type: Literal['docker'] = 'docker'
+        +image: str
+        +container_id: str
+    }
+
+    class DockerSandboxSession {
+        ' ── Backend handles ──
+        -_docker_client: DockerSDKClient
+        -_container: Container
+        +state: DockerSandboxSessionState
+        ' ── PTY state ──
+        -_pty_lock: asyncio.Lock
+        -_pty_processes: dict[int, _DockerPtyProcessEntry]
+        -_reserved_pty_process_ids: set[int]
+        -{static} _ARCHIVE_STAGING_DIR: Path
+        ' ── Factory ──
+        +{classmethod} from_state(state, container, docker_client): DockerSandboxSession
+        ' ── Capabilities ──
+        +supports_pty(): bool
+        +supports_docker_volume_mounts(): bool
+        +{property} container_id: str
+        ' ── Lifecycle hooks ──
+        +async _ensure_backend_started(): None
+        +async _shutdown_backend(): None
+        ' ── Execution ──
+        +async _exec_internal(*command, timeout): ExecResult
+        +async running(): bool
+        ' ── I/O ──
+        +async read(path, user): IOBase
+        +async write(path, data, user): None
+        +async ls(path, user): list[FileEntry]
+        +async rm(path, recursive, user): None
+        +async mkdir(path, parents, user): None
+        ' ── Snapshot ──
+        +async persist_workspace(): IOBase
+        +async hydrate_workspace(data): None
+        ' ── Port ──
+        +async _resolve_exposed_port(port): ExposedPortEndpoint
+        ' ── PTY ──
+        +async pty_exec_start(...): PtyExecUpdate
+        +async pty_write_stdin(...): PtyExecUpdate
+        +async pty_terminate_all(): None
+    }
+
+    class DockerSandboxClientOptions <<pydantic.BaseModel>> {
+        +type: Literal['docker'] = 'docker'
+        +image: str
+        +exposed_ports: tuple[int, ...]
+    }
+
+}
+
+' ─────────────────────────────────────────────
+'  Unix-local backend package
+' ─────────────────────────────────────────────
+package "agents.sandbox.sandboxes.unix_local" {
+
+    class UnixLocalSandboxSessionState <<pydantic.BaseModel>> {
+        +type: Literal['unix_local'] = 'unix_local'
+        +workspace_root_owned: bool = False
+    }
+
+    class UnixLocalSandboxSession {
+        ' ── State ──
+        +state: UnixLocalSandboxSessionState
+        -_running: bool
+        ' ── PTY state ──
+        -_pty_lock: asyncio.Lock
+        -_pty_processes: dict[int, _UnixPtyProcessEntry]
+        -_reserved_pty_process_ids: set[int]
+        ' ── Factory ──
+        +{classmethod} from_state(state): UnixLocalSandboxSession
+        ' ── Capabilities ──
+        +supports_pty(): bool
+        ' ── Lifecycle hooks ──
+        +async _prepare_backend_workspace(): None
+        +async _after_start(): None
+        +async _after_shutdown(): None
+        ' ── Execution ──
+        +async _exec_internal(*command, timeout): ExecResult
+        +async running(): bool
+        ' ── I/O ──
+        +async read(path, user): IOBase
+        +async write(path, data, user): None
+        +async ls(path, user): list[FileEntry]
+        +async rm(path, recursive, user): None
+        +async mkdir(path, parents, user): None
+        ' ── Snapshot ──
+        +async persist_workspace(): IOBase
+        +async hydrate_workspace(data): None
+        ' ── Path policy ──
+        +normalize_path(path): Path
+        ' ── macOS confinement ──
+        -_confined_exec_command(...): list[str]
+        -{static} _darwin_exec_profile(workspace_root, extra_read_paths): str
+        ' ── Manifest ──
+        +async _apply_manifest(only_ephemeral, provision_accounts): MaterializationResult
+        ' ── PTY ──
+        +async pty_exec_start(...): PtyExecUpdate
+        +async pty_write_stdin(...): PtyExecUpdate
+        +async pty_terminate_all(): None
+    }
+
+    class UnixLocalSandboxClient {
+        ' ── Registry ──
+        +{static} backend_id: str = 'unix_local'
+        +{static} supports_default_options: bool = True
+        ' ── Dependencies ──
+        -_instrumentation: Instrumentation
+        -_dependencies: Dependencies | None
+        ' ── Constructor ──
+        +__init__(instrumentation, dependencies): None
+        ' ── Client operations ──
+        +async create(snapshot, manifest, options): SandboxSession
+        +async delete(session): SandboxSession
+        +async resume(state): SandboxSession
+        +deserialize_session_state(payload): SandboxSessionState
+    }
+
+    class UnixLocalSandboxClientOptions <<pydantic.BaseModel>> {
+        +type: Literal['unix_local'] = 'unix_local'
+        +exposed_ports: tuple[int, ...]
+    }
+
+}
+
+' ─────────────────────────────────────────────
+'  Inheritance relationships
+' ─────────────────────────────────────────────
+SandboxSession               --|> BaseSandboxSession          : extends
+DockerSandboxSession         --|> BaseSandboxSession          : extends
+UnixLocalSandboxSession      --|> BaseSandboxSession          : extends
+
+DockerSandboxSessionState    --|> SandboxSessionState         : extends
+UnixLocalSandboxSessionState --|> SandboxSessionState         : extends
+
+UnixLocalSandboxClient       --|> BaseSandboxClient           : extends
+
+DockerSandboxClientOptions   --|> BaseSandboxClientOptions    : extends
+UnixLocalSandboxClientOptions --|> BaseSandboxClientOptions   : extends
+
+' ─────────────────────────────────────────────
+'  Composition / association
+' ─────────────────────────────────────────────
+SandboxSession               *-- BaseSandboxSession          : _inner\n(decorator)
+SandboxSession               o-- Instrumentation             : _instrumentation
+
+BaseSandboxSession           o-- SandboxSessionState         : state
+BaseSandboxSession           o-- Dependencies                : _dependencies
+
+DockerSandboxSession         *-- DockerSandboxSessionState   : state
+
+UnixLocalSandboxSession      *-- UnixLocalSandboxSessionState : state
+
+SandboxSessionState          o-- SnapshotBase                : snapshot
+SandboxSessionState          o-- Manifest                    : manifest
+
+UnixLocalSandboxClient       ..> SandboxSession              : creates / returns
+UnixLocalSandboxClient       ..> UnixLocalSandboxClientOptions : uses
+
+' ─────────────────────────────────────────────
+'  Notes
+' ─────────────────────────────────────────────
+note top of BaseSandboxSession
+  **Template Method pattern**
+  start() orchestrates: _ensure_backend_started →
+  _prepare_backend_workspace → _ensure_runtime_helpers →
+  _start_workspace → _after_start.
+  Subclasses override individual hook methods.
+  stop() persists snapshot only;
+  shutdown() tears down the backend.
+  aclose() = pre_stop_hooks → stop → shutdown.
+end note
+
+note right of SandboxSession
+  **Decorator / Instrumentation wrapper**
+  Every operation is wrapped with _annotate()
+  which emits SandboxSession{Start,Finish}Event
+  audit events and optional SDK trace spans.
+  Callers always receive SandboxSession —
+  _inner holds the real backend session.
+end note
+
+note bottom of SandboxSessionState
+  **Discriminated-union registry**
+  parse() dispatches to the correct registered
+  subclass using the 'type' field.
+  Every subclass auto-registers itself via
+  __pydantic_init_subclass__ with its
+  Literal 'type' default.
+end note
+
+note bottom of UnixLocalSandboxSession
+  **macOS confinement**: exec commands are
+  wrapped with sandbox-exec using an SBPL
+  profile that denies broad host filesystem reads.
+  Refuses manifest users/groups to avoid
+  affecting the host OS.
+end note
+
+note bottom of DockerSandboxSession
+  **Docker exec backend**
+  Workspace persistence = copy_archive (tar stream).
+  Reconnects to existing container on resume.
+  Supports PTY sessions and volume mounts.
+  Both backends track PTY processes in
+  _pty_processes dict with LRU-style pruning.
+end note
+
+@enduml

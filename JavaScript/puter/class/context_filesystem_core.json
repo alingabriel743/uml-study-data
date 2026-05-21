@@ -1,0 +1,197 @@
+{
+  "scope": "filesystem_core",
+  "title": "Filesystem Core Services",
+  "diagram_type": "class",
+  "description": "PuterFS module, mountpoint management, locking, resource tracking, and size accounting",
+
+  "classes": [
+    {
+      "name": "PuterFSModule",
+      "extends": "AdvancedBase",
+      "package": "@heyputer/putility",
+      "file": "modules/puterfs/PuterFSModule.js",
+      "methods": [
+        "async install(context): void"
+      ],
+      "responsibilities": [
+        "Registers ResourceService, SizeService, MountpointService via services.registerService()",
+        "Creates and registers a RuntimeModule named 'fs' exposing capabilities, selectors, FSNodeContext, PuterPath, lock modes, resource constants, UploadProgressTracker"
+      ]
+    },
+    {
+      "name": "BaseService",
+      "extends": "concepts.Service",
+      "file": "services/BaseService.js",
+      "key_fields": ["services", "config", "global_config", "context", "service_name", "args"],
+      "methods": [
+        "constructor(service_resources)",
+        "async run_as_early_as_possible()",
+        "_construct()",
+        "_init()"
+      ],
+      "note": "Base for all services; provides lifecycle hooks _construct/_init, logging, error reporting"
+    },
+    {
+      "name": "MountpointService",
+      "extends": "BaseService",
+      "file": "modules/puterfs/MountpointService.js",
+      "registered_as": "mountpoint",
+      "private_fields": [
+        "#storage: { [provider: string]: StorageBackend }",
+        "#mounters: { [name: string]: FilesystemType }",
+        "#mountpoints: { [path: string]: { provider: Provider } }"
+      ],
+      "methods": [
+        "register_mounter(name, mounter): void",
+        "async '__on_boot.consolidation'(): void",
+        "async get_provider(selector): Provider",
+        "set_storage(provider, storage): void",
+        "get_storage(provider): StorageBackend"
+      ],
+      "boot_logic": [
+        "Emits 'create.filesystem-types' event to allow external registration of filesystem types",
+        "Reads config.mountpoints (default: {'/':{mounter:'puterfs'}})",
+        "Calls mounter.mount({path, options}) for each configured mountpoint",
+        "Emits 'filesystem.ready' with list of mounted paths"
+      ],
+      "get_provider_logic": [
+        "Single mountpoint fast-path: returns only provider directly",
+        "RootNodeSelector → returns '/' provider",
+        "NodeUIDSelector → iterates providers, calls provider.quick_check({selector})",
+        "NodeChildSelector → delegates to get_provider(selector.path) or get_provider(selector.parent)",
+        "Path-based → longest-prefix match across #mountpoints keys",
+        "Fallback → '/' provider"
+      ]
+    },
+    {
+      "name": "FSLockService",
+      "extends": "BaseService",
+      "file": "services/fs/FSLockService.js",
+      "registered_as": "NOT registered by PuterFSModule (registered externally)",
+      "static_fields": ["LOG_DEBUG: boolean = true"],
+      "instance_fields": ["locks: { [path: string]: RWLock }"],
+      "constants": ["MODE_READ: Symbol", "MODE_WRITE: Symbol"],
+      "methods": [
+        "async _construct(): void — initializes this.locks = {}",
+        "async _init(): void",
+        "async lock_child(path, name, mode): Promise — delegates to lock_path(path/name, mode)",
+        "async lock_path(path, mode): Promise — creates RWLock if absent, calls rlock() or wlock()"
+      ],
+      "dependencies": ["RWLock (util/lockutil)"]
+    },
+    {
+      "name": "SizeService",
+      "extends": "BaseService",
+      "file": "modules/puterfs/SizeService.js",
+      "registered_as": "sizeService",
+      "instance_fields": ["usages: { [user_id]: number }", "db: DatabaseWriteHandle"],
+      "methods": [
+        "_construct(): void — initializes this.usages = {}",
+        "_init(): void — gets DB_WRITE handle via services.get('database').get(DB_WRITE, 'filesystem')",
+        "async get_usage(user_id): number — SELECT SUM(size) FROM fsentries WHERE user_id=?",
+        "async change_usage(user_id, delta): void — get_usage + delta",
+        "async add_node_size(fs, node, user, factor=1): void — computes size then calls change_usage",
+        "async get_storage_capacity(user_or_id, {exclude_transient}): number",
+        "async add_storage(user_or_id, amount_in_bytes, reason, {field_a, field_b}): void"
+      ],
+      "add_storage_logic": [
+        "Adapts user_or_id via UserParameter.adapt()",
+        "Gets current capacity with exclude_transient:true",
+        "Writes audit row to storage_audit table",
+        "Updates user.free_storage in DB",
+        "Calls invalidate_cached_user_by_id(user.id)"
+      ],
+      "dependencies": ["DB_WRITE const", "get_dir_size, id2path, get_user, invalidate_cached_user_by_id (helpers)"]
+    },
+    {
+      "name": "ResourceService",
+      "extends": "BaseService",
+      "file": "modules/puterfs/ResourceService.js",
+      "registered_as": "resourceService",
+      "instance_fields": [
+        "uidToEntry: { [uid]: ResourceEntry }",
+        "uidToPath: { [uid]: string }",
+        "pathToEntry: { [path]: ResourceEntry }"
+      ],
+      "constants": [
+        "RESOURCE_STATUS_PENDING_CREATE: {}",
+        "RESOURCE_STATUS_PENDING_UPDATE: {}",
+        "RS_DIRECTORY_PENDING_CHILD_INSERT: {}"
+      ],
+      "methods": [
+        "register(entry): ResourceEntry — stores entry by uid/path, attaches freePromise",
+        "free(uid): void — deletes entry, resolves freePromise via entry.free()",
+        "async waitForResourceByPath(path): void",
+        "async waitForResourceByUID(uid): void",
+        "async waitForResource(selector): void — dispatches by selector type (NodePathSelector, NodeUIDSelector, NodeInternalIDSelector, NodeChildSelector)",
+        "getResourceInfo(uid): ResourceEntry|undefined"
+      ],
+      "note": "Simple intra-server write consistency: callers wait on freePromise before reading a resource being written"
+    },
+    {
+      "name": "UserParameter",
+      "file": "modules/puterfs/SizeService.js",
+      "type": "utility class (not a service)",
+      "methods": [
+        "static async adapt(value): UserObject — if object return as-is; if number query by id; if string query by username"
+      ]
+    },
+    {
+      "name": "RWLock",
+      "file": "util/lockutil.js",
+      "type": "external utility",
+      "methods": ["rlock(): Promise", "wlock(): Promise", "on_empty_: callback"]
+    },
+    {
+      "name": "RuntimeModule",
+      "file": "extension/RuntimeModule.js",
+      "type": "external utility",
+      "methods": ["constructor({name})", "register to runtime-modules"]
+    }
+  ],
+
+  "relationships": [
+    "PuterFSModule extends AdvancedBase",
+    "MountpointService extends BaseService",
+    "FSLockService extends BaseService",
+    "SizeService extends BaseService",
+    "ResourceService extends BaseService",
+    "PuterFSModule creates_and_registers ResourceService (services.registerService('resourceService'))",
+    "PuterFSModule creates_and_registers SizeService (services.registerService('sizeService'))",
+    "PuterFSModule creates_and_registers MountpointService (services.registerService('mountpoint'))",
+    "PuterFSModule uses MODE_READ, MODE_WRITE from FSLockService (imported constants)",
+    "PuterFSModule uses RESOURCE_STATUS_PENDING_CREATE from ResourceService",
+    "PuterFSModule creates RuntimeModule and registers fs exports",
+    "FSLockService depends_on RWLock (composition via locks map)",
+    "SizeService depends_on UserParameter (internal utility)",
+    "SizeService depends_on database service (DB_WRITE handle)",
+    "MountpointService depends_on event service (emit 'create.filesystem-types', 'filesystem.ready')",
+    "MountpointService depends_on Mounter.mount() interface (duck-typed filesystem providers)",
+    "ResourceService depends_on selector types: NodePathSelector, NodeUIDSelector, NodeInternalIDSelector, NodeChildSelector"
+  ],
+
+  "key_interfaces": {
+    "Mounter": "{ mount({path, options}): Promise<Provider> }",
+    "Provider": "{ quick_check({selector}): Promise<boolean> }",
+    "ResourceEntry": "{ uid, path?, status, freePromise, free(), onFree() }"
+  },
+
+  "important_notes": [
+    "FSLockService uses Symbol-based lock modes (MODE_READ, MODE_WRITE) — not strings",
+    "MountpointService mounts filesystems during 'boot.consolidation' phase; emits 'filesystem.ready'",
+    "SizeService caches user usages in-memory (this.usages) but reads DB on each get_usage call",
+    "ResourceService is intra-server only — not distributed locking",
+    "RWLock auto-deletes from locks map via on_empty_ callback when no active locks remain",
+    "MountpointService default mount: '/' → puterfs (configurable via config.mountpoints)",
+    "add_node_size supports factor param (e.g. -1 to subtract size on delete)"
+  ],
+
+  "source_files_analyzed": [
+    "src/backend/src/modules/puterfs/PuterFSModule.js",
+    "src/backend/src/modules/puterfs/MountpointService.js",
+    "src/backend/src/services/fs/FSLockService.js",
+    "src/backend/src/modules/puterfs/SizeService.js",
+    "src/backend/src/modules/puterfs/ResourceService.js",
+    "src/backend/src/services/BaseService.js (partial)"
+  ]
+}

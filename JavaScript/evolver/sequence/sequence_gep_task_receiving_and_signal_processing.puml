@@ -1,0 +1,135 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceArrowColor #495057
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceGroupBorderColor #6C757D
+skinparam sequenceGroupBackgroundColor #E9ECEF22
+skinparam noteBackgroundColor #FFF9C4
+skinparam noteBorderColor #F0C040
+skinparam activationBarColor #CED4DA
+skinparam activationBarBorderColor #495057
+
+title GEP Task Receiving and Signal Processing
+
+participant "EvolutionLoop" as loop
+participant "taskReceiver" as tr
+participant "a2aProtocol" as a2a
+participant "Hub\n(A2A_HUB_URL)" as hub
+participant "signals" as sig
+
+== Task Fetching ==
+
+loop -> tr : fetchTasks(opts?)
+activate tr
+
+tr -> a2a : getNodeId()
+activate a2a
+a2a --> tr : nodeId | null
+deactivate a2a
+
+alt nodeId is null
+    tr --> loop : return { tasks: [] }
+end
+
+tr -> a2a : buildHubHeaders()
+activate a2a
+note right of a2a : buildAuthHeaders() delegates\nto a2aProtocol.buildHubHeaders()
+a2a --> tr : authHeaders
+deactivate a2a
+
+tr -> tr : build gep-a2a message\n{ protocol:'gep-a2a', message_type:'fetch',\n  sender_id, payload:{tasks_only,\n  include_tasks, questions?} }
+
+tr -> hub : POST /a2a/fetch\n(JSON msg, authHeaders)\n[AbortController 8s timeout]
+activate hub
+
+alt HTTP success
+    hub --> tr : { payload: { tasks[], questions_created?,\n  relevant_lessons? } }
+else HTTP error / timeout
+    hub --> tr : error → { tasks: [] }
+end
+deactivate hub
+
+tr --> loop : return { tasks, questions_created?,\n  relevant_lessons? }
+deactivate tr
+
+== Signal Parsing (per-task) ==
+
+loop -> tr : parseSignals(task.signals)
+activate tr
+note right of tr : Simple CSV parser:\ncomma-split, trim, lowercase
+tr --> loop : string[]
+deactivate tr
+
+== Multi-Layer Signal Extraction ==
+
+loop -> sig : extractSignals({ recentSessionTranscript,\n  todayLog, memorySnippet,\n  userSnippet, recentEvents })
+activate sig
+
+sig -> sig : build corpus =\njoin(transcript, todayLog,\nmemorySnippet, userSnippet)
+
+sig -> sig : analyzeRecentHistory(recentEvents)\n→ { suppressedSignals:Set,\n    consecutiveRepairCount,\n    emptyCycleCount, ... }
+
+sig -> sig : detect errorHit\n(regex on lower corpus)
+
+sig -> sig : _extractRegex(corpus, lower, errorHit)
+activate sig
+note right of sig : Layer 1 — Deterministic (0ms)\nPatterns: errsig, memory_missing,\nprotocol_drift, recurring_error,\nfeature_request, tool_bypass
+sig --> sig : regexSignals[]
+deactivate sig
+
+sig -> sig : _extractKeywordScore(lower)
+activate sig
+note right of sig : Layer 2 — Weighted scoring (0ms)\nSIGNAL_PROFILES: perf_bottleneck,\ncapability_gap, user_feature_request,\nevolution_stagnation_detected, ...\nFires if totalScore >= threshold
+sig --> sig : scoreSignals[]
+deactivate sig
+
+sig -> sig : _extractLLM(corpus)
+activate sig
+note right of sig : Layer 3 — Rate-limited\n(every LLM_SIGNAL_INTERVAL=5 cycles)\nUses execSync+curl (blocks event loop)
+
+sig -> hub : curl POST /a2a/signal/analyze\n{ corpus_summary (2000ch),\n  signal_types: OPPORTUNITY_SIGNALS,\n  sender_id }\n[execSync, 12s timeout]
+activate hub
+
+alt LLM analysis success
+    hub --> sig : { signals: [] | signal[] }
+else error / timeout
+    hub --> sig : error → []
+end
+deactivate hub
+
+sig --> sig : llmSignals[]
+deactivate sig
+
+sig -> sig : _mergeSignals(regexSignals,\n  scoreSignals, llmSignals)
+activate sig
+note right of sig : Deduplicates via Set;\nlogs per-layer contributions
+sig --> sig : mergedSignals[]
+deactivate sig
+
+sig -> sig : post-process:\n• prioritize actionable signals\n• dedup vs suppressedSignals\n• force innovation on repair/empty loops\n• saturation checks / plateau detection
+
+sig --> loop : return signals[]\n(deduplicated, post-processed)
+deactivate sig
+
+@enduml

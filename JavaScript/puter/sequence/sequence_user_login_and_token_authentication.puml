@@ -1,0 +1,243 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    NoteBackgroundColor #FFF3CD
+    NoteBorderColor #856404
+}
+
+title User Login and Token Authentication Flow
+
+actor "Client" as Client
+participant "LoginRouter\n(POST /login)" as LoginRouter
+participant "requireCaptcha\nMiddleware" as Captcha
+participant "EdgeRateLimitService" as RateLimit
+participant "Database" as DB
+participant "complete_()" as Complete
+participant "AuthService" as AuthService
+participant "SessionService" as SessionService
+participant "TokenService" as TokenService
+participant "Redis" as Redis
+
+' ─────────────────────────────────────────
+' PART 1: LOGIN FLOW
+' ─────────────────────────────────────────
+
+box "Login Flow" #EEF2FF
+    participant LoginRouter
+    participant Captcha
+    participant RateLimit
+end box
+
+Client -> LoginRouter : POST /login\n(username|email, password, captchaToken)
+activate LoginRouter
+
+LoginRouter -> Captcha : validateCaptcha(strictMode: true,\neventType: 'login')
+activate Captcha
+Captcha --> LoginRouter : captcha valid
+deactivate Captcha
+
+LoginRouter -> RateLimit : check('login', true)
+activate RateLimit
+alt Rate limit exceeded
+    RateLimit --> Client : 429 Too Many Requests
+end
+RateLimit --> LoginRouter : within limit
+deactivate RateLimit
+
+LoginRouter -> DB : get_user({ username }) or\nget_user({ email })
+activate DB
+alt User not found
+    DB --> Client : 400 Bad Request
+end
+DB --> LoginRouter : user record
+deactivate DB
+
+LoginRouter -> LoginRouter : bcrypt.compare(password, user.password)
+note right : 400 if password mismatch
+
+alt OTP / MFA Required
+    LoginRouter -> TokenService : sign('otp', { user_uid },\n{ expiresIn: '5m' })
+    activate TokenService
+    TokenService --> LoginRouter : otp_jwt_token
+    deactivate TokenService
+    LoginRouter --> Client : 202 { next_step: 'otp', otp_jwt_token }
+else Normal Login Path
+    LoginRouter -> Complete : complete_(req, res, user)
+    activate Complete
+
+    ' — Create session token —
+    Complete -> AuthService : create_session_token(user, { req })
+    activate AuthService
+
+    AuthService -> AuthService : create_session_(user, meta)\n[extract ip, user_agent, referer, origin]
+
+    AuthService -> SessionService : create_session(user, meta)
+    activate SessionService
+
+    SessionService -> DB : INSERT INTO sessions\n(uuid, user_id, meta, last_activity, created_at)
+    activate DB
+    DB --> SessionService : session row
+    deactivate DB
+
+    SessionService -> Redis : SET session-cache:{uuid}\nJSON(session) EX 300
+    activate Redis
+    Redis --> SessionService : OK
+    deactivate Redis
+
+    SessionService -> Redis : SADD session-cache:user-sessions:{user_id} {uuid}
+    activate Redis
+    Redis --> SessionService : OK
+    deactivate Redis
+
+    SessionService --> AuthService : session { uuid, user_uid, user_id, meta }
+    deactivate SessionService
+
+    AuthService -> TokenService : sign('auth', { type: 'session',\nuuid, user_uid })
+    activate TokenService
+    TokenService --> AuthService : session_token (JWT)
+    deactivate TokenService
+
+    AuthService --> Complete : { session, token: session_token }
+    deactivate AuthService
+
+    ' — Create GUI token —
+    Complete -> AuthService : create_gui_token(user, session)
+    activate AuthService
+    AuthService -> TokenService : sign('auth', { type: 'gui',\nuuid, user_uid })
+    activate TokenService
+    TokenService --> AuthService : gui_token (JWT)
+    deactivate TokenService
+    AuthService --> Complete : gui_token
+    deactivate AuthService
+
+    ' — Respond to client —
+    Complete --> Client : Set-Cookie: session_token\n(httpOnly, secure, sameSite='none')
+    Complete --> Client : 200 { proceed: true,\nnext_step: 'complete',\ntoken: gui_token,\nuser: { username, uuid, email, ... } }
+    deactivate Complete
+end
+
+deactivate LoginRouter
+
+' ─────────────────────────────────────────────
+' PART 2: TOKEN AUTHENTICATION FLOW
+' ─────────────────────────────────────────────
+
+participant "configurable_auth\nMiddleware" as ConfigAuth
+participant "AuthService" as AuthService2
+participant "SessionService" as SessionService2
+participant "TokenService" as TokenService2
+participant "Database" as DB2
+participant "Redis" as Redis2
+participant "Protected\nRoute Handler" as Handler
+
+|||
+== Subsequent Authenticated Request ==
+|||
+
+Client -> ConfigAuth : Request with token\n(cookie | Authorization header\n| body.auth_token | query.auth_token)
+activate ConfigAuth
+
+ConfigAuth -> ConfigAuth : extract token from request\n(body > header > cookie > query > socket)
+
+ConfigAuth -> AuthService2 : authenticate_from_token(token)
+activate AuthService2
+
+AuthService2 -> TokenService2 : verify('auth', token)
+activate TokenService2
+TokenService2 --> AuthService2 : decoded JWT payload { type, uuid, user_uid }
+deactivate TokenService2
+
+alt type = 'session' or 'gui'
+    AuthService2 -> SessionService2 : getSession(decoded.uuid)
+    activate SessionService2
+
+    SessionService2 -> Redis2 : GET session-cache:{uuid}
+    activate Redis2
+
+    alt Cache miss
+        Redis2 --> SessionService2 : null
+        deactivate Redis2
+        SessionService2 -> DB2 : SELECT * FROM sessions\nWHERE uuid = ? (tryHardRead)
+        activate DB2
+        DB2 --> SessionService2 : session row
+        deactivate DB2
+        SessionService2 -> Redis2 : SET session-cache:{uuid} +\nSADD flush-pending-set
+        activate Redis2
+        Redis2 --> SessionService2 : OK
+        deactivate Redis2
+    else Cache hit
+        Redis2 --> SessionService2 : session JSON
+    end
+
+    SessionService2 --> AuthService2 : session (sanitized)
+    deactivate SessionService2
+
+    AuthService2 -> DB2 : get_user({ uuid: decoded.user_uid })
+    activate DB2
+    DB2 --> AuthService2 : user record
+    deactivate DB2
+
+    AuthService2 --> ConfigAuth : Actor(UserActorType {\n  user, session: uuid,\n  hasHttpOnlyCookie: type==='session' })
+
+else type = 'app-under-user'
+    AuthService2 -> AuthService2 : uuid_fpe.decrypt(decoded.session)\n→ session_uuid
+    AuthService2 -> SessionService2 : getSession(session_uuid)
+    activate SessionService2
+    SessionService2 --> AuthService2 : session
+    deactivate SessionService2
+    AuthService2 --> ConfigAuth : Actor(AppUnderUserActorType {\n  user, app, session })
+
+else type = 'access-token'
+    AuthService2 --> ConfigAuth : Actor(AccessTokenActorType {\n  token, authorizer, authorized })
+
+else type = 'actor-site'
+    AuthService2 --> ConfigAuth : Actor(SiteActorType {\n  site, iat })
+
+else No 'type' field → LegacyTokenError
+    note over AuthService2 : Legacy token upgrade path\n(triggered on /whoami)
+    AuthService2 -> TokenService2 : verify('auth', token) → decoded.uuid
+    activate TokenService2
+    TokenService2 --> AuthService2 : legacy payload
+    deactivate TokenService2
+    AuthService2 -> AuthService2 : create_session_token() +\ncreate_gui_token()
+    AuthService2 --> ConfigAuth : { actor, user, token: gui_token, session_token }
+    ConfigAuth --> Client : Set-Cookie: new session_token
+end
+
+deactivate AuthService2
+
+ConfigAuth -> ConfigAuth : context.set('actor', actor)\ncontext.set('user', user)\nreq.actor = actor; req.user = user; req.token = token
+
+ConfigAuth -> Handler : next()
+activate Handler
+Handler --> Client : Protected resource response
+deactivate Handler
+
+deactivate ConfigAuth
+
+@enduml

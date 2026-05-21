@@ -1,0 +1,409 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    GroupBackgroundColor #DEE2E6
+    GroupBorderColor #6C757D
+    DividerBackgroundColor #CED4DA
+    DividerBorderColor #6C757D
+    NoteBackgroundColor #FFF3CD
+    NoteBorderColor #FBBF24
+}
+
+title JDBC Connection Lifecycle Flow
+
+actor Caller as caller
+
+box "SQL Server Layer" #E8F4FD
+    participant "SqlServerConnection" as ssc
+end box
+
+box "JDBC Core Layer" #EDF7ED
+    participant "JdbcConnection" as jdbc
+    participant "StatementCache\n(LIRS, cap=10000)" as cache
+end box
+
+box "Connection Factory" #FDF3E8
+    participant "ConnectionFactory\nDecorator" as cfd
+    participant "ConnectionFactory" as cf
+end box
+
+box "JDBC Driver" #F8F3FD
+    participant "DriverManager" as dm
+    participant "Connection" as conn
+    participant "Statement /\nPreparedStatement" as stmt
+    participant "ResultSet" as rs
+end box
+
+participant "CancellableResultSet" as crs
+
+' =========================================================
+== Instantiation ==
+' =========================================================
+
+caller -> ssc : new SqlServerConnection(\n  config, valueConverters,\n  skippedOperations, useSingleDatabase)
+activate ssc
+
+ssc -> jdbc : super(jdbcConfig,\n  createConnectionFactory(config),\n  '[', ']')
+activate jdbc
+
+jdbc -> cfd : new ConnectionFactoryDecorator(connectionFactory)
+activate cfd
+cfd --> jdbc : decorator instance
+deactivate cfd
+
+note over jdbc
+  Stores: config, factory, initialOps,
+  queryTimeout = config.getQueryTimeout().toSeconds(),
+  conn = null, statementCache initialized
+end note
+
+jdbc --> ssc : JdbcConnection initialized
+deactivate jdbc
+
+ssc -> ssc : buildGetAllChangesForTableQuery(\n  dataQueryMode, skippedOperations)
+note right of ssc
+  Pre-builds CDC SQL template with
+  FUNCTION or DIRECT mode placeholders:
+  #db, #table/#function, captured columns
+end note
+
+ssc --> caller : SqlServerConnection ready
+deactivate ssc
+
+' =========================================================
+== Connection Acquisition ==
+' =========================================================
+
+caller -> ssc : connection(executeOnConnect=true)
+activate ssc
+
+ssc -> jdbc : super.connection(executeOnConnect)
+activate jdbc
+
+jdbc -> jdbc : isConnected()\n[synchronized: conn == null?]
+note right of jdbc : conn == null → not connected
+
+jdbc -> jdbc : establishConnection()
+
+jdbc -> cfd : connect(JdbcConfiguration.adapt(config))
+activate cfd
+
+cfd -> cf : connect(config)\n[checks custom factory class in config]
+activate cf
+
+cf -> dm : getConnection(url, props)\n[url = jdbc:sqlserver://${host}:${port}\n[;databaseName=${db}]]
+activate dm
+
+dm --> conn ** : new Connection
+dm --> cf : Connection
+deactivate dm
+
+cf --> cfd : Connection
+deactivate cf
+
+cfd --> jdbc : Connection\n(conn field set)
+deactivate cfd
+
+alt initialOps configured
+    jdbc -> jdbc : execute(initialOps)
+    note right of jdbc : Runs initial operations on new connection
+end
+
+alt ON_CONNECT_STATEMENTS configured
+    jdbc -> jdbc : execute(parsedStatements[])
+    note right of jdbc : Arbitrary SQL from config run on connect
+end
+
+jdbc --> ssc : Connection (raw)
+deactivate jdbc
+
+ssc -> conn : setAutoCommit(false)
+activate conn
+note right of conn : SqlServerConnection ALWAYS\ndisables autoCommit on new connection
+conn --> ssc
+deactivate conn
+
+ssc --> caller : Connection
+deactivate ssc
+
+' =========================================================
+== Prepared Statement Creation (Internal) ==
+' =========================================================
+
+caller -> jdbc : prepareQueryAndMap(sql,\n  StatementPreparer, ResultSetMapper<T>)
+activate jdbc
+
+jdbc -> cache : computeIfAbsent(sql)
+activate cache
+
+alt Cache MISS
+    cache -> jdbc : createUncachedPreparedStatement(sql)
+    jdbc -> conn : prepareStatement(sql)
+    activate conn
+    conn --> stmt ** : PreparedStatement
+    conn --> jdbc : PreparedStatement
+    deactivate conn
+    jdbc -> stmt : initializeStatement(stmt)\n[setQueryTimeout(queryTimeout)]
+    activate stmt
+    stmt --> jdbc
+    deactivate stmt
+    jdbc --> cache : PreparedStatement (stored)
+else Cache HIT
+    cache --> jdbc : cached PreparedStatement
+end
+cache --> jdbc : PreparedStatement
+deactivate cache
+
+jdbc -> stmt : accept(preparedStatement)\n[StatementPreparer: bind params]
+activate stmt
+stmt --> jdbc
+deactivate stmt
+
+jdbc -> stmt : executeQuery()
+activate stmt
+stmt --> rs ** : ResultSet
+stmt --> jdbc : ResultSet
+deactivate stmt
+
+jdbc -> rs : apply(resultSet) → T\n[ResultSetMapper]
+activate rs
+rs --> jdbc : T
+deactivate rs
+
+jdbc -> rs : close() [try-with-resources]
+activate rs
+rs --> jdbc
+deactivate rs
+
+jdbc --> caller : T (mapped result)
+deactivate jdbc
+
+' =========================================================
+== Plain Query Execution ==
+' =========================================================
+
+caller -> jdbc : query(sql, ResultSetConsumer)
+activate jdbc
+
+jdbc -> jdbc : createStatementFromFactory(\n  Connection::createStatement)
+
+jdbc -> conn : createStatement()
+activate conn
+conn --> stmt ** : Statement
+conn --> jdbc : Statement
+deactivate conn
+
+jdbc -> stmt : executeQuery(sql)
+activate stmt
+stmt --> rs ** : ResultSet
+stmt --> jdbc : ResultSet
+deactivate stmt
+
+jdbc -> rs : accept(resultSet)\n[ResultSetConsumer]
+activate rs
+rs --> jdbc
+deactivate rs
+
+jdbc -> rs : close() [try-with-resources]
+activate rs
+rs --> jdbc
+deactivate rs
+
+jdbc -> stmt : close() [try-with-resources]
+activate stmt
+stmt --> jdbc
+deactivate stmt
+
+jdbc --> caller
+deactivate jdbc
+
+' =========================================================
+== SQL Server CDC Changes Query ==
+' =========================================================
+
+caller -> ssc : getChangesForTable(\n  changeTable, fromLsn, seqval,\n  opFrom, toLsn, maxRows)
+activate ssc
+
+ssc -> ssc : build SQL from\ngetAllChangesForTable template\n[replaces #db, #table/#function,\ncaptured column placeholders]
+
+ssc -> jdbc : connection()
+activate jdbc
+jdbc --> ssc : existing Connection
+deactivate jdbc
+
+ssc -> conn : prepareStatement(query)
+activate conn
+conn --> stmt ** : PreparedStatement
+conn --> ssc : PreparedStatement
+deactivate conn
+
+alt queryFetchSize > 0
+    ssc -> stmt : setFetchSize(queryFetchSize)
+    activate stmt
+    stmt --> ssc
+    deactivate stmt
+end
+
+ssc -> stmt : setBytes/setInt\n[LSN range parameters]
+activate stmt
+stmt --> ssc
+deactivate stmt
+
+ssc -> stmt : executeQuery()
+activate stmt
+stmt --> rs ** : ResultSet (raw)
+stmt --> ssc : ResultSet
+deactivate stmt
+
+ssc --> caller : ResultSet (raw, not wrapped)
+deactivate ssc
+
+' =========================================================
+== CancellableResultSet Usage ==
+' =========================================================
+
+caller -> crs : CancellableResultSet.from(resultSet)\n[static factory — wraps ResultSet]
+activate crs
+note right of crs
+  Decorator pattern over java.sql.ResultSet
+  Purpose: server-side cancel on early close,
+  avoids iterating all rows in large snapshots
+end note
+
+loop iterate rows
+    caller -> crs : next()
+    activate crs
+    crs -> rs : next()
+    activate rs
+    rs --> crs : boolean
+    deactivate rs
+    crs --> caller : boolean
+    deactivate crs
+
+    caller -> crs : getXxx(column)
+    activate crs
+    crs -> rs : getXxx(column)
+    activate rs
+    rs --> crs : value
+    deactivate rs
+    crs --> caller : value
+    deactivate crs
+end
+
+caller -> crs : close()
+activate crs
+
+alt ResultSet open AND not after last row
+    crs -> stmt : cancel()\n[server-side cancel — skips cycling remaining rows]
+    activate stmt
+    stmt --> crs
+    deactivate stmt
+end
+
+crs -> rs : close()
+activate rs
+rs --> crs
+deactivate rs
+
+crs --> caller
+deactivate crs
+
+' =========================================================
+== Transaction Control ==
+' =========================================================
+
+caller -> jdbc : execute(String... sqls)
+activate jdbc
+jdbc -> jdbc : createStatement()
+jdbc -> conn : createStatement()
+activate conn
+conn --> jdbc : Statement
+deactivate conn
+jdbc -> stmt : execute(sql) [for each sql]
+activate stmt
+stmt --> jdbc
+deactivate stmt
+jdbc -> jdbc : commit()
+jdbc -> conn : commit()\n[only if !autoCommit]
+activate conn
+conn --> jdbc
+deactivate conn
+jdbc --> caller
+deactivate jdbc
+
+caller -> jdbc : rollback()
+activate jdbc
+note right of jdbc : synchronized — only if !autoCommit
+jdbc -> conn : rollback()
+activate conn
+conn --> jdbc
+deactivate conn
+jdbc --> caller
+deactivate jdbc
+
+' =========================================================
+== Connection Close ==
+' =========================================================
+
+caller -> jdbc : close()\n[synchronized, AutoCloseable]
+activate jdbc
+
+jdbc -> cache : values().forEach(\n  cleanupPreparedStatement)
+activate cache
+note right of cache : Closes each cached PreparedStatement
+cache --> jdbc
+deactivate cache
+
+jdbc -> cache : clear()
+activate cache
+cache --> jdbc
+deactivate cache
+
+jdbc -> jdbc : doClose()
+
+jdbc -> jdbc : Threads.runWithTimeout(\n  conn.close(), 10s timeout)
+
+alt Close within 10s (success)
+    jdbc -> conn : close()
+    activate conn
+    note right of conn : Connection gracefully closed
+    conn --> jdbc
+    deactivate conn
+else Timeout / interrupted
+    jdbc -> conn : abort(Runnable::run)
+    activate conn
+    note right of conn : Force abort — bypasses graceful shutdown
+    conn --> jdbc
+    deactivate conn
+end
+
+jdbc -> jdbc : conn = null
+
+jdbc --> caller
+deactivate jdbc
+
+@enduml

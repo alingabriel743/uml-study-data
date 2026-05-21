@@ -1,0 +1,134 @@
+{
+  "scope": "mcp_server_reconnect_and_cleanup",
+  "title": "MCP Server Reconnect and Cleanup",
+  "diagram_type": "activity",
+  "source_files_analyzed": [
+    "src/agents/mcp/manager.py",
+    "tests/mcp/test_mcp_server_manager.py",
+    "docs/mcp.md"
+  ],
+
+  "key_actors": ["MCPServerManager", "_ServerWorker", "MCPServer"],
+
+  "activity_flows": [
+    {
+      "name": "reconnect(failed_only)",
+      "entry": "caller invokes manager.reconnect(failed_only=True|False)",
+      "steps": [
+        "DECISION: failed_only == True?",
+        "YES → servers_to_retry = _unique_servers(failed_servers)",
+        "NO  → await cleanup_all() [teardown all servers in reverse order]",
+        "NO  → servers_to_retry = list(_all_servers); reset failed_servers/errors",
+        "servers_to_retry = _servers_to_connect(servers_to_retry)  [skip already-connected]",
+        "DECISION: connect_in_parallel?",
+        "PARALLEL → await _connect_all_parallel(servers_to_retry)  [concurrent tasks]",
+        "SEQUENTIAL → for each server: await _attempt_connect(server)",
+        "FINALLY (always): _refresh_active_servers()",
+        "return _active_servers"
+      ]
+    },
+    {
+      "name": "_refresh_active_servers()",
+      "steps": [
+        "DECISION: drop_failed_servers == True?",
+        "YES → _active_servers = [s for s in _all_servers if s not in _failed_server_set]",
+        "NO  → _active_servers = list(_all_servers)"
+      ]
+    },
+    {
+      "name": "cleanup_all()",
+      "entry": "called by __aexit__ or reconnect(failed_only=False)",
+      "steps": [
+        "for server in reversed(_all_servers):",
+        "  await _cleanup_server(server)",
+        "  CATCH asyncio.CancelledError → if suppress_cancelled_error: log+record; else raise",
+        "  CATCH Exception → log exception, record in errors"
+      ]
+    },
+    {
+      "name": "_cleanup_servers(servers)",
+      "note": "Used during connect_all() error recovery (not full teardown)",
+      "steps": [
+        "for server in reversed(list(servers)):",
+        "  await _cleanup_server(server)",
+        "  CATCH asyncio.CancelledError → suppress or re-raise per flag",
+        "  CATCH Exception → log + record in errors"
+      ]
+    },
+    {
+      "name": "_cleanup_server(server)",
+      "steps": [
+        "DECISION: connect_in_parallel AND server in _workers?",
+        "YES AND worker.is_done → pop worker, discard from _connected_servers, RETURN",
+        "YES AND worker running → await worker.cleanup(); FINALLY: pop worker, discard from _connected_servers",
+        "NO (sequential mode) → await _run_with_timeout(server.cleanup, cleanup_timeout_seconds)",
+        "FINALLY: _connected_servers.discard(server)"
+      ]
+    },
+    {
+      "name": "_attempt_connect(server)",
+      "steps": [
+        "await _run_connect(server)",
+        "SUCCESS → _connected_servers.add(server); if server was failed: _remove_failed_server(); pop from errors",
+        "CATCH asyncio.CancelledError → suppress or re-raise; _record_failure(server, exc, 'connect')",
+        "CATCH Exception → _record_failure(server, exc, 'connect'); if raise_on_error (strict): re-raise",
+        "CATCH BaseException → _record_failure(server, exc, 'connect'); always re-raise"
+      ]
+    },
+    {
+      "name": "_connect_all_parallel(servers)",
+      "steps": [
+        "Create asyncio.Task per server: _attempt_connect(server, raise_on_error=False)",
+        "await asyncio.gather(*tasks, return_exceptions=True)",
+        "if not suppress_cancelled_error: raise first CancelledError found",
+        "raise first non-CancelledError BaseException found",
+        "DECISION: strict AND failed_servers present?",
+        "YES → find first_failure (skip CancelledErrors if suppressing); raise its stored error"
+      ]
+    }
+  ],
+
+  "state_transitions": {
+    "server_states": ["unconnected", "connected (in _connected_servers)", "failed (in _failed_server_set)", "cleaned up"],
+    "active_servers_update": "always via _refresh_active_servers() after connect/reconnect",
+    "failed_tracking": "failed_servers list + _failed_server_set (deduped) + errors dict"
+  },
+
+  "key_conditions_and_branches": [
+    "failed_only: True → retry only failed_servers; False → full cleanup then retry all",
+    "connect_in_parallel: True → worker tasks; False → sequential loop",
+    "drop_failed_servers: True → exclude failures from active_servers; False → include all",
+    "strict: True → raise on first failure (sequential) or after gather (parallel)",
+    "suppress_cancelled_error: True → log+swallow CancelledError; False → propagate",
+    "worker.is_done: if worker task already finished, skip cleanup call"
+  ],
+
+  "timeout_handling": {
+    "mechanism": "_run_with_timeout_in_task(func, timeout_seconds)",
+    "python_313_plus": "asyncio.timeout() context manager",
+    "python_310_minus": "loop.call_later() + task.cancel() manual approach",
+    "default_connect_timeout": "10.0 seconds",
+    "default_cleanup_timeout": "10.0 seconds"
+  },
+
+  "worker_pattern": {
+    "class": "_ServerWorker",
+    "purpose": "Keeps connect/cleanup on same asyncio task (required by AnyIO cancel scopes)",
+    "queue": "asyncio.Queue[_ServerCommand] — actions: 'connect' | 'cleanup'",
+    "lifecycle": "Created on first _get_worker(); destroyed after cleanup command"
+  },
+
+  "error_recovery_in_connect_all": [
+    "If BaseException during sequential connect → _cleanup_servers([connected + failed]); restore previous active_servers; re-raise",
+    "If BaseException during parallel connect → _cleanup_servers(all servers_to_connect); restore previous active_servers; re-raise"
+  ],
+
+  "important_notes": [
+    "reconnect(failed_only=False) calls cleanup_all() first, ensuring proper teardown before retry",
+    "_servers_to_connect() skips already-connected servers — connect_all is idempotent",
+    "cleanup_all iterates reversed(_all_servers) — reverse order teardown",
+    "_cleanup_servers also reverses — consistent LIFO teardown semantics",
+    "active_servers is a property returning a copy of _active_servers list",
+    "Parallel mode uses dedicated _ServerWorker per server to preserve task affinity"
+  ]
+}

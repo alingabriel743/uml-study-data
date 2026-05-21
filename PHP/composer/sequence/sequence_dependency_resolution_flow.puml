@@ -1,0 +1,257 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipant underline
+skinparam sequenceBoxBackgroundColor #E9ECEF
+skinparam sequenceBoxBorderColor #6C757D
+skinparam sequenceLifeLineBorderColor #495057
+skinparam sequenceGroupBorderColor #6C757D
+skinparam sequenceGroupBackgroundColor #F1F3F5
+skinparam noteFontSize 11
+skinparam noteBorderColor #6C757D
+skinparam noteBackgroundColor #FFF9E6
+
+title Dependency Resolution: Pool Building and Solver
+
+participant "Installer" as installer
+participant "Request" as request
+participant "RepositorySet" as reposet
+participant "PoolBuilder" as poolbuilder
+participant "RepositoryInterface" as repo
+participant "EventDispatcher" as evtdisp
+participant "PoolOptimizer" as optimizer
+participant "Pool" as pool
+participant "Solver" as solver
+participant "RuleSetGenerator" as rulegen
+participant "Decisions\n/ RuleWatchGraph" as decisions
+participant "LockTransaction" as locktx
+
+== Phase 1: Build Request ==
+
+installer -> installer: run()\ngc_disable(), detect update/install mode
+activate installer
+
+installer -> installer: createRequest(rootPackage, platformRepo, lockedRepository)
+activate installer
+    installer -> request **: new Request(lockedRepository)
+    installer -> request: fixPackage(rootPackage)
+    installer -> request: fixPackage(platformPackages[])
+deactivate installer
+
+installer -> request: requireName(name, constraint)\n[for each root require / devRequire]
+activate request
+request --> installer: —
+deactivate request
+
+opt Partial Update
+    installer -> request: setUpdateAllowList(updateAllowList, transitiveMode)
+end
+
+== Phase 2: Build Pool ==
+
+installer -> reposet: createPool(request, io, eventDispatcher, poolOptimizer, ...)
+activate reposet
+
+    reposet -> poolbuilder **: new PoolBuilder(acceptableStabilities, stabilityFlags,\nrootAliases, rootReferences, io, eventDispatcher,\npoolOptimizer, temporaryConstraints, ...)
+    reposet -> poolbuilder: setIgnoredTypes(ignoredTypes)
+    reposet -> poolbuilder: setAllowedTypes(allowedTypes)
+
+    reposet -> poolbuilder: buildPool(repositories[], request)
+    activate poolbuilder
+
+        note over poolbuilder
+          Iterate lockedRepository.getPackages():
+          • fixed/locked → request.lockPackage()
+          • skipped (updateAllowList) → skippedLoad[]
+        end note
+
+        poolbuilder -> poolbuilder: populate skippedLoad[] or request.lockPackage()\n[for each locked package]
+
+        poolbuilder -> poolbuilder: loadedPackages[name] = MatchAllConstraint\n+ loadPackage()\n[for each fixed/locked package]
+
+        poolbuilder -> poolbuilder: packagesToLoad[name] = constraint\n[for each request.getRequires()]
+
+        loop while packagesToLoad not empty
+
+            poolbuilder -> poolbuilder: loadPackagesMarkedForLoading(request, repositories)
+            activate poolbuilder
+
+                note over poolbuilder
+                  Chunk packagesToLoad into
+                  batches of 50 (LOAD_BATCH_SIZE)
+                end note
+
+                poolbuilder -> repo: loadPackages(batch, acceptableStabilities,\nstabilityFlags, loadedPerRepo)
+                activate repo
+                repo --> poolbuilder: { namesFound, packages[] }
+                deactivate repo
+
+                loop for each loaded package
+
+                    poolbuilder -> poolbuilder: loadPackage(request, repositories, package, propagateUpdate)
+                    activate poolbuilder
+
+                        note right of poolbuilder
+                          • packages[index] = package
+                          • Update aliasMap if AliasPackage
+                          • Create AliasPackage / CompleteAliasPackage\n    for root aliases
+                        end note
+
+                        poolbuilder -> poolbuilder: markPackageNameForLoading()\n[for each package.getRequires()]
+
+                        opt propagateUpdate && transitiveDeps
+                            poolbuilder -> poolbuilder: unlockPackage() / markPackageNameForLoading()\n[for skipped transitive deps]
+                        end
+
+                    deactivate poolbuilder
+
+                end
+
+            deactivate poolbuilder
+
+        end
+
+        poolbuilder -> poolbuilder: filter temporaryConstraints\n(remove non-matching package versions)
+
+        opt EventDispatcher configured
+            poolbuilder -> evtdisp: dispatch(PRE_POOL_CREATE, PrePoolCreateEvent)
+            activate evtdisp
+            evtdisp --> poolbuilder: —
+            deactivate evtdisp
+        end
+
+        poolbuilder -> pool **: new Pool(packages[], unacceptableFixedOrLockedPackages[])
+
+        opt SecurityAdvisoryPoolFilter active
+            poolbuilder -> poolbuilder: runSecurityAdvisoryFilter(pool, repositories, request)
+            note right: Removes vulnerable\npackage versions
+        end
+
+        opt FilterListPoolFilter active
+            poolbuilder -> poolbuilder: runFilterListFilter(pool, repositories, request)
+            note right: Applies allow/deny list
+        end
+
+        opt PoolOptimizer configured
+            poolbuilder -> optimizer: runOptimizer(request, pool)
+            activate optimizer
+            optimizer -> pool: optimize(request, pool)
+            activate pool
+            pool --> optimizer: optimizedPool
+            deactivate pool
+            optimizer --> poolbuilder: optimizedPool
+            deactivate optimizer
+        end
+
+        poolbuilder --> reposet: Pool
+    deactivate poolbuilder
+
+reposet --> installer: Pool
+deactivate reposet
+
+== Phase 3: Solve Dependencies ==
+
+installer -> solver **: new Solver(policy, pool, io)
+
+installer -> solver: solve(request, platformRequirementFilter)
+activate solver
+
+    solver -> solver: setupFixedMap(request)\n[fixedMap[package.id] = package]
+
+    solver -> rulegen **: new RuleSetGenerator(policy, pool)
+
+    solver -> rulegen: getRulesFor(request, platformRequirementFilter)
+    activate rulegen
+    note right of rulegen
+      Generates install/conflict/
+      require rules from pool
+      packages and request
+    end note
+    rulegen --> solver: RuleSet
+    deactivate rulegen
+
+    solver -> solver: checkForRootRequireProblems(request, filter)\n[pool.whatProvides(name, constraint) per require]
+
+    solver -> decisions **: new Decisions(pool)\nnew RuleWatchGraph()
+
+    solver -> decisions: watchGraph.insert(new RuleWatchNode(rule))\n[for each rule in RuleSet]
+
+    solver -> solver: makeAssertionRuleDecisions()\n[process assertion rules; record conflicts as Problems]
+
+    group runSat() — DPLL-style SAT solver
+
+        loop until all packages resolved
+
+            solver -> decisions: propagate(level)\n→ watchGraph.propagateLiteral() per decision
+            activate decisions
+            decisions --> solver: propagation result / conflict?
+            deactivate decisions
+
+            alt No conflict — select next package
+                solver -> solver: selectAndInstall(level, decisionQueue, rule)\n[for TYPE_REQUEST rules]
+                activate solver
+
+                    solver -> solver: policy.selectPreferredPackages(\n    pool, decisionQueue, requiredPackage)\n→ literals[]
+
+                    solver -> solver: setPropagateLearn(level, selectedLiteral, rule)
+                    activate solver
+                        solver -> decisions: decisions.decide(literal, level, rule)
+                        activate decisions
+                        decisions --> solver: —
+                        deactivate decisions
+                        solver -> decisions: propagate(level)
+                        activate decisions
+                        decisions --> solver: —
+                        deactivate decisions
+                    deactivate solver
+
+                deactivate solver
+
+            else Conflict detected
+                solver -> solver: analyze(level, rule)\n→ [learnLiteral, newLevel, newRule, why]
+                solver -> solver: revert(newLevel)
+                solver -> solver: rules.add(newRule, TYPE_LEARNED)\ndecide(learnLiteral)
+            end
+
+        end
+
+        solver -> solver: minimization step\n(revert branches to lower levels if possible)
+
+    end
+
+    alt Problems found
+        solver -> installer: throw SolverProblemsException(problems, learnedPool)
+    else Solution found
+        solver -> locktx **: new LockTransaction(pool, presentMap,\nfixedPackagesMap, decisions)
+        solver --> installer: LockTransaction
+    end
+
+deactivate solver
+
+== Phase 4: Extract Operations ==
+
+installer -> locktx: getOperations()
+activate locktx
+locktx --> installer: InstallOperation[] / UpdateOperation[] / UninstallOperation[]
+deactivate locktx
+
+installer -> installer: setLockData(newPackages, devPackages, platformReqs, aliases, ...)\n→ writes composer.lock
+
+deactivate installer
+
+@enduml

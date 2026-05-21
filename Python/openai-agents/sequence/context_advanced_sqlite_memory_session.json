@@ -1,0 +1,156 @@
+{
+  "scope": "advanced_sqlite_memory_session",
+  "title": "Advanced SQLite Memory Session",
+  "diagram_type": "sequence",
+  "description": "Storing and retrieving conversation items with branch/turn tracking in a SQLite-backed memory session",
+
+  "key_participants": [
+    "Caller (Runner / User Code)",
+    "AdvancedSQLiteSession",
+    "SQLiteSession (base)",
+    "SQLiteDB (via _locked_connection)",
+    "message_structure table",
+    "turn_usage table",
+    "agent_messages table"
+  ],
+
+  "class_hierarchy": [
+    "AdvancedSQLiteSession extends SQLiteSession",
+    "SQLiteSession implements Session protocol",
+    "AdvancedSQLiteSession imports: RunResult, Usage, TResponseInputItem, SessionSettings"
+  ],
+
+  "initialization_flow": [
+    "Caller → AdvancedSQLiteSession.__init__(session_id, db_path, create_tables, logger, session_settings)",
+    "AdvancedSQLiteSession → SQLiteSession.__init__(session_id, db_path, session_settings)",
+    "AdvancedSQLiteSession sets _current_branch_id = 'main'",
+    "if create_tables: AdvancedSQLiteSession → _init_structure_tables()",
+    "_init_structure_tables() → SQLiteDB: CREATE TABLE message_structure (id, session_id, message_id, branch_id, message_type, sequence_number, user_turn_number, branch_turn_number, tool_name, created_at)",
+    "_init_structure_tables() → SQLiteDB: CREATE TABLE turn_usage (id, session_id, branch_id, user_turn_number, requests, input/output/total_tokens, input_tokens_details JSON, output_tokens_details JSON)",
+    "_init_structure_tables() → SQLiteDB: CREATE 5 indexes on message_structure and turn_usage"
+  ],
+
+  "add_items_flow": [
+    "Caller → AdvancedSQLiteSession.add_items(items: list[TResponseInputItem])",
+    "add_items() → asyncio.to_thread(_add_items_sync)",
+    "_add_items_sync() acquires _locked_connection()",
+    "_add_items_sync() → SQLiteSession._insert_items(conn, items) → agent_messages table INSERT",
+    "_add_items_sync() → conn.commit()",
+    "_add_items_sync() → _insert_structure_metadata(conn, items)",
+    "_insert_structure_metadata() → SELECT last N ids FROM agent_messages ORDER BY id DESC LIMIT len(items)",
+    "_insert_structure_metadata() → SELECT MAX(sequence_number) FROM message_structure WHERE session_id",
+    "_insert_structure_metadata() → SELECT MAX(user_turn_number), MAX(branch_turn_number) FROM message_structure WHERE session_id AND branch_id",
+    "for each item: _classify_message_type(item) → 'user'|'assistant'|item.type|'other'",
+    "for each item: _extract_tool_name(item) → tool name string or None",
+    "for each item: _is_user_message(item) → increments user_message_count, updates item_turn/item_branch_turn",
+    "_insert_structure_metadata() → INSERT INTO message_structure executemany(session_id, message_id, branch_id, message_type, sequence_number, user_turn_number, branch_turn_number, tool_name)",
+    "_add_items_sync() → conn.commit()",
+    "on structure metadata error: _cleanup_orphaned_messages_sync(conn) → DELETE orphaned agent_messages rows"
+  ],
+
+  "get_items_flow": [
+    "Caller → AdvancedSQLiteSession.get_items(limit?, branch_id?)",
+    "get_items() → resolve_session_limit(limit, session_settings) → effective_limit",
+    "if branch_id is None: uses _current_branch_id",
+    "get_items() → asyncio.to_thread(_get_items_sync)",
+    "_get_items_sync() → SELECT m.message_data FROM agent_messages m JOIN message_structure s ON m.id = s.message_id WHERE session_id=? AND branch_id=? ORDER BY sequence_number ASC [LIMIT ?]",
+    "if limit applied: rows reversed to maintain chronological order",
+    "for each row: json.loads(message_data) → item dict",
+    "return list[TResponseInputItem]"
+  ],
+
+  "get_next_turn_number_flow": [
+    "Caller → AdvancedSQLiteSession._get_next_turn_number(branch_id)",
+    "_get_next_turn_number() → _locked_connection()",
+    "SELECT COALESCE(MAX(user_turn_number), 0) FROM message_structure WHERE session_id=? AND branch_id=?",
+    "return max_turn + 1"
+  ],
+
+  "store_run_usage_flow": [
+    "Caller → AdvancedSQLiteSession.store_run_usage(result: RunResult)",
+    "store_run_usage() checks result.context_wrapper.usage is not None",
+    "store_run_usage() → _get_current_turn_number() → SELECT MAX(user_turn_number) from message_structure",
+    "store_run_usage() → _update_turn_usage_internal(current_turn, usage: Usage)",
+    "_update_turn_usage_internal → INSERT OR REPLACE INTO turn_usage (session_id, branch_id, user_turn_number, requests, input_tokens, output_tokens, total_tokens, input_tokens_details, output_tokens_details)"
+  ],
+
+  "branching_flow": [
+    "Caller → AdvancedSQLiteSession.create_branch_from_turn(turn_number, branch_name?)",
+    "create_branch_from_turn() → asyncio.to_thread(_validate_turn)",
+    "_validate_turn() → SELECT message_data FROM message_structure JOIN agent_messages WHERE branch_turn_number=? AND message_type='user'",
+    "if branch_name is None: branch_name = 'branch_from_turn_{N}_{timestamp}'",
+    "create_branch_from_turn() → _copy_messages_to_new_branch(new_branch_id, from_turn_number)",
+    "_copy_messages_to_new_branch() → SELECT ms.* WHERE branch_turn_number < from_turn_number ORDER BY sequence_number",
+    "_copy_messages_to_new_branch() → INSERT INTO message_structure (new rows with new_branch_id, new sequence_numbers, same message_ids)",
+    "create_branch_from_turn() sets _current_branch_id = branch_name",
+    "return branch_name",
+    "",
+    "Caller → switch_to_branch(branch_id)",
+    "switch_to_branch() → asyncio.to_thread(_validate_branch) → SELECT COUNT(*) FROM message_structure WHERE branch_id=?",
+    "switch_to_branch() sets _current_branch_id = branch_id",
+    "",
+    "Caller → delete_branch(branch_id, force=False)",
+    "delete_branch() guards: cannot delete 'main'; if deleting current and force=True → switch_to_branch('main') first",
+    "delete_branch() → DELETE FROM turn_usage WHERE branch_id=?",
+    "delete_branch() → DELETE FROM message_structure WHERE branch_id=?"
+  ],
+
+  "key_methods": [
+    "__init__(session_id, db_path=':memory:', create_tables=False, logger, session_settings)",
+    "_init_structure_tables() -> None  [sync, creates message_structure + turn_usage tables]",
+    "add_items(items) -> None  [async, inserts messages + structure metadata atomically]",
+    "get_items(limit?, branch_id?) -> list[TResponseInputItem]  [async, branch-scoped query]",
+    "_get_next_turn_number(branch_id) -> int  [sync]",
+    "_get_next_branch_turn_number(branch_id) -> int  [sync]",
+    "_get_current_turn_number() -> int  [sync, uses _current_branch_id]",
+    "_insert_structure_metadata(conn, items) -> None  [sync, assigns seq/turn numbers]",
+    "_classify_message_type(item) -> str  [sync, returns 'user'|'assistant'|type|'other']",
+    "_extract_tool_name(item) -> str|None  [sync, handles MCP/built-in/function tools]",
+    "_is_user_message(item) -> bool  [sync]",
+    "store_run_usage(result: RunResult) -> None  [async]",
+    "create_branch_from_turn(turn_number, branch_name?) -> str  [async]",
+    "create_branch_from_content(search_term, branch_name?) -> str  [async]",
+    "switch_to_branch(branch_id) -> None  [async]",
+    "delete_branch(branch_id, force=False) -> None  [async]",
+    "list_branches() -> list[dict]  [async]",
+    "get_conversation_turns(branch_id?) -> list[dict]  [async]",
+    "get_conversation_by_turns() -> dict[int, list]  [async]",
+    "get_tool_usage() -> list  [async]",
+    "find_turns_by_content(search_term) -> list[dict]  [async]",
+    "get_session_usage(branch_id?) -> dict|None  [async, aggregated from turn_usage]",
+    "get_turn_usage(user_turn_number?) -> list|dict  [async]",
+    "_copy_messages_to_new_branch(new_branch_id, from_turn_number) -> None  [async]",
+    "_cleanup_orphaned_messages() -> int  [async]",
+    "_cleanup_orphaned_messages_sync(conn) -> int  [sync]"
+  ],
+
+  "db_tables": {
+    "agent_sessions": "inherited from SQLiteSession — stores session records",
+    "agent_messages": "inherited from SQLiteSession — stores message_data JSON blobs",
+    "message_structure": "branch_id, sequence_number, user_turn_number, branch_turn_number, message_type, tool_name — links messages to branches/turns",
+    "turn_usage": "branch_id, user_turn_number, requests, input/output/total_tokens, JSON details — per-turn token analytics"
+  },
+
+  "key_relationships": [
+    "AdvancedSQLiteSession extends SQLiteSession (inherits _locked_connection, _insert_items, sessions_table, messages_table)",
+    "message_structure.message_id FK → agent_messages.id",
+    "turn_usage UNIQUE(session_id, branch_id, user_turn_number)",
+    "Branch isolation: same physical message rows, different message_structure entries per branch",
+    "asyncio.to_thread wraps all sync SQLite calls for async-safe operation"
+  ],
+
+  "important_notes": [
+    "State: _current_branch_id (default 'main') tracks active branch in memory",
+    "Branch copy shares actual message_data rows — only message_structure rows are duplicated",
+    "store_run_usage() must be called manually after each Runner.run() — not automatic",
+    "Atomicity: add_items() does _insert_items + _insert_structure_metadata in one _locked_connection critical section; on metadata failure, orphaned messages are cleaned up",
+    "Session usage is aggregated on demand from turn_usage (not stored separately)",
+    "Tool name extraction handles: MCP tools (server_label.name), built-in types (computer_call, file_search_call, etc.), function tools with 'name' field (qualified with namespace)"
+  ],
+
+  "source_files_analyzed": [
+    "src/agents/extensions/memory/advanced_sqlite_session.py",
+    "docs/sessions/advanced_sqlite_session.md",
+    "examples/memory/advanced_sqlite_session_example.py"
+  ]
+}

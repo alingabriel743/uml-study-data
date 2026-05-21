@@ -1,0 +1,263 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBorderColor #ADB5BD
+    BoxBackgroundColor #F1F3F5
+    DividerBorderColor #ADB5BD
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #DEE2E6
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #ADB5BD
+}
+
+title Shell & Apply-Patch Tool Execution
+
+participant "RunLoop" as RunLoop
+participant "ToolExecutor\n(tool_execution)" as ToolExec
+participant "ShellAction" as ShellAction
+participant "LocalShellAction" as LocalShellAction
+participant "ApplyPatchAction" as ApplyPatchAction
+participant "RunHooks /\nAgentHooks" as Hooks
+participant "ShellTool\n(executor)" as ShellTool
+participant "LocalShellTool\n(executor)" as LocalShellTool
+participant "ApplyPatchTool\n(editor)" as ApplyPatchTool
+participant "ExecCommandTool\n(Sandbox)" as ExecCmdTool
+participant "BaseSandboxSession" as Sandbox
+participant "Editor\n(create/update/delete)" as Editor
+
+== Shell Call Execution (Sandbox / Hosted) ==
+
+RunLoop -> ToolExec : execute_shell_calls(agent, calls, context_wrapper, hooks, config)
+activate ToolExec
+
+loop for each ShellCall [serial]
+    ToolExec -> ShellAction : execute(agent, call, hooks, context_wrapper, config)
+    activate ShellAction
+
+    ShellAction -> ShellAction : coerce_shell_call(call.tool_call)\n→ ShellCommandData
+
+    ShellAction -> ShellAction : evaluate_needs_approval_setting(\n  shell_tool.needs_approval, context_wrapper,\n  shell_call.action, call_id)
+
+    alt needs_approval == True
+        ShellAction -> ShellAction : resolve_approval_status(\n  tool_name, call_id, raw_item,\n  agent, context_wrapper, on_approval)
+
+        alt approval rejected
+            ShellAction -> ShellAction : shell_rejection_item(agent, call_id)
+            ShellAction --> ToolExec : ToolCallOutputItem (rejected)
+        else approval pending
+            ShellAction --> ToolExec : approval_item (interruption)
+        end
+    end
+
+    ShellAction -> Hooks : on_tool_start(context_wrapper, agent, shell_tool)\n[asyncio.gather — RunHooks + AgentHooks in parallel]
+    activate Hooks
+    Hooks --> ShellAction : [started]
+    deactivate Hooks
+
+    ShellAction -> ShellTool : executor(ShellCommandRequest)
+    activate ShellTool
+
+    note right of ShellTool
+      If executor is None (hosted env),
+      the model runs the shell call
+      server-side; needs_approval and
+      on_approval must be False/None.
+    end note
+
+    ShellTool --> ShellAction : ShellResult { output: list[ShellOutput] }
+    deactivate ShellTool
+
+    ShellAction -> ShellAction : normalize_shell_output(entries)\n→ truncate_shell_outputs()\n→ render_shell_outputs()\n→ output_text
+
+    ShellAction -> Hooks : on_tool_end(context_wrapper, agent, shell_tool, output_text)\n[asyncio.gather — RunHooks + AgentHooks in parallel]
+    activate Hooks
+    Hooks --> ShellAction : [ended]
+    deactivate Hooks
+
+    ShellAction --> ToolExec : ToolCallOutputItem\n{ type: shell_call_output, call_id, output, status }
+    deactivate ShellAction
+end
+
+ToolExec --> RunLoop : list[ToolCallOutputItem]
+deactivate ToolExec
+
+== Local Shell Call Execution (No Approval) ==
+
+RunLoop -> ToolExec : execute_local_shell_calls(agent, calls, context_wrapper, hooks, config)
+activate ToolExec
+
+loop for each LocalShellCall [serial]
+    ToolExec -> LocalShellAction : execute(agent, call, hooks, context_wrapper, config)
+    activate LocalShellAction
+
+    note right of LocalShellAction
+      No approval plumbing —
+      executor is called directly.
+    end note
+
+    LocalShellAction -> Hooks : on_tool_start(context_wrapper, agent, local_shell_tool)\n[asyncio.gather in parallel]
+    activate Hooks
+    Hooks --> LocalShellAction : [started]
+    deactivate Hooks
+
+    LocalShellAction -> LocalShellTool : executor(LocalShellCommandRequest)\n[sync or async]
+    activate LocalShellTool
+    LocalShellTool --> LocalShellAction : result
+    deactivate LocalShellTool
+
+    LocalShellAction -> Hooks : on_tool_end(context_wrapper, agent, local_shell_tool, output)\n[asyncio.gather in parallel]
+    activate Hooks
+    Hooks --> LocalShellAction : [ended]
+    deactivate Hooks
+
+    LocalShellAction --> ToolExec : ToolCallOutputItem\n{ type: local_shell_call_output, call_id, output }
+    deactivate LocalShellAction
+end
+
+ToolExec --> RunLoop : list[ToolCallOutputItem]
+deactivate ToolExec
+
+== Apply-Patch Call Execution ==
+
+RunLoop -> ToolExec : execute_apply_patch_calls(agent, calls, context_wrapper, hooks, config)
+activate ToolExec
+
+loop for each ApplyPatchCall [serial]
+    ToolExec -> ApplyPatchAction : execute(agent, call, hooks, context_wrapper, config)
+    activate ApplyPatchAction
+
+    ApplyPatchAction -> ApplyPatchAction : coerce_apply_patch_operations(call.tool_call, context_wrapper)\n→ list[ApplyPatchOperation]
+    ApplyPatchAction -> ApplyPatchAction : extract_apply_patch_call_id(call.tool_call) → call_id
+
+    loop per operation [check needs_approval]
+        ApplyPatchAction -> ApplyPatchAction : evaluate_needs_approval_setting(\n  apply_patch_tool.needs_approval, ...)
+    end
+
+    alt any operation needs_approval
+        ApplyPatchAction -> ApplyPatchAction : resolve_approval_status(...) → approval_status
+
+        alt rejected
+            ApplyPatchAction -> ApplyPatchAction : apply_patch_rejection_item(agent, call_id)
+            ApplyPatchAction --> ToolExec : ToolCallOutputItem (rejected)
+        end
+    end
+
+    ApplyPatchAction -> Hooks : on_tool_start(context_wrapper, agent, apply_patch_tool)\n[asyncio.gather in parallel]
+    activate Hooks
+    Hooks --> ApplyPatchAction : [started]
+    deactivate Hooks
+
+    loop per ApplyPatchOperation
+        alt operation.type == create_file
+            ApplyPatchAction -> ApplyPatchTool : editor.create_file(op)
+            activate ApplyPatchTool
+            ApplyPatchTool -> Editor : create_file(path, content)
+            activate Editor
+            Editor --> ApplyPatchTool : result
+            deactivate Editor
+            ApplyPatchTool --> ApplyPatchAction : result
+            deactivate ApplyPatchTool
+        else operation.type == update_file
+            ApplyPatchAction -> ApplyPatchTool : editor.update_file(op)
+            activate ApplyPatchTool
+            ApplyPatchTool -> Editor : update_file(path, diff)
+            activate Editor
+            Editor --> ApplyPatchTool : result
+            deactivate Editor
+            ApplyPatchTool --> ApplyPatchAction : result
+            deactivate ApplyPatchTool
+        else operation.type == delete_file
+            ApplyPatchAction -> ApplyPatchTool : editor.delete_file(op)
+            activate ApplyPatchTool
+            ApplyPatchTool -> Editor : delete_file(path)
+            activate Editor
+            Editor --> ApplyPatchTool : result
+            deactivate Editor
+            ApplyPatchTool --> ApplyPatchAction : result
+            deactivate ApplyPatchTool
+        end
+    end
+
+    ApplyPatchAction -> ApplyPatchAction : normalize_apply_patch_result(awaited)\n→ ApplyPatchResult { status, output }
+
+    ApplyPatchAction -> Hooks : on_tool_end(context_wrapper, agent, apply_patch_tool, output_text)\n[asyncio.gather in parallel]
+    activate Hooks
+    Hooks --> ApplyPatchAction : [ended]
+    deactivate Hooks
+
+    ApplyPatchAction --> ToolExec : ToolCallOutputItem\n{ type: apply_patch_call_output, call_id, status, output }
+    deactivate ApplyPatchAction
+end
+
+ToolExec --> RunLoop : list[ToolCallOutputItem]
+deactivate ToolExec
+
+== Sandbox ExecCommandTool (Shell Capability) ==
+
+note over ExecCmdTool, Sandbox
+  Shell(Capability).tools() exposes ExecCommandTool
+  (tool_name=exec_command) and optionally WriteStdinTool
+  (if session supports PTY) via ShellToolSet.
+end note
+
+ShellTool -> ExecCmdTool : _invoke(ctx, raw_input)
+activate ExecCmdTool
+
+ExecCmdTool -> ExecCmdTool : ExecCommandArgs.model_validate_json(raw_input)\n→ ExecCommandArgs { cmd, workdir, shell, login, tty, yield_time_ms, max_output_tokens }
+ExecCmdTool -> ExecCmdTool : _resolve_workdir_command(session, cmd, workdir)\n→ wrapped_command
+ExecCmdTool -> ExecCmdTool : _resolve_shell(args.shell, args.login)\n→ shell spec
+
+alt session.supports_pty() == True
+    ExecCmdTool -> Sandbox : pty_exec_start(cmd, shell, tty, user, yield_time_s, max_output_tokens)
+    activate Sandbox
+    Sandbox --> ExecCmdTool : PTY output stream
+
+    opt ExecTransportError (retry_safe)
+        ExecCmdTool -> ExecCmdTool : fallback to _run_one_shot_exec\n(with fallback_notice)
+    end
+
+    deactivate Sandbox
+else no PTY support
+    ExecCmdTool -> ExecCmdTool : _run_one_shot_exec(\n  session, command, timeout_s, shell,\n  max_output_tokens, user)
+    ExecCmdTool -> Sandbox : exec(command, timeout, shell, user)
+    activate Sandbox
+
+    alt ExecTimeoutError / TimeoutError
+        Sandbox --> ExecCmdTool : timeout exception
+        ExecCmdTool -> ExecCmdTool : output = "Command timed out after N seconds"
+    else success
+        Sandbox --> ExecCmdTool : ExecResult { stdout, stderr, exit_code }
+    end
+    deactivate Sandbox
+
+    ExecCmdTool -> ExecCmdTool : _normalize_output(stdout, stderr)\n→ _truncate_output(output, max_output_tokens)
+end
+
+ExecCmdTool -> ExecCmdTool : _format_response(\n  output, wall_time, exit_code,\n  process_id, original_token_count)\n→ formatted str
+
+ExecCmdTool --> ShellTool : formatted output string
+deactivate ExecCmdTool
+
+@enduml

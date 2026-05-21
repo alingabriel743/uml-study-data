@@ -1,0 +1,195 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #495057
+    LifeLineBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    ActorBorderColor #495057
+    ActorBackgroundColor #F8F9FA
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #E9ECEF
+    DividerBorderColor #6C757D
+    GroupBorderColor #6C757D
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Function and Method Hooking Flow\n(DDTrace hook_function / hook_method / trace_function / trace_method)
+
+participant "UserCode" as user
+participant "ConcreteIntegration\n(e.g. PHPRedisIntegration)" as integration
+participant "Integration\n(abstract class)" as base
+participant "DDTrace C Extension\n(ddtrace.stub.php)" as ext
+participant "SpanData" as span
+participant "TracingClosure /\nPre+Post Hooks" as hooks
+participant "AppSec / WAF\nListeners" as appsec
+
+== Integration Lifecycle: Registration ==
+
+user -> integration : init() [static]
+activate integration
+
+integration -> base : shouldLoad($name)
+activate base
+base -> ext : extension_loaded("ddtrace")\n+ ddtrace_config_integration_enabled($name)
+activate ext
+ext --> base : true / false
+deactivate ext
+base --> integration : bool
+deactivate base
+
+alt shouldLoad() returns false
+    integration --> user : NOT_AVAILABLE
+else shouldLoad() returns true
+    note over integration : Registers hooks via\ntrace_function / trace_method\nor hook_function / hook_method
+
+    integration -> ext : DDTrace\\trace_function(\n  $functionName, $tracingClosure)
+    activate ext
+    ext --> integration : true (hook registered)
+    deactivate ext
+
+    integration -> ext : DDTrace\\trace_method(\n  $className, $methodName, $tracingClosure)
+    activate ext
+    ext --> integration : true (hook registered)
+    deactivate ext
+
+    integration -> ext : DDTrace\\hook_function(\n  $functionName, $prehook, $posthook)
+    activate ext
+    ext --> integration : true (hook registered)
+    deactivate ext
+
+    integration -> ext : DDTrace\\hook_method(\n  $className, $methodName, $prehook, $posthook)
+    activate ext
+    ext --> integration : true (hook registered)
+    deactivate ext
+
+    integration --> user : LOADED
+end
+
+deactivate integration
+
+== Runtime: trace_function / trace_method (Auto-Span Management) ==
+
+note over ext : trace_* automatically opens and\ncloses a SpanData around the call
+
+user -> ext : calls $functionName(...)\nor $className::$methodName(...)
+activate ext
+
+ext -> span : new SpanData (auto-open)
+activate span
+note right of span : name, resource, service,\nmeta, metrics pre-set
+
+ext -> ext : execute original function/method\n(closure bound to target object/scope)
+
+ext -> hooks : invoke $tracingClosure(\n  SpanData $span,\n  array $args,\n  mixed $retval,\n  Throwable|null $exception)
+activate hooks
+hooks -> span : $span->name = "..."
+hooks -> span : $span->resource = "..."
+hooks -> span : $span->service = "..."
+hooks -> span : $span->meta[Tag] = "..."
+hooks -> span : $span->metrics[Tag] = "..."
+hooks --> ext : void
+deactivate hooks
+
+ext -> span : close SpanData (auto)\n+ record exception if present
+deactivate span
+
+ext --> user : $retval
+deactivate ext
+
+== Runtime: hook_function / hook_method (Raw Hooks — No Auto-Span) ==
+
+note over ext : hook_* runs closures only;\nno SpanData is opened automatically
+
+user -> ext : calls $functionName(...)\nor $className::$methodName(...)
+activate ext
+
+ext -> hooks : invoke $prehook(\n  [hook_function: array $args]\n  [hook_method:   object $object,\n                  string $scope,\n                  array $args])\n[before execution]
+activate hooks
+note right of hooks : retval/exception NOT available\nin prehook — fires before call
+hooks --> ext : void
+deactivate hooks
+
+ext -> ext : execute original function/method
+
+ext -> hooks : invoke $posthook(\n  [hook_function: array $args,\n                  mixed $retval,\n                  Throwable|null $exception]\n  [hook_method:   object $object,\n                  string $scope,\n                  array $args,\n                  mixed $retval,\n                  Throwable|null $exception])\n[after execution]
+activate hooks
+note right of hooks : retval and exception ARE\navailable in posthook
+hooks --> ext : void
+deactivate hooks
+
+ext --> user : $retval
+deactivate ext
+
+== Runtime: notify_start / notify_commit (AppSec / Per-Request Lifecycle) ==
+
+note over integration : Long-running servers (Frankenphp,\nRoadrunner, Ratchet) use hook_method\non framework request-handler +\nnotify_start / notify_commit
+
+user -> ext : Framework receives HTTP request\n→ triggers posthook/prehook
+activate ext
+
+ext -> hooks : prehook / posthook fires
+activate hooks
+
+hooks -> ext : DDTrace\\UserRequest\\notify_start(\n  RootSpanData $rootSpan,\n  array $requestData,\n  mixed $requestBody = null)
+activate ext
+ext -> appsec : dispatch request event\n(evaluate rules / WAF)
+activate appsec
+appsec --> ext : ?array{status, headers, body}\nor null (continue)
+deactivate appsec
+
+alt AppSec blocks request
+    ext --> hooks : array{status, headers, body} — block response
+    note right of hooks : Integration returns block\nresponse immediately
+else Request allowed
+    ext --> hooks : null — continue processing
+end
+deactivate ext
+
+hooks --> ext : void
+deactivate hooks
+
+ext -> ext : Framework generates response
+
+ext -> hooks : posthook fires at response egress
+activate hooks
+
+hooks -> ext : DDTrace\\UserRequest\\notify_commit(\n  RootSpanData $span,\n  int $status,\n  array $headers,\n  mixed $responseBody = null)
+activate ext
+ext -> appsec : dispatch response event\n(evaluate response / WAF)
+activate appsec
+appsec --> ext : ?array{status, headers, body}\nor null (pass-through)
+deactivate appsec
+
+alt AppSec replaces response
+    ext --> hooks : array{status, headers, body} — replacement response
+else Response passes through
+    ext --> hooks : null — original response sent
+end
+deactivate ext
+
+hooks --> ext : void
+deactivate hooks
+
+ext --> user : HTTP Response
+deactivate ext
+
+@enduml

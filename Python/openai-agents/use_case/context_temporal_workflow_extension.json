@@ -1,0 +1,148 @@
+{
+  "scope": "temporal_workflow_extension",
+  "title": "Temporal Workflow Extension",
+  "diagram_type": "use_case",
+  "description": "Agent sessions are orchestrated as durable Temporal workflows. A singleton SessionManagerWorkflow acts as the orchestrator for all agent session lifecycles, while individual AgentWorkflow instances handle conversational turns.",
+
+  "actors": [
+    "TUI Client (temporal_sandbox_tui.py) — human operator driving sessions interactively",
+    "Developer — starts Temporal worker and server, configures backends",
+    "Temporal Worker — executes workflow and activity code",
+    "SessionManagerWorkflow — singleton orchestrator (workflow ID: 'session-manager')",
+    "AgentWorkflow — individual long-lived agent session workflow",
+    "OpenAI Agents SDK (Runner) — processes each conversation turn"
+  ],
+
+  "use_cases": [
+    "Create new agent session (CreateSessionRequest: cwd, manifest, backend)",
+    "Destroy/terminate an agent session",
+    "List all active sessions (query, sorted newest first)",
+    "Rename an existing session (RenameRequest: workflow_id, title)",
+    "Fork a session to same or different backend (ForkSessionRequest: source_workflow_id, title, target_backend)",
+    "Switch session backend in-place (SwitchBackendRequest: source_workflow_id, target_backend)",
+    "Pause an agent session (stops active sandbox session)",
+    "Resume a paused/forked session with prior conversation history",
+    "Send user message to agent (chat turn)",
+    "Approve or reject agent tool calls (human-in-the-loop)",
+    "Query live turn state (polling: status, tool calls, approval requests)",
+    "Query workflow snapshot (WorkflowSnapshot: history, sandbox_session_state, snapshot)",
+    "Update session snapshot ID (after backend switch/fork)",
+    "Shutdown the session manager workflow"
+  ],
+
+  "key_components": {
+    "SessionManagerWorkflow": {
+      "type": "Temporal @workflow.defn (singleton)",
+      "workflow_id": "session-manager",
+      "state": "_sessions: dict[str, SessionInfo], _shutdown: bool",
+      "updates": [
+        "create_session(CreateSessionRequest) -> str  [starts child AgentWorkflow, registers SessionInfo]",
+        "fork_session(ForkSessionRequest) -> str  [pause source, snapshot, start new child]",
+        "switch_backend(SwitchBackendRequest) -> str  [signals AgentWorkflow to change backend in-place]",
+        "destroy_session(workflow_id: str) -> None  [signals AgentWorkflow.destroy, removes from registry]"
+      ],
+      "queries": [
+        "list_sessions() -> list[SessionInfo]  [returns all active sessions, newest first]"
+      ],
+      "signals": [
+        "rename_session(RenameRequest)",
+        "update_snapshot_id(RenameRequest)",
+        "shutdown()"
+      ]
+    },
+    "AgentWorkflow": {
+      "type": "Temporal @workflow.defn (per-session, long-lived)",
+      "task_queue": "sandbox-agent-queue",
+      "updates": ["pause()", "switch_backend(SwitchBackendSignal) -> changes backend and manifest"],
+      "queries": ["get_snapshot() -> WorkflowSnapshot"],
+      "signals": ["destroy()"],
+      "behavior": "Idles between conversation turns; each turn calls Runner.run() with SandboxRunConfig targeting active backend"
+    },
+    "Activities": [
+      "pause_workflow(workflow_id: str) -> None  [executes AgentWorkflow.pause update via client]",
+      "switch_workflow_backend(_SwitchWorkflowBackendArgs) -> None  [executes AgentWorkflow.switch_backend update]",
+      "query_workflow_snapshot(workflow_id: str) -> WorkflowSnapshot  [queries AgentWorkflow.get_snapshot]"
+    ]
+  },
+
+  "data_models": [
+    "SessionInfo: workflow_id, title, created_at, cwd, backend: BackendConfig, parent_workflow_id, fork_count, snapshot_id",
+    "CreateSessionRequest: cwd, manifest: Manifest|None, backend: BackendConfig",
+    "ForkSessionRequest: source_workflow_id, title, target_backend: BackendConfig|None",
+    "SwitchBackendRequest: source_workflow_id, target_backend: BackendConfig",
+    "RenameRequest: workflow_id, title",
+    "BackendConfig: DaytonaBackendConfig | DockerBackendConfig | E2BBackendConfig | LocalBackendConfig",
+    "WorkflowSnapshot: sandbox_session_state, snapshot: SnapshotBase|None, previous_response_id, history: list",
+    "AgentRequest: messages, cwd, backend, sandbox_session_state, snapshot, previous_response_id, history, manifest",
+    "SwitchBackendSignal: target (daytona|docker|e2b|SwitchToLocalBackend)"
+  ],
+
+  "key_relationships": [
+    "TUI Client --update--> SessionManagerWorkflow: create_session, fork_session, switch_backend, destroy_session",
+    "TUI Client --query--> SessionManagerWorkflow: list_sessions",
+    "TUI Client --signal--> SessionManagerWorkflow: rename_session, shutdown",
+    "SessionManagerWorkflow --start_child_workflow--> AgentWorkflow: on create_session and fork_session",
+    "SessionManagerWorkflow --execute_activity--> pause_workflow: during fork_session",
+    "SessionManagerWorkflow --execute_activity--> query_workflow_snapshot: during fork_session",
+    "SessionManagerWorkflow --execute_activity--> switch_workflow_backend: during switch_backend",
+    "SessionManagerWorkflow --signal--> AgentWorkflow: destroy (on destroy_session)",
+    "pause_workflow activity --execute_update--> AgentWorkflow: pause",
+    "switch_workflow_backend activity --execute_update--> AgentWorkflow: switch_backend",
+    "query_workflow_snapshot activity --query--> AgentWorkflow: get_snapshot",
+    "AgentWorkflow --uses--> Runner.run(): each conversation turn",
+    "AgentWorkflow --uses--> OpenAIAgentsPlugin: for tracing context"
+  ],
+
+  "workflow_flows": {
+    "create_session": [
+      "TUI → SessionManagerWorkflow.create_session(CreateSessionRequest)",
+      "SessionManagerWorkflow: generate workflow_id = 'sandbox-agent-{uuid}'",
+      "SessionManagerWorkflow: derive manifest from backend config if not provided",
+      "SessionManagerWorkflow: start_child_workflow(AgentWorkflow.run, AgentRequest, id=workflow_id, ABANDON policy)",
+      "SessionManagerWorkflow: register SessionInfo in _sessions registry",
+      "Return workflow_id to TUI"
+    ],
+    "fork_session": [
+      "TUI → SessionManagerWorkflow.fork_session(ForkSessionRequest)",
+      "SessionManagerWorkflow: execute_activity pause_workflow(source_workflow_id, timeout=11min)",
+      "SessionManagerWorkflow: execute_activity query_workflow_snapshot(source_workflow_id, timeout=30s)",
+      "SessionManagerWorkflow: determine target_backend and fork title",
+      "SessionManagerWorkflow: start_child_workflow(AgentWorkflow.run, AgentRequest with history+snapshot, ABANDON)",
+      "Register new SessionInfo with parent_workflow_id set",
+      "Return new workflow_id"
+    ],
+    "switch_backend": [
+      "TUI → SessionManagerWorkflow.switch_backend(SwitchBackendRequest)",
+      "SessionManagerWorkflow: execute_activity switch_workflow_backend(_SwitchWorkflowBackendArgs, timeout=30s)",
+      "switch_workflow_backend activity: execute_update AgentWorkflow.switch_backend(SwitchBackendSignal)",
+      "SessionManagerWorkflow: update source.backend in registry",
+      "Return source_workflow_id"
+    ],
+    "destroy_session": [
+      "TUI → SessionManagerWorkflow.destroy_session(workflow_id)",
+      "SessionManagerWorkflow: get_external_workflow_handle(workflow_id)",
+      "SessionManagerWorkflow: signal AgentWorkflow.destroy",
+      "Remove from _sessions registry"
+    ]
+  },
+
+  "important_notes": [
+    "SessionManagerWorkflow is a singleton (well-known ID 'session-manager'), lives forever until shutdown signal",
+    "AgentWorkflow instances are long-lived, idle between turns, persist indefinitely in Temporal",
+    "ParentClosePolicy.ABANDON ensures child agent workflows survive if manager restarts",
+    "Fork uses portable SnapshotBase (cross-backend) but NOT backend-specific session state",
+    "Switch backend is in-place: same workflow_id, clears session state, next turn creates fresh backend session",
+    "All Temporal client connections: localhost:7233 with pydantic_data_converter",
+    "Backends supported: Daytona, Docker, E2B, Local (unix)",
+    "TASK_QUEUE = 'sandbox-agent-queue'",
+    "OpenAIAgentsPlugin used for tracing context during session creation"
+  ],
+
+  "source_files_analyzed": [
+    "examples/sandbox/extensions/temporal/temporal_session_manager.py",
+    "examples/sandbox/extensions/temporal/temporal_sandbox_agent.py",
+    "examples/sandbox/extensions/temporal/README.md",
+    "docs/running_agents.md (Temporal integration section)",
+    "docs/index.md"
+  ]
+}

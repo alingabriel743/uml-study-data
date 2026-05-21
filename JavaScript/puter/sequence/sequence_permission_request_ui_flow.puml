@@ -1,0 +1,197 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipantBorderColor #495057
+skinparam sequenceParticipantBackgroundColor #F8F9FA
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceGroupBorderColor #6C757D
+skinparam sequenceGroupBackgroundColor #E9ECEF
+skinparam noteBorderColor #495057
+skinparam noteBackgroundColor #FFF9C4
+
+title Permission Request UI Flow
+
+actor "Caller\n(App / Origin)" as Caller
+participant "UIWindowRequest\nPermission" as UIWRP
+participant "get_permission\n_description" as GPD
+participant "puter.auth\n(whoami)" as PuterAuth
+participant "puter.fs\n(stat)" as PuterFS
+participant "create_permission\n_window" as CPW
+participant "create_window\n_content" as CWC
+participant "UIWindow" as UIW
+participant "setup_window\n_events" as SWE
+actor "User" as User
+participant "Browser\n(fetch API)" as Fetch
+participant "BackendRouter\nPOST /auth/grant-user-app" as Backend
+participant "PermissionService" as PermSvc
+database "Database" as DB
+
+== Initiation ==
+
+Caller -> UIWRP : UIWindowRequestPermission(options)\noptions: {permission, app_uid, app_name, origin, reload_on_success}
+activate UIWRP
+
+UIWRP -> GPD : get_permission_description(options.permission)
+activate GPD
+
+note right of GPD
+  Parses colon-delimited permission string
+  e.g. "fs:/path:read" or "user:<uuid>:email:read"
+end note
+
+GPD -> GPD : split_permission(permission) → parts[]
+
+== Permission Description Resolution ==
+
+alt fs permission type
+    GPD -> GPD : check if standard folder (Desktop, Documents, etc.)
+    opt standard folder
+        GPD -> PuterAuth : whoami() → {directories{}}
+        activate PuterAuth
+        PuterAuth --> GPD : user directories map
+        deactivate PuterAuth
+    end
+    opt non-standard folder (path or uuid)
+        GPD -> PuterFS : stat({path|uid, consistency:'eventual'})
+        activate PuterFS
+        PuterFS --> GPD : file/folder metadata
+        deactivate PuterFS
+    end
+else user / apps-of-user / subdomains-of-user / app-root-dir type
+    GPD -> PuterAuth : whoami()
+    activate PuterAuth
+    PuterAuth --> GPD : user info
+    deactivate PuterAuth
+end
+
+GPD --> UIWRP : permission_description (HTML string) | null
+deactivate GPD
+
+== Early Exit Guard ==
+
+alt no description found (unknown permission type)
+    UIWRP --> Caller : resolve(false)
+    note right of UIWRP : Dialog not shown — permission\ntype could not be described
+end
+
+== Dialog Construction ==
+
+UIWRP -> CPW : create_permission_window(options, permission_description, resolve)
+activate CPW
+
+CPW -> CWC : create_window_content(requestingEntity, permission_description)
+activate CWC
+CWC --> CPW : HTML body string
+deactivate CWC
+
+CPW -> UIW : UIWindow({title:null, app:'request-authorization',\nbody_content:html, width:350,\ndominant:true, single_instance:true,\non_close:resolve(false)})
+activate UIW
+UIW --> CPW : el_window (DOM element)
+deactivate UIW
+
+CPW --> UIWRP : el_window
+deactivate CPW
+
+== Event Binding ==
+
+UIWRP -> SWE : setup_window_events(el_window, options, resolve)
+activate SWE
+SWE -> UIW : bind click on '.app-auth-allow'
+SWE -> UIW : bind click on '.app-auth-dont-allow'
+SWE --> UIWRP : (events registered)
+
+== User Interaction ==
+
+User -> UIW : views permission request dialog
+activate UIW
+
+alt User clicks "Allow"
+    User -> UIW : click '.app-auth-allow'
+    UIW -> SWE : click event fires
+    deactivate UIW
+
+    SWE -> Fetch : POST /auth/grant-user-app\n{app_uid, origin, permission}\nAuthorization: Bearer <token>
+    activate Fetch
+
+    Fetch -> Backend : POST /auth/grant-user-app
+    activate Backend
+
+    Backend -> Backend : validate actor is UserActorType
+    opt origin provided instead of app_uid
+        Backend -> Backend : svc_auth.app_uid_from_origin(origin)
+    end
+    Backend -> Backend : validate_fields({app_uid, permission, extra, meta})
+
+    Backend -> PermSvc : grant_user_app_permission(actor, app_uid, permission, extra, meta)
+    activate PermSvc
+
+    PermSvc -> PermSvc : _rewrite_permission(permission)\nvia Context.sub({is_grant_user_app_permission:true})
+    PermSvc -> DB : get_app({uid}) or get_app({name})
+    activate DB
+    DB --> PermSvc : app record
+    deactivate DB
+
+    PermSvc -> DB : SELECT user_to_app_permissions\n(check if permission already exists)
+    activate DB
+    DB --> PermSvc : existing rows
+    deactivate DB
+
+    opt permission does not already exist
+        PermSvc -> DB : INSERT/UPSERT user_to_app_permissions
+        activate DB
+        DB --> PermSvc : ok
+        deactivate DB
+        PermSvc -> DB : INSERT audit_user_to_app_permissions\n(action='grant')
+        activate DB
+        DB --> PermSvc : ok
+        deactivate DB
+    end
+
+    PermSvc -> PermSvc : invalidate_permission_scan_cache_for_app_under_user\n(user_uuid, app_uid, permission)
+    PermSvc --> Backend : granted
+    deactivate PermSvc
+
+    Backend --> Fetch : 200 {}
+    deactivate Backend
+
+    Fetch --> SWE : response ok
+    deactivate Fetch
+
+    SWE -> UIW : $(el_window).close()
+    SWE --> UIWRP : resolve(true)
+    UIWRP --> Caller : true (permission granted)
+
+else User clicks "Don't Allow"
+    User -> UIW : click '.app-auth-dont-allow'
+    UIW -> SWE : click event fires
+    deactivate UIW
+    SWE -> UIW : $(el_window).close()
+    SWE --> UIWRP : resolve(false)
+    UIWRP --> Caller : false (permission denied)
+
+else User closes window directly
+    User -> UIW : closes dialog
+    UIW -> UIWRP : on_close callback → resolve(false)
+    deactivate UIW
+    UIWRP --> Caller : false (permission denied)
+end
+
+deactivate SWE
+deactivate UIWRP
+
+@enduml

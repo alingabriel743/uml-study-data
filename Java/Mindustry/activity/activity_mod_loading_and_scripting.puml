@@ -1,0 +1,208 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activityBackgroundColor #F8F9FA
+skinparam activityBorderColor #495057
+skinparam activityArrowColor #495057
+skinparam activityFontColor #212529
+skinparam activityDiamondBackgroundColor #DEE2E6
+skinparam activityDiamondBorderColor #495057
+skinparam swimlaneBorderColor #6C757D
+skinparam swimlaneBackgroundColor #E9ECEF
+skinparam noteBackgroundColor #FFF3CD
+skinparam noteBorderColor #856404
+
+title Mod Loading & Script Injection
+
+|Mods|
+start
+:App Start — Mods.load();
+
+|FileSystem / Workshop|
+:Scan modDirectory for .jar / .zip / directories\ncontaining mod.json or mod.hjson;
+:Add Steam Workshop mods\nvia platform.getWorkshopContent();
+:For each candidate: resolveRoot()\nthen findMeta() → parse ModMeta;
+
+|Mods|
+if (meta == null or meta.name == null?) then (yes — invalid)
+  :Skip candidate\n(no mod.json or empty name);
+else (no — valid)
+  :Collect ModMeta into candidates list;
+endif
+
+:resolveDependencies(metas)\nTopological sort → Map<name, ModState>;
+
+group For each resolved mod candidate
+  :loadMod(file, overwrite, initialize);
+
+  if (Duplicate baseName already loaded?) then (yes)
+    if (overwrite && no Steam ID?) then (yes)
+      :Close old classloader\nDelete old zip / dir\nRemove from mods list;
+    else (no)
+      :Throw ModLoadException\n"already imported";
+    endif
+  endif
+
+  if (skipModLoading OR disabled\nOR version incompatible OR blacklisted?) then (yes)
+    :mainMod = null\n(script-only or JSON-only mod);
+  else (no — initialize class)
+    if (Android platform?) then (yes)
+      :AndroidDexClassLoader\nmainFile = classes.dex;
+    else (Desktop)
+      :ModClassLoader extends mainLoader\ntraverse .class path segments;
+    endif
+    :loadClass(mainClass)\nInstantiate Mod via reflection\nmetas.put(mod.class, meta)\nmod.init();
+  endif
+
+  :Return LoadedMod\n(root, sourceFile, meta, mainMod, loader);
+end group
+
+:mods.each(updateDependencies)\nResolve dependency and soft-dependency refs;
+
+if (mod.state == enabled\n&& !mod.isSupported()?) then (yes)
+  :Set state = unsupported;
+elseif (mod.state == enabled\n&& !mod.shouldBeEnabled()?) then (yes)
+  :Set state = disabled;
+endif
+
+:sortMods()\nSort by state ordinal then name;
+
+|FileTree|
+:buildFiles()\nWalk each enabled mod root recursively;
+:FileTree.addFile(path, fi)\nNormalise paths, store in ObjectMap;
+note right
+  Skips special folders.
+  Mod files override internal
+  assets by path precedence.
+end note
+:Load bundle .properties files\ninto I18NBundle chain;
+:Events.fire(FileTreeInitEvent);
+
+|Mods|
+:loadAsync() — Async Sprite Packing;
+note right
+  eachEnabled: scan sprites/**/*.png
+  and sprites-override/**/*.png.
+  Submit async tasks: read Pixmap,
+  optionally bleed(2 px), queue packing.
+  Java mods: mod.main.packSprites(packer).
+  Await futures → flush MultiPacker
+  → new TextureAtlas.
+  Events.fire(AtlasPackEvent).
+end note
+
+|ContentLoader|
+:createModContent() → Mods.loadContent();
+
+group Phase A — Java Mod Content
+  :For each mod where mod.main != null\n&& !mod.meta.hidden;
+  :content.setCurrentMod(mod);
+  :mod.main.loadContent()\nRegisters Items, Blocks, Units, Bullets etc.;
+end group
+
+group Phase B — JSON / HJSON Mod Content
+  :Scan mod.root/content/{type}s/\nfor .json and .hjson files;
+  :Apply meta.contentOrder:\nordered files first, rest alphabetical;
+  :For each LoadRun: content.setCurrentMod(run.mod)\nparser.parse(mod, name, fileContent, contentType);
+  if (Duplicate content name?) then (yes)
+    :Remove from list\nThrow IllegalArgumentException;
+  else (no)
+    :handleContent()\nAssign content ID\ntransformName() → prefix "modname-"\nAdd to nameMap and contentMap;
+  endif
+  if (Parse failure?) then (yes)
+    :mods.handleContentError(content, e)\nLog and continue to next file;
+  endif
+end group
+
+:content.setCurrentMod(null);
+
+|Scripts / Rhino|
+if (skipModCode == true?) then (yes)
+  :Return immediately\nNo script execution;
+  |Mods|
+  :checkWarnings();
+  stop
+else (no — execute scripts)
+  :eachEnabled(mod)\nCheck mod.root/scripts/ exists;
+
+  if (scripts == null?\n(Rhino engine not yet initialised)) then (yes — lazy init)
+    :platform.createScripts();
+    if (Android platform?) then (yes)
+      :AndroidRhinoContext.enter(cacheDir);
+      if (!ContextFactory.hasExplicitGlobal()?) then (yes)
+        :Create AndroidContextFactory(cacheDir)\ninitApplicationClassLoader;
+        if (Android SDK >= 26 (Oreo+)?) then (yes)
+          :InMemoryAndroidClassLoader\n(holds DEX in ByteBuffer);
+        else (older Android)
+          :FileAndroidClassLoader\n(writes .dex to cache file);
+        endif
+      else (global exists)
+        if (Not AndroidContextFactory?) then (yes)
+          :Throw IllegalStateException;
+        endif
+      endif
+      :factory.enterContext()\nRhino Context ready;
+    else (Desktop)
+      :Context.enter()\nRhino Context ready;
+    endif
+    :Create ImporterTopLevel scope;
+    :RequireBuilder.setSandboxed(true)\n.createRequire().install(scope);
+    :run(global.js)\n→ importPackage(Packages.xxx)\n→ EventType consts;
+    if (global.js parse error?) then (yes)
+      :scripts.errored = true;
+    endif
+  else (already initialised)
+  endif
+
+  if (Only one .js file in mod?) then (yes)
+    :Use that single file as main script;
+  else (no)
+    :Use scripts/main.js as entry point;
+  endif
+
+  if (main.js exists && is not a directory?) then (yes)
+    :scripts.run(mod, main);
+    :currentMod = mod;
+    :context.evaluateString(\n'modName = "..."; scriptName = "..."');
+    :context.evaluateString(scope,\n'(function(){"use strict";\n' + script + '\n})();');
+    if (Throwable thrown?) then (yes)
+      :Log error at LogLevel.err\nReturn false;
+    else (no)
+      :Script executed successfully;
+    endif
+    :currentMod = null;
+  else (no main.js)
+    :Skip mod scripting;
+  endif
+endif
+
+|Mods|
+:checkWarnings();
+if (scripts.hasErrored()?) then (yes)
+  :ui.showErrorMessage()\nReport script init failure;
+endif
+
+|ContentLoader|
+:init()\nContent::init → Content::postInit\nfor all ContentType entries;
+:logicVars.init();
+:Events.fire(ContentInitEvent);
+:load() [client only]\nContent::loadIcon → Content::load;
+
+|Mods|
+if (New mod imported via importMod()?\nmods.reload() triggered) then (yes)
+  :newImports.each(updateDependencies);
+  if (Missing or soft dependencies?) then (yes)
+    :checkDependencies()\nShow auto-import dialog;
+  else (no)
+    :ui.showInfoOnHidden("@mods.reloadexit")\nCore.app.exit() on confirm;
+    :On next app launch:\nFull pipeline re-runs\nfrom discovery (Phase 1);
+  endif
+endif
+
+stop
+
+@enduml

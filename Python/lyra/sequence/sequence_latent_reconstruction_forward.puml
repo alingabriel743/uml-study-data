@@ -1,0 +1,255 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #F1F3F5
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #6C757D
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #F8F9FA
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Latent Reconstruction Forward Pass
+
+participant "train.py\n(Caller)" as caller
+participant "get_plucker_embedding\n_and_rays" as plucker_fn
+participant "ray_condition" as ray_cond
+participant "LatentRecon" as recon
+participant "PatchEmbed3D" as patch_embed
+participant "enc_blocks\n(Transformer/Mamba)" as enc
+participant "deconv\n(ConvTranspose3d)" as deconv
+participant "subsample_x_and_rays\n_wrapper" as subsample
+participant "gaussian_processing" as gauss_proc
+participant "gaussian_pruning" as gauss_prune
+participant "GaussianRenderer\n(gs)" as renderer
+participant "rasterization\n(gsplat)" as raster
+participant "compute_loss" as loss_fn
+
+== PRE-PROCESSING: Plucker Embedding ==
+
+caller -> plucker_fn: get_plucker_embedding_and_rays(\n  intrinsics, c2ws, img_size,\n  patch_size_out_factor, flip_flag)
+activate plucker_fn
+
+plucker_fn -> ray_cond: ray_condition(intrinsics, c2ws, H, W, flip_flag)
+activate ray_cond
+ray_cond --> plucker_fn: plucker_embedding [B,T,6,H,W]\nrays_os [B,T,3,H,W], rays_ds [B,T,3,H,W]
+deactivate ray_cond
+
+opt patch_size_out_factor != 1
+    plucker_fn -> ray_cond: ray_condition(intrinsics_resized, c2ws,\n  H//factor, W//factor)
+    activate ray_cond
+    ray_cond --> plucker_fn: rays_os_patch, rays_ds_patch
+    deactivate ray_cond
+end
+
+plucker_fn --> caller: plucker_embedding, rays_os, rays_ds
+deactivate plucker_fn
+
+== FORWARD PASS ==
+
+caller -> recon: forward(data)\n[rays_os, rays_ds, plucker_embedding,\nimages_input_embed, time_embeddings,\ncam_view, intrinsics, num_input_multi_views]
+activate recon
+
+recon -> recon: forward_gaussians(\n  images, plucker_embedding,\n  rays_os, rays_ds,\n  time_embeddings, num_input_multi_views)
+activate recon
+
+note right of recon
+  reshape_mv_temp_to_batch:
+  'b (v t) c h w → (b v) t c h w'
+end note
+
+recon -> patch_embed: patch_embed(images_input)
+activate patch_embed
+patch_embed --> recon: x [B*V, T*h*w, enc_embed_dim]
+deactivate patch_embed
+
+opt use_plucker
+    recon -> patch_embed: patch_plucker_embed(plucker_embedding)
+    activate patch_embed
+    patch_embed --> recon: plucker_tokens
+    deactivate patch_embed
+    note right of recon: x = x + plucker_tokens
+end
+
+opt time_embedding
+    recon -> recon: get_time_embedding(time_embeddings, V)
+    note right of recon: x = x + x_time_emb + x_time_emb_tgt
+end
+
+opt process_multi_views
+    note right of recon: reshape_mv_batch_to_temp:\nmerge views into T dim for joint attention
+end
+
+loop enc_blocks[i] for each block
+    recon -> enc: block(x)
+    activate enc
+    enc --> recon: x  [attention + gradient checkpointing]
+    deactivate enc
+end
+
+note right of recon
+  enc_norm(x) → LayerNorm
+  block_out(x) → optional Linear reduction
+  rearrange: '(b*v)(t h w)c → (b*v)c t h w'
+end note
+
+recon -> deconv: deconv(x)
+activate deconv
+deconv --> recon: x [B*V, output_dims, T_out, H_out, W_out]
+deactivate deconv
+
+opt sub_sample_gaussians == 'learned'
+    note right of recon: x_mask = x[:, [-1]]
+end
+
+opt sub_sample_gaussians enabled
+    recon -> subsample: subsample_x_and_rays_wrapper(\n  x, rays_os, rays_ds, x_mask)
+    activate subsample
+
+    alt type == 'random'
+        note right of subsample
+          subsample_pixels_spatio_temporal(
+            [B,T,H,W], [t_out, h_out, w_out]
+          ) → b_idx, t_idx, h_idx, w_idx
+          query_z_with_indices → subsampled [B, N_sub, C]
+        end note
+    else type == 'learned'
+        note right of subsample
+          process_tensors(tokens=x,
+            mask_logits=x_mask,
+            other_tensors=[rays_os, rays_ds],
+            k_t, k_hw, temperature, training
+          ) → Gumbel-Softmax differentiable top-k
+        end note
+    end
+
+    subsample --> recon: x, rays_os, rays_ds, x_mask\n[B*V, N_sub, output_dims]
+    deactivate subsample
+end
+
+== GAUSSIAN PROCESSING ==
+
+recon -> gauss_proc: gaussian_processing(x, rays_os, rays_ds)
+activate gauss_proc
+
+note right of gauss_proc
+  Split x → distance(1), rgb(3),
+    scaling(3), rotation(4), opacity(1)
+  depth = dnear*(1-sigmoid(dist)) + dfar*sigmoid(dist)
+  pos  = rays_os + rays_ds * depth
+  Activations:
+    opacity  = sigmoid(x − 2)
+    scale    = exp(x − shift).clamp(cap)
+    rotation = L2-normalize
+    rgb      = 0.5 * tanh(x) + 0.5
+  cat([pos, opacity, scale, rotation, rgb])
+end note
+
+gauss_proc --> recon: gaussians [B*V, N, 14]
+deactivate gauss_proc
+
+note right of recon: reshape_mv_batch_to_temp:\n'(b v) d c → b (v d) c'
+
+recon -> gauss_prune: gaussian_pruning(gaussians)
+activate gauss_prune
+
+note right of gauss_prune
+  argsort opacity descending
+  keep top-(1-prune_ratio) indices
+  + small random fraction
+  gather selected Gaussians
+end note
+
+gauss_prune --> recon: gaussians [B, N_pruned, 14]
+deactivate gauss_prune
+
+deactivate recon
+note right of recon: return gaussians [B, N_pruned, 14], x_mask
+
+== MULTI-VIEW RENDERING ==
+
+recon -> renderer: gs.render(\n  gaussians, cam_view,\n  bg_color=[1,1,1], intrinsics)
+activate renderer
+
+loop batch B × views V (in chunks)
+    renderer -> raster: rasterization(\n  means3D, quats=rotations, scales,\n  opacities, colors=rgbs,\n  viewmats, Ks, width, height,\n  near_plane, far_plane,\n  render_mode='RGB+ED')
+    activate raster
+    raster --> renderer: rendered_image_all\nrendered_alpha_all
+    deactivate raster
+end
+
+renderer --> recon: results {\n  images_pred [B,V,3,H,W],\n  depths_pred [B,V,1,H,W]\n}
+deactivate renderer
+
+alt training
+    recon --> caller: out {\n  images_pred, depths_pred, opacity_pred\n}
+else inference
+    recon --> caller: out {\n  images_pred, depths_pred,\n  gaussians, gaussians_mask_pred\n}
+end
+deactivate recon
+
+== LOSS COMPUTATION (training only) ==
+
+caller -> loss_fn: compute_loss(\n  accelerator, train_loss,\n  pred_images, gt_images,\n  pred_depths, gt_depths,\n  pred_opacity, config, lpips_loss_module)
+activate loss_fn
+
+note right of loss_fn
+  loss = MSE(pred_images, gt_images)   [always]
+end note
+
+opt lambda_lpips > 0
+    loss_fn -> loss_fn: compute_lpips_loss_in_chunks(\n  lpips_module, gt, pred)
+    note right of loss_fn: loss_lpips
+end
+
+opt lambda_ssim > 0
+    loss_fn -> loss_fn: fused_ssim(pred, gt)
+    note right of loss_fn: loss_ssim
+end
+
+opt lambda_depth > 0
+    loss_fn -> loss_fn: compute_depth_loss(\n  pred_depths, gt_depths)
+    note right of loss_fn: normalize_depth → smooth_l1_loss
+end
+
+opt lambda_opacity > 0
+    note right of loss_fn: loss_opacity = pred_opacity.sigmoid().mean()
+end
+
+note right of loss_fn
+  total = MSE
+        + λ_lpips  × LPIPS
+        + λ_ssim   × SSIM
+        + λ_depth  × SmoothL1Depth
+        + λ_opacity × OpacityReg
+end note
+
+loss_fn -> loss_fn: accelerator.gather(loss) → avg_loss\n[distributed training sync]
+loss_fn --> caller: train_loss, loss
+deactivate loss_fn
+
+@enduml

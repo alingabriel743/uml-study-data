@@ -1,0 +1,253 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #DEE2E6
+}
+
+title Plugin Manager: Loading and Registering Plugins
+
+actor Caller
+participant "PluginManager" as pm
+participant "Composer" as composer
+participant "PartialComposer\n(globalComposer)" as globalComposer
+participant "RepositoryManager" as repoMgr
+participant "RepositoryInterface\n(localRepo)" as localRepo
+participant "PackageSorter" as sorter
+participant "RepositoryUtils" as repoUtils
+participant "InstalledRepository" as installedRepo
+participant "AutoloadGenerator" as autoloadGen
+participant "ClassLoader" as classLoader
+participant "PluginInterface /\nInstallerInterface" as plugin
+participant "InstallationManager" as installMgr
+participant "EventDispatcher" as eventDispatcher
+participant "IOInterface" as io
+
+== loadInstalledPlugins: Local Plugins ==
+
+Caller -> pm: loadInstalledPlugins()
+activate pm
+
+pm -> pm: arePluginsDisabled('local')
+note right: Returns false → continue
+
+pm -> composer: getRepositoryManager()
+activate composer
+composer --> pm: RepositoryManager
+deactivate composer
+
+pm -> repoMgr: getLocalRepository()
+activate repoMgr
+repoMgr --> pm: localRepo
+deactivate repoMgr
+
+pm -> pm: loadRepository(localRepo, isGlobalRepo=false, rootPackage)
+activate pm
+
+  pm -> localRepo: getPackages()
+  activate localRepo
+  localRepo --> pm: CompletePackage[]
+  deactivate localRepo
+
+  pm -> sorter: sortPackages(packages, weights)
+  activate sorter
+  note right: composer/installers gets\nweight -10000 → sorted first
+  sorter --> pm: sortedPackages[]
+  deactivate sorter
+
+  pm -> repoUtils: filterRequiredPackages(packages, rootPackage, true)
+  activate repoUtils
+  repoUtils --> pm: requiredPackages[]
+  deactivate repoUtils
+
+  loop each package of type composer-plugin or composer-installer
+
+    alt package NOT in requiredPackages
+      pm -> pm: isPluginAllowed(package.name, isGlobalPlugin=false, optional=true)
+      note right: Checks allow-plugins rules;\nmay prompt user via IOInterface;\nthrows PluginBlockedException if denied
+    end
+
+    pm -> pm: registerPackage(package, failOnMissingClasses=false, isGlobalPlugin=false)
+
+  end
+
+deactivate pm
+
+== loadInstalledPlugins: Global Plugins ==
+
+opt globalComposer != null
+  pm -> pm: arePluginsDisabled('global')
+  note right: Returns false → continue
+
+  pm -> globalComposer: getRepositoryManager().getLocalRepository()
+  activate globalComposer
+  globalComposer --> pm: globalRepo
+  deactivate globalComposer
+
+  pm -> pm: loadRepository(globalRepo, isGlobalRepo=true)
+  note right: Same loop as local,\nwith isGlobalPlugin=true
+end
+
+== registerPackage: Validation & Autoload Setup ==
+
+activate pm
+
+  pm -> pm: arePluginsDisabled('local'|'global')
+  note right: Guard — return early if disabled
+
+  pm -> localRepo: getType()
+  note right: Must be composer-plugin\nor composer-installer
+
+  alt composer-plugin type
+    pm -> pm: validate composer-plugin-api constraint\n(VersionParser + Constraint vs PLUGIN_API_VERSION)
+  end
+
+  pm -> pm: isPluginAllowed(package.name, isGlobalPlugin, optional)
+  note right: May prompt IOInterface if interactive\nand no matching rule found
+
+  pm -> pm: check registeredPlugins[package.name]
+  note right: Duplicate guard — skip if already registered
+
+  pm -> localRepo: getExtra()
+  activate localRepo
+  localRepo --> pm: extra['class'] (string | string[])
+  deactivate localRepo
+
+  pm -> composer: getRepositoryManager().getLocalRepository()
+  activate composer
+  composer --> pm: localRepo
+  deactivate composer
+
+  pm -> composer: getPackage() → rootPackage (clone; files autoload cleared)
+  activate composer
+  composer --> pm: rootPackage
+  deactivate composer
+
+  pm -> installedRepo: new InstalledRepository([localRepo, rootPackageRepo])
+  activate installedRepo
+
+  opt globalRepo exists
+    pm -> installedRepo: addRepository(globalRepo)
+  end
+
+  pm -> pm: collectDependencies(installedRepo, autoloadPackages, package)
+  activate pm
+    pm -> localRepo: getRequires() → Link[]
+    pm -> installedRepo: findPackagesWithReplacersAndProviders(target) [recursive]
+  deactivate pm
+
+  deactivate installedRepo
+
+  loop each dep package
+    pm -> pm: shouldAutoloadPackage(pkg, path)
+    note right: Dedup via\nautoloadedPackages[name:version:path] cache
+  end
+
+  pm -> composer: getAutoloadGenerator()
+  activate composer
+  composer --> pm: AutoloadGenerator
+  deactivate composer
+
+  pm -> autoloadGen: parseAutoloads(autoloads[], rootPackage)
+  activate autoloadGen
+  autoloadGen --> pm: autoload map
+  deactivate autoloadGen
+
+  pm -> autoloadGen: createLoader(map, vendor-dir)
+  activate autoloadGen
+  autoloadGen --> pm: ClassLoader
+  deactivate autoloadGen
+
+  pm -> classLoader: register(false)
+  activate classLoader
+  classLoader --> pm: (registered)
+  deactivate classLoader
+
+  loop each file in map['files']
+    pm -> pm: composerRequire(fileIdentifier, file)
+    note right: Skip laminas bridge hack;\nrequires file into runtime
+  end
+
+== registerPackage: Class Instantiation ==
+
+  loop each $class in extra['class']
+
+    alt class already loaded
+      pm -> pm: eval patched class code\n(renamed _composer_tmpN suffix)
+      note right: Handles class collision\nfor hot-reload scenarios
+    end
+
+    alt package type == composer-installer
+      pm -> installMgr: new $class(io, composer) → addInstaller(installer)
+      activate installMgr
+      installMgr --> pm: (installer registered)
+      deactivate installMgr
+    else package type == composer-plugin
+      pm -> pm: addPlugin(new $class(), isGlobalPlugin, package)
+    end
+
+  end
+
+deactivate pm
+
+== addPlugin: Activation & Event Subscription ==
+
+activate pm
+
+  pm -> pm: arePluginsDisabled() [guard]
+  pm -> pm: isPluginAllowed(sourcePackage.name, isGlobalPlugin, optional) [guard]
+
+  pm -> io: writeError('Loading plugin <name>', DEBUG)
+  activate io
+  io --> pm
+  deactivate io
+
+  pm -> pm: plugins[] ← append plugin instance
+
+  pm -> plugin: activate(composer, io)
+  activate plugin
+  plugin --> pm: (activated)
+  deactivate plugin
+
+  opt plugin instanceof EventSubscriberInterface
+    pm -> composer: getEventDispatcher()
+    activate composer
+    composer --> pm: EventDispatcher
+    deactivate composer
+
+    pm -> eventDispatcher: addSubscriber(plugin)
+    activate eventDispatcher
+    eventDispatcher --> pm: (subscribed)
+    deactivate eventDispatcher
+  end
+
+deactivate pm
+
+pm --> Caller: (all plugins loaded and activated)
+deactivate pm
+
+@enduml

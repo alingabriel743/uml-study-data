@@ -1,0 +1,199 @@
+{
+  "scope": "core_evolution_and_configuration",
+  "title": "Core Evolution & Configuration",
+  "diagram_type": "use_case",
+  "description": "Top-level evolve loop, system configuration loading, and canary/smoke-test gate",
+
+  "actors": [
+    {
+      "name": "Operator",
+      "type": "primary",
+      "description": "Developer/CI invoking the CLI (node index.js <command>)"
+    },
+    {
+      "name": "Daemon",
+      "type": "primary",
+      "description": "Automated internal loop running continuous evolution cycles (--loop / --mad-dog)"
+    },
+    {
+      "name": "Environment",
+      "type": "secondary",
+      "description": "OS environment variables that override config defaults (EVOLVER_* env vars)"
+    },
+    {
+      "name": "ChildProcess",
+      "type": "secondary",
+      "description": "Forked child process used for canary smoke-test and daemon self-restart"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC01",
+      "name": "Run Single Evolution Cycle",
+      "actor": "Operator",
+      "trigger": "node index.js [run|/evolve] (no --loop flag)",
+      "steps": [
+        "main() parses CLI args, detects single-run mode",
+        "Calls evolve.run() directly",
+        "Logs result; exits with code 0 or 1"
+      ],
+      "modules": ["index.js:main()", "src/evolve.js:run()"]
+    },
+    {
+      "id": "UC02",
+      "name": "Start Continuous Daemon Loop",
+      "actor": "Operator",
+      "trigger": "node index.js --loop | --mad-dog",
+      "steps": [
+        "main() enables loop mode, patches console with timestamps",
+        "acquireLock() writes evolver.pid; exits if another instance is running",
+        "Registers SIGINT/SIGTERM/uncaughtException handlers to releaseLock()",
+        "Sets EVOLVE_LOOP=true, conditionally sets EVOLVE_BRIDGE",
+        "Starts A2A heartbeat (a2aProtocol.startHeartbeat) and SSE event stream",
+        "Optionally starts proxy (EVOMAP_PROXY=1) or mailbox transport",
+        "Optionally auto-starts ATP merchant agent if atpMode=auto|on",
+        "Enters while(true) loop calling evolve.run() each cycle"
+      ],
+      "modules": ["index.js:main()", "index.js:acquireLock()", "src/gep/a2aProtocol", "src/atp", "src/proxy"]
+    },
+    {
+      "id": "UC03",
+      "name": "Gate Cycle on Pending Solidify",
+      "actor": "Daemon",
+      "trigger": "Automatic — checked at start of every daemon loop iteration",
+      "steps": [
+        "readJsonSafe(solidifyStatePath) loads evolution_solidify_state.json",
+        "isPendingSolidify(state) compares last_run.run_id vs last_solidify.run_id",
+        "If pending: sleepMs(pendingSleepMs) and continue; skipping evolve.run()",
+        "If EVOLVE_BRIDGE=false after run: rejectPendingRun() auto-rejects and marks state"
+      ],
+      "modules": ["index.js:isPendingSolidify()", "index.js:rejectPendingRun()", "index.js:readJsonSafe()"]
+    },
+    {
+      "id": "UC04",
+      "name": "Load & Override System Configuration",
+      "actor": "Environment",
+      "trigger": "Module load time (src/config.js required)",
+      "steps": [
+        "envInt/envFloat/envStr helpers read process.env at module init",
+        "Each constant falls back to a hardcoded default if env var absent/invalid",
+        "Groups: Network (HELLO_TIMEOUT_MS, HEARTBEAT_*), Solidify (CANARY_TIMEOUT_MS, MIN_PUBLISH_SCORE), Evolution (REPAIR_LOOP_THRESHOLD, PROMPT_MAX_CHARS), Ops (MAX_SILENCE_MS, LOCK_MAX_AGE_MS), Self-PR, Leak-check",
+        "All constants exported as module.exports for use by evolve, solidify, canary callers"
+      ],
+      "modules": ["src/config.js:envInt()", "src/config.js:envFloat()", "src/config.js:envStr()"],
+      "key_constants": [
+        "CANARY_TIMEOUT_MS=30000",
+        "VALIDATION_TIMEOUT_MS=180000",
+        "MIN_PUBLISH_SCORE=0.78",
+        "REPAIR_LOOP_THRESHOLD=3",
+        "IDLE_FETCH_INTERVAL_MS=600000",
+        "SOLIDIFY_MAX_RETRIES=2",
+        "MAX_SILENCE_MS=30min"
+      ]
+    },
+    {
+      "id": "UC05",
+      "name": "Run Canary Smoke-Test Gate",
+      "actor": "ChildProcess",
+      "trigger": "Forked by solidify pipeline before committing an evolution",
+      "steps": [
+        "canary.js executes in a forked child process (not called directly from evolve/index)",
+        "Calls require('../index.js') inside try/catch",
+        "If index.js loads without throwing: process.exit(0) — safe to solidify",
+        "If any error (syntax, missing require, runtime crash): writes error to stderr, process.exit(1) — abort solidify"
+      ],
+      "modules": ["src/canary.js"],
+      "note": "canary.js is the last safety net; catches broken patches before daemon restarts with corrupt code"
+    },
+    {
+      "id": "UC06",
+      "name": "Adaptive Sleep Between Cycles",
+      "actor": "Daemon",
+      "trigger": "After each evolve.run() completes",
+      "steps": [
+        "If cycle failed or took < idleThresholdMs: double currentSleepMs (capped at maxSleepMs)",
+        "If cycle succeeded and took >= idleThresholdMs: reset to minSleepMs",
+        "OMLS: getScheduleRecommendation() returns sleep_multiplier; triggers distillation or exploration if idle",
+        "Saturation: reads last_run.signals; force_steady_state → 4x sleep, evolution_saturation → 2x sleep",
+        "Jitter: random 0–250ms added to avoid lockstep restarts",
+        "Final sleep = max(minSleepMs, (base + jitter) * satMult * omlsMult)"
+      ],
+      "modules": ["index.js:main()/loop", "src/gep/idleScheduler:getScheduleRecommendation()"]
+    },
+    {
+      "id": "UC07",
+      "name": "Self-Restart Daemon (Suicide Gate)",
+      "actor": "Daemon",
+      "trigger": "cycleCount >= EVOLVER_MAX_CYCLES_PER_PROCESS (default 100) OR rss > EVOLVER_MAX_RSS_MB (default 500MB)",
+      "steps": [
+        "Opens evolver log file for append",
+        "spawn(process.execPath, [__filename, ...args], {detached:true}) to fork replacement",
+        "child.unref() to detach",
+        "releaseLock()",
+        "process.exit(0) to terminate current instance"
+      ],
+      "modules": ["index.js:main()/suicide-check", "child_process:spawn"]
+    },
+    {
+      "id": "UC08",
+      "name": "Acquire / Release Singleton Lock",
+      "actor": "Daemon",
+      "trigger": "On daemon start (acquireLock) and shutdown (releaseLock)",
+      "steps": [
+        "acquireLock(): writes PID to evolver.pid with exclusive flag wx",
+        "If EEXIST: reads existing PID, sends signal 0 to check liveness",
+        "Stale lock (dead PID) → overwrites and takes over",
+        "Live lock → logs 'already running' and exits 0",
+        "releaseLock(): reads PID file, unlinks only if pid === process.pid"
+      ],
+      "modules": ["index.js:acquireLock()", "index.js:releaseLock()"]
+    },
+    {
+      "id": "UC09",
+      "name": "Bootstrap Environment (.env loading)",
+      "actor": "Operator",
+      "trigger": "Module load time at top of index.js",
+      "steps": [
+        "require('dotenv').config({path: path.join(getRepoRoot(), '.env')})",
+        "Silently warns if dotenv not found — non-fatal",
+        "Populates process.env before config.js constants are evaluated"
+      ],
+      "modules": ["index.js (top-level)", "src/gep/paths:getRepoRoot()"]
+    }
+  ],
+
+  "key_relationships": [
+    "index.js:main() includes UC01, UC02, UC06, UC07, UC08, UC09",
+    "UC02 extends UC03 (loop checks pending solidify each iteration)",
+    "UC02 extends UC06 (adaptive sleep after each cycle)",
+    "UC02 extends UC07 (suicide gate checked each cycle)",
+    "UC05 (canary) is invoked by solidify pipeline, not by evolve loop directly",
+    "UC04 (config loading) is used_by evolve.run(), solidify, canary, a2aProtocol",
+    "UC08 is included_by UC02 (daemon must hold lock while running)"
+  ],
+
+  "system_boundaries": {
+    "core_entry_point": "index.js — CLI dispatcher and daemon controller",
+    "evolution_engine": "src/evolve.js — obfuscated; exposed as evolve.run() async function",
+    "configuration": "src/config.js — env-var-overridable constants, grouped by concern",
+    "smoke_test_gate": "src/canary.js — forked child, validates index.js loads cleanly",
+    "external_dependencies": ["src/gep/solidify", "src/gep/a2aProtocol", "src/gep/paths", "src/gep/idleScheduler", "src/atp", "src/proxy"]
+  },
+
+  "important_notes": [
+    "src/evolve.js is obfuscated (all internal names are hex-encoded _0x...). The public interface is only evolve.run() (async, no parameters, called from index.js).",
+    "canary.js is NOT called from index.js or evolve.js directly — it is a standalone script spawned by the solidify pipeline as a pre-commit safety check.",
+    "config.js has no classes or state — pure constants evaluated once at require() time.",
+    "Daemon loop has multiple sleep multipliers that compose: base × saturation(1x/2x/4x) × OMLS(idle scheduler).",
+    "EVOLVE_BRIDGE env var controls whether pending runs are auto-rejected in loop mode (false = no solidify bridge, auto-reject state without git rollback).",
+    "Singleton lock uses evolver.pid at project root; stale-lock detection via process.kill(pid, 0)."
+  ],
+
+  "source_files_analyzed": [
+    "index.js (908 lines, fully readable)",
+    "src/config.js (144 lines, fully readable)",
+    "src/canary.js (13 lines, fully readable)",
+    "src/evolve.js (obfuscated — internal functions not analyzable, public API: evolve.run())"
+  ]
+}

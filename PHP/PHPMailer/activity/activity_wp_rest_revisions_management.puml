@@ -1,0 +1,253 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    DiamondFontColor #533F03
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #DEE2E6
+    TitleFontColor #212529
+    TitleFontSize 12
+}
+skinparam noteBackgroundColor #D1ECF1
+skinparam noteBorderColor #0C5460
+skinparam noteFontColor #0C5460
+
+title WordPress REST Revisions Management Flow\n<size:11>WP_REST_Revisions_Controller  |  Namespace: wp/v2  |  REST Base: revisions</size>
+
+|REST Client|
+start
+:REST API Request\n(GET or DELETE on revisions endpoint);
+
+|WP_REST_Revisions_Controller|
+if (Endpoint?) then (GET /{parent}/revisions)
+
+  '──────────────────────────────────────────
+  '  FLOW 1 — LIST REVISIONS
+  '──────────────────────────────────────────
+  :get_items_permissions_check(request);
+  :get_parent(request['parent']);
+  if (parent_id > 0\nAND post_type = parent_post_type?) then (no)
+    |REST Client|
+    :WP_Error: rest_post_invalid_parent\n← 404 Not Found;
+    detach
+  else (yes)
+  endif
+
+  |WP_REST_Revisions_Controller|
+  :current_user_can('edit_post', parent->ID);
+  if (user has edit_post\ncapability?) then (no)
+    |REST Client|
+    :WP_Error: rest_cannot_read\n← 403 Forbidden;
+    detach
+  else (yes)
+  endif
+
+  |WP_REST_Revisions_Controller|
+  :get_items(request);
+  if (orderby = 'relevance'\nwithout search param?) then (yes)
+    |REST Client|
+    :WP_Error: rest_invalid_param\n← 400 Bad Request;
+    detach
+  else (no)
+  endif
+  if (orderby = 'include'\nwithout include param?) then (yes)
+    |REST Client|
+    :WP_Error: rest_invalid_param\n← 400 Bad Request;
+    detach
+  else (no)
+  endif
+
+  |WordPress Core|
+  :wp_revisions_enabled(parent);
+  |WP_REST_Revisions_Controller|
+  if (revisions enabled\non parent post?) then (yes)
+    :Build WP_Query args\n(post_parent, post_type='revision',\npost_status='inherit', order=DESC);
+    :Map request params\n(exclude, include, offset, order,\norderby, page, per_page, search);
+    :Apply filter: rest_revision_query\n(allows third-party query modification);
+    :prepare_items_query(args, request)\n→ sanitised query_args;
+    |WordPress Core|
+    :WP_Query->query(query_args)\n→ revisions collection;
+    |WP_REST_Revisions_Controller|
+    :Compute total_revisions\nand max_pages;
+    if (offset >= total_revisions\nOR page > max_pages?) then (yes)
+      |REST Client|
+      :WP_Error: out-of-bounds\n← 400 Bad Request;
+      detach
+    else (no)
+    endif
+  else (no — revisions disabled)
+    :Set revisions = []\ntotal = 0, max_pages = 0;
+  endif
+
+  :For each revision:\nprepare_item_for_response()\n→ prepare_response_for_collection();
+  note right
+    Fields filtered by context:
+    view | edit | embed
+    Date fields → RFC3339 via
+    prepare_date_response()
+  end note
+  :Build WP_REST_Response;
+  :Set headers:\nX-WP-Total, X-WP-TotalPages;
+  :Add Link: prev / next\npagination headers;
+
+  |REST Client|
+  :← 200 OK\nRevision list with pagination headers;
+  stop
+
+elseif (GET /{parent}/revisions/{id}) then (yes)
+
+  '──────────────────────────────────────────
+  '  FLOW 2 — GET SINGLE REVISION
+  '──────────────────────────────────────────
+  :get_item_permissions_check(request)\n→ delegates entirely to\nget_items_permissions_check(request);
+  :get_parent(request['parent']);
+  if (parent valid?) then (no)
+    |REST Client|
+    :WP_Error: rest_post_invalid_parent\n← 404 Not Found;
+    detach
+  else (yes)
+  endif
+
+  |WP_REST_Revisions_Controller|
+  :current_user_can('edit_post', parent->ID);
+  if (user has edit_post\ncapability?) then (no)
+    |REST Client|
+    :WP_Error: rest_cannot_read\n← 403 Forbidden;
+    detach
+  else (yes)
+  endif
+
+  |WP_REST_Revisions_Controller|
+  :get_item(request);
+  :get_revision(request['id']);
+  if (revision_id > 0?) then (no)
+    |REST Client|
+    :WP_Error: rest_post_invalid_id\n← 404 Not Found;
+    detach
+  else (yes)
+  endif
+
+  |WordPress Core|
+  :get_post(revision_id) → WP_Post;
+  |WP_REST_Revisions_Controller|
+  if (post found AND\npost_type = 'revision'?) then (no)
+    |REST Client|
+    :WP_Error: rest_post_invalid_id\n← 404 Not Found;
+    detach
+  else (yes)
+  endif
+
+  :prepare_item_for_response\n(revision, request);
+  :rest_ensure_response(response);
+  note right
+    Adds parent link:
+    add_link('parent', rest_url(...))
+    Applies filter:
+    rest_prepare_revision(response, post, request)
+  end note
+
+  |REST Client|
+  :← 200 OK\nSingle revision data;
+  stop
+
+else (DELETE /{parent}/revisions/{id})
+
+  '──────────────────────────────────────────
+  '  FLOW 3 — DELETE REVISION
+  '──────────────────────────────────────────
+  :delete_item_permissions_check(request);
+  :get_parent(request['parent']);
+  if (parent valid?) then (no)
+    |REST Client|
+    :WP_Error: rest_post_invalid_parent\n← 404 Not Found;
+    detach
+  else (yes)
+  endif
+
+  |WP_REST_Revisions_Controller|
+  :current_user_can('delete_post', parent->ID);
+  if (user has delete_post\non parent?) then (no)
+    |REST Client|
+    :WP_Error: rest_cannot_delete\n← 403 Forbidden;
+    detach
+  else (yes)
+  endif
+
+  :get_revision(request['id']);
+  if (revision valid\nand post_type = 'revision'?) then (no)
+    |REST Client|
+    :WP_Error: rest_post_invalid_id\n← 404 Not Found;
+    detach
+  else (yes)
+  endif
+
+  :get_items_permissions_check(request)\n(verify edit_post capability on parent);
+  :current_user_can('delete_post', revision->ID);
+  if (all delete permissions\ngranted?) then (no)
+    |REST Client|
+    :WP_Error: rest_cannot_delete\n← 403 Forbidden;
+    detach
+  else (yes)
+  endif
+
+  |WP_REST_Revisions_Controller|
+  :delete_item(request);
+  if (force param = true?) then (no, false or missing)
+    note right
+      Revisions do NOT support trashing.
+      force=true is MANDATORY for DELETE.
+      Omitting it always returns 501.
+    end note
+    |REST Client|
+    :WP_Error: rest_trash_not_supported\n← 501 Not Implemented;
+    detach
+  else (yes — hard delete)
+  endif
+
+  :get_revision(request['id']);
+  :prepare_item_for_response(revision, request)\n→ capture $previous snapshot;
+  |WordPress Core|
+  :wp_delete_post(revision_id, true)\n(permanent deletion — bypasses trash);
+  :Fire action:\nrest_delete_revision(result, request);
+  |WP_REST_Revisions_Controller|
+  if (delete result\nreturned truthy?) then (no)
+    |REST Client|
+    :WP_Error: rest_cannot_delete\n← 500 Internal Server Error;
+    detach
+  else (yes)
+  endif
+
+  :Build WP_REST_Response:\n{ deleted: true,\n  previous: previous->get_data() };
+
+  |REST Client|
+  :← 200 OK\n{ deleted: true, previous: { ... } };
+  stop
+
+endif
+
+'──────────────────────────────────────────
+'  SHARED HELPER — prepare_date_response
+'──────────────────────────────────────────
+|WP_REST_Revisions_Controller|
+note
+  <b>prepare_date_response(date_gmt, date = null)</b>
+  ┌─ date_gmt = '0000-00-00 00:00:00' ──→ return null
+  ├─ $date provided ────────────────────→ mysql_to_rfc3339($date)
+  └─ default ───────────────────────────→ mysql_to_rfc3339($date_gmt)
+  Called for: date, date_gmt, modified, modified_gmt fields
+  Output format: RFC3339 / ISO 8601
+end note
+
+stop
+@enduml

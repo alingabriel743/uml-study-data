@@ -1,0 +1,157 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #495057
+    EndColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title Datadog INI Configuration Management
+
+|CLI / main()|
+start
+:Parse CLI arguments\n(parse_cli_arguments());
+if (Command?) then (config list)
+
+  |cmd_config_list|
+  :config_list($options);
+  note right
+    1. get_ini_settings() — load all DD INI setting definitions
+    2. array_slice() skips first 3 extension= entries
+       (CMD_CONFIG_NUM_SHIFT = 3: ddtrace, profiling, appsec)
+    3. require_binaries_or_exit() → resolve PHP binaries
+    4. For each binary: ini_values() → $phpProps
+    5. find_all_ini_files() → scan INI scan directory
+    6. parse_ini_file() → intersect raw keys with DD setting names
+    7. Build IniRecord(setting, currentValue, defaultValue,
+       iniFile, binary) per matched setting
+  end note
+  :For each IniRecord:\n$record->println();
+
+  |CLI / main()|
+  stop
+
+elseif (Command?) then (config get)
+
+  |cmd_config_get|
+  if ($options['d'] provided?) then (no)
+    :print_help();
+    stop
+  endif
+  :config_list($options)\n→ array<string, IniRecord>\n(later INI file entries overwrite earlier ones);
+  :For each requested setting\nname in $options['d'];
+  if (Setting found\nin IniRecord[]?) then (yes)
+    :$record->println()\nfor each matching IniRecord;
+  else (no)
+    :Echo "; <setting> = undefined\n; is missing in INI files";
+  endif
+
+  |CLI / main()|
+  stop
+
+else (config set)
+
+  |cmd_config_set|
+  if ($options['d'] provided?) then (no)
+    :print_help();
+    stop
+  endif
+  :require_binaries_or_exit($options)\n→ $selectedBinaries\n(--php-bin option or auto-discovery);
+  :For each PHP binary\n($command => $fullPath);
+  :Echo "Setting configuration for binary: <path>";
+  :ini_values($fullPath)\n→ $phpProps\n(PHP_VER, INI_MAIN, INI_SCANDIR,\nEXTENSION_DIR, THREAD_SAFETY, PHP_API, IS_DEBUG);
+  :For each CLI setting string\nin $options['d'];
+  :parse_ini_setting($cliIniSetting)\nexplode('=', 2) + trim each part\nvalidate via parse_ini_string();
+  if (Valid "key=value"\nformat?) then (no)
+    :Echo skip warning\ncontinue to next setting;
+  else (yes)
+    :find_all_ini_files($phpProps)\n→ $allIniFilePaths\n(98-ddtrace.ini sorted first);
+    note right
+      Debian-based detection:
+      INI_SCANDIR contains '/cli/conf.d'
+      → also scans apache2/fpm SAPI conf.d dirs.
+      filter_ssi_ini_paths() removes paths
+      containing 'datadog-apm-library-php'.
+    end note
+
+    :**PASS 1** — Update Active Lines\n(promoteComment = false);
+    :For each $iniFile:\nupdate_ini_setting(setting, iniFile, false)\nRegex: ^\\h*key\\h*=...\nReplaces ALL active occurrences (limit = -1);
+    if (preg_replace error\n(returns null)?) then (yes)
+      :Echo regex error;
+    else (count > 0)
+      :file_put_contents($iniFile, newContent)\nEcho success  $matchCount++;
+    endif
+    if (Active match found\n($matchCount >= 1)?) then (yes)
+      if ($matchCount >= 2?) then (yes)
+        :Echo duplicate\nsetting warning;
+      endif
+      :Setting updated in active line ✓\ncontinue to next setting;
+    else (no match)
+
+      :**PASS 2** — Promote Commented Lines\n(promoteComment = true);
+      :For each $iniFile:\nupdate_ini_setting(setting, iniFile, true)\nRegex: ^[\\h;]*key\\h*=...\nPromotes FIRST commented occurrence only (limit = 1);
+      if (preg_replace error\n(returns null)?) then (yes)
+        :Echo regex error;
+      else (count > 0)
+        :file_put_contents($iniFile, newContent)\nEcho success  $matchCount++  break;
+      endif
+      if (Commented match\npromoted ($matchCount >= 1)?) then (yes)
+        :Commented line activated ✓\ncontinue to next setting;
+      else (no match)
+
+        :**PASS 3** — Create New Entry;
+        :find_main_ini_files($phpProps)\n→ $mainIniFilePaths\n(default filename: 98-ddtrace.ini);
+        note right
+          Scans INI_SCANDIR for any .ini file
+          containing "extension = ddtrace"
+          → uses that filename instead.
+          Debian: derives apache2/fpm SAPI paths.
+          If neither INI_SCANDIR nor INI_MAIN set
+          → returns empty array.
+        end note
+        :For each $mainIniFile;
+        if (File does not exist?) then (yes)
+          :file_put_contents('') — create empty file;
+          if (Creation failed?) then (yes)
+            :Echo error\ncontinue to next main file;
+          endif
+        endif
+        :Read existing content\nIf not ending with newline → append EOL;
+        :Append "key = value" line\nfile_put_contents($iniFile, updatedContent);
+        if (Write succeeded?) then (yes)
+          :Echo success\n$set = true;
+        else (no)
+          :Echo write error;
+        endif
+        if (!$set after all main\nfiles attempted?) then (yes)
+          #FF6B6B:Echo "Unable to set configuration";
+          end
+        else (no)
+          :New entry created in\nmain INI file ✓;
+        endif
+
+      endif
+    endif
+  endif
+
+  |CLI / main()|
+  stop
+
+endif
+
+@enduml

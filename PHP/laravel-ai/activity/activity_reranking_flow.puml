@@ -1,0 +1,118 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #212529
+    EndColor #212529
+    BarColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+skinparam noteBackgroundColor #E9ECEF
+skinparam noteBorderColor #6C757D
+
+title Reranking Flow
+
+|Caller|
+start
+:Call **Reranking::of**(documents);
+
+if (documents is a list\n(not associative array)?) then (yes)
+    :Create **PendingReranking**(documents);
+    note right
+        Holds documents array
+        and optional limit cap
+    end note
+    if (limit cap required?) then (yes)
+        :Call **PendingReranking::limit**(n);
+    else (no)
+    endif
+    :Call **PendingReranking::rerank**\n(query, provider?, model?);
+
+|PendingReranking|
+    :Resolve provider list via\n**Provider::formatProviderAndModelList**\n(provider ?? config('ai.default_for_reranking'), model)\n→ providers map;
+    fork
+    fork again
+    end fork
+    note right: Supports multiple providers\nfor failover
+
+    while (foreach providers as $provider => $model?) is (more providers)
+        :Resolve **RerankingProvider** instance via\n**Ai::fakeableRerankingProvider**($provider);
+        if (model explicitly set?) then (no)
+            :Resolve default model:\n**provider->defaultRerankingModel()**\n(e.g. "rerank-2.5-lite");
+        else (yes)
+        endif
+
+|Reranks Trait / VoyageAiProvider|
+        :Create **RerankingPrompt**\n(documents, query, limit, provider, model);
+        if (**Ai::rerankingIsFaked**()?) then (yes)
+            :Record prompt via\n**Ai::recordReranking**(prompt)\nusing FakeRerankingGateway;
+        else (no)
+        endif
+        :Dispatch **Reranking** event\n(invocationId, provider, model, prompt);
+        :Call **rerankingGateway()->rerank**\n(provider, model, documents, query, limit);
+
+|VoyageAiGateway|
+        :Build HTTP client via\n**CreatesVoyageAiClient::client**(provider)\n→ Http::baseUrl('https://api.voyageai.com/v1')\n->withToken(apiKey);
+        if (limit set?) then (yes)
+            :HTTP **POST /rerank**\n{ model, query, documents, top_k };
+        else (no)
+            :HTTP **POST /rerank**\n{ model, query, documents };
+        endif
+        :Receive JSON response\n{ data: [{index, relevance_score}],\nmodel, usage };
+        :Map each data entry:\nnew **RankedDocument**(index, documents[index],\nrelevance_score);
+        :Return **RerankingResponse**\n(RankedDocument[], new Meta(provider, model));
+
+|Reranks Trait / VoyageAiProvider|
+        if (provider->rerank() throws\n**FailoverableException**?) then (yes)
+            :Dispatch **ProviderFailedOver** event\n(provider, model, exception);
+            note right
+                Continue to next provider
+                in failover loop
+            end note
+        else (no)
+            :Dispatch **Reranked** event\n(invocationId, provider, model, prompt, response);
+
+|PendingReranking|
+            :Return **RerankingResponse** to caller;
+
+|Caller|
+            :Receive **RerankingResponse**\nwith ranked RankedDocument[] + Meta;
+            stop
+        endif
+    endwhile (all providers exhausted)
+
+|PendingReranking|
+    :Throw last captured exception;
+
+|Caller|
+else (no)
+    :Throw **InvalidArgumentException**\n("documents must be a list");
+endif
+
+stop
+
+@enduml

@@ -1,0 +1,227 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #F9A825
+    FontColor #212529
+    FontSize 11
+}
+skinparam ArrowColor #495057
+
+title Model Offloading & Memory Management
+
+' ─────────────────────────────────────────────
+' PHASE 1 — Pipeline Initialisation
+' ─────────────────────────────────────────────
+|#E3F2FD|Pipeline Controller|
+start
+:Pipeline.__init__(cfg);
+
+fork
+  if (NOT offload_text_encoder_model\nOR disable_prompt_encoder?) then (yes)
+    :_load_text_encoder_model();
+    note right
+      CosmosT5TextEncoder (real)
+      OR DummyT5TextEncoder (stub)
+    end note
+  else (no — defer to runtime)
+  endif
+fork again
+  if (NOT offload_guardrail_models\nAND NOT disable_guardrail?) then (yes)
+    :_load_text_guardrail();
+    :_load_video_guardrail();
+  else (no — defer to runtime)
+  endif
+fork again
+  if (NOT offload_network?) then (yes)
+    :_load_network();
+    note right
+      DiffusionT2W: model.pt checkpoint
+      AutoRegressive: AR model + tensor-parallel shards
+    end note
+  else (no — defer to runtime)
+  endif
+fork again
+  if (NOT offload_tokenizer?) then (yes)
+    :_load_tokenizer();
+    note right
+      e.g. Cosmos-Tokenize1-CV8x8x8-720p
+    end note
+  else (no — defer to runtime)
+  endif
+end fork
+
+:_load_model();
+note right: Always called — loads model config & skeleton
+
+' ─────────────────────────────────────────────
+' PHASE 2 — generate() top-level flow
+' ─────────────────────────────────────────────
+:generate(prompt, negative_prompt);
+
+' ── Guardrail: prompt ──
+|#FCE4EC|Safety (Guardrails)|
+if (disable_guardrail?) then (no)
+  if (offload_guardrail_models?) then (yes)
+    :_load_text_guardrail();
+    note right: Lazy-load on demand
+  endif
+  :_run_guardrail_on_prompt(prompt);
+  if (offload_guardrail_models?) then (yes)
+    :_offload_guardrail_models();
+    |#E8F5E9|GPU Memory (CUDA)|
+    :del text_guardrail → None
+gc.collect()
+torch.cuda.empty_cache();
+    |#FCE4EC|Safety (Guardrails)|
+  endif
+  if (prompt safe?) then (no)
+    |#E3F2FD|Pipeline Controller|
+    #FF8A80:Log CRITICAL — unsafe prompt;
+    stop
+  endif
+else (yes — skip)
+  |#E3F2FD|Pipeline Controller|
+  :Skip prompt guardrail check;
+endif
+
+' ── Prompt upsampler (optional) ──
+|#E3F2FD|Pipeline Controller|
+if (enable_prompt_upsampler\nAND word_count ≤ limit?) then (yes)
+  :_run_prompt_upsampler_on_prompt_with_offload(prompt);
+  note right: Returns enhanced_prompt
+  if (disable_guardrail?) then (no)
+    |#FCE4EC|Safety (Guardrails)|
+    if (offload_guardrail_models?) then (yes)
+      :_load_text_guardrail();
+    endif
+    :_run_guardrail_on_prompt(enhanced_prompt);
+    if (offload_guardrail_models?) then (yes)
+      :_offload_guardrail_models();
+      |#E8F5E9|GPU Memory (CUDA)|
+      :del text_guardrail → None
+gc.collect()
+torch.cuda.empty_cache();
+      |#FCE4EC|Safety (Guardrails)|
+    endif
+    if (enhanced prompt safe?) then (no)
+      |#E3F2FD|Pipeline Controller|
+      #FF8A80:Return None — unsafe upsampled prompt;
+      stop
+    endif
+  endif
+  |#E3F2FD|Pipeline Controller|
+endif
+
+' ── Text Encoding ──
+|#EDE7F6|Text Encoder|
+if (offload_text_encoder_model?) then (yes)
+  :_load_text_encoder_model();
+  note right: Lazy-load on demand
+endif
+:_run_text_embedding_on_prompt(prompts);
+note right: Returns (embeddings, masks)
+if (offload_text_encoder_model?) then (yes)
+  :_offload_text_encoder_model();
+  |#E8F5E9|GPU Memory (CUDA)|
+  :del text_encoder → None
+gc.collect()
+torch.cuda.empty_cache();
+  |#EDE7F6|Text Encoder|
+endif
+
+' ── _run_model_with_offload ──
+|#FFF3E0|Generation Network|
+if (offload_network?) then (yes)
+  :_load_network();
+  note right
+    DiffusionT2W: load_network_model(model.pt)
+    AutoRegressive: load_ar_model(shard_ckpt,
+      tokenizer_cfg) — tensor parallel supported
+  end note
+endif
+
+|#E1F5FE|Tokenizer|
+if (offload_tokenizer?) then (yes)
+  :_load_tokenizer();
+  note right: e.g. Cosmos-Tokenize1-CV8x8x8-720p
+endif
+
+|#FFF3E0|Generation Network|
+:_run_model(prompt_embedding,\nnegative_prompt_embedding);
+note right: Returns sample (latent tensor)
+
+if (offload_network?) then (yes)
+  :_offload_network();
+  |#E8F5E9|GPU Memory (CUDA)|
+  :del model.model → None
+gc.collect()
+torch.cuda.empty_cache();
+  |#FFF3E0|Generation Network|
+endif
+
+|#E1F5FE|Tokenizer|
+if (offload_tokenizer?) then (yes)
+  :_load_tokenizer();
+  note right: Reload tokenizer specifically\nfor the decoding step
+endif
+:_run_tokenizer_decoding(sample);
+note right: Returns video (np.ndarray uint8)
+if (offload_tokenizer?) then (yes)
+  :_offload_tokenizer();
+  |#E8F5E9|GPU Memory (CUDA)|
+  :del model.tokenizer → None
+gc.collect()
+torch.cuda.empty_cache();
+  |#E1F5FE|Tokenizer|
+endif
+
+' ── Guardrail: video output ──
+|#FCE4EC|Safety (Guardrails)|
+if (disable_guardrail?) then (no)
+  if (offload_guardrail_models?) then (yes)
+    :_load_video_guardrail();
+    note right: Lazy-load on demand
+  endif
+  :_run_guardrail_on_video(video);
+  if (offload_guardrail_models?) then (yes)
+    :_offload_guardrail_models();
+    |#E8F5E9|GPU Memory (CUDA)|
+    :del video_guardrail → None
+gc.collect()
+torch.cuda.empty_cache();
+    |#FCE4EC|Safety (Guardrails)|
+  endif
+  if (video safe?) then (no)
+    |#E3F2FD|Pipeline Controller|
+    #FF8A80:Return None — unsafe video output;
+    stop
+  endif
+else (yes — skip)
+  |#E3F2FD|Pipeline Controller|
+  :Skip video guardrail check;
+endif
+
+|#E3F2FD|Pipeline Controller|
+#90EE90:Return (video_frames, final_prompt);
+stop
+
+@enduml

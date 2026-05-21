@@ -1,0 +1,166 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam actor {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #F1F3F5
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #DEE2E6
+    DividerBackgroundColor #CED4DA
+    DividerBorderColor #6C757D
+}
+
+title Shipment and Demand Notification Flow
+
+actor Admin as admin
+participant "ShipmentServlet" as shipSrv
+participant "OrderServiceImpl" as orderSvc
+participant "UserServiceImpl" as userSvc
+participant "MailMessage" as mail
+participant "JavaMailUtil" as javamail
+participant "SMTPServer\n(smtp.gmail.com:587)" as smtp
+database "Database" as db
+
+actor Customer as customer
+participant "AddtoCart" as cart
+participant "DemandServiceImpl" as demandSvc
+participant "UpdateProductSrv" as updateSrv
+participant "ProductServiceImpl" as prodSvc
+
+== Shipment Flow ==
+
+admin -> shipSrv : GET /ShipmentServlet\n?orderid=&prodid=&userid=&amount=
+activate shipSrv
+
+shipSrv -> shipSrv : getAttribute("usertype")\nguard: redirect to login if null
+
+shipSrv -> orderSvc : shipNow(orderId, prodId)
+activate orderSvc
+orderSvc -> db : UPDATE orders SET shipped=1\nWHERE orderid=? AND prodid=? AND shipped=0
+db --> orderSvc : rows updated
+orderSvc --> shipSrv : "Order Has been shipped successfully!!" | "FAILURE"
+deactivate orderSvc
+
+alt status != "FAILURE"
+    shipSrv -> userSvc : getFName(userName)
+    activate userSvc
+    userSvc -> db : SELECT fname FROM users WHERE username=?
+    db --> userSvc : firstName
+    userSvc --> shipSrv : name
+    deactivate userSvc
+
+    shipSrv -> mail : orderShipped(userName, name, orderId, amount)
+    activate mail
+    mail -> javamail : sendMail(recipient, subject, htmlTextMessage)
+    activate javamail
+    javamail -> smtp : Transport.send(MimeMessage)
+    smtp --> javamail : delivered
+    deactivate javamail
+    deactivate mail
+
+    shipSrv --> admin : forward to shippedItems.jsp
+else status == "FAILURE"
+    shipSrv --> admin : forward to unshippedItems.jsp
+end
+
+deactivate shipSrv
+
+== Demand Registration Flow (qty > available) ==
+
+customer -> cart : add item (qty > availableQty)
+activate cart
+cart -> demandSvc : addProduct(DemandBean\n  {userName, prodId, pQty - availableQty})
+activate demandSvc
+demandSvc -> db : SELECT FROM user_demand\nWHERE username=? AND prodid=?
+db --> demandSvc : existing record | empty
+
+alt not already demanded
+    demandSvc -> db : INSERT INTO user_demand\nVALUES(userId, prodId, demandQty)
+    db --> demandSvc : inserted
+end
+
+demandSvc --> cart : boolean result
+deactivate demandSvc
+cart --> customer : cart updated / demand registered
+deactivate cart
+
+== Demand Notification Flow (product restocked) ==
+
+admin -> updateSrv : GET /UpdateProductSrv\n?pid=&quantity=... (increased)
+activate updateSrv
+
+updateSrv -> prodSvc : updateProductWithoutImage(prodId, productBean)
+activate prodSvc
+prodSvc -> db : UPDATE product SET ...\nWHERE pid=?
+db --> prodSvc : k (rows updated)
+
+alt k > 0 AND prevQuantity < updatedQuantity
+
+    prodSvc -> demandSvc : haveDemanded(prevProductId)
+    activate demandSvc
+    demandSvc -> db : SELECT * FROM user_demand WHERE prodid=?
+    db --> demandSvc : List<DemandBean>
+    demandSvc --> prodSvc : demandList
+    deactivate demandSvc
+
+    loop for each DemandBean in demandList
+        prodSvc -> userSvc : getFName(demand.getUserName())
+        activate userSvc
+        userSvc -> db : SELECT fname FROM users WHERE username=?
+        db --> userSvc : firstName
+        userSvc --> prodSvc : userFName
+        deactivate userSvc
+
+        prodSvc -> mail : productAvailableNow(\n  demand.getUserName(), userFName,\n  prodName, prodId)
+        activate mail
+        mail -> javamail : sendMail(recipient, subject, htmlText)
+        activate javamail
+        javamail -> smtp : Transport.send(MimeMessage)
+        smtp --> javamail : delivered
+        deactivate javamail
+        deactivate mail
+
+        prodSvc -> demandSvc : removeProduct(\n  demand.getUserName(), prevProductId)
+        activate demandSvc
+        demandSvc -> db : DELETE FROM user_demand\nWHERE username=? AND prodid=?
+        db --> demandSvc : deleted
+        demandSvc --> prodSvc : true
+        deactivate demandSvc
+    end
+
+    prodSvc --> updateSrv : "Product Updated Successfully!\nAnd Mail Send to customers..."
+end
+
+deactivate prodSvc
+updateSrv --> admin : forward to updateProduct.jsp\n?prodid=&message=
+deactivate updateSrv
+
+@enduml

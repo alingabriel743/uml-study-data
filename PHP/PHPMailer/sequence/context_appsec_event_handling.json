@@ -1,0 +1,105 @@
+{
+  "scope": "appsec_event_handling",
+  "title": "AppSec Event Handling and Blocking Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "PHP Framework / SAPI",
+    "DDTrace\\UserRequest (PHP API)",
+    "RequestLifecycle (C: request_lifecycle.c)",
+    "ddtrace.c (symbol bridge)",
+    "AppSec Helper Daemon",
+    "BlockingFunction (PHP callable)",
+    "SpanData / RootSpanData"
+  ],
+  "interaction_flow": [
+    "=== Startup: Listener Registration ===",
+    "RequestLifecycle.dd_req_lifecycle_startup() → ddtrace.c.dd_trace_user_req_add_listeners(&dd_user_req_listeners)",
+    "ddtrace.c → _ddtrace_user_req_add_listeners(listeners) [via dlsym to ddtrace ext]",
+    "dd_user_req_listeners registered with priority=-10, callbacks: _start_user_req, _response_commit, _set_blocking_function, _finish_user_req",
+
+    "=== PHP Request Begin (PHP SAPI path) ===",
+    "PHP SAPI RINIT → RequestLifecycle._do_request_begin_php()",
+    "_do_request_begin_php() → dd_request_body_buffered(max_body_size) → _do_request_begin(rbe_zv)",
+
+    "=== User Request Begin (DDTrace notify_start path) ===",
+    "Framework → DDTrace\\UserRequest::notify_start(RootSpanData $span, array $data, mixed $body): ?array",
+    "ddtrace ext → _start_user_req(listener, span, superglob_equiv, rbe_zv)",
+    "_start_user_req() stores _cur_req_span, _superglob_equiv → calls _do_request_begin_user_req(rbe_zv)",
+    "_do_request_begin_user_req() → _do_request_begin(rbe_zv)",
+
+    "=== Core Request Init (WAF evaluation) ===",
+    "_do_request_begin() → dd_entity_body_rinit() → [optional: dd_config_sync(conn)] → dd_request_init(conn, &req_info)",
+    "AppSec Helper Daemon evaluates WAF rules against request data (headers, body, params)",
+    "dd_request_init returns: dd_success | dd_should_block | dd_should_redirect | dd_should_record | dd_network",
+
+    "=== Blocking Decision at Request Begin ===",
+    "if (res == dd_should_block || dd_should_redirect) → dd_req_lifecycle_abort(REQUEST_STAGE_REQUEST_BEGIN, res, &block_params)",
+    "dd_req_lifecycle_abort [user_req, begin/end stage] → dd_request_abort_static_page_spec(block_params, server) OR dd_request_abort_redirect_spec(block_params, server)",
+    "Blocking spec (status/headers/body) returned to framework → framework sends block response",
+
+    "=== Register Mid-Request Blocking Callback ===",
+    "Framework → DDTrace\\UserRequest::set_blocking_function(RootSpanData $span, callable $blockingFunction): void",
+    "ddtrace ext → _set_blocking_function(self, span, blocking_function)",
+    "_set_blocking_function validates _cur_req_span match, not already set, not after shutdown → ZVAL_COPY(&_blocking_function, blocking_function)",
+
+    "=== Mid-Request WAF Trigger (MID_REQUEST stage) ===",
+    "WAF fires mid-request → dd_req_lifecycle_abort(REQUEST_STAGE_MID_REQUEST, dd_should_block, &block_params)",
+    "dd_req_lifecycle_abort [user_req, MID_REQUEST] → _call_blocking_function(result, block_params)",
+    "_call_blocking_function() → dd_request_abort_static_page_spec() OR dd_request_abort_redirect_spec() → builds spec",
+    "_call_blocking_function() → invokes stored PHP callable $blockingFunction(spec) via zend_call_function()",
+
+    "=== Response Commit / Request End ===",
+    "Framework → DDTrace\\UserRequest::notify_commit(RootSpanData $span, int $status, array $headers, mixed $body): ?array",
+    "ddtrace ext → _response_commit(listener, span, status, resp_headers, rbe_zv)",
+    "_response_commit() → _do_request_finish_user_req(false, superglob_equiv, status, headers, rbe)",
+    "_do_request_finish_user_req() → dd_request_shutdown(conn, &ctx) → AppSec Helper re-evaluates rules at response",
+    "if (res == dd_should_block/redirect) → dd_req_lifecycle_abort(REQUEST_STAGE_REQUEST_END, ...) → blocking spec returned",
+    "_do_request_finish_user_req() → dd_tags_add_tags(_cur_req_span, superglob_equiv) → add security tags to span",
+
+    "=== ASM Event Emission ===",
+    "Trigger path A: DDTrace\\Testing\\emit_asm_event() [test/internal API]",
+    "Trigger path B: user_tracking.c._emit_user_event() [from track_user_login_success etc.]",
+    "_emit_user_event() → dd_tags_set_user_event_triggered() → dd_trace_emit_asm_event()",
+    "ddtrace.c.dd_trace_emit_asm_event() checks _asm_event_emitted guard (prevents double-emit)",
+    "dd_trace_emit_asm_event() → _ddtrace_emit_asm_event() [via dlsym to ddtrace ext]",
+    "ddtrace ext emits ASM (Application Security Management) event on current span"
+  ],
+  "key_relationships": [
+    "RequestLifecycle implements ddtrace_user_req_listeners interface (C struct with function pointers)",
+    "ddtrace.c bridges AppSec C extension → ddtrace PHP extension via dlsym symbol loading",
+    "dd_user_req_listeners registered at startup with priority=-10 (higher priority = earlier invocation)",
+    "SpanData/RootSpanData (PHP objects as zend_object*) passed through entire pipeline",
+    "block_params carries security_response_id + redirection_location for blocking decisions",
+    "_asm_event_emitted flag prevents duplicate ASM events per request"
+  ],
+  "key_data_structures": {
+    "ddtrace_user_req_listeners": "C struct: { int priority; start_user_req*, response_committed*, finish_user_req*, set_blocking_function*, delete* }",
+    "SpanData (PHP)": "name, service, resource, type, meta[], metrics[], peerServiceSources[], parent: SpanData|null, stack: SpanStack",
+    "RootSpanData extends SpanData": "origin, propagatedTags, samplingPriority, gitMetadata, inferredSpan",
+    "block_params": "C struct: { zend_string* security_response_id; zend_string* redirection_location }",
+    "dd_result (enum)": "dd_success | dd_should_block | dd_should_redirect | dd_should_record | dd_network"
+  },
+  "blocking_decision_matrix": {
+    "user_req + REQUEST_BEGIN or REQUEST_END": "Returns blocking spec (array with status/headers/body) to framework — framework sends response",
+    "user_req + MID_REQUEST": "Calls registered PHP $blockingFunction callable with spec",
+    "non_user_req + REQUEST_END": "Calls dd_trace_close_all_spans_and_flush() then dd_request_abort_static_page() or dd_request_abort_redirect() directly"
+  },
+  "important_notes": [
+    "PHP namespace DDTrace\\UserRequest provides the public API; actual logic is in C extension (request_lifecycle.c)",
+    "DDTrace\\Testing\\emit_asm_event() is the test/stub entry point; production path goes through user_tracking.c._emit_user_event()",
+    "has_listeners() in DDTrace\\UserRequest returns bool — used by frameworks to skip overhead when AppSec not loaded",
+    "AppSec registers with ddtrace at startup via dd_trace_user_req_add_listeners; if ddtrace not loaded, AppSec operates in standalone PHP mode",
+    "The blocking function (set_blocking_function) is a PHP callable registered by the framework (e.g., Symfony/Laravel integration) to handle mid-request blocking gracefully (exception or early response)",
+    "ASM events are tied to SpanData on the root span; dd_tags_set_user_event_triggered() sets appsec.events.users.* tags",
+    "All blocking paths eventually produce a 'spec' array {status, headers, body} derived from WAF block_params"
+  ],
+  "source_files_analyzed": [
+    "ext/ddtrace.stub.php",
+    "appsec/src/extension/ddtrace.c",
+    "appsec/src/extension/ddtrace.h",
+    "appsec/src/extension/request_lifecycle.c",
+    "appsec/src/extension/request_lifecycle.h",
+    "appsec/src/extension/user_tracking.c",
+    "ext/ddtrace_arginfo.h"
+  ]
+}

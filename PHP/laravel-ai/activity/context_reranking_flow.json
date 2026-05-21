@@ -1,0 +1,117 @@
+{
+  "scope": "reranking_flow",
+  "title": "Reranking Flow",
+  "diagram_type": "activity",
+  "description": "RerankingProvider receiving query + documents → gateway reranking call → RankedDocument results returned",
+
+  "entry_point": "Reranking::of(array $documents): PendingReranking",
+
+  "activity_steps": [
+    "START: Caller invokes Reranking::of(documents)",
+    "VALIDATE: Check documents is a list (not associative array) — throw InvalidArgumentException if not",
+    "CREATE: new PendingReranking(documents)",
+    "OPTIONAL: PendingReranking::limit(?int $limit) — sets result cap",
+    "INVOKE: PendingReranking::rerank(query, provider, model)",
+    "RESOLVE: Provider::formatProviderAndModelList(provider ?? config('ai.default_for_reranking'), model) → providers map",
+    "LOOP: foreach providers as $provider => $model",
+    "  RESOLVE: Ai::fakeableRerankingProvider($provider) → RerankingProvider instance",
+    "  RESOLVE: model ??= provider->defaultRerankingModel() (e.g. 'rerank-2.5-lite')",
+    "  TRY: provider->rerank(documents, query, limit, model)",
+    "    CREATE: RerankingPrompt(documents, query, limit, provider, model)",
+    "    CHECK: if Ai::rerankingIsFaked() → Ai::recordReranking(prompt)",
+    "    DISPATCH EVENT: Reranking(invocationId, provider, model, prompt)",
+    "    CALL GATEWAY: provider->rerankingGateway()->rerank(provider, model, documents, query, limit)",
+    "      BUILD CLIENT: CreatesVoyageAiClient::client(provider) → Http::baseUrl('https://api.voyageai.com/v1')->withToken(key)",
+    "      HTTP POST: /rerank with {model, query, documents, top_k?}",
+    "      RECEIVE: JSON response {data: [{index, relevance_score}], model, usage}",
+    "      MAP RESULTS: foreach data → new RankedDocument(index, documents[index], relevance_score)",
+    "      RETURN: new RerankingResponse(RankedDocument[], new Meta(provider, model))",
+    "    DISPATCH EVENT: Reranked(invocationId, provider, model, prompt, response)",
+    "    RETURN: RerankingResponse to caller",
+    "  CATCH FailoverableException: dispatch ProviderFailedOver event, continue to next provider",
+    "END LOOP: if all providers fail → throw last exception",
+    "END: caller receives RerankingResponse"
+  ],
+
+  "decision_points": [
+    "documents is a list? → proceed : throw InvalidArgumentException",
+    "limit set? → include top_k in HTTP payload : omit top_k",
+    "Ai::rerankingIsFaked()? → record prompt for assertions : skip",
+    "provider->rerank() throws FailoverableException? → try next provider : return response",
+    "all providers exhausted? → throw last exception"
+  ],
+
+  "key_participants": [
+    "Reranking (static facade/entry-point)",
+    "PendingReranking (builder: holds documents + limit)",
+    "RerankingProvider (interface: rerank, rerankingGateway, defaultRerankingModel, useRerankingGateway)",
+    "VoyageAiProvider (implements RerankingProvider via Reranks + HasRerankingGateway traits)",
+    "Reranks (trait: orchestrates event dispatch + gateway call)",
+    "HasRerankingGateway (trait: stores/returns RerankingGateway instance)",
+    "RerankingGateway (interface: rerank(provider, model, documents, query, limit))",
+    "VoyageAiGateway (implements RerankingGateway + EmbeddingGateway)",
+    "CreatesVoyageAiClient (trait on VoyageAiGateway: builds HTTP client)",
+    "RerankingPrompt (DTO: documents, query, limit, provider, model)",
+    "RerankingResponse (result: RankedDocument[], Meta)",
+    "RankedDocument (DTO: index, document, score)",
+    "Meta (DTO: provider name, model name)",
+    "Ai (static coordinator: fake/record/assert reranking)",
+    "EventDispatcher (dispatches Reranking + Reranked events)"
+  ],
+
+  "key_relationships": [
+    "Reranking::of() creates PendingReranking",
+    "PendingReranking::rerank() resolves and calls RerankingProvider::rerank()",
+    "VoyageAiProvider uses traits Reranks + HasRerankingGateway",
+    "Reranks trait dispatches events and delegates to rerankingGateway()->rerank()",
+    "HasRerankingGateway stores/returns RerankingGateway (default: VoyageAiGateway)",
+    "VoyageAiGateway implements RerankingGateway; uses CreatesVoyageAiClient to build HTTP client",
+    "VoyageAiGateway::rerank() POSTs to https://api.voyageai.com/v1/rerank",
+    "VoyageAiGateway::rerank() maps response data[] → RankedDocument[]",
+    "RerankingResponse contains RankedDocument[] + Meta",
+    "PendingReranking supports provider failover via FailoverableException + ProviderFailedOver event"
+  ],
+
+  "method_signatures": {
+    "Reranking::of": "static of(Collection|array $documents): PendingReranking",
+    "PendingReranking::limit": "limit(?int $limit): self",
+    "PendingReranking::rerank": "rerank(string $query, Lab|array|string|null $provider = null, ?string $model = null): RerankingResponse",
+    "RerankingProvider::rerank": "rerank(array $documents, string $query, ?int $limit, ?string $model): RerankingResponse",
+    "RerankingGateway::rerank": "rerank(RerankingProvider $provider, string $model, array $documents, string $query, ?int $limit): RerankingResponse",
+    "VoyageAiGateway::rerank": "rerank(RerankingProvider $provider, string $model, array $documents, string $query, ?int $limit): RerankingResponse",
+    "Reranks::rerank": "rerank(array $documents, string $query, ?int $limit, ?string $model): RerankingResponse",
+    "VoyageAiProvider::defaultRerankingModel": "defaultRerankingModel(): string — default 'rerank-2.5-lite'",
+    "VoyageAiProvider::rerankingGateway": "rerankingGateway(): RerankingGateway — lazy-creates VoyageAiGateway"
+  },
+
+  "http_details": {
+    "endpoint": "POST https://api.voyageai.com/v1/rerank",
+    "auth": "Bearer token from provider config key",
+    "request_body": {"model": "string", "query": "string", "documents": "string[]", "top_k": "int (optional)"},
+    "response_body": {"data": [{"index": "int", "relevance_score": "float"}], "model": "string", "usage": {"total_tokens": "int"}}
+  },
+
+  "events": [
+    "Reranking(invocationId, provider, model, prompt) — dispatched before gateway call",
+    "Reranked(invocationId, provider, model, prompt, response) — dispatched after gateway call",
+    "ProviderFailedOver(provider, model, exception) — dispatched on FailoverableException"
+  ],
+
+  "important_notes": "VoyageAiProvider lazily instantiates VoyageAiGateway for reranking. Failover loops through multiple providers; all must throw FailoverableException to exhaust. Fake mode intercepts via Ai::fakeableRerankingProvider() and FakeRerankingGateway. RankedDocument carries original index into documents array plus relevance score.",
+
+  "source_files_analyzed": [
+    "src/Reranking.php",
+    "src/PendingResponses/PendingReranking.php",
+    "src/Contracts/Providers/RerankingProvider.php",
+    "src/Contracts/Gateway/RerankingGateway.php",
+    "src/Providers/Concerns/Reranks.php",
+    "src/Providers/Concerns/HasRerankingGateway.php",
+    "src/Providers/VoyageAiProvider.php",
+    "src/Gateway/VoyageAi/VoyageAiGateway.php",
+    "src/Gateway/VoyageAi/Concerns/CreatesVoyageAiClient.php",
+    "src/Prompts/RerankingPrompt.php",
+    "src/Responses/RerankingResponse.php",
+    "src/Responses/Data/RankedDocument.php",
+    "tests/Feature/Providers/VoyageAi/RerankingTest.php"
+  ]
+}

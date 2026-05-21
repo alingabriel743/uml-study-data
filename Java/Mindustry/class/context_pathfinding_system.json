@@ -1,0 +1,331 @@
+{
+  "scope": "pathfinding_system",
+  "title": "Pathfinding System",
+  "diagram_type": "class",
+  "description": "Hierarchical cluster-based pathfinding (HPA*) combined with full-world flow fields, with per-team/per-cost-type path graphs",
+
+  "classes": [
+    {
+      "name": "ControlPathfinder",
+      "package": "mindustry.ai",
+      "implements": ["Runnable"],
+      "stereotype": "service",
+      "static_constants": [
+        "int wallImpassableCap = 1_000_000",
+        "int solidCap = 7000",
+        "int clusterSize = 12",
+        "int costIdGround=0, costIdHover=1, costIdLegs=2, costIdNaval=3",
+        "PathCost costGround, costHover, costLegs, costNaval (static final lambda)",
+        "Seq<PathCost> costTypes"
+      ],
+      "fields": [
+        "Cluster[][][] clusters [256][team][costId]",
+        "int cwidth, cheight",
+        "ObjectMap<Unit, PathRequest> unitRequests",
+        "Seq<PathRequest> threadPathRequests",
+        "LongMap<FieldCache> fields (keyed by FieldIndex)",
+        "Seq<FieldCache> fieldList (main thread)",
+        "TaskQueue queue",
+        "PathfindQueue innerFrontier",
+        "IntFloatMap innerCosts",
+        "IntSet clustersToUpdate, clustersToInnerUpdate",
+        "ObjectSet<PathRequest> invalidRequests",
+        "Thread thread",
+        "volatile boolean invalidated",
+        "IntSet usedEdges"
+      ],
+      "methods": [
+        "void run() — pathfinding thread loop: queue.run, updateClustersComplete, updateClustersInner, invalidRequests check, updateFields per cache",
+        "boolean getPathPosition(Unit, Vec2 destination, Vec2 mainDestination, Vec2 out, boolean[] noResultFound) — main entry; raycast shortcut or flow field lookup",
+        "void recalculatePath(PathRequest) — delegates to initializePathRequest",
+        "void initializePathRequest(request, team, costId, unitX, unitY, goalX, goalY) — findClosestNode x2, clusterAstar, addFlowCluster along path",
+        "IntSeq clusterAstar(PathRequest, pathCost, startNodeIndex, endNodeIndex) — A* over cluster graph nodes",
+        "float innerAstar(team, PathCost, minX,minY,maxX,maxY, startPos, goalPos, ...) — A* within a single cluster; returns -1 if no path",
+        "Cluster updateCluster(team, pathCost, cx, cy) — scans cluster edges to find portals, then calls updateInnerEdges",
+        "void updateInnerEdges(team, PathCost, cx, cy, Cluster) — connects portals within cluster via innerAstar; stores IntraEdge costs",
+        "void updateFields(FieldCache, nsToRun) — BFS flow field propagation across cluster weight arrays",
+        "void addFlowCluster(FieldCache, cx, cy, boolean addingFrontier) — registers cluster weight array; seeds frontier from adjacent clusters",
+        "int findClosestNode(team, pathCost, tileX, tileY) — A* from tile to nearest portal node",
+        "int makeNodeIndex(cx, cy, dir, portal) — packs cluster+dir+portal into NodeIndex",
+        "void checkEdges(PathRequest, team, pathCost, current, goal, cx, cy, LongSeq) — relaxes A* edges during clusterAstar",
+        "void updateTile(Tile) — calls updateSingleTile on linked tiles",
+        "void updateSingleTile(Tile) — queues cluster updates for affected clusters",
+        "void queueClusterUpdate(cx, cy)",
+        "void updateClustersComplete(clusterIndex) — updateCluster + clusterChanged for all teams/costs",
+        "void updateClustersInner(clusterIndex) — updateInnerEdges + clusterChanged",
+        "void clusterChanged(team, pathCost, cx, cy) — marks PathRequests as invalid if their field overlaps changed cluster",
+        "static boolean raycast(team, PathCost, x1,y1,x2,y2)",
+        "static int raycastFast(team, PathCost, x1,y1,x2,y2)",
+        "static int raycastFastAvoid(team, PathCost, x1,y1,x2,y2)",
+        "static boolean raycastRect(initialCost, ...) — width-aware raycast",
+        "static boolean isNearObstacle(Unit, x1,y1,x2,y2)",
+        "static boolean solid(team, PathCost, x, y)",
+        "static boolean passable(team, PathCost, pos)",
+        "static boolean nearPassable(initialCost, team, PathCost, pos)",
+        "static boolean avoid(team, PathCost, tilePos)",
+        "static int cost(team, PathCost, tilePos)",
+        "static float heuristic(a, b) — manhattan distance",
+        "float clusterNodeHeuristic(team, pathCost, nodeA, nodeB)",
+        "Cluster getCluster(team, pathCost, cx, cy)",
+        "Cluster getCreateCluster(team, pathCost, cx, cy)",
+        "PathCost idToCost(costId)",
+        "void start(), void stop()",
+        "static void checkEvents() — registers WorldLoad/Reset/TileChange/update events once"
+      ]
+    },
+    {
+      "name": "PathRequest",
+      "package": "mindustry.ai",
+      "enclosing": "ControlPathfinder",
+      "stereotype": "data",
+      "fields": [
+        "Unit unit",
+        "int destination, team, costId",
+        "IntSeq resultPath",
+        "IntFloatMap costs (nullable, cleared after A*)",
+        "IntIntMap cameFrom (nullable)",
+        "PathfindQueue frontier (nullable)",
+        "long lastUpdateId",
+        "volatile boolean notFound",
+        "volatile boolean invalidated",
+        "FieldCache oldCache (volatile nullable)",
+        "boolean lastRaycastResult",
+        "int lastRaycastTile, lastWorldUpdate, lastTile",
+        "Tile lastTargetTile"
+      ],
+      "methods": [
+        "PathRequest(Unit, team, costId, destination)"
+      ]
+    },
+    {
+      "name": "FieldCache",
+      "package": "mindustry.ai",
+      "enclosing": "ControlPathfinder",
+      "stereotype": "data",
+      "fields": [
+        "PathCost cost",
+        "int costId, team, goalPos",
+        "IntQueue frontier",
+        "IntMap<int[]> fields (clusterIndex -> weight array[clusterSize*clusterSize])",
+        "long mapKey (packed FieldIndex)",
+        "long lastUpdateId"
+      ],
+      "methods": [
+        "FieldCache(PathCost, costId, team, goalPos)"
+      ]
+    },
+    {
+      "name": "Cluster",
+      "package": "mindustry.ai",
+      "enclosing": "ControlPathfinder",
+      "stereotype": "data",
+      "fields": [
+        "IntSeq[] portals [4] — per direction, packed (from,to) ranges of passable edge tiles",
+        "LongSeq[][] portalConnections [4][] — per direction, per portal: list of IntraEdge longs"
+      ]
+    },
+    {
+      "name": "Pathfinder",
+      "package": "mindustry.ai",
+      "implements": ["Runnable"],
+      "stereotype": "service",
+      "static_constants": [
+        "int fieldCore=0, maxFields=10",
+        "int costGround=0, costLegs=1, costNaval=2, costNeoplasm=3, costNone=4, costHover=5, maxCosts=8",
+        "Seq<Prov<Flowfield>> fieldTypes",
+        "Seq<PathCost> costTypes (lambda implementations)",
+        "int wwidth, wheight (cached world size)",
+        "int impassable = -1"
+      ],
+      "fields": [
+        "int[] tiles — packed PathTile data for whole world",
+        "Flowfield[][][] cache [256][maxCosts][maxFields]",
+        "Seq<Flowfield> threadList, mainList",
+        "TaskQueue queue",
+        "Thread thread",
+        "boolean needsRefresh",
+        "long lastRefreshTime",
+        "IntSeq tmpArray"
+      ],
+      "methods": [
+        "void run() — per-interval: queue.run, updateTargets for dirty fields, updateFrontier",
+        "Flowfield getField(Team, costType, fieldType) — cache lookup/create + queue registerPath",
+        "Tile getTargetTile(Tile, Flowfield) — flow field next-step lookup with diagonal support and avoidance",
+        "Tile getTargetTile(Tile, Flowfield, boolean diagonals)",
+        "Tile getTargetTile(Tile, Flowfield, boolean diagonals, int avoidanceId)",
+        "void updateTile(Tile) — packTile + controlPath.updateTile + needsRefresh=true",
+        "int packTile(Tile) — encodes tile properties into PathTile int",
+        "int get(x, y) — raw tile data access",
+        "void updateTargets(Flowfield) — increments search, seeds frontier",
+        "void updateFrontier(Flowfield, nsToRun) — BFS flow field expansion",
+        "void preloadPath(Flowfield) — synchronous full computation",
+        "void registerPath(Flowfield) — setup + add to threadList/mainList",
+        "void clearCache()",
+        "void start(), void stop()"
+      ]
+    },
+    {
+      "name": "Flowfield",
+      "package": "mindustry.ai",
+      "enclosing": "Pathfinder",
+      "stereotype": "abstract",
+      "fields": [
+        "int refreshRate",
+        "Team team",
+        "PathCost cost",
+        "volatile boolean hasComplete",
+        "boolean dirty",
+        "int[] weights, completeWeights",
+        "short[] searches",
+        "int resolution, width, height",
+        "IntQueue frontier",
+        "IntSeq targets",
+        "int search",
+        "long lastUpdateTime",
+        "boolean initialized"
+      ],
+      "methods": [
+        "void setup() — allocates weight/search/complete arrays",
+        "int getCost(int[] tiles, int pos)",
+        "Tile getNextTile(Tile from)",
+        "Tile getNextTile(Tile from, boolean diagonals)",
+        "Tile getNextTile(Tile from, int unitAvoidanceId)",
+        "boolean hasTargets()",
+        "boolean hasCompleteWeights()",
+        "void updateTargetPositions()",
+        "boolean needsRefresh()",
+        "boolean passable(int pos)",
+        "abstract void getPositions(IntSeq out)"
+      ]
+    },
+    {
+      "name": "EnemyCoreField",
+      "package": "mindustry.ai",
+      "enclosing": "Pathfinder",
+      "extends": "Flowfield",
+      "fields": ["Rand rand"],
+      "methods": [
+        "void getPositions(IntSeq out) — targets enemy cores + spawn points; supports randomWaveAI targeting random block flags"
+      ]
+    },
+    {
+      "name": "PositionTarget",
+      "package": "mindustry.ai",
+      "enclosing": "Pathfinder",
+      "extends": "Flowfield",
+      "fields": ["Position position"],
+      "methods": [
+        "void getPositions(IntSeq out) — targets single world position; refreshRate=900ms"
+      ]
+    },
+    {
+      "name": "PathCost",
+      "package": "mindustry.ai",
+      "enclosing": "Pathfinder",
+      "stereotype": "interface",
+      "methods": [
+        "int getCost(int team, int tile)"
+      ]
+    },
+    {
+      "name": "PathfindQueue",
+      "package": "mindustry.ai",
+      "stereotype": "utility",
+      "note": "Priority queue used for A* in ControlPathfinder (innerFrontier) and per-PathRequest frontier",
+      "methods": [
+        "void add(int node, float priority)",
+        "int poll()",
+        "void clear()",
+        "int size"
+      ]
+    },
+    {
+      "name": "PathTileStruct → PathTile",
+      "package": "mindustry.ai",
+      "enclosing": "Pathfinder",
+      "stereotype": "struct",
+      "note": "@Struct annotation generates PathTile static helper class",
+      "fields": [
+        "@StructField(8) int health",
+        "@StructField(8) int team",
+        "boolean solid, liquid, legSolid, nearLiquid, nearGround, nearSolid, nearLegSolid, deep, damages, allDeep, nearDeep, teamPassable"
+      ]
+    },
+    {
+      "name": "NodeIndexStruct → NodeIndex",
+      "package": "mindustry.ai",
+      "enclosing": "ControlPathfinder",
+      "stereotype": "struct",
+      "fields": [
+        "@StructField(22) int cluster",
+        "@StructField(2) int dir",
+        "@StructField(8) int portal"
+      ]
+    },
+    {
+      "name": "IntraEdgeStruct → IntraEdge",
+      "package": "mindustry.ai",
+      "enclosing": "ControlPathfinder",
+      "stereotype": "struct",
+      "fields": [
+        "@StructField(8) int dir",
+        "@StructField(8) int portal",
+        "float cost"
+      ]
+    },
+    {
+      "name": "FieldIndexStruct → FieldIndex",
+      "package": "mindustry.ai",
+      "enclosing": "ControlPathfinder",
+      "stereotype": "struct",
+      "fields": [
+        "int pos",
+        "@StructField(8) int costId",
+        "@StructField(8) int team"
+      ]
+    }
+  ],
+
+  "relationships": [
+    "ControlPathfinder implements Runnable",
+    "Pathfinder implements Runnable",
+    "EnemyCoreField extends Flowfield",
+    "PositionTarget extends Flowfield",
+    "ControlPathfinder composes Cluster [256][4][]",
+    "ControlPathfinder composes PathRequest (ObjectMap<Unit,PathRequest> unitRequests)",
+    "ControlPathfinder composes FieldCache (LongMap<FieldCache> fields)",
+    "ControlPathfinder composes PathfindQueue innerFrontier",
+    "ControlPathfinder uses PathCost (interface)",
+    "ControlPathfinder uses NodeIndex, IntraEdge, FieldIndex (generated @Struct helpers)",
+    "FieldCache contains PathCost cost",
+    "PathRequest references FieldCache oldCache",
+    "Cluster contains IntSeq[] portals and LongSeq[][] portalConnections (IntraEdge packed)",
+    "Flowfield contains PathCost cost",
+    "Pathfinder.updateTile() calls controlPath.updateTile() — cross-dependency between Pathfinder and ControlPathfinder",
+    "Pathfinder composes Flowfield[][][] cache [256][maxCosts][maxFields]",
+    "PathTile (generated from PathTileStruct) used by Pathfinder.packTile and all PathCost lambdas"
+  ],
+
+  "key_workflows": [
+    "UNIT PATH QUERY: getPathPosition(unit,dest,out) → raycast shortcut check → lookup PathRequest → getCost(FieldCache,x,y) per tile → output next Vec2 position",
+    "NEW REQUEST: create PathRequest → queue.post(recalculatePath) → initializePathRequest → findClosestNode (innerAstar to nearest portal) → clusterAstar (A* on portal graph) → addFlowCluster along path → flow field computed in run() via updateFields",
+    "TILE CHANGE: Pathfinder.updateTile → packTile + controlPath.updateTile → queueClusterUpdate → run() calls updateClustersComplete/Inner → clusterChanged → invalidRequests → recalculatePath",
+    "FLOW FIELD UPDATE: updateFields(FieldCache) — BFS from goalPos through cluster weight arrays; triggered each thread loop iteration; time-budgeted via nsToRun",
+    "CLUSTER BUILD: updateCluster(team,cost,cx,cy) — scans 4 edges for passable runs (portals) → updateInnerEdges → innerAstar between all portal pairs → stores IntraEdge costs in portalConnections"
+  ],
+
+  "important_notes": [
+    "ControlPathfinder: HPA* (Hierarchical Pathfinding A*) — portal-graph A* + per-destination flow fields per cluster. Thread-safe via TaskQueue; clusters[team][costId][clusterIdx]",
+    "Pathfinder: simpler full-world flow fields (Dijkstra BFS) per team/cost/fieldType. Used for wave enemy targeting via EnemyCoreField. Cache Flowfield[256][8][10]",
+    "PathCost: functional interface with 4 implementations in ControlPathfinder (ground/hover/legs/naval) and 6 in Pathfinder (ground/legs/naval/neoplasm/none/hover)",
+    "clusterSize=12 tiles; clusters keyed by team+costId; portal = contiguous passable run on cluster edge stored as packed (from,to) int",
+    "NodeIndex packs (cluster 22bit, dir 2bit, portal 8bit) into int; IntraEdge packs (dir 8bit, portal 8bit, cost float) into long; FieldIndex packs (pos, costId 8bit, team 8bit) into long",
+    "Two thread safety models: ControlPathfinder uses volatile+TaskQueue; Pathfinder uses synchronized(path.targets) for target list updates",
+    "PathRequest caches raycast results per tile position to avoid per-frame raycasting; oldCache allows smooth transitions during field recalculation"
+  ],
+
+  "source_files_analyzed": [
+    "core/src/mindustry/ai/ControlPathfinder.java",
+    "core/src/mindustry/ai/Pathfinder.java"
+  ]
+}

@@ -1,0 +1,222 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #E9ECEF
+    NoteBackgroundColor #FFF3CD
+    NoteBorderColor #856404
+}
+
+title Schema Change (DDL) Handling Flow
+
+actor "Binlog Event Source" as source
+
+participant "BinlogStreamingChangeEventSource" as connector
+participant "BinlogDatabaseSchema" as schema
+participant "AntlrDdlParser\n(MySql/MariaDb)" as parser
+participant "Lexer" as lexer
+participant "CommonTokenStream" as tokens
+participant "Parser (ANTLR)" as antlrParser
+participant "ParseTreeWalker" as walker
+participant "AntlrDdlParserListener" as listener
+participant "DdlChanges" as ddlChanges
+participant "SchemaChangeEvent" as changeEvent
+participant "HistorizedRelationalDatabaseSchema\n(SchemaHistory)" as history
+
+== DDL Event Detection ==
+
+source -> connector : DDL statement received\n(e.g., CREATE/ALTER/DROP TABLE)
+activate connector
+
+connector -> schema : parseStreamingDdl(partition, ddlStatements,\n  databaseName, offset, sourceTime)
+activate schema
+
+== Short-Circuit Check ==
+
+schema -> schema : parseDdl(partition, ddlStatements,\n  databaseName, offset, sourceTime, snapshot=false)
+
+alt ddlStatements matches ignoredQueryStatements\n(BEGIN / END / FLUSH PRIVILEGES)
+    schema --> connector : return [] (empty list)
+else proceed with parsing
+end
+
+== ANTLR Parser Invocation ==
+
+schema -> parser : setCurrentSchema(databaseName)
+activate parser
+
+schema -> parser : parse(ddlStatements, tables())
+note right of parser : Initiates full ANTLR pipeline
+
+parser -> lexer : createNewLexerInstance(\n  CaseChangingCharStream(ddlContent))
+activate lexer
+lexer --> parser : Lexer instance
+deactivate lexer
+
+parser -> tokens : new CommonTokenStream(lexer)
+activate tokens
+tokens --> parser : CommonTokenStream
+deactivate tokens
+
+parser -> antlrParser : createNewParserInstance(commonTokenStream)
+activate antlrParser
+antlrParser --> parser : Parser instance (P extends Parser)
+deactivate antlrParser
+
+parser -> antlrParser : removeErrorListener(ConsoleErrorListener)
+activate antlrParser
+parser -> antlrParser : addErrorListener(ParsingErrorListener)
+antlrParser --> parser : configured
+deactivate antlrParser
+
+parser -> antlrParser : parseTree(parser)
+activate antlrParser
+antlrParser --> parser : ParseTree
+deactivate antlrParser
+
+== Parse Tree Walking ==
+
+parser -> parser : createParseTreeWalkerListener()
+parser -> listener : new AntlrDdlParserListener(antlrDdlParser)
+activate listener
+
+parser -> walker : DEFAULT.walk(antlrDdlParserListener, parseTree)
+activate walker
+
+loop for each grammar rule node in ParseTree
+    walker -> listener : enterXxx(ctx) / exitXxx(ctx)
+    activate listener
+
+    alt CREATE TABLE statement
+        listener -> parser : signalCreateTable(tableId, ctx)
+    else ALTER TABLE statement
+        listener -> parser : signalAlterTable(tableId, previousTableId, ctx)
+    else DROP TABLE statement
+        listener -> parser : signalDropTable(tableId, ctx)
+    else TRUNCATE TABLE statement
+        listener -> parser : signalTruncateTable(tableId, ctx)
+    else SET variable statement
+        listener -> parser : signalSetVariable(name, value, order, ctx)
+    end
+
+    parser -> ddlChanges : record DdlParserListener.Event\n(grouped by database name)
+    activate ddlChanges
+    deactivate ddlChanges
+
+    deactivate listener
+end
+
+walker --> parser : walk complete
+deactivate walker
+deactivate listener
+
+parser -> ddlChanges : getAndResetDdlChanges()
+activate ddlChanges
+ddlChanges --> parser : DdlChanges
+deactivate ddlChanges
+
+parser --> schema : return DdlChanges
+deactivate parser
+
+== Schema Change Event Emission ==
+
+alt ddlChanges.isEmpty()
+    schema -> changeEvent : SchemaChangeEvent.ofDatabase(\n  partition, offset, databaseName, ddl, snapshot)
+    activate changeEvent
+    changeEvent --> schema : SchemaChangeEvent (DATABASE type)
+    deactivate changeEvent
+else ddlChanges has events && acceptableDatabase
+    schema -> ddlChanges : getEventsByDatabase(consumer)
+    activate ddlChanges
+
+    loop for each DdlParserListener.Event grouped by database
+        ddlChanges --> schema : event (TableCreated/TableAltered/\n  TableDropped/TableTruncated/SetVariable)
+        deactivate ddlChanges
+
+        schema -> schema : handleTableEvent(offset, dbName,\n  tableIds, sourceTime)
+        schema -> schema : emitChangeEvent(partition, offset,\n  schemaChangeEvents, dbName, event,\n  tableId, type, snapshot)
+
+        alt TableAlteredEvent with previousTableId != null (RENAME)
+            schema -> changeEvent : SchemaChangeEvent.ofRename(\n  partition, offset, dbName, null,\n  ddl, table, previousTableId)
+            activate changeEvent
+            changeEvent --> schema : SchemaChangeEvent (RENAME)
+            deactivate changeEvent
+        else any other event type
+            schema -> changeEvent : SchemaChangeEvent.of(\n  type, partition, offset, dbName,\n  null, ddl, table, snapshot)
+            activate changeEvent
+            note right of changeEvent
+                type resolved from event:
+                TableCreatedEvent     → CREATE
+                TableAlteredEvent     → ALTER
+                TableIndexCreated/Dropped → ALTER
+                TableDroppedEvent     → DROP
+                TableTruncatedEvent   → TRUNCATE
+                SetVariableEvent(order==0) → DATABASE
+            end note
+            changeEvent --> schema : SchemaChangeEvent
+            deactivate changeEvent
+        end
+
+        activate ddlChanges
+    end
+    deactivate ddlChanges
+end
+
+schema --> connector : return List<SchemaChangeEvent>
+deactivate schema
+
+== Schema Registry Update & History Persistence ==
+
+loop for each SchemaChangeEvent
+    connector -> schema : applySchemaChange(schemaChangeEvent)
+    activate schema
+
+    alt event type == CREATE or ALTER
+        schema -> history : buildAndRegisterSchema(table)
+        activate history
+        history --> schema : schema registered
+        deactivate history
+    else event type == DROP
+        schema -> history : removeSchema(tableId)
+        activate history
+        history --> schema : schema removed
+        deactivate history
+    end
+
+    alt captureFilter passes (not skipSchemaChangeEvent)
+        schema -> history : record(schemaChange, tableChanges)\n[persists to SchemaHistory store]
+        activate history
+        history --> schema : persisted
+        deactivate history
+    end
+
+    schema --> connector : done
+    deactivate schema
+end
+
+connector --> source : DDL processing complete
+deactivate connector
+
+@enduml

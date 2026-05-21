@@ -1,0 +1,180 @@
+{
+  "scope": "json_encode_decode_flow",
+  "title": "JSON Encoding & Decoding Flow",
+  "diagram_type": "activity",
+  "domain": "WordPress JSON serialization service (deprecated since WP 5.3.0 in favor of native PHP JSON extension)",
+
+  "classes": [
+    {
+      "name": "Services_JSON",
+      "properties": ["$use (int flags)", "$_mb_strlen (bool)", "$_mb_substr (bool)", "$_mb_convert_encoding (bool)"],
+      "constructor": "__construct($use = 0)"
+    },
+    {
+      "name": "Services_JSON_Error",
+      "extends": "PEAR_Error (if available) or standalone",
+      "constructor": "__construct($message, $code, $mode, $options, $userinfo)"
+    }
+  ],
+
+  "constants": [
+    "SERVICES_JSON_SLICE = 1 (decode stack: slice boundary)",
+    "SERVICES_JSON_IN_STR = 2 (decode stack: inside string)",
+    "SERVICES_JSON_IN_ARR = 3 (decode stack: inside array)",
+    "SERVICES_JSON_IN_OBJ = 4 (decode stack: inside object)",
+    "SERVICES_JSON_IN_CMT = 5 (decode stack: inside comment)",
+    "SERVICES_JSON_LOOSE_TYPE = 16 (flag: decode objects as assoc arrays)",
+    "SERVICES_JSON_SUPPRESS_ERRORS = 32 (flag: encode returns null on error instead of throwing)",
+    "SERVICES_JSON_USE_TO_JSON = 64 (flag: call toJSON() on objects during encode)"
+  ],
+
+  "encode_flow": [
+    "START: encode($var)",
+    "→ Set Content-type: application/json header",
+    "→ Call encodeUnsafe($var)",
+    "  → Save current LC_NUMERIC locale",
+    "  → Set locale to 'C' (prevent numeric locale issues)",
+    "  → Call _encode($var)",
+    "  → Restore LC_NUMERIC locale",
+    "  → Return result",
+
+    "_encode($var) — TYPE DISPATCH:",
+    "  [boolean] → return 'true' or 'false'",
+    "  [NULL]    → return 'null'",
+    "  [integer] → return cast int",
+    "  [double/float] → return cast float",
+
+    "  [string]:",
+    "    → Iterate each byte via strlen8()",
+    "    → For ASCII control chars (0x08-0x0D): emit escape sequence (\\b \\t \\n \\f \\r)",
+    "    → For quote/slash/backslash: emit escaped char",
+    "    → For ASCII printable (0x20-0x7F): emit as-is",
+    "    → For 2-byte UTF-8 (mask 0xC0): pack bytes → utf82utf16() → sprintf('\\uXXXX')",
+    "    → For 3-byte UTF-8 (mask 0xE0): pack bytes → utf82utf16() → sprintf('\\uXXXX')",
+    "    → For 4-byte UTF-8 (mask 0xF0): pack bytes → utf82utf16() → sprintf('\\uXXXX')",
+    "    → For 5-byte UTF-8 (mask 0xF8): pack bytes → utf82utf16() → sprintf('\\uXXXX')",
+    "    → For 6-byte UTF-8 (mask 0xFC): pack bytes → utf82utf16() → sprintf('\\uXXXX')",
+    "    → If incomplete multibyte sequence at end: emit '?'",
+    "    → Return '\"' + $ascii + '\"'",
+
+    "  [array — associative (non-sequential keys)]:",
+    "    → array_map(name_value, keys, values)",
+    "    → For each property: if isError($property) → return error immediately",
+    "    → Return '{' + join(',', $properties) + '}'",
+
+    "  [array — sequential]:",
+    "    → array_map(_encode, $var)",
+    "    → For each element: if isError($element) → return error immediately",
+    "    → Return '[' + join(',', $elements) + ']'",
+
+    "  [object]:",
+    "    → If SERVICES_JSON_USE_TO_JSON flag AND method toJSON() exists:",
+    "      → Call $var->toJSON()",
+    "      → If result also has toJSON(): return null (SUPPRESS) or Services_JSON_Error (infinite recursion guard)",
+    "      → Else: recursively call _encode($recode)",
+    "    → Else: get_object_vars($var) → array_map(name_value, keys, values)",
+    "    → For each property: if isError($property) → return error immediately",
+    "    → Return '{' + join(',', $properties) + '}'",
+
+    "  [default/unsupported type]:",
+    "    → If SERVICES_JSON_SUPPRESS_ERRORS: return 'null'",
+    "    → Else: return new Services_JSON_Error('type cannot be encoded')",
+
+    "name_value($name, $value):",
+    "  → _encode($value) → if isError: return error",
+    "  → Return _encode(strval($name)) + ':' + encoded_value"
+  ],
+
+  "decode_flow": [
+    "START: decode($str)",
+    "→ reduce_string($str): strip // comments, /* */ comments, trim whitespace",
+
+    "→ LITERAL DISPATCH (strtolower):",
+    "  'true'  → return true",
+    "  'false' → return false",
+    "  'null'  → return null",
+
+    "→ is_numeric($str) → return int or float (prefers int when float==int)",
+
+    "→ preg_match string pattern /^([\"']).*\\1$/s:",
+    "  → Extract inner chars via substr8()",
+    "  → Iterate each byte:",
+    "    → Escape sequences (\\b \\t \\n \\f \\r \\\" \\' \\\\ \\/): emit decoded char",
+    "    → Unicode escape \\uXXXX: chr(hexdec) + chr(hexdec) → utf162utf8() → append to $utf8",
+    "    → ASCII printable (0x20-0x7F): pass through",
+    "    → Multi-byte UTF-8 (masks 0xC0/0xE0/0xF0/0xF8/0xFC): substr8($chrs, $c, N) pass through",
+    "  → Return $utf8 string",
+
+    "→ preg_match array/object pattern /^\\[.*\\]$/ or /^\\{.*\\}$/:",
+    "  → INITIALIZE STACK:",
+    "    '[' → push SERVICES_JSON_IN_ARR; $arr = []",
+    "    '{' → push SERVICES_JSON_IN_OBJ; $obj = stdClass() OR [] (LOOSE_TYPE flag)",
+    "    → push initial SLICE marker {what: SLICE, where: 0, delim: false}",
+    "  → reduce_string() on inner content",
+    "  → If empty content: return $arr or $obj immediately",
+
+    "  → CHARACTER-BY-CHARACTER STATE MACHINE LOOP:",
+    "    [comma at SLICE level / end-of-string]:",
+    "      → Extract slice = substr8(chrs, top.where, length)",
+    "      → Push new SLICE marker",
+    "      → If IN_ARR: array_push($arr, decode($slice))  [recursive]",
+    "      → If IN_OBJ:",
+    "        → Match quoted 'name':value → key = decode(parts[1]); val = decode(trim(value))",
+    "        → Or unquoted name:value → key = parts[1]; val = decode(trim(value))",
+    "        → Assign to $obj->key or $obj[$key] (LOOSE_TYPE flag)",
+    "    [quote char, not IN_STR] → push IN_STR with delimiter",
+    "    [quote char, IN_STR, not escaped] → pop IN_STR",
+    "    ['[' in SLICE/ARR/OBJ context] → push IN_ARR",
+    "    [']' in IN_ARR] → pop IN_ARR",
+    "    ['{' in SLICE/ARR/OBJ context] → push IN_OBJ",
+    "    ['}' in IN_OBJ] → pop IN_OBJ",
+    "    ['/*' in SLICE/ARR/OBJ context] → push IN_CMT",
+    "    ['*/' in IN_CMT] → pop IN_CMT; blank out comment chars in $chrs",
+
+    "  → After loop: return $arr (if IN_ARR) or $obj (if IN_OBJ)"
+  ],
+
+  "helper_methods": [
+    "utf82utf16($utf8): Convert UTF-8 char to UTF-16. Uses mb_convert_encoding if available; else manual bit-shift for 1/2/3-byte sequences.",
+    "utf162utf8($utf16): Convert UTF-16 char to UTF-8. Uses mb_convert_encoding if available; else manual bit-shift for 1/2/3-byte output.",
+    "strlen8($str): Byte-length of string. Uses mb_strlen($str,'8bit') or strlen().",
+    "substr8($string, $start, $length): Byte-based substr. Uses mb_substr($str,$s,$l,'8bit') or substr().",
+    "reduce_string($str): Strips // single-line comments, /* */ block comments (start+end), then trim().",
+    "isError($data, $code): Returns true if $data is PEAR::isError OR instance/subclass of Services_JSON_Error."
+  ],
+
+  "error_handling": [
+    "Services_JSON_Error class: extends PEAR_Error if PEAR available, else standalone",
+    "isError() used as guard after every _encode() / name_value() call in arrays and objects",
+    "Errors bubble up immediately — first error in collection aborts and returns that error",
+    "SERVICES_JSON_SUPPRESS_ERRORS flag: replaces error returns with literal 'null' string",
+    "toJSON() recursion guard: if returned object also has toJSON(), error or null is returned"
+  ],
+
+  "key_relationships": [
+    "encode() → encodeUnsafe() → _encode() (public API chain)",
+    "_encode() calls name_value() for associative arrays and objects",
+    "name_value() calls _encode() recursively on both name and value",
+    "_encode() calls utf82utf16() for multibyte string chars",
+    "decode() calls reduce_string() first, then calls itself recursively for nested arrays/objects",
+    "decode() calls utf162utf8() for \\uXXXX escape sequences in strings",
+    "Both encode() and decode() call isError() for error propagation checks",
+    "strlen8() and substr8() used throughout both flows for byte-safe string operations"
+  ],
+
+  "activity_swimlanes": ["encode path", "decode path", "UTF conversion", "error handling"],
+
+  "important_notes": [
+    "Entire class is deprecated since WP 5.3.0 — PHP native JSON extension is the replacement",
+    "encode() sends Content-type header as side effect; encodeUnsafe() does not (XSS warning)",
+    "LC_NUMERIC locale forced to 'C' during encode to prevent locale-specific decimal separators",
+    "Strings must be ASCII or UTF-8 input for encode(); decode() always returns UTF-8",
+    "SERVICES_JSON_LOOSE_TYPE: '{}' decoded as PHP array instead of stdClass",
+    "decode() state machine handles nested arrays, objects, strings, and inline comments",
+    "Comments (// and /* */) are valid inside JSON strings for this implementation"
+  ],
+
+  "source_files_analyzed": [
+    "dockerfiles/testing-environment/Wordpress5/app/wp-includes/class-json.php"
+  ]
+}

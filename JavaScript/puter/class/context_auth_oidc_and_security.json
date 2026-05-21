@@ -1,0 +1,153 @@
+{
+  "scope": "auth_oidc_and_security",
+  "title": "OIDC, OTP & Security Services",
+  "diagram_type": "class",
+  "classes": [
+    {
+      "name": "BaseService",
+      "type": "abstract",
+      "extends": "concepts.Service",
+      "key_attributes": ["services", "config", "global_config", "log", "args", "service_name"],
+      "key_methods": ["_construct()", "_init()", "require(module)"]
+    },
+    {
+      "name": "OIDCService",
+      "extends": "BaseService",
+      "file": "services/auth/OIDCService.js",
+      "private_fields": ["#googleDiscovery"],
+      "attributes": ["db", "providers"],
+      "methods": [
+        "_init(): void — sets db (DB_WRITE/auth), loads this.config.providers",
+        "getProviderConfig(providerId): Promise<ProviderConfig|null> — resolves Google endpoints via discovery or uses raw config",
+        "#getGoogleDiscovery(): Promise<object|null> — lazy-fetches GOOGLE_DISCOVERY_URL, caches result",
+        "getCallbackUrlForFlow(flow): string|null — builds /auth/oidc/callback/<flow> URL; validates against VALID_OIDC_FLOWS",
+        "getAuthorizationUrl(providerId, state, flow): Promise<string|null> — assembles OAuth2 authorize URL with URLSearchParams",
+        "signState(payload): string — jwt.sign(payload, jwt_secret, {expiresIn: 600})",
+        "verifyState(token): object|null — jwt.verify(token, jwt_secret)",
+        "exchangeCodeForTokens(providerId, code, redirectUri): Promise<object|null> — POST to token_endpoint with authorization_code grant",
+        "getUserInfo(providerId, accessToken): Promise<object|null> — GET userinfo_endpoint with Bearer token",
+        "findUserByProviderSub(providerId, providerSub): Promise<User|null> — SELECT from user_oidc_providers, delegates to get-user service",
+        "linkProviderToUser(userId, providerId, providerSub, refreshToken?): Promise<void> — INSERT into user_oidc_providers (handles UNIQUE conflict)",
+        "createUserFromOIDC(providerId, claims): Promise<OutcomeObject> — delegates to signup service, calls linkProviderToUser on success",
+        "getEnabledProviderIds(): Promise<string[]> — filters providers by valid config"
+      ],
+      "constants": ["GOOGLE_DISCOVERY_URL", "GOOGLE_SCOPES", "STATE_EXPIRY_SEC=600", "VALID_OIDC_FLOWS=['login','signup','revalidate']"],
+      "dependencies": ["database(DB_WRITE)", "get-user service", "signup service", "jwt", "fetch API"]
+    },
+    {
+      "name": "OTPService",
+      "extends": "BaseService",
+      "file": "services/auth/OTPService.js",
+      "static_fields": ["MODULES: {otpauth, crypto, hi-base32}"],
+      "methods": [
+        "create_secret(label): {url, secret} — creates TOTP (SHA1, 6 digits, issuer puter.com), returns otpauth URL + secret",
+        "create_recovery_code(): string — crypto.randomBytes(6) → base32 encode → trim to 8 chars",
+        "verify(label, secret, code): boolean — validates TOTP token with delta in [-1,0,1]",
+        "gen_otp_secret_(): string — crypto.randomBytes(15) → base32 encode → trim to 24 chars (private)"
+      ],
+      "dependencies": ["otpauth (TOTP)", "crypto", "hi-base32"]
+    },
+    {
+      "name": "AntiCSRFService",
+      "extends": "BaseService",
+      "file": "services/auth/AntiCSRFService.js",
+      "attributes": ["map_session_to_tokens: {[sessionId]: CircularQueue(10)}"],
+      "methods": [
+        "_construct(): void — initializes map_session_to_tokens = {}",
+        "'__on_install.routes'(): void — registers GET /get-anticsrf-token endpoint (auth2 required, subdomain guard)",
+        "create_token(session): string — creates/gets CircularQueue(10) per session, pushes new token, returns it",
+        "consume_token(session, token): boolean — calls CircularQueue.maybe_consume(token)",
+        "generate_token_(): string — crypto.randomBytes(32).toString('hex') (private)"
+      ],
+      "route": "GET /get-anticsrf-token — returns {token} for authenticated user; blocks api. subdomain",
+      "dependencies": ["eggspress (route registration)", "CircularQueue", "web-server service", "crypto"]
+    },
+    {
+      "name": "SUService",
+      "extends": "BaseService",
+      "file": "services/SUService.js",
+      "attributes": [
+        "sys_user_: TeePromise",
+        "sys_actor_: TeePromise"
+      ],
+      "methods": [
+        "_construct(): void — initializes sys_user_ and sys_actor_ as TeePromise instances",
+        "'__on_boot.consolidation'(): Promise<void> — fetches system user via get-user service, creates Actor(UserActorType), resolves both promises",
+        "get_system_user(): Promise<User> — returns sys_user_ promise",
+        "get_system_actor(): Promise<Actor> — returns sys_actor_ promise",
+        "sudo(actor?, callback): Promise<T> — runs callback in Context.sub({actor, user}) with elevated privileges; defaults to sys_actor_ if no actor given"
+      ],
+      "dependencies": ["get-user service", "Actor", "UserActorType", "TeePromise", "Context"]
+    },
+    {
+      "name": "VerifiedGroupService",
+      "extends": "BaseService",
+      "file": "services/VerifiedGroupService.js",
+      "methods": [
+        "_init(): void — subscribes to 'user.email-confirmed' event; on fire: fetches user, removes from default_temp_group, adds to default_user_group"
+      ],
+      "event_handlers": ["'user.email-confirmed' → (_, {user_uid}) — group promotion logic"],
+      "dependencies": ["event service", "group service", "get_user helper", "global_config.default_temp_group", "global_config.default_user_group"]
+    },
+    {
+      "name": "CircularQueue",
+      "type": "utility",
+      "file": "util/CircularQueue.js",
+      "note": "Fixed-size queue (capacity 10 for CSRF tokens); used by AntiCSRFService",
+      "methods": ["push(item)", "maybe_consume(item): boolean"]
+    },
+    {
+      "name": "Actor",
+      "type": "model",
+      "file": "services/auth/Actor.js",
+      "note": "Represents an authenticated principal; has a type (e.g. UserActorType)",
+      "methods": ["Actor.adapt(actor): Actor — static factory/coerce"]
+    },
+    {
+      "name": "OutcomeObject",
+      "type": "utility",
+      "file": "util/outcomeutil.js",
+      "note": "Result wrapper; used by OIDCService.createUserFromOIDC"
+    }
+  ],
+  "relationships": [
+    "OIDCService extends BaseService",
+    "OTPService extends BaseService",
+    "AntiCSRFService extends BaseService",
+    "SUService extends BaseService",
+    "VerifiedGroupService extends BaseService",
+    "OIDCService depends_on SignupService (creates users)",
+    "OIDCService depends_on GetUserService (finds users)",
+    "OIDCService depends_on DatabaseService (user_oidc_providers table)",
+    "OIDCService uses OutcomeObject (result wrapping)",
+    "OIDCService uses jwt (state signing/verification)",
+    "AntiCSRFService composes CircularQueue (per-session token store, capacity 10)",
+    "AntiCSRFService depends_on WebServerService (route registration)",
+    "SUService composes Actor + UserActorType (system actor)",
+    "SUService depends_on GetUserService (fetch system user)",
+    "SUService uses Context (sub-context for privilege escalation)",
+    "SUService uses TeePromise (deferred resolution)",
+    "VerifiedGroupService depends_on EventService (user.email-confirmed)",
+    "VerifiedGroupService depends_on GroupService (add/remove users)",
+    "OTPService uses otpauth.TOTP (TOTP generation/verification)"
+  ],
+  "key_patterns": [
+    "All services extend BaseService; lifecycle hooks: _construct() → _init() → __on_boot.*  → __on_install.*",
+    "OIDCService: OAuth2 authorization_code flow with JWT-signed state for CSRF; supports Google (discovery) + generic OIDC providers",
+    "OTPService: TOTP (RFC 6238) with 6-digit SHA1, window delta [-1,0,1]; base32-encoded secrets/recovery codes via hi-base32",
+    "AntiCSRFService: session-keyed CircularQueue(10) of random 32-byte hex tokens; consumed once (maybe_consume); route blocked on api. subdomain",
+    "SUService: privilege escalation via Context.sub({actor, user}); system actor resolved once at boot.consolidation phase",
+    "VerifiedGroupService: event-driven group promotion on email confirmation (temp → verified group)"
+  ],
+  "database_tables": [
+    "user_oidc_providers (user_id, provider, provider_sub, refresh_token) — managed by OIDCService"
+  ],
+  "important_notes": "Module styles mixed: OIDCService/SUService use ES module (import/export); OTPService/AntiCSRFService/VerifiedGroupService use CommonJS (require/module.exports). All extend BaseService which extends concepts.Service from @heyputer/putility.",
+  "source_files_analyzed": [
+    "src/backend/src/services/auth/OIDCService.js",
+    "src/backend/src/services/auth/OTPService.js",
+    "src/backend/src/services/auth/AntiCSRFService.js",
+    "src/backend/src/services/SUService.js",
+    "src/backend/src/services/VerifiedGroupService.js"
+  ]
+}

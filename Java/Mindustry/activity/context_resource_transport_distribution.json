@@ -1,0 +1,197 @@
+{
+  "scope": "resource_transport_distribution",
+  "title": "Resource Transport & Distribution",
+  "diagram_type": "activity",
+  "subsystem": "Distribution block subsystem (mindustry.world.blocks.distribution)",
+
+  "key_participants": [
+    "ItemBuffer", "DirectionalItemBuffer", "Tiles",
+    "Conveyor/ConveyorBuild", "Router/RouterBuild",
+    "Junction/JunctionBuild", "OverflowGate/OverflowGateBuild",
+    "OverflowDuct/OverflowDuctBuild", "BufferedItemBridge/BufferedItemBridgeBuild"
+  ],
+
+  "data_structures": {
+    "ItemBuffer": {
+      "fields": "long[] buffer (packed TimeItem: short data, short item, float time), int index",
+      "capacity": "constructor param",
+      "key_methods": [
+        "accepts() → index < buffer.length",
+        "accept(Item, short data) → buffer[index++] = TimeItem.get(data, item.id, Time.time)",
+        "accept(Item) → accept(item, (short)-1)",
+        "poll(float speed) → returns item if Time.time >= buffer[0].time + speed (or time wrap); else null",
+        "remove() → arraycopy left-shift, index--",
+        "write(Writes) / read(Reads)"
+      ]
+    },
+    "DirectionalItemBuffer": {
+      "fields": "long[4][] buffers (4 directions × capacity), int[5] indexes",
+      "key_methods": [
+        "accepts(int dir) → indexes[dir] < buffers[dir].length",
+        "accept(int dir, Item) → buffers[dir][indexes[dir]++] = BufferItem.get(item.id, Time.time)",
+        "poll(int dir, float speed) → returns item if time elapsed; else null",
+        "remove(int dir) → arraycopy left-shift",
+        "read(Reads, boolean legacy) → converts old 1-byte item format to 2-byte"
+      ]
+    },
+    "Tiles": {
+      "fields": "Tile[] array, Puddle[] puddles, Fire[] fires, int width/height, long[] tmpFloorState/tmpBlockState",
+      "key_methods": [
+        "get(x,y) → nullable, bounds-checked",
+        "getn(x,y) → throws if OOB",
+        "getc(x,y) → clamped access",
+        "geti(idx) → raw index access",
+        "getp(int pos) → Point2.x/y unpacking",
+        "getPuddle/setPuddle, getFire/setFire",
+        "fill() → populates with empty Tile objects",
+        "each(Intc2) / eachTile(Cons<Tile>) / iterator()"
+      ]
+    }
+  },
+
+  "activity_flows": [
+    {
+      "name": "Conveyor Item Transport Loop",
+      "trigger": "updateTile() called each game tick",
+      "steps": [
+        "IF len==0 AND timeScale==1 → set clogHeat=0, sleep(), return",
+        "Compute nextMax (aligned to next conveyor? 1 - max(itemSpace - nextc.minitem,0) : 1)",
+        "FOR each item i from back to front:",
+        "  Compute maxmove = clamp(nextpos - ys[i], 0, moved)",
+        "  ys[i] += maxmove; cap at nextMax",
+        "  xs[i] approach 0 (centering)",
+        "  IF ys[i] >= 1.0 → call pass(ids[i])",
+        "    pass(): IF next != null AND next.acceptItem(this, item) → next.handleItem(this, item); remove item; return true",
+        "    ELSE: item stays, waits",
+        "  ELSE: track minitem",
+        "IF minitem < itemSpace threshold → increment clogHeat (max 1.0); ELSE clogHeat=0",
+        "acceptItem(source, item): checks len<capacity, direction angle (0=aligned, ±1=side), minitem spacing",
+        "handleItem(source, item): inserts at index 0 (front-facing) or mid (side-facing) with xs offset"
+      ]
+    },
+    {
+      "name": "Router Distribution (Round-Robin)",
+      "trigger": "updateTile() called each tick",
+      "steps": [
+        "IF lastItem==null AND items.any() → lastItem = items.first()",
+        "IF lastItem != null → time += 1/speed * delta()",
+        "Call getTileTarget(lastItem, lastInput, false) to find candidate",
+        "IF target found AND (time>=1 OR target is not Router/instantTransfer):",
+        "  getTileTarget(lastItem, lastInput, true) — advance rotation counter",
+        "  target.handleItem(this, lastItem)",
+        "  items.remove(lastItem, 1); lastItem = null",
+        "getTileTarget(): iterate proximity[] starting at rotation offset;",
+        "  SKIP tile that matches lastInput if source was overflowGate",
+        "  RETURN first neighbor where acceptItem(this, item)==true",
+        "  IF unit-controlled: use aim angle → compute quadrant → nearby(angle).acceptItem",
+        "acceptItem(): ONLY accept if lastItem==null AND items.total()==0 (capacity=1)",
+        "handleItem(): items.add, lastItem=item, time=0, lastInput=source.tile"
+      ]
+    },
+    {
+      "name": "Junction Crossover (Directional Buffer)",
+      "trigger": "updateTile() called each tick",
+      "steps": [
+        "FOR each direction i in [0..3]:",
+        "  IF buffer.indexes[i] > 0:",
+        "    Cap indexes[i] to capacity if overflowed",
+        "    Read buffer[i][0]: extract time via BufferItem.time()",
+        "    IF Time.time >= time + speed/timeScale OR time wrap → item is ready",
+        "    dest = nearby(i)",
+        "    IF item==null OR dest==null OR !dest.acceptItem(this,item) OR wrong team → SKIP (keep waiting)",
+        "    ELSE → dest.handleItem(this, item); remove from buffer (arraycopy + indexes[i]--)",
+        "handleItem(source, item): relative = source.relativeTo(tile); buffer.accept(relative, item)",
+        "acceptItem(source, item): relative = source.relativeTo(tile); check buffer.accepts(relative) AND nearby(relative) exists"
+      ]
+    },
+    {
+      "name": "OverflowGate Routing (Forward-Priority with Fallback)",
+      "trigger": "Instant transfer — no updateTile(); called synchronously on item arrival",
+      "steps": [
+        "acceptItem(source, item): call getTileTarget(item, source, false); return non-null AND acceptItem AND same team",
+        "handleItem(source, item): call getTileTarget(item, source, true); IF target → target.handleItem(this, item)",
+        "getTileTarget(item, src, flip):",
+        "  from = relativeToEdge(src.tile); IF -1 → null",
+        "  to = nearby((from+2)%4)  [opposite = forward direction]",
+        "  canForward = to exists AND !instantTransfer-to-instantTransfer AND to.acceptItem",
+        "  inv = (invert == enabled)  [XOR flag]",
+        "  IF canForward AND NOT inv → return forward 'to'",
+        "  ELSE: try sides a=nearby((from-1)%4), b=nearby((from+1)%4)",
+        "    IF neither side accepts: return (inv&&canForward ? to : null)",
+        "    IF only a accepts → return a",
+        "    IF only b accepts → return b",
+        "    IF both accept → alternate via rotation bitmask; IF flip → toggle bit"
+      ]
+    },
+    {
+      "name": "OverflowDuct Transport (Timed with Overflow Fallback)",
+      "trigger": "updateTile() called each tick",
+      "steps": [
+        "progress += edelta()/speed*2",
+        "IF current != null AND progress >= (1 - 1/speed):",
+        "  target = target()",
+        "  IF target != null → target.handleItem(this, current); cdump toggle (0↔2); items.remove; current=null; progress %= threshold",
+        "IF current==null AND items.total()>0 → current = items.first()",
+        "target() when normal (not invert):",
+        "  TRY front() first — forward direction",
+        "  IF front blocked: iterate sides with cdump round-robin (dir = mod(rotation + offset + cdump, 4), skip rotation dir)",
+        "target() when invert:",
+        "  TRY left() and right() first",
+        "  IF both accept → use cdump to alternate",
+        "  TRY front() as last resort",
+        "acceptItem(source, item): current==null AND items==0 AND source faces rotation direction"
+      ]
+    },
+    {
+      "name": "BufferedItemBridge Transport (Buffered Cross-Distance)",
+      "trigger": "updateTransport(other: Building) called by parent ItemBridge.updateTile()",
+      "steps": [
+        "IF buffer.accepts() AND items.total()>0 → item = items.take(); buffer.accept(item)",
+        "item = buffer.poll(speed / timeScale)  [speed-gated FIFO dequeue]",
+        "IF timer(timerAccept, 4/timeScale) fires AND item != null AND other.acceptItem(this, item):",
+        "  moved = true",
+        "  other.handleItem(this, item)",
+        "  buffer.remove()",
+        "Serialization: buffer.write()/buffer.read() wraps ItemBuffer state"
+      ]
+    }
+  ],
+
+  "key_relationships": [
+    "Junction.JunctionBuild HAS-A DirectionalItemBuffer (4-dir, capacity 6)",
+    "BufferedItemBridge.BufferedItemBridgeBuild HAS-A ItemBuffer (capacity 50)",
+    "Conveyor extends Block implements Autotiler",
+    "Router extends Block; RouterBuild implements ControlBlock",
+    "Junction extends Block; outputsItems()=true",
+    "OverflowGate extends Block; instantTransfer=true, update=false",
+    "OverflowDuct extends Block; conveyorPlacement=true, rotate=true",
+    "BufferedItemBridge extends ItemBridge",
+    "Tiles composes Tile[], Puddle[], Fire[] arrays",
+    "All Building subclasses call acceptItem()/handleItem() on neighbors via Building.nearby(dir)"
+  ],
+
+  "important_notes": [
+    "Common item-passing protocol: source calls dest.acceptItem(src, item) → if true → dest.handleItem(src, item)",
+    "ConveyorBuild tracks clogHeat [0..1]: rises when items are backed up (minitem < itemSpace); sleeping when empty",
+    "Router itemCapacity=1; only accepts when completely empty; round-robin via rotating 'rotation' counter mod proximity.size",
+    "Junction uses DirectionalItemBuffer per incoming direction; items cross without merging; speed=26 frames transit",
+    "OverflowGate is instantTransfer (synchronous, no tick); prefers forward, falls to alternating sides",
+    "OverflowDuct is a 1-item duct with progress timer; normal=forward-first, invert=sides-first",
+    "ItemBuffer packed format: long = TimeItem(short data, short item, float time); supports legacy 1-byte item read",
+    "Tiles.tmpFloorState / tmpBlockState are nullable lazy-init long arrays for transient state",
+    "Conveyor aligns xs of items when passing to aligned next conveyor (same rotation)",
+    "Router skips overflowGate-sourced tiles during round-robin to prevent feedback loops"
+  ],
+
+  "source_files_analyzed": [
+    "core/src/mindustry/world/ItemBuffer.java",
+    "core/src/mindustry/world/DirectionalItemBuffer.java",
+    "core/src/mindustry/world/Tiles.java",
+    "core/src/mindustry/world/blocks/distribution/Conveyor.java",
+    "core/src/mindustry/world/blocks/distribution/Router.java",
+    "core/src/mindustry/world/blocks/distribution/Junction.java",
+    "core/src/mindustry/world/blocks/distribution/OverflowGate.java",
+    "core/src/mindustry/world/blocks/distribution/OverflowDuct.java",
+    "core/src/mindustry/world/blocks/distribution/BufferedItemBridge.java"
+  ]
+}

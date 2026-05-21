@@ -1,0 +1,180 @@
+{
+  "scope": "long_video_generation_inference",
+  "title": "Long Video Generation (LVG) Inference",
+  "diagram_type": "use_case",
+  "description": "User requests generation of extended-length multi-view video via video extension pipeline (LVG). Conditioned on initial input frames and per-camera text prompts, the system extends video across multiple views using a diffusion denoising loop.",
+
+  "actors": [
+    {
+      "name": "User",
+      "type": "primary",
+      "description": "Provides input video/image and per-view text prompts via CLI or API"
+    },
+    {
+      "name": "System",
+      "type": "secondary",
+      "description": "Cosmos Predict1 inference runtime"
+    },
+    {
+      "name": "Guardrail",
+      "type": "secondary",
+      "description": "Safety/content filter for input prompts and generated video"
+    },
+    {
+      "name": "TextEncoder",
+      "type": "secondary",
+      "description": "T5-based encoder converting per-view text prompts to embeddings"
+    },
+    {
+      "name": "VAE/Tokenizer",
+      "type": "secondary",
+      "description": "Video encoder/decoder (encode to latent, decode to pixel video)"
+    },
+    {
+      "name": "DiffusionNet",
+      "type": "secondary",
+      "description": "MultiviewVideoExtendGeneralDIT / VideoExtendMultiviewGeneralDIT transformer"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Submit LVG Inference Request",
+      "actor": "User",
+      "description": "User provides input image/video path, per-camera prompts (front, left, right, back, back-left, back-right), and generation params (height, width, fps, num_video_frames, num_input_frames, guidance, num_steps, seed) via video2world_multiview.py demo() / CLI args",
+      "entry_point": "demo(args) in video2world_multiview.py → pipeline.generate(prompt, image_or_video_path)"
+    },
+    {
+      "id": "UC2",
+      "name": "Validate Inputs & Check Guardrails",
+      "actor": "Guardrail",
+      "description": "validate_args() checks args consistency. Guardrail model screens input prompt and (optionally) generated video. If blocked, pipeline.generate() returns None and generation is skipped.",
+      "includes": ["UC1"],
+      "condition": "disable_guardrail=False"
+    },
+    {
+      "id": "UC3",
+      "name": "Encode Per-View Text Prompts",
+      "actor": "TextEncoder",
+      "description": "_run_text_embedding_on_prompt_with_offload(prompts) encodes 6 per-camera text prompts into crossattn_emb tensors. T5 model is optionally offloaded after encoding.",
+      "method": "DiffusionVideo2WorldMultiviewGenerationPipeline._run_text_embedding_on_prompt_with_offload()"
+    },
+    {
+      "id": "UC4",
+      "name": "Encode Condition Video to Latent",
+      "actor": "VAE/Tokenizer",
+      "description": "Load input frames (1 or 9) from image/video path. DiffusionMultiviewV2WModel.encode() rearranges B C (V T) H W → (B V) C T H W, calls tokenizer.encode(), rescales by sigma_data, returns latent condition tensor.",
+      "method": "DiffusionMultiviewV2WModel.encode(state) → tokenizer.encode()"
+    },
+    {
+      "id": "UC5",
+      "name": "Prepare Video Extension Condition",
+      "actor": "System",
+      "description": "add_condition_video_indicator_and_video_input_mask() sets condition_video_indicator (binary 1x1xTx1x1 tensor marking first_n conditioned frames), condition_video_input_mask (B,1,T,H,W channel concatenated to network input), and gt_latent on VideoExtendCondition object. Handles n_views rearrangement and context-parallel split.",
+      "method": "DiffusionMultiviewV2WModel.add_condition_video_indicator_and_video_input_mask(latent_state, condition, num_condition_t)"
+    },
+    {
+      "id": "UC6",
+      "name": "Run Multiview Diffusion Denoising Loop",
+      "actor": "DiffusionNet",
+      "description": "generate_samples_from_batch() initializes noise x_t ~ N(0, sigma_max). For each timestep t: (1) _augment_noise_with_latent() blends gt_latent (augmented with condition_augment_sigma) into condition region; (2) MultiviewVideoExtendGeneralDIT.forward() predicts noise — concatenates [x, condition_video_input_mask, (optional) condition_video_pose] along channel dim before super().forward(); (3) CFG: net_output = cond + guidance*(cond - uncond); (4) scheduler.step() produces x_{t-1}. Context parallel splits/gathers across V views for multi-GPU.",
+      "method": "DiffusionMultiviewV2WModel.generate_samples_from_batch() → _augment_noise_with_latent() → net(x, timesteps, **condition.to_dict()) [×num_steps]",
+      "key_params": "guidance=7.0, num_steps=35, condition_augment_sigma, num_condition_t"
+    },
+    {
+      "id": "UC7",
+      "name": "Decode Latent to Multi-View Video",
+      "actor": "VAE/Tokenizer",
+      "description": "DiffusionMultiviewV2WModel.decode() rearranges B C (V T) H W → (B V) C T H W, calls tokenizer.decode(latent / sigma_data), reassembles to B C (V T) H W. Produces pixel video (B,3,T,H,W).",
+      "method": "DiffusionMultiviewV2WModel.decode(latent)"
+    },
+    {
+      "id": "UC8",
+      "name": "Assemble and Save Generated Video",
+      "actor": "User",
+      "description": "Pipeline returns [video_grid, video] (grid arranges 6 camera views into a 2×3 mosaic). save_video() writes .mp4 (individual + grid). Prompts saved to .txt. Output resolution: default 480×848 per camera, 57 frames.",
+      "method": "save_video(video, fps, H, W) — called twice (per-cam + grid)"
+    },
+    {
+      "id": "UC9",
+      "name": "Enable Multi-GPU Context Parallel Inference",
+      "actor": "System",
+      "description": "If num_gpus > 1, megatron parallel_state initialized with context_parallel_size=num_gpus. pipeline.model.net.enable_context_parallel(process_group) splits temporal sequence dimension across GPUs per view. Outputs gathered via cat_outputs_cp() after denoising.",
+      "extends": ["UC6"],
+      "condition": "num_gpus > 1"
+    }
+  ],
+
+  "key_classes": [
+    {
+      "name": "MultiviewVideoExtendGeneralDIT",
+      "file": "diffusion/networks/general_dit_video_conditioned_multiview.py",
+      "inherits": "MultiviewGeneralDIT",
+      "role": "Inference-side LVG network. Adds +1 input channel for condition mask. forward() cats [x, condition_video_input_mask, (opt) condition_video_pose] before calling super().forward()."
+    },
+    {
+      "name": "VideoExtendMultiviewGeneralDIT",
+      "file": "diffusion/training/networks/general_dit_lvg_multiview.py",
+      "inherits": "MultiviewGeneralDIT (training)",
+      "role": "Training-side LVG network. Identical structure to inference counterpart."
+    },
+    {
+      "name": "MultiviewGeneralDIT",
+      "file": "diffusion/networks/general_dit_multiview.py",
+      "inherits": "GeneralDIT",
+      "role": "Base multiview DIT. n_views camera views, view_embeddings (nn.Embedding), MultiviewVideoRopePosition3DEmb, GeneralDITTransformerBlock with n_views. prepare_embedded_sequence() adds per-view learnable embeddings."
+    },
+    {
+      "name": "DiffusionMultiviewV2WModel",
+      "file": "diffusion/model/model_v2w_multiview.py",
+      "inherits": "DiffusionV2WModel",
+      "role": "Inference model. encode/decode with view rearrangement. Orchestrates condition mask prep and denoising loop. generate_samples_from_batch() is the top-level generation method."
+    },
+    {
+      "name": "MultiviewExtendDiffusionModel",
+      "file": "diffusion/training/models/extend_model_multiview.py",
+      "inherits": "ExtendDiffusionModel",
+      "role": "Training model. denoise() handles conditional frame injection. get_x0_fn_from_batch_with_condition_latent() builds CFG x0_fn. FSDPExtendDiffusionModel wraps with FSDP."
+    },
+    {
+      "name": "DiffusionVideo2WorldMultiviewGenerationPipeline",
+      "file": "diffusion/inference/world_generation_pipeline.py",
+      "inherits": "DiffusionText2WorldMultiviewGenerationPipeline",
+      "role": "User-facing pipeline. generate(prompt_dict, image_or_video_path) orchestrates text encoding → condition latent encoding → _run_model() → decode → save. Uses DiffusionMultiviewV2WModel."
+    }
+  ],
+
+  "key_relationships": [
+    "DiffusionVideo2WorldMultiviewGenerationPipeline extends DiffusionText2WorldMultiviewGenerationPipeline",
+    "DiffusionVideo2WorldMultiviewGenerationPipeline uses DiffusionMultiviewV2WModel",
+    "DiffusionMultiviewV2WModel uses MultiviewVideoExtendGeneralDIT (as self.net)",
+    "MultiviewVideoExtendGeneralDIT extends MultiviewGeneralDIT (inference)",
+    "VideoExtendMultiviewGeneralDIT extends MultiviewGeneralDIT (training)",
+    "MultiviewGeneralDIT extends GeneralDIT",
+    "MultiviewExtendDiffusionModel extends ExtendDiffusionModel (training path)",
+    "DiffusionMultiviewV2WModel uses VAE/Tokenizer for encode/decode",
+    "Guardrail guards UC1 input and UC8 output"
+  ],
+
+  "important_notes": [
+    "LVG = Long Video Generation / Video Extension: generates new frames conditioned on first N frames (condition_location=first_n)",
+    "6 camera views: front, left, right, back, back-left, back-right; all views processed jointly B C (V T) H W",
+    "Extra +1 channel: condition_video_input_mask concatenated to noisy input x before DIT forward pass",
+    "condition_video_augment_sigma controls noise added to conditioning frames (inference default 0.001)",
+    "Context parallel: temporal T dimension split across GPUs per view for multi-GPU scaling",
+    "Default output: 480×848 per camera, 57 frames @ 24fps; 6-view grid (2×3) also saved",
+    "CFG: guidance=7.0 default; net_output = cond + guidance*(cond - uncond) per denoising step",
+    "Model weights: Cosmos-Predict1-7B-Video2World-Sample-AV-Multiview"
+  ],
+
+  "source_files_analyzed": [
+    "Lyra-1/cosmos_predict1/diffusion/networks/general_dit_video_conditioned_multiview.py",
+    "Lyra-1/cosmos_predict1/diffusion/training/networks/general_dit_lvg_multiview.py",
+    "Lyra-1/cosmos_predict1/diffusion/networks/general_dit_multiview.py",
+    "Lyra-1/cosmos_predict1/diffusion/model/model_v2w_multiview.py",
+    "Lyra-1/cosmos_predict1/diffusion/training/models/extend_model_multiview.py",
+    "Lyra-1/cosmos_predict1/diffusion/inference/video2world_multiview.py",
+    "Lyra-1/cosmos_predict1/diffusion/inference/world_generation_pipeline.py (DiffusionVideo2WorldMultiviewGenerationPipeline)"
+  ]
+}

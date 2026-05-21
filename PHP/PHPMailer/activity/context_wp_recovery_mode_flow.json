@@ -1,0 +1,164 @@
+{
+  "scope": "wp_recovery_mode_flow",
+  "title": "WordPress Recovery Mode End-to-End Flow",
+  "diagram_type": "activity",
+  "since": "WordPress 5.2.0",
+
+  "key_participants": [
+    "WP_Recovery_Mode (orchestrator)",
+    "WP_Recovery_Mode_Link_Service",
+    "WP_Recovery_Mode_Key_Service",
+    "WP_Recovery_Mode_Cookie_Service",
+    "PasswordHash (phpass)",
+    "WordPress DB (get_option / update_option)",
+    "Browser / HTTP Client"
+  ],
+
+  "constants": {
+    "LOGIN_ACTION_ENTER": "enter_recovery_mode",
+    "LOGIN_ACTION_ENTERED": "entered_recovery_mode",
+    "RECOVERY_MODE_COOKIE": "wordpress_rec_... (wp constant)",
+    "option_name": "recovery_keys"
+  },
+
+  "activity_flows": [
+    {
+      "flow": "1. Generate Recovery URL",
+      "trigger": "WP_Recovery_Mode calls link_service->generate_url()",
+      "steps": [
+        "link_service->generate_url() START",
+        "  → key_service->generate_recovery_mode_token(): wp_generate_password(22, false) → $token (22-char random, no special chars)",
+        "  → key_service->generate_and_store_recovery_mode_key($token):",
+        "       wp_generate_password(22, false) → $key (plaintext)",
+        "       PasswordHash->HashPassword($key) → $hashed",
+        "       get_keys(): get_option('recovery_keys', []) → $records",
+        "       $records[$token] = ['hashed_key' => $hashed, 'created_at' => time()]",
+        "       update_keys($records): update_option('recovery_keys', $records)",
+        "       do_action('generate_recovery_mode_key', $token, $key)",
+        "       return $key (plaintext, will be put in URL)",
+        "  → get_recovery_mode_begin_url($token, $key):",
+        "       build URL: wp_login_url() + ?action=enter_recovery_mode&rm_token={token}&rm_key={key}",
+        "       apply_filters('recovery_mode_begin_url', $url, $token, $key)",
+        "       return $url",
+        "RETURN: recovery URL (sent to admin via email by WP_Recovery_Mode_Email_Service)"
+      ]
+    },
+    {
+      "flow": "2. Handle Begin Link (User Clicks URL)",
+      "trigger": "User visits wp-login.php?action=enter_recovery_mode&rm_token=X&rm_key=Y",
+      "steps": [
+        "link_service->handle_begin_link($ttl) START",
+        "  [GUARD] pagenow != 'wp-login.php' → return (abort, not on login page)",
+        "  [GUARD] $_GET['action'] | rm_token | rm_key missing OR action != 'enter_recovery_mode' → return (abort)",
+        "  ensure wp_generate_password() available (require pluggable.php if needed)",
+        "  key_service->validate_recovery_mode_key($_GET['rm_token'], $_GET['rm_key'], $ttl):",
+        "       get_keys() → $records from DB",
+        "       [CHECK] token in $records? NO → WP_Error('token_not_found') → wp_die() [END: error]",
+        "       remove_key($token): consume key (one-time use), update_option",
+        "       [CHECK] record is array with hashed_key + created_at? NO → WP_Error('invalid_recovery_key_format') → wp_die() [END: error]",
+        "       wp_check_password($key, $record['hashed_key'])? NO → WP_Error('hash_mismatch') → wp_die() [END: error]",
+        "       [CHECK] time() > record['created_at'] + $ttl? YES → WP_Error('key_expired') → wp_die() [END: error]",
+        "       return true",
+        "  [VALIDATED] cookie_service->set_cookie():",
+        "       generate_cookie():",
+        "           to_sign = 'recovery_mode|{time()}|{wp_generate_password(20, false)}'",
+        "           signed = recovery_mode_hash(to_sign) → hash_hmac('sha1', data, AUTH_KEY+AUTH_SALT)",
+        "           return base64_encode('{to_sign}|{signed}')",
+        "       apply_filters('recovery_mode_cookie_length', WEEK_IN_SECONDS) → $length",
+        "       $expire = time() + $length",
+        "       setcookie(RECOVERY_MODE_COOKIE, $value, $expire, COOKIEPATH, COOKIE_DOMAIN, is_ssl(), true)",
+        "       if COOKIEPATH != SITECOOKIEPATH: setcookie again for SITECOOKIEPATH",
+        "  wp_redirect(wp_login_url() + ?action=entered_recovery_mode)",
+        "  die() [END: session started, cookie set]"
+      ]
+    },
+    {
+      "flow": "3. Validate Cookie on Subsequent Requests",
+      "trigger": "WP_Recovery_Mode->initialize() on each WP bootstrap",
+      "steps": [
+        "WP_Recovery_Mode->initialize() START",
+        "  [CHECK] is_initialized? YES → return (already done)",
+        "  link_service->handle_begin_link($ttl) [runs flow 2 if URL params present]",
+        "  cookie_service->is_cookie_set(): !empty($_COOKIE[RECOVERY_MODE_COOKIE])",
+        "  [CHECK] cookie set? NO → $is_active = false; END",
+        "  cookie_service->validate_cookie():",
+        "       read $_COOKIE[RECOVERY_MODE_COOKIE] if not passed",
+        "       [CHECK] cookie present? NO → WP_Error('no_cookie')",
+        "       parse_cookie($cookie):",
+        "           base64_decode($cookie)",
+        "           explode('|', ...) → expect exactly 4 parts: [recovery_mode, created_at, random, signature]",
+        "           [CHECK] count != 4 → WP_Error('invalid_format')",
+        "       [CHECK] created_at is digit? NO → WP_Error('invalid_created_at')",
+        "       apply_filters('recovery_mode_cookie_length', WEEK_IN_SECONDS) → $length",
+        "       [CHECK] time() > created_at + length? YES → WP_Error('expired')",
+        "       to_sign = 'recovery_mode|{created_at}|{random}'",
+        "       recovery_mode_hash(to_sign) → hash_hmac('sha1', ...)",
+        "       hash_equals(signature, hashed)? NO → WP_Error('signature_mismatch')",
+        "       return true",
+        "  [CHECK] validate_cookie returned WP_Error? YES → $is_active = false; END",
+        "  cookie_service->get_session_id_from_cookie():",
+        "       parse_cookie() → extract $random (3rd part)",
+        "       return sha1($random)",
+        "  $this->session_id = session_id",
+        "  $this->is_active = true",
+        "  $this->is_initialized = true",
+        "  END: recovery mode active for this request"
+      ]
+    },
+    {
+      "flow": "4. Exit Recovery Mode",
+      "trigger": "Admin clicks 'Exit Recovery Mode' or handle_exit_recovery_mode()",
+      "steps": [
+        "WP_Recovery_Mode->exit_recovery_mode() / handle_exit_recovery_mode()",
+        "  cookie_service->clear_cookie():",
+        "       setcookie(RECOVERY_MODE_COOKIE, ' ', time() - YEAR_IN_SECONDS, COOKIEPATH, COOKIE_DOMAIN)",
+        "       setcookie(RECOVERY_MODE_COOKIE, ' ', time() - YEAR_IN_SECONDS, SITECOOKIEPATH, COOKIE_DOMAIN)",
+        "  $is_active = false",
+        "  redirect / session ended"
+      ]
+    }
+  ],
+
+  "key_relationships": [
+    "WP_Recovery_Mode composes WP_Recovery_Mode_Link_Service",
+    "WP_Recovery_Mode composes WP_Recovery_Mode_Cookie_Service",
+    "WP_Recovery_Mode composes WP_Recovery_Mode_Key_Service",
+    "WP_Recovery_Mode composes WP_Recovery_Mode_Email_Service",
+    "WP_Recovery_Mode_Link_Service depends_on WP_Recovery_Mode_Key_Service (via $key_service)",
+    "WP_Recovery_Mode_Link_Service depends_on WP_Recovery_Mode_Cookie_Service (via $cookie_service)",
+    "WP_Recovery_Mode_Key_Service reads/writes WordPress DB (get_option/update_option 'recovery_keys')",
+    "WP_Recovery_Mode_Cookie_Service uses AUTH_KEY+AUTH_SALT for HMAC signing"
+  ],
+
+  "business_rules": [
+    "Recovery keys are ONE-TIME USE: remove_key($token) is called before validation passes",
+    "Recovery key TTL enforced: time() > created_at + ttl → key_expired error",
+    "Cookie validity: 1 week by default (WEEK_IN_SECONDS), filterable via 'recovery_mode_cookie_length'",
+    "Cookie format: base64('recovery_mode|{iat}|{rand20}|{hmac_sha1}')",
+    "Session ID derived from cookie: sha1($random) — random part of the cookie",
+    "Cookie HMAC uses AUTH_KEY+AUTH_SALT; if defaults are used, auto-generates and stores site options 'recovery_mode_auth_key' / 'recovery_mode_auth_salt'",
+    "Only one valid recovery URL at a time (previous keys stored by token, overwritten on new generate)",
+    "Recovery URL format: wp-login.php?action=enter_recovery_mode&rm_token=X&rm_key=Y",
+    "After entering recovery mode, redirect to: wp-login.php?action=entered_recovery_mode",
+    "handle_begin_link only executes on wp-login.php page (pagenow guard)"
+  ],
+
+  "error_paths": [
+    "token_not_found: token not in DB → wp_die()",
+    "invalid_recovery_key_format: stored record malformed → wp_die()",
+    "hash_mismatch: key doesn't match stored hash → wp_die()",
+    "key_expired: TTL exceeded at validation → wp_die()",
+    "no_cookie: RECOVERY_MODE_COOKIE not in $_COOKIE → not active",
+    "invalid_format: cookie base64 doesn't have 4 parts → not active",
+    "invalid_created_at: non-numeric timestamp → not active",
+    "expired: cookie past its validity window → not active",
+    "signature_mismatch: HMAC check fails → not active"
+  ],
+
+  "source_files_analyzed": [
+    "dockerfiles/testing-environment/Wordpress5/app/wp-includes/class-wp-recovery-mode-link-service.php",
+    "dockerfiles/testing-environment/Wordpress5/app/wp-includes/class-wp-recovery-mode-key-service.php",
+    "tests/Frameworks/WordPress/Version_6_1/wp-includes/class-wp-recovery-mode-cookie-service.php",
+    "ir_postprocessed.json (WP_Recovery_Mode orchestrator class)"
+  ]
+}

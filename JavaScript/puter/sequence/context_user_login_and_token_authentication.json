@@ -1,0 +1,144 @@
+{
+  "scope": "user_login_and_token_authentication",
+  "title": "User Login and Token Authentication Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Client",
+    "LoginRouter",
+    "configurable_auth",
+    "AuthService",
+    "SessionService",
+    "TokenService",
+    "Database",
+    "Redis",
+    "EdgeRateLimitService"
+  ],
+  "interaction_flow": {
+    "login_flow": [
+      "Client → LoginRouter: POST /login (username|email, password, captchaToken)",
+      "LoginRouter → requireCaptcha: validate captcha (strictMode:true, eventType:'login')",
+      "LoginRouter → EdgeRateLimitService: check('login', true) — 429 if exceeded",
+      "LoginRouter → Database: get_user({username}) or get_user({email}) — 400 if not found",
+      "LoginRouter: bcrypt.compare(password, user.password) — 400 if mismatch",
+      "LoginRouter [OTP path]: → TokenService.sign('otp', {user_uid}, {expiresIn:'5m'}) → return 202 {next_step:'otp', otp_jwt_token}",
+      "LoginRouter [normal path]: → complete_(req, res, user)",
+      "complete_ → AuthService: create_session_token(user, {req})",
+      "  AuthService → AuthService: create_session_(user, meta) — extracts ip, user_agent, referer, origin from req",
+      "  AuthService → SessionService: create_session(user, meta)",
+      "    SessionService → Database: INSERT INTO sessions (uuid, user_id, meta, last_activity, created_at)",
+      "    SessionService → Redis: SET session-cache:{uuid} JSON(session) EX 300",
+      "    SessionService → Redis: SADD session-cache:user-sessions:{user_id} {uuid}",
+      "    SessionService returns session {uuid, user_uid, user_id, meta}",
+      "  AuthService → TokenService: sign('auth', {type:'session', uuid, user_uid}) → session_token (JWT)",
+      "  AuthService returns {session, token: session_token}",
+      "complete_ → AuthService: create_gui_token(user, session)",
+      "  AuthService → TokenService: sign('auth', {type:'gui', uuid, user_uid}) → gui_token (JWT)",
+      "complete_ → Client: res.cookie(config.cookie_name, session_token, {httpOnly:true, secure:true, sameSite:'none'})",
+      "complete_ → Client: res.send({proceed:true, next_step:'complete', token:gui_token, user:{username,uuid,email,email_confirmed,is_temp}})"
+    ],
+    "token_auth_flow": [
+      "Client → configurable_auth: request with token (body.auth_token | Authorization header | cookie | query.auth_token | socket)",
+      "configurable_auth: extract token from request source (body > header > cookie > query > socket)",
+      "configurable_auth → AuthService: authenticate_from_token(token)",
+      "  AuthService → TokenService: verify('auth', token) → decoded JWT payload",
+      "  [type='session' or 'gui']: AuthService → SessionService: getSession(decoded.uuid)",
+      "    SessionService → Redis: GET session-cache:{uuid}",
+      "    [cache miss]: SessionService → Database: SELECT * FROM sessions WHERE uuid=? — tryHardRead",
+      "    SessionService → Redis: SET session-cache:{uuid} (pending flush) + SADD flush-pending-set",
+      "    SessionService returns session (without internal fields)",
+      "  AuthService → get_user({uuid: decoded.user_uid})",
+      "  AuthService returns Actor(UserActorType{user, session:uuid, hasHttpOnlyCookie: type==='session'})",
+      "  [type='app-under-user']: AuthService: uuid_fpe.decrypt(decoded.session) → session_uuid",
+      "  AuthService → SessionService: getSession(session_uuid)",
+      "  AuthService → get_user({uuid}), get_app({uid})",
+      "  AuthService returns Actor(AppUnderUserActorType{user, app, session})",
+      "  [type='access-token']: AuthService → Actor.create(AppUnderUserActorType|UserActorType)",
+      "  AuthService returns Actor(AccessTokenActorType{token, authorizer, authorized})",
+      "  [type='actor-site']: AuthService → puter-site.get_subdomain_by_uid(site_uid)",
+      "  AuthService returns Actor(SiteActorType{site, iat})",
+      "configurable_auth: context.set('actor', actor); context.set('user', actor.type.user)",
+      "configurable_auth: req.actor = actor; req.user = user; req.token = token",
+      "configurable_auth → next()"
+    ],
+    "legacy_token_upgrade": [
+      "configurable_auth catches LegacyTokenError (token has no 'type' field) on /whoami",
+      "configurable_auth → AuthService: check_session(token, {req, from_upgrade:true})",
+      "  AuthService → TokenService: verify('auth', cur_token) → decoded (legacy format with .uuid)",
+      "  AuthService → get_user({uuid: decoded.uuid})",
+      "  AuthService → SessionService: getSession(decoded.uuid)",
+      "  AuthService → AuthService: create_session_token(user, meta) → {session, token:session_token}",
+      "  AuthService → AuthService: create_gui_token(user, session) → gui_token",
+      "  AuthService returns {actor, user, token:gui_token, session_token}",
+      "configurable_auth → Client: res.cookie(config.cookie_name, session_token, {httpOnly:true, secure:true, sameSite:'none'})"
+    ],
+    "get_user_app_token": [
+      "Caller → AuthService: get_user_app_token(app_uid)",
+      "AuthService: actor = Context.get('actor') — must be UserActorType or throws 403",
+      "AuthService → TokenService: sign('auth', {type:'app-under-user', user_uid, app_uid, session:uuid_fpe.encrypt(session)}) → JWT",
+      "AuthService returns app-under-user JWT token"
+    ],
+    "get_public_hosted_actor_cookie_name": [
+      "Caller → AuthService: getPublicHostedActorCookieName()",
+      "AuthService: reads global_config.public_hosted_actor_cookie_name",
+      "AuthService returns configured name or DEFAULT_PUBLIC_HOSTED_ACTOR_COOKIE_NAME"
+    ],
+    "session_flush_loop": [
+      "SessionService (background): scheduleSessionFlushLoop() — random interval 5s–60s",
+      "SessionService → Redis: SMEMBERS session-cache:flush-pending",
+      "SessionService → Redis: SET flush-lock:{uuid} EX 30 NX (skip if lock not acquired)",
+      "SessionService → Database: UPDATE sessions SET meta=?, last_activity=? WHERE uuid=?",
+      "SessionService → Database: UPDATE user SET last_activity_ts=? WHERE id=?",
+      "SessionService → Redis: cacheSession({flushPending:false}, {flushState:'flushed'})"
+    ]
+  },
+  "key_relationships": [
+    "AuthService extends BaseService",
+    "SessionService extends BaseService",
+    "AuthService depends_on SessionService (this.sessionService = services.get('session'))",
+    "AuthService depends_on TokenService (this.tokenService = services.get('token'))",
+    "AuthService depends_on Database (DB_WRITE, 'auth')",
+    "SessionService depends_on Database (services.get('database'))",
+    "SessionService depends_on Redis (redisClient for cache)",
+    "configurable_auth depends_on AuthService (authenticate_from_token)",
+    "LoginRouter depends_on AuthService (create_session_token, create_gui_token)",
+    "LoginRouter depends_on EdgeRateLimitService (rate limiting)",
+    "Actor uses UserActorType | AppUnderUserActorType | AccessTokenActorType | SiteActorType"
+  ],
+  "token_types": {
+    "session": "HTTP-only cookie token; hasHttpOnlyCookie=true; allows user-protected endpoints",
+    "gui": "Response-body token; hasHttpOnlyCookie=false; client-side use only",
+    "app-under-user": "App acting on behalf of user; includes encrypted session UUID",
+    "access-token": "Long-lived API token; references authorizer actor",
+    "actor-site": "Site-level token; references puter site by site_uid",
+    "otp": "Short-lived (5m) token for MFA step; signed with 'otp' namespace"
+  },
+  "cookie_setup": {
+    "cookie_name": "config.cookie_name (configurable)",
+    "options": "{sameSite:'none', secure:true, httpOnly:true}",
+    "public_hosted_actor": "getPublicHostedActorCookieName() → global_config.public_hosted_actor_cookie_name or DEFAULT",
+    "private_asset": "getPrivateAssetCookieName() → global_config.private_app_asset_cookie_name or DEFAULT"
+  },
+  "session_cache": {
+    "redis_key": "session-cache:{uuid}",
+    "ttl": "300s (SESSION_CACHE_TTL_SECONDS)",
+    "user_set_key": "session-cache:user-sessions:{user_id}",
+    "flush_pending_key": "session-cache:flush-pending",
+    "flush_lock_key": "session-cache:flush-lock:{uuid} (TTL 30s)"
+  },
+  "important_notes": [
+    "Two-token architecture: session_token (httpOnly cookie, for protected endpoints) + gui_token (response body, for client JS)",
+    "authenticate_from_token dispatches on JWT 'type' field; missing 'type' → LegacyTokenError (upgrade path)",
+    "Session UUIDs in app-under-user tokens are Format-Preserving Encrypted (UUIDFPE) to avoid exposure",
+    "check_session handles legacy token upgrade on /whoami — creates new session, returns GUI token",
+    "OTP path: login returns 202 with otp_jwt_token; client POSTs to /login/otp with code",
+    "Rate limiting via EdgeRateLimitService.check('login') on every login attempt",
+    "Session flush to DB is async, distributed-locked, random-interval (5–60s)",
+    "/get-gui-token endpoint exchanges session cookie for GUI token; /session/sync-cookie syncs cookie after user switch"
+  ],
+  "source_files_analyzed": [
+    "src/backend/src/routers/login.js",
+    "src/backend/src/services/auth/AuthService.js",
+    "src/backend/src/services/SessionService.js",
+    "src/backend/src/middleware/configurable_auth.js"
+  ]
+}

@@ -1,0 +1,90 @@
+{
+  "scope": "tokenizer_encoding_decoding",
+  "title": "Tokenizer Encoding & Decoding Flow",
+  "diagram_type": "activity",
+  "key_participants": [
+    "BaseWorldGenerationPipeline",
+    "DiffusionText2WorldGenerationPipeline",
+    "DiffusionVideo2WorldGenerationPipeline",
+    "DiffusionMultiviewV2WGenerationPipeline",
+    "DiffusionWorldInterpolatorGenerationPipeline",
+    "model.tokenizer",
+    "inference_utils (get_condition_latent, get_condition_latent_multiview, load_tokenizer_model)"
+  ],
+  "initialization_flow": [
+    "START: __init__(offload_tokenizer: bool)",
+    "DECISION: offload_tokenizer == False?",
+    "  YES → _load_tokenizer() immediately",
+    "  NO  → defer; tokenizer loaded on-demand inside _run_model_with_offload",
+    "_load_tokenizer (diffusion): load_tokenizer_model(model, '{checkpoint_dir}/Cosmos-Tokenize1-CV8x8x8-720p')",
+    "_load_tokenizer (base): pass (no-op; subclass responsibility)"
+  ],
+  "encoding_flow": [
+    "ENTRY: _run_model_with_offload(..., image_or_video_path)",
+    "DECISION: offload_tokenizer?  YES → _load_tokenizer()",
+    "CALL: _run_tokenizer_encoding(image_or_video_path) → condition_latent: torch.Tensor",
+    "  [V2W variant] → get_condition_latent(model, path, num_input_frames, state_shape) → latent",
+    "  [MultiviewV2W variant] → get_condition_latent_multiview(model, path, num_input_frames, state_shape) → (condition_latent, condition_frames)",
+    "  [Interpolator variant] → get_condition_latent(model, path, num_input_frames, state_shape, frame_index, frame_stride) → latent (iterates over frame pairs in loop)",
+    "RETURN: condition_latent tensor used as conditioning for diffusion model"
+  ],
+  "decoding_flow": [
+    "ENTRY: _run_tokenizer_decoding(sample: torch.Tensor[B,C,T,H,W])",
+    "CALL: self.model.decode(sample) → raw video tensor",
+    "NORMALIZE: (1.0 + raw).clamp(0,2) / 2  →  [B, 3, T, H, W] in [0,1]",
+    "RESHAPE/PERMUTE: video[0].permute(1,2,3,0) → [T,H,W,C]",
+    "CONVERT: * 255 → torch.uint8 → .cpu().numpy()",
+    "  [Multiview variant] additionally rearranges views into 2x3 grid via einops",
+    "RETURN: np.ndarray uint8 [T, H, W, C]  (or [grid_video, video] for multiview)",
+    "DECISION: offload_tokenizer?  YES → _offload_tokenizer()"
+  ],
+  "offload_flow": [
+    "_offload_tokenizer(): del self.model.tokenizer → None; gc.collect(); torch.cuda.empty_cache()",
+    "Called after decoding completes when offload_tokenizer=True"
+  ],
+  "full_pipeline_sequence": [
+    "1. [Optional] LOAD tokenizer if offload_tokenizer=True",
+    "2. ENCODING: _run_tokenizer_encoding(path) → condition_latent",
+    "3. [Optional] LOAD network if offload_network=True",
+    "4. DIFFUSION: _run_model(embedding, condition_latent) → sample latent",
+    "5. [Optional] OFFLOAD network",
+    "6. DECODING: _run_tokenizer_decoding(sample) → video np.ndarray",
+    "7. [Optional] OFFLOAD tokenizer"
+  ],
+  "key_method_signatures": {
+    "_load_tokenizer": "def _load_tokenizer(self) -> None  [base: no-op; diffusion subclass: load_tokenizer_model(model, path)]",
+    "_offload_tokenizer": "def _offload_tokenizer(self) -> None  [base: del model.tokenizer; gc; cuda empty_cache]",
+    "_run_tokenizer_encoding_v2w": "def _run_tokenizer_encoding(self, image_or_video_path: str) -> torch.Tensor",
+    "_run_tokenizer_encoding_multiview": "def _run_tokenizer_encoding(self, image_or_video_path: str, state_shape: list) -> Tuple[torch.Tensor, torch.Tensor]",
+    "_run_tokenizer_encoding_interpolator": "def _run_tokenizer_encoding(self, image_or_video_path: str, frame_index: int=0, frame_stride: int=1) -> torch.Tensor",
+    "_run_tokenizer_decoding": "def _run_tokenizer_decoding(self, sample: torch.Tensor) -> np.ndarray  [input: [B,C,T,H,W]; output: uint8 [T,H,W,C]]"
+  },
+  "key_relationships": [
+    "BaseWorldGenerationPipeline (ABC) defines _load_tokenizer (no-op), _offload_tokenizer, _run_tokenizer_decoding (no-op)",
+    "DiffusionText2WorldGenerationPipeline extends BaseWorldGenerationPipeline — no _run_tokenizer_encoding (T2W only decodes)",
+    "DiffusionVideo2WorldGenerationPipeline extends BaseWorldGenerationPipeline — overrides _run_tokenizer_encoding, _run_tokenizer_decoding",
+    "DiffusionMultiviewV2WGenerationPipeline extends BaseWorldGenerationPipeline — overrides _run_tokenizer_encoding (multiview), _run_tokenizer_decoding (grid layout)",
+    "DiffusionWorldInterpolatorGenerationPipeline extends DiffusionVideo2WorldGenerationPipeline — overrides _run_tokenizer_encoding with frame_index/stride; loops over frame pairs",
+    "model.tokenizer: spatial_compression_factor used to compute H,W from state_shape in interpolator",
+    "Tokenizer checkpoint: Cosmos-Tokenize1-CV8x8x8-720p (8x temporal, 8x8 spatial compression)"
+  ],
+  "branching_conditions": [
+    "offload_tokenizer=True → load on demand before encode, offload after decode",
+    "offload_tokenizer=False → tokenizer stays on GPU (loaded at init)",
+    "T2W pipeline → no encoding phase (pure text-to-video, decode only)",
+    "V2W/multiview pipeline → encoding required before diffusion",
+    "Interpolator pipeline → encoding runs in loop per frame pair (frame_index_start to num_frame_pairs)",
+    "Multiview decode → einops rearrange into 2x3 grid; returns [grid_video, video]"
+  ],
+  "data_types": {
+    "input_to_encode": "image_or_video_path: str",
+    "condition_latent": "torch.Tensor — conditioned input to diffusion model",
+    "sample": "torch.Tensor [B, C, T, H, W] — raw diffusion output",
+    "decoded_video": "np.ndarray uint8 [T, H, W, C] in range [0, 255]"
+  },
+  "important_notes": "Tokenizer is Cosmos-Tokenize1-CV8x8x8-720p (8x temporal, 8x8 spatial). Encoding converts video frames to latent space; decoding applies model.decode() + normalize + cast to uint8. T2W pipelines skip encoding entirely. Memory offloading (offload_tokenizer flag) controls whether tokenizer stays on GPU. Interpolator pipeline iterates encoding per frame pair then concatenates outputs, skipping first frame of subsequent segments to avoid duplication.",
+  "source_files_analyzed": [
+    "Lyra-1/cosmos_predict1/utils/base_world_generation_pipeline.py",
+    "Lyra-1/cosmos_predict1/diffusion/inference/world_generation_pipeline.py"
+  ]
+}

@@ -1,0 +1,154 @@
+{
+  "scope": "voice_pipeline_audio_processing",
+  "title": "Voice Pipeline Audio Processing",
+  "diagram_type": "activity",
+  "description": "Ingest audio input, run STT, pass transcript to agent workflow, receive text response, run TTS, output streaming audio",
+
+  "key_participants": [
+    "VoicePipeline",
+    "VoicePipelineConfig",
+    "AudioInput / StreamedAudioInput",
+    "STTModel",
+    "TTSModel",
+    "VoiceWorkflowBase",
+    "StreamedAudioResult",
+    "TranscriptionSession"
+  ],
+
+  "activity_flow": [
+    "START: caller invokes VoicePipeline.run(audio_input)",
+    "DECISION: isinstance(audio_input, AudioInput)? → _run_single_turn | isinstance(StreamedAudioInput)? → _run_multi_turn | else raise UserError",
+
+    "--- SINGLE-TURN BRANCH ---",
+    "Create StreamedAudioResult(tts_model, tts_settings, config)",
+    "Launch asyncio.Task: stream_events()",
+    "Open TraceCtxManager (workflow_name, group_id, metadata, tracing)",
+    "  → _process_audio_input(audio_input)",
+    "    → _get_stt_model() [lazy-init from config.model_provider if not set]",
+    "    → STTModel.transcribe(audio_input, stt_settings, trace_flags) → input_text: str",
+    "  → workflow.run(input_text) [async generator]",
+    "    → for each text_event: output._add_text(text_event)",
+    "      → _start_turn() if not started (emits VoiceStreamEventLifecycle 'turn_started')",
+    "      → buffer text; run tts_settings.text_splitter",
+    "      DECISION: combined_sentences >= 20 chars?",
+    "        YES → create local_queue, spawn asyncio.Task _stream_audio(text, local_queue)",
+    "             → if dispatcher not running, start _dispatch_audio()",
+    "        NO  → continue buffering",
+    "  → output._turn_done()",
+    "    → flush remaining _text_buffer via _stream_audio(text, local_queue, finish_turn=True)",
+    "    → await asyncio.gather(*_tasks)",
+    "  → output._done() → _completed_session=True → _wait_for_completion()",
+    "EXCEPTION path: output._add_error(e) → queue VoiceStreamEventError",
+    "Return StreamedAudioResult to caller",
+
+    "--- MULTI-TURN BRANCH ---",
+    "Create StreamedAudioResult(tts_model, tts_settings, config)",
+    "Launch asyncio.Task: process_turns()",
+    "Open TraceCtxManager",
+    "  TRY workflow.on_start() → yield intro texts → output._add_text() for each",
+    "  WARN if on_start() raises",
+    "  → _get_stt_model().create_session(audio_input, stt_settings, trace_flags) → transcription_session",
+    "  → transcription_session.transcribe_turns() [async generator of turns]",
+    "    → for each input_text:",
+    "      → workflow.run(input_text) [async generator]",
+    "        → for each text_event: output._add_text(text_event) [same TTS buffering as single-turn]",
+    "      → output._turn_done()",
+    "  EXCEPTION path: output._add_error(e)",
+    "  FINALLY: transcription_session.close() + output._done()",
+    "Return StreamedAudioResult to caller",
+
+    "--- TTS AUDIO STREAMING (_stream_audio) ---",
+    "Open speech_span(model, input, voice/instructions/speed, format=pcm)",
+    "  → TTSModel.run(text, tts_settings) [async generator of bytes chunks]",
+    "    → buffer chunks; when buffer >= buffer_size:",
+    "      → _transform_audio_buffer(buffer, dtype) → numpy array (int16 or float32)",
+    "      → optional tts_settings.transform_data(audio_np)",
+    "      → local_queue.put(VoiceStreamEventAudio(data=audio_np))",
+    "  → flush remaining buffer (pad if odd-length bytes)",
+    "  DECISION: finish_turn?",
+    "    YES → local_queue.put(VoiceStreamEventLifecycle 'turn_ended')",
+    "    NO  → local_queue.put(None) [segment complete signal]",
+    "  EXCEPTION → local_queue.put(VoiceStreamEventLifecycle 'session_ended')",
+
+    "--- DISPATCH & CONSUME ---",
+    "_dispatch_audio(): ordered deque of local_queues; forwards events in order to main _queue",
+    "  → on turn_ended: _finish_turn() (closes tracing span, resets buffers)",
+    "  → when all queues drained and _completed_session: put VoiceStreamEventLifecycle 'session_ended'",
+    "Caller iterates StreamedAudioResult.stream():",
+    "  → yields VoiceStreamEventAudio, VoiceStreamEventLifecycle events",
+    "  → stops on 'session_ended' or VoiceStreamEventError",
+    "  → _cleanup_tasks() cancels any outstanding tasks",
+    "END"
+  ],
+
+  "key_decisions": [
+    "AudioInput type → single-turn vs multi-turn path",
+    "STTModel lazy init: model object vs model name string vs default from provider",
+    "TTSModel lazy init: same pattern as STT",
+    "Text buffer threshold (>= 20 chars of combined sentences) → triggers async TTS task",
+    "finish_turn flag in _stream_audio → emits 'turn_ended' vs None sentinel",
+    "trace_include_sensitive_data / trace_include_sensitive_audio_data → controls what is stored in spans"
+  ],
+
+  "key_classes_and_signatures": {
+    "VoicePipeline.__init__": "workflow: VoiceWorkflowBase, stt_model: STTModel|str|None, tts_model: TTSModel|str|None, config: VoicePipelineConfig|None",
+    "VoicePipeline.run": "async (audio_input: AudioInput|StreamedAudioInput) -> StreamedAudioResult",
+    "VoicePipeline._get_stt_model": "() -> STTModel  [lazy init via config.model_provider.get_stt_model()]",
+    "VoicePipeline._get_tts_model": "() -> TTSModel  [lazy init via config.model_provider.get_tts_model()]",
+    "VoicePipeline._process_audio_input": "async (audio_input: AudioInput) -> str  [calls STTModel.transcribe]",
+    "VoicePipeline._run_single_turn": "async (audio_input: AudioInput) -> StreamedAudioResult",
+    "VoicePipeline._run_multi_turn": "async (audio_input: StreamedAudioInput) -> StreamedAudioResult",
+    "StreamedAudioResult._add_text": "async (text: str) → buffers, splits, spawns _stream_audio tasks",
+    "StreamedAudioResult._turn_done": "async () → flush buffer, gather tasks",
+    "StreamedAudioResult._stream_audio": "async (text, local_queue, finish_turn=False) → streams TTS chunks",
+    "StreamedAudioResult._dispatch_audio": "async () → ordered forwarding from local_queues to main queue",
+    "StreamedAudioResult.stream": "async generator → AsyncIterator[VoiceStreamEvent]"
+  },
+
+  "VoicePipelineConfig_fields": {
+    "model_provider": "VoiceModelProvider (default: OpenAIVoiceModelProvider)",
+    "stt_settings": "STTModelSettings",
+    "tts_settings": "TTSModelSettings",
+    "tracing_disabled": "bool (default False)",
+    "tracing": "TracingConfig | None",
+    "trace_include_sensitive_data": "bool (default True)",
+    "trace_include_sensitive_audio_data": "bool (default True)",
+    "workflow_name": "str (default 'Voice Agent')",
+    "group_id": "str (auto-generated via gen_group_id)",
+    "trace_metadata": "dict[str, Any] | None"
+  },
+
+  "events_emitted": [
+    "VoiceStreamEventLifecycle(event='turn_started') — start of each turn",
+    "VoiceStreamEventAudio(data=numpy_array) — audio chunk",
+    "VoiceStreamEventLifecycle(event='turn_ended') — end of each turn",
+    "VoiceStreamEventLifecycle(event='session_ended') — end of full session",
+    "VoiceStreamEventError(error) — on exception"
+  ],
+
+  "key_relationships": [
+    "VoicePipeline composes VoicePipelineConfig",
+    "VoicePipeline depends_on STTModel (lazy via VoiceModelProvider)",
+    "VoicePipeline depends_on TTSModel (lazy via VoiceModelProvider)",
+    "VoicePipeline depends_on VoiceWorkflowBase (injected)",
+    "VoicePipeline creates StreamedAudioResult",
+    "StreamedAudioResult uses TTSModel to stream audio",
+    "VoicePipelineConfig uses OpenAIVoiceModelProvider by default",
+    "Multi-turn path: STTModel.create_session() → TranscriptionSession.transcribe_turns()"
+  ],
+
+  "important_notes": [
+    "All audio output is non-blocking: StreamedAudioResult is returned immediately; processing runs in background asyncio tasks",
+    "Ordered audio dispatch: local_queues per TTS segment ensure audio order matches text order even with parallel TTS tasks",
+    "Tracing: each full session wrapped in TraceCtxManager; each TTS call gets speech_span; group of TTS calls gets speech_group_span",
+    "Multi-turn: supports streaming audio intro via workflow.on_start() before transcription begins",
+    "Text splitter (tts_settings.text_splitter) controls sentence boundary detection for TTS chunking",
+    "Audio dtype: int16 or float32; optional transform_data callback for custom post-processing"
+  ],
+
+  "source_files_analyzed": [
+    "src/agents/voice/pipeline.py",
+    "src/agents/voice/pipeline_config.py",
+    "src/agents/voice/result.py"
+  ]
+}

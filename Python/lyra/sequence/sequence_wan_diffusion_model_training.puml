@@ -1,0 +1,261 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    GroupBackgroundColor #E9ECEF
+    GroupBorderColor #6C757D
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #6C757D
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+}
+
+title WAN Diffusion Model Training
+
+participant "Trainer" as trainer
+participant "WANDiffusionModel" as wan
+participant "FlowUniPCMultistepScheduler" as scheduler
+participant "BaseVAE\n(tokenizer)" as vae
+participant "Conditioner" as cond
+participant "net\n(WAN DiT)" as net
+participant "LoRA\n(peft)" as lora
+participant "EMAWorker\n(FastEmaModelUpdater)" as ema
+participant "RectifiedFlow" as rf
+participant "Optimizer /\nScheduler" as optim
+
+== Initialization ==
+
+trainer -> wan : __init__(config: T2VModelConfig)
+activate wan
+
+wan -> wan : setup_data_key()\n— sets input_data_key, input_image_key
+
+wan -> scheduler : __init__(num_train_timesteps=1000, shift=1)
+activate scheduler
+scheduler --> wan : scheduler instance
+deactivate scheduler
+
+wan -> vae : lazy_instantiate(config.tokenizer)
+activate vae
+vae --> wan : BaseVAE instance
+deactivate vae
+
+wan -> wan : set_up_model()
+activate wan
+
+  wan -> cond : lazy_instantiate(config.conditioner)
+  activate cond
+  cond --> wan : Conditioner instance
+  deactivate cond
+
+  wan -> wan : build_net()
+  activate wan
+
+    wan -> net : lazy_instantiate(config.net)\n[on meta device]
+    activate net
+    net --> wan : WAN DiT instance
+    deactivate net
+
+    group LoRA Injection — Phase 1: Inject Adapter Structure
+      wan -> wan : maybe_inject_lora_to_net(net, skip_load=True)
+      wan -> wan : add_lora_to_model(adapter_name, lora_rank,\n  lora_target_modules, init_lora_weights)
+      wan -> lora : LoraConfig(r, lora_alpha, target_modules)
+      activate lora
+      lora --> wan : lora_config
+      wan -> lora : inject_adapter_in_model(lora_config, net)
+      lora --> wan : adapter layers injected (inplace)
+      deactivate lora
+    end
+
+    wan -> net : to_empty(device='cuda') + init_weights()
+    activate net
+    net --> wan : initialized on CUDA
+    deactivate net
+
+    note right of wan
+      If FSDP: broadcast_dtensor_model_states(net, fsdp_device_mesh)
+    end note
+
+    group LoRA Injection — Phase 2: Load LoRA Weights
+      wan -> wan : maybe_inject_lora_to_net(net, skip_inject=True)
+      wan -> wan : load_lora_weights(lora_path, adapter_name, training_mode)
+      wan -> wan : load_state_dict(lora_path)
+      wan -> wan : add_lora_to_model(...) [inject LoRA layers]
+      wan -> wan : load_weights_to_lora(pretrained_lora_state_dict,\n  converter, model)
+      wan -> net : load_state_dict(state_dict, strict=False)
+      activate net
+      net --> wan : weights loaded
+      deactivate net
+    end
+
+  deactivate wan
+
+  group EMA Setup (if ema.enabled)
+    wan -> net : build_net() [second pass for net_ema]
+    activate net
+    net --> wan : net_ema instance
+    deactivate net
+    wan -> ema : FastEmaModelUpdater / DTensorFastEmaModelUpdater
+    activate ema
+    ema --> wan : net_ema_worker
+    wan -> ema : copy_to(src=net, tgt=net_ema)
+    ema --> wan : net_ema initialized
+    deactivate ema
+  end
+
+deactivate wan
+
+wan -> rf : __init__(velocity_field=net,\n  train_time_distribution, shift, ...)
+activate rf
+rf --> wan : RectifiedFlow instance
+deactivate rf
+
+deactivate wan
+
+== Optimizer Initialization ==
+
+trainer -> wan : init_optimizer_scheduler(\n  optimizer_config, scheduler_config)
+activate wan
+
+wan -> optim : lazy_instantiate(optimizer_config, model=self.net)
+activate optim
+optim --> wan : Optimizer
+wan -> optim : get_base_scheduler(optimizer, model, scheduler_config)
+optim --> wan : Scheduler
+deactivate optim
+
+wan --> trainer : (optimizer, scheduler)
+deactivate wan
+
+== on_train_start ==
+
+trainer -> wan : on_train_start(memory_format)
+activate wan
+
+opt ema.enabled
+  wan -> ema : net_ema.to(dtype=float32)
+  activate ema
+  ema --> wan
+  deactivate ema
+end
+
+wan -> vae : tokenizer.reset_dtype()
+activate vae
+vae --> wan
+deactivate vae
+
+wan -> net : net.to(memory_format, **tensor_kwargs)
+activate net
+net --> wan
+deactivate net
+
+opt use_torch_compile
+  wan -> net : torch.compile(net, dynamic=False)
+  activate net
+  net --> wan : compiled net
+  deactivate net
+end
+
+deactivate wan
+
+== Training Step ==
+
+trainer -> wan : training_step(data_batch, iteration)
+activate wan
+
+wan -> wan : _update_train_stats(data_batch)\n— updates image/video counters
+
+wan -> wan : get_data_and_condition(data_batch)
+activate wan
+  wan -> vae : tokenizer.encode(video/image)
+  activate vae
+  vae --> wan : latents (x0_B_C_T_H_W)
+  deactivate vae
+  wan -> cond : conditioner(data_batch)
+  activate cond
+  cond --> wan : T2VCondition
+  deactivate cond
+deactivate wan
+wan --> wan : (_, x0_B_C_T_H_W, condition)
+
+wan -> wan : torch.randn(x0.size())\n→ epsilon_B_C_T_H_W
+
+wan -> rf : sample_train_time(batch_size)
+activate rf
+rf --> wan : t_B
+deactivate rf
+
+note right of wan
+  If context_parallel > 1:
+  broadcast_split_for_model_parallelism(x0, condition, ε, t_B)
+  → net.enable_context_parallel(cp_group)
+end note
+
+wan -> rf : get_discrete_timestamp(t_B)
+activate rf
+rf --> wan : timesteps
+deactivate rf
+
+wan -> rf : get_sigmas(timesteps)
+activate rf
+rf --> wan : sigmas
+deactivate rf
+
+wan -> rf : get_interpolation(epsilon, x0, sigmas)
+activate rf
+rf --> wan : (xt, vt)
+deactivate rf
+
+wan -> net : forward(x_B_C_T_H_W=xt,\n  timesteps_B_T=timesteps,\n  **condition.to_dict())
+activate net
+net --> wan : vt_pred
+deactivate net
+
+wan -> rf : train_time_weight(timesteps)
+activate rf
+rf --> wan : time_weights_B
+deactivate rf
+
+wan -> wan : loss = mean(time_weights_B\n  × ||vt_pred − vt||²)
+
+wan --> trainer : (output_batch={edm_loss}, loss)
+deactivate wan
+
+== Post-Step EMA Update ==
+
+trainer -> wan : on_before_zero_grad(\n  optimizer, scheduler, iteration)
+activate wan
+
+wan -> wan : ema_beta(iteration) → beta\n(polynomial roots formula)
+
+wan -> ema : update_average(net, net_ema, beta=beta)
+activate ema
+ema --> wan : net_ema updated
+deactivate ema
+
+deactivate wan
+
+@enduml

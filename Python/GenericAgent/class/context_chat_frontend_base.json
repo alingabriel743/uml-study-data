@@ -1,0 +1,140 @@
+{
+  "scope": "chat_frontend_base",
+  "title": "Chat Frontend Base & Common Infrastructure",
+  "diagram_type": "class",
+  "source_files_analyzed": [
+    "frontends/chatapp_common.py",
+    "frontends/qqapp.py",
+    "frontends/wecomapp.py",
+    "frontends/dingtalkapp.py"
+  ],
+
+  "classes": [
+    {
+      "name": "AgentChatMixin",
+      "file": "frontends/chatapp_common.py",
+      "type": "mixin_base",
+      "class_attributes": [
+        "label: str = 'Chat'",
+        "source: str = 'chat'",
+        "split_limit: int = 1500",
+        "ping_interval: int = 20"
+      ],
+      "instance_attributes": [
+        "agent: Agent  (injected via __init__)",
+        "user_tasks: dict[chat_id, task_state]  (injected via __init__)"
+      ],
+      "methods": [
+        "__init__(self, agent, user_tasks) -> None",
+        "send_text(self, chat_id, content, **ctx) -> None  [abstract / NotImplementedError]",
+        "send_done(self, chat_id, raw_text, **ctx) -> None  [calls build_done_text + send_text]",
+        "handle_command(self, chat_id, cmd, **ctx) -> None  [dispatches /stop /status /llm /restore /new /help]",
+        "run_agent(self, chat_id, text, **ctx) -> None  [async task loop, polls agent.put_task() dequeue]"
+      ],
+      "task_state_schema": "{ 'running': bool }  — stored in user_tasks[chat_id]"
+    },
+    {
+      "name": "QQApp",
+      "file": "frontends/qqapp.py",
+      "inherits": "AgentChatMixin",
+      "overridden_attrs": "label='QQ', source='qq', split_limit=1500",
+      "key_methods": [
+        "send_text(self, chat_id, content, *, msg_id=None, is_group=False) -> None",
+        "on_message(self, data, is_group=False) -> None  [entry point from QQ platform]"
+      ]
+    },
+    {
+      "name": "WeComApp",
+      "file": "frontends/wecomapp.py",
+      "inherits": "AgentChatMixin",
+      "overridden_attrs": "label='WeCom', source='wecom', split_limit=1200",
+      "key_methods": [
+        "send_text(self, chat_id, content) -> None",
+        "on_message(...) -> None  [entry point from WeCom webhook]"
+      ]
+    },
+    {
+      "name": "DingTalkApp",
+      "file": "frontends/dingtalkapp.py",
+      "inherits": "AgentChatMixin",
+      "overridden_attrs": "label='DingTalk', source='dingtalk', split_limit=1800",
+      "key_methods": [
+        "send_text(self, chat_id, content) -> None  [calls split_text + platform API]",
+        "on_message(self, content, sender_id, sender_name, conversation_type=None, conversation_id=None) -> None"
+      ]
+    }
+  ],
+
+  "module_level_functions": {
+    "text_processing": [
+      "clean_reply(text) -> str  — strips XML-like tags, collapses blank lines",
+      "extract_files(text) -> list[str]  — finds [FILE:path] refs",
+      "strip_files(text) -> str  — removes [FILE:path] markers",
+      "split_text(text, limit) -> list[str]  — word-wrap splitter for platform limits",
+      "build_done_text(raw_text) -> str  — cleans reply + appends file paths"
+    ],
+    "restore_history": [
+      "_restore_log_files() -> list[str]  — globs temp/model_responses_*.txt",
+      "_restore_text_pairs(content) -> list[str]  — parse USER/Response blocks",
+      "_restore_native_history(content) -> list[str]  — parse native JSON prompt/response log",
+      "_native_prompt_obj(prompt_body) -> dict|None",
+      "_native_prompt_text(prompt) -> str",
+      "_native_history_lines(prompt_text) -> list[str]",
+      "_native_first_user_line(prompt_text) -> str",
+      "_native_response_summary(response_body) -> str",
+      "format_restore() -> tuple[info, err]  — top-level restore entry"
+    ],
+    "access_control": [
+      "public_access(allowed) -> bool",
+      "to_allowed_set(value) -> set",
+      "allowed_label(allowed) -> str|list"
+    ],
+    "runtime_helpers": [
+      "ensure_single_instance(port, label) -> socket  — binds lock socket or sys.exit",
+      "require_runtime(agent, label, **required) -> None  — validates keys + llmclient",
+      "redirect_log(script_file, log_name, label, allowed) -> None  — redirects stdout/stderr to file"
+    ]
+  },
+
+  "key_relationships": [
+    "QQApp inherits AgentChatMixin",
+    "WeComApp inherits AgentChatMixin",
+    "DingTalkApp inherits AgentChatMixin",
+    "AgentChatMixin depends_on Agent (composition via self.agent)",
+    "AgentChatMixin uses user_tasks: dict as task state registry",
+    "AgentChatMixin calls agent.put_task() to enqueue work",
+    "AgentChatMixin calls agent.abort(), agent.history, agent.is_running, agent.llmclient, agent.llm_no, agent.get_llm_name(), agent.next_llm(), agent.list_llms()",
+    "send_done() delegates to send_text() + build_done_text()",
+    "run_agent() delegates to send_text() and send_done()",
+    "handle_command() delegates to format_restore(), send_text()"
+  ],
+
+  "command_dispatch": {
+    "/stop": "set user_tasks[chat_id]['running']=False, agent.abort()",
+    "/status": "report agent.is_running, agent.llm_no, llm name",
+    "/llm [n]": "agent.next_llm(n) or list agent.list_llms()",
+    "/restore": "format_restore() → agent.abort() + agent.history.extend(restored)",
+    "/new": "agent.abort() + agent.history=[]",
+    "default": "send HELP_TEXT"
+  },
+
+  "run_agent_flow": [
+    "1. state={'running':True} stored in user_tasks[chat_id]",
+    "2. send_text '思考中...' (thinking...)",
+    "3. dq = agent.put_task(FILE_HINT + text, source=self.source)",
+    "4. Loop: asyncio.to_thread(dq.get, True, 3) with 3s timeout",
+    "5. If Q.Empty and ping_interval exceeded: send '⏳ 还在处理中' ping",
+    "6. On item['done']: call send_done, break",
+    "7. If state['running']=False: send '⏹️ 已停止'",
+    "8. finally: user_tasks.pop(chat_id)"
+  ],
+
+  "important_notes": [
+    "send_text() is abstract — subclasses MUST implement it",
+    "user_tasks is a shared dict keyed by chat_id, value is {running: bool}",
+    "FILE_HINT constant prepended to every user message sent to agent",
+    "split_limit is platform-specific (QQ=1500, WeCom=1200, DingTalk=1800, base=1500)",
+    "ping_interval=20s between heartbeat messages during long tasks",
+    "Restore feature reads temp/model_responses_*.txt log files"
+  ]
+}

@@ -1,0 +1,143 @@
+{
+  "scope": "ema_and_callback_lifecycle",
+  "title": "EMA and Callback Lifecycle",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Trainer",
+    "CallBackGroup",
+    "EMAModelCallback",
+    "IterationLoggerCallback",
+    "GradClipCallback",
+    "FastEmaModelUpdater",
+    "EMAModelTracker",
+    "Model",
+    "Optimizer",
+    "Scheduler",
+    "GradScaler"
+  ],
+  "class_structure": {
+    "CallBackGroup": {
+      "file": "cosmos_predict1/utils/callback.py",
+      "init": "__init__(config: Config, trainer: Trainer)",
+      "key_method": "__getattr__(method_name: str) -> Callable — loops self._callbacks and calls method_name on each",
+      "role": "Dispatcher: fans out each hook call to all registered Callback instances"
+    },
+    "Callback": {
+      "file": "cosmos_predict1/utils/callback.py",
+      "role": "Base class; all hooks are no-ops by default",
+      "hooks": [
+        "on_train_start(model, iteration)",
+        "on_training_step_start(model, data, iteration)",
+        "on_before_forward(iteration)",
+        "on_after_forward(iteration)",
+        "on_before_backward(model_ddp, loss, iteration)",
+        "on_after_backward(model_ddp, iteration)",
+        "on_before_optimizer_step(model_ddp, optimizer, scheduler, grad_scaler, iteration)",
+        "on_before_zero_grad(model_ddp, optimizer, scheduler, iteration)",
+        "on_training_step_end(model, data_batch, output_batch, loss, iteration)",
+        "on_validation_start / on_validation_step_start / on_validation_step_end / on_validation_end",
+        "on_load_checkpoint_start/end, on_save_checkpoint_start/end/success",
+        "on_train_end(model, iteration)",
+        "on_app_end()"
+      ]
+    },
+    "EMAModelCallback": {
+      "file": "cosmos_predict1/utils/callback.py",
+      "base": "Callback",
+      "on_train_start": "if model.config.ema.enabled: cast model.ema to float32; assert model.ema exists",
+      "on_training_step_end": "if model.config.ema.enabled: model.ema.update_average(model, iteration)"
+    },
+    "IterationLoggerCallback": {
+      "file": "cosmos_predict1/utils/callback.py",
+      "base": "Callback",
+      "on_train_start": "@rank0_only — records self.start_iteration_time, self.elapsed_iteration_time=0",
+      "on_training_step_start": "@rank0_only — resets self.start_iteration_time = time.time()",
+      "on_training_step_end": "@rank0_only — accumulates elapsed time; every logging_iter iterations logs: iteration, avg_iter_time, total_loss"
+    },
+    "GradClipCallback": {
+      "file": "cosmos_predict1/utils/callback.py",
+      "base": "Callback",
+      "init": "__init__(grad_clip_norm: float = 1.0)",
+      "on_before_optimizer_step": "grad_scaler.unscale_(optimizer); torch.nn.utils.clip_grad_norm_(model_ddp.module.parameters(), max_norm=grad_clip_norm)"
+    },
+    "FastEmaModelUpdater": {
+      "file": "cosmos_predict1/utils/ema.py",
+      "role": "Stateless EMA updater (no registered buffers); works with FSDP",
+      "update_average": "update_average(src_model, tgt_model, beta=0.9999) — _foreach_mul_(tgt, beta) + _foreach_add_(tgt, src, alpha=1-beta)",
+      "copy_to": "copy_to(src_model, tgt_model) — copies src params into tgt",
+      "cache": "cache(parameters, is_cpu) — clones params to cpu/cuda; sets is_cached=True",
+      "restore": "restore(parameters) — copies collected_params back; clears cache"
+    },
+    "EMAModelTracker": {
+      "file": "cosmos_predict1/utils/ema.py",
+      "base": "torch.nn.Module",
+      "role": "Stateful EMA tracker — registers EMA weights as buffers (param names with '.' replaced by '-')",
+      "update_average": "update_average(model, iteration) — same _foreach logic using registered buffers",
+      "copy_to": "copy_to(model) — copies buffer data into model parameters",
+      "factory": "initialize_multi_rank_ema(model, rate, num, enabled) — assigns different beta per DP rank"
+    },
+    "PowerEMATracker": {
+      "base": "EMAModelTracker",
+      "update_average": "Computes iteration-dependent beta = (1-1/i)^(exp+1) before delegating to super()"
+    }
+  },
+  "interaction_flow": [
+    "--- TRAINING START ---",
+    "Trainer.train() → CallBackGroup.on_train_start(model, iteration)",
+    "CallBackGroup → EMAModelCallback.on_train_start: cast model.ema to float32 (if ema.enabled)",
+    "CallBackGroup → IterationLoggerCallback.on_train_start: record start_iteration_time [rank0]",
+    "--- PER-ITERATION LOOP ---",
+    "Trainer → CallBackGroup.on_training_step_start(model, data_batch, iteration)",
+    "CallBackGroup → IterationLoggerCallback.on_training_step_start: reset start_iteration_time [rank0]",
+    "Trainer → model_ddp.training_step(data, iteration) → returns (output_batch, loss)",
+    "Trainer → CallBackGroup.on_before_backward(model_ddp, loss, iteration)",
+    "Trainer → grad_scaler.scale(loss).backward()",
+    "Trainer → CallBackGroup.on_after_backward(model_ddp, iteration)",
+    "--- OPTIMIZER STEP (every grad_accum_iter steps) ---",
+    "Trainer → CallBackGroup.on_before_optimizer_step(model_ddp, optimizer, scheduler, grad_scaler, iteration)",
+    "CallBackGroup → GradClipCallback.on_before_optimizer_step: grad_scaler.unscale_(optimizer); clip_grad_norm_(model_ddp.module.parameters(), max_norm)",
+    "Trainer → grad_scaler.step(optimizer)",
+    "Trainer → grad_scaler.update()",
+    "Trainer → scheduler.step()  [LR schedule advance]",
+    "Trainer → CallBackGroup.on_before_zero_grad(model_ddp, optimizer, scheduler, iteration)",
+    "Trainer → optimizer.zero_grad(set_to_none=True)",
+    "--- END OF STEP ---",
+    "Trainer → CallBackGroup.on_training_step_end(model, data_batch, output_batch, loss, iteration)",
+    "CallBackGroup → EMAModelCallback.on_training_step_end: model.ema.update_average(model, iteration) [if ema.enabled]",
+    "  EMAModelCallback → FastEmaModelUpdater.update_average(src=model, tgt=model.ema, beta=0.9999): _foreach_mul_ + _foreach_add_",
+    "CallBackGroup → IterationLoggerCallback.on_training_step_end: accumulate elapsed time; log every logging_iter iters [rank0]",
+    "--- VALIDATION (periodic) ---",
+    "Trainer → ema_scope(model, enabled=ema.enabled): model.ema.cache(model.parameters()); model.ema.copy_to(model)",
+    "Trainer → validate inner loop: on_validation_step_start → model.validation_step → on_validation_step_end",
+    "Trainer → ema_scope exit: model.ema.restore(model.parameters())",
+    "--- TRAIN END ---",
+    "Trainer → CallBackGroup.on_train_end(model, iteration)",
+    "Trainer → CallBackGroup.on_app_end()"
+  ],
+  "key_relationships": [
+    "CallBackGroup composes list[Callback] — instantiated from config via lazy_config.instantiate()",
+    "CallBackGroup.__getattr__ dispatches any hook to all callbacks via multi_callback_wrapper",
+    "EMAModelCallback extends Callback — holds no state, delegates to model.ema (FastEmaModelUpdater or EMAModelTracker)",
+    "GradClipCallback extends Callback — stateful: grad_clip_norm float",
+    "IterationLoggerCallback extends Callback — stateful: start_iteration_time, elapsed_iteration_time",
+    "FastEmaModelUpdater: standalone updater (not nn.Module); preferred for FSDP",
+    "EMAModelTracker extends torch.nn.Module: EMA buffers stored in module state dict",
+    "PowerEMATracker extends EMAModelTracker: iteration-dependent beta following EDM2 schedule",
+    "Trainer owns CallBackGroup, invokes hooks around each training phase boundary",
+    "ema_scope() context manager: cache → copy_to (switch to EMA) → yield → restore (switch back)"
+  ],
+  "important_notes": [
+    "EMA update (beta=0.9999 default): tgt = beta*tgt + (1-beta)*src using torch._foreach fused ops",
+    "GradClipCallback must call grad_scaler.unscale_ before clip_grad_norm_; operates on model_ddp.module",
+    "IterationLoggerCallback is @rank0_only decorated — only runs on rank 0",
+    "CallBackGroup sets _callback.config and _callback.trainer after instantiation (deprecated path)",
+    "Validation uses ema_scope to temporarily swap in EMA weights without disturbing optimizer state",
+    "EMAModelTracker.initialize_multi_rank_ema assigns different decay rates per DP rank for multi-EMA training",
+    "PowerEMATracker implements EDM2-style schedule: beta = (1-1/i)^(exp+1), exp derived from s parameter"
+  ],
+  "source_files_analyzed": [
+    "Lyra-1/cosmos_predict1/utils/callback.py",
+    "Lyra-1/cosmos_predict1/utils/ema.py",
+    "Lyra-1/cosmos_predict1/utils/trainer.py (partial)"
+  ]
+}

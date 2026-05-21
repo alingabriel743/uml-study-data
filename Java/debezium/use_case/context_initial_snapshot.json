@@ -1,0 +1,180 @@
+{
+  "scope": "initial_snapshot",
+  "title": "Initial Snapshot",
+  "diagram_type": "use_case",
+  "description": "Database administrator triggers and monitors a full initial table snapshot via the Debezium Binlog Connector.",
+
+  "actors": [
+    {
+      "name": "DatabaseAdministrator",
+      "type": "primary",
+      "description": "Configures snapshot mode, triggers initial snapshot, monitors progress via notifications"
+    },
+    {
+      "name": "ConnectorFramework",
+      "type": "system",
+      "description": "Debezium internal framework that orchestrates snapshot lifecycle (BaseSourceTask, ServiceRegistry)"
+    },
+    {
+      "name": "NotificationChannel",
+      "type": "secondary",
+      "description": "Downstream channel (Kafka topic or log) that receives snapshot status notifications"
+    }
+  ],
+
+  "system_boundary": "Debezium Binlog Connector (MySQL / MariaDB)",
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Configure Snapshot Mode",
+      "actor": "DatabaseAdministrator",
+      "description": "DBA sets snapshot.mode in connector config (initial, schema_only, never, custom, etc.)",
+      "component": "SnapshotterServiceProvider.snapshotMode(CommonConnectorConfig)",
+      "details": "Reads connector config; if mode=custom, uses snapshot.mode.custom.name; resolves Snapshotter via ServiceLoader"
+    },
+    {
+      "id": "UC2",
+      "name": "Provision Snapshotter Service",
+      "actor": "ConnectorFramework",
+      "description": "Framework instantiates SnapshotterService with resolved Snapshotter, SnapshotQuery, and SnapshotLock",
+      "component": "SnapshotterServiceProvider.createService(Configuration, ServiceRegistry)",
+      "details": "Looks up BeanRegistry → CommonConnectorConfig → loads Snapshotter via ServiceLoader → injects BeanRegistry if BeanRegistryAware → calls snapshotter.configure(map) → new SnapshotterService(snapshotter, snapshotQuery, snapshotLock)"
+    },
+    {
+      "id": "UC3",
+      "name": "Initiate Full Table Snapshot",
+      "actor": "ConnectorFramework",
+      "description": "Framework invokes snapshot source; BinlogSnapshotChangeEventSource prepares BinlogSnapshotContext and fires STARTED notification",
+      "component": "BinlogSnapshotChangeEventSource.prepare(partition, onDemand) → BinlogSnapshotContext(partition, onDemand)",
+      "extends": ["UC2"],
+      "notification": "InitialSnapshotNotificationService.notifyStarted(partition, offsetContext) → SnapshotResultStatus.STARTED"
+    },
+    {
+      "id": "UC4",
+      "name": "Acquire Database Lock",
+      "actor": "ConnectorFramework",
+      "description": "Connector acquires global read lock (or per-table locks) to ensure consistent snapshot",
+      "component": "BinlogSnapshotChangeEventSource.lockTablesForSchemaSnapshot()",
+      "details": "Sets TRANSACTION ISOLATION LEVEL REPEATABLE READ; tries FLUSH TABLES WITH READ LOCK (globalLock) or FLUSH TABLES <list> WITH READ LOCK (tableLock); starts lock heartbeat every 30s; records globalLockAcquiredAt / tableLockAcquiredAt; calls metrics.setGlobalLockAcquired()"
+    },
+    {
+      "id": "UC5",
+      "name": "Capture Table Schema",
+      "actor": "ConnectorFramework",
+      "description": "Connector reads DDL for each captured table and emits schema change events",
+      "component": "BinlogSnapshotChangeEventSource.readTableStructure()",
+      "details": "SHOW CREATE TABLE per table; optional two-phase schema capture if twoPhaseSchemaSnapshot(); parallel DDL reading via ExecutorService if locking disabled; schema events dispatched via dispatcher.dispatchSchemaChangeEvent()"
+    },
+    {
+      "id": "UC6",
+      "name": "Determine Binlog Snapshot Offset",
+      "actor": "ConnectorFramework",
+      "description": "Connector records current binlog position so streaming can resume exactly after snapshot",
+      "component": "BinlogSnapshotChangeEventSource.determineSnapshotOffset(ctx, previousOffset)",
+      "details": "Calls setOffsetContextBinlogPositionAndGtidDetailsForSnapshot(offsetContext, connection, snapshotterService); checks snapshotterService.getSnapshotter().shouldStreamEventsStartingFromSnapshot()"
+    },
+    {
+      "id": "UC7",
+      "name": "Release Schema Locks",
+      "actor": "ConnectorFramework",
+      "description": "Minimal-locking mode: global read lock released early after schema is captured, before data rows are read",
+      "component": "BinlogSnapshotChangeEventSource.releaseSchemaSnapshotLocks()",
+      "details": "Calls globalUnlock() if isGloballyLocked() and minimal locking enabled; table locks retained until data read completes"
+    },
+    {
+      "id": "UC8",
+      "name": "Snapshot Table Data",
+      "actor": "ConnectorFramework",
+      "description": "Connector reads all rows from each captured table and dispatches change events",
+      "component": "BinlogSnapshotChangeEventSource (inherits RelationalSnapshotChangeEventSource row reading)",
+      "details": "getSnapshotSelect() delegates to snapshotterService.getSnapshotQuery().snapshotQuery(tableId, columns); large tables use forward-only cursor with MIN_VALUE fetch size; row count estimated via connection.getEstimatedTableSize()"
+    },
+    {
+      "id": "UC9",
+      "name": "Monitor Snapshot Progress",
+      "actor": "DatabaseAdministrator",
+      "description": "DBA observes per-table and per-chunk progress notifications emitted during snapshot",
+      "component": "InitialSnapshotNotificationService",
+      "notification_methods": [
+        "notifyTableInProgress(partition, offsetContext, currentCollection) → IN_PROGRESS",
+        "notifyTableInProgress(partition, offsetContext, currentCollection, tables) → IN_PROGRESS + data_collections",
+        "notifyTableChunkInProgress(partition, offsetContext, currentCollection, chunkIndex, totalChunks, totalRowsScanned) → TABLE_CHUNK_IN_PROGRESS",
+        "notifyCompletedTableSuccessfully(partition, offsetContext, currentCollection) → TABLE_SCAN_COMPLETED/SUCCEEDED",
+        "notifyCompletedTableChunkSuccessfully(...) → TABLE_CHUNK_COMPLETED/SUCCEEDED",
+        "notifyCompletedTableWithError(partition, offsetContext, currentCollection) → TABLE_SCAN_COMPLETED/SQL_EXCEPTION"
+      ]
+    },
+    {
+      "id": "UC10",
+      "name": "Release Data Locks",
+      "actor": "ConnectorFramework",
+      "description": "After all table data is read, all remaining locks are released and delayed schema events processed",
+      "component": "BinlogSnapshotChangeEventSource.releaseDataSnapshotLocks()",
+      "details": "globalUnlock() or tableUnlock() (UNLOCK TABLES); stops lock heartbeat; if delayedSchemaSnapshotTables non-empty, re-captures schema and dispatches events"
+    },
+    {
+      "id": "UC11",
+      "name": "Complete Snapshot",
+      "actor": "ConnectorFramework",
+      "description": "Snapshot finalized: last event marked, COMPLETED notification sent",
+      "component": "BinlogSnapshotChangeEventSource.postSnapshot()",
+      "details": "lastEventProcessor marks last record with SNAPSHOT_KEY=last; calls super.postSnapshot()",
+      "notification": "InitialSnapshotNotificationService.notifyCompleted(partition, offsetContext) → SnapshotResultStatus.COMPLETED"
+    },
+    {
+      "id": "UC12",
+      "name": "Receive Snapshot Completion Notification",
+      "actor": "DatabaseAdministrator",
+      "description": "DBA receives final snapshot status: COMPLETED, ABORTED, or SKIPPED via notification channel",
+      "component": "NotificationService.notify(notification, offsets)",
+      "notification_statuses": ["STARTED", "COMPLETED", "ABORTED", "SKIPPED"]
+    },
+    {
+      "id": "UC13",
+      "name": "Abort Snapshot",
+      "actor": "ConnectorFramework",
+      "description": "Snapshot interrupted; identity function applied to last event and ABORTED notification sent",
+      "component": "BinlogSnapshotChangeEventSource.aborted(snapshotContext)",
+      "details": "lastEventProcessor.accept(Function.identity()); calls super.aborted()",
+      "notification": "InitialSnapshotNotificationService.notifyAborted(partition, offsetContext) → SnapshotResultStatus.ABORTED"
+    }
+  ],
+
+  "key_relationships": [
+    "BinlogSnapshotChangeEventSource extends RelationalSnapshotChangeEventSource<P,O>",
+    "BinlogSnapshotContext extends RelationalSnapshotContext<P,O> (inner static class)",
+    "BinlogSnapshotChangeEventSource depends_on SnapshotterService (injected via constructor)",
+    "BinlogSnapshotChangeEventSource depends_on NotificationService<P,O> (passed to super)",
+    "BinlogSnapshotChangeEventSource depends_on InitialSnapshotNotificationService (via super/RelationalSnapshotChangeEventSource)",
+    "SnapshotterServiceProvider implements ServiceProvider<SnapshotterService>",
+    "SnapshotterServiceProvider creates SnapshotterService(Snapshotter, SnapshotQuery, SnapshotLock)",
+    "SnapshotterService composes Snapshotter + SnapshotQuery + SnapshotLock (all @Immutable)",
+    "InitialSnapshotNotificationService delegates_to NotificationService.notify()",
+    "InitialSnapshotNotificationService builds Notification with aggregateType=Initial Snapshot",
+    "MySqlSnapshotChangeEventSource extends BinlogSnapshotChangeEventSource",
+    "MariaDbSnapshotChangeEventSource extends BinlogSnapshotChangeEventSource"
+  ],
+
+  "notification_statuses": {
+    "lifecycle": ["STARTED", "COMPLETED", "ABORTED", "SKIPPED"],
+    "table_level": ["IN_PROGRESS", "TABLE_SCAN_COMPLETED", "TABLE_CHUNK_IN_PROGRESS", "TABLE_CHUNK_COMPLETED"],
+    "completion_statuses": ["SUCCEEDED", "SQL_EXCEPTION"]
+  },
+
+  "important_notes": [
+    "Snapshot mode 'custom' uses snapshot.mode.custom.name to load a user-defined Snapshotter via ServiceLoader",
+    "Two-phase schema snapshot: if global lock not acquired and table locks enabled, schema captured in two rounds",
+    "Lock heartbeat runs every 30s (SELECT 1) to keep connection alive during long snapshots",
+    "Large tables (> largeTableRowCount rows) use ResultSet.TYPE_FORWARD_ONLY + MIN_VALUE fetchSize to avoid OOM",
+    "snapshotterService.getSnapshotLock().tableLockingStatement() drives which SQL lock statement is executed",
+    "Notifications include connector_name, status, scanned_collection, data_collections, total_rows_scanned, chunk_index, total_chunks"
+  ],
+
+  "source_files_analyzed": [
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogSnapshotChangeEventSource.java",
+    "debezium-connector-common/src/main/java/io/debezium/snapshot/SnapshotterService.java",
+    "debezium-connector-common/src/main/java/io/debezium/snapshot/SnapshotterServiceProvider.java",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/notification/InitialSnapshotNotificationService.java"
+  ]
+}

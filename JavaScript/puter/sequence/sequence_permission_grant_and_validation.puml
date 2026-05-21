@@ -1,0 +1,202 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipantBorderColor #495057
+skinparam sequenceParticipantBackgroundColor #F8F9FA
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceGroupBorderColor #6C757D
+skinparam sequenceGroupBackgroundColor #E9ECEF
+skinparam sequenceGroupBodyBackgroundColor #FEFEFE
+skinparam noteBorderColor #6C757D
+skinparam noteBackgroundColor #FFF9C4
+
+title Permission Grant and Validation Flow
+
+actor "App / Client" as App
+participant "Perms.js" as Perms
+participant "Router\n(grant-user-app.js)" as Router
+participant "AuthService" as AuthSvc
+participant "PermissionService" as PermSvc
+participant "PermissionRewriter\nChain" as Rewriter
+participant "Database (DB)" as DB
+participant "Redis Cache" as Redis
+participant "KVService" as KV
+participant "PermissionScanners" as Scanners
+
+== CLIENT-SIDE GRANT ==
+
+App -> Perms: grantApp(app_uid, permission)
+activate Perms
+Perms -> Router: POST /auth/grant-user-app\n{app_uid, permission}
+deactivate Perms
+
+== GRANT USER-APP PERMISSION (Router + PermissionService) ==
+
+activate Router
+note right of Router
+  Validates actor is UserActorType
+  (throws 'forbidden' if not)
+end note
+
+opt origin provided instead of app_uid
+    Router -> AuthSvc: app_uid_from_origin(origin)
+    activate AuthSvc
+    AuthSvc --> Router: app_uid
+    deactivate AuthSvc
+end
+
+Router -> Router: validate_fields(\n  {app_uid, permission, extra, meta})
+Router -> PermSvc: grant_user_app_permission(\n  actor, app_uid, permission, extra, meta)
+activate PermSvc
+
+PermSvc -> Rewriter: _rewrite_permission(permission)\n[Context.sub({is_grant_user_app_permission:true})]
+activate Rewriter
+note right of Rewriter
+  Iterates _permission_rewriters,
+  applies matching rewrites
+end note
+Rewriter --> PermSvc: rewritten_permission
+deactivate Rewriter
+
+PermSvc -> DB: get_app({uid: app_uid})\nOR get_app({name: app_uid})
+activate DB
+DB --> PermSvc: app (throws entity_not_found if missing)
+deactivate DB
+
+PermSvc -> DB: SELECT 1 FROM user_to_app_permissions\nWHERE user_id=? AND app_id=? AND permission=?
+activate DB
+DB --> PermSvc: exists?
+deactivate DB
+
+alt permission already exists (idempotent)
+    PermSvc --> Router: void (skip write + invalidation)
+else permission does not exist
+    PermSvc -> DB: UPSERT INTO user_to_app_permissions\n(user_id, app_id, permission, extra)
+    activate DB
+    DB --> PermSvc: ok
+    deactivate DB
+
+    PermSvc -> DB: INSERT INTO audit_user_to_app_permissions\n(user_id, app_id, permission, action='grant', reason)
+    activate DB
+    DB --> PermSvc: ok
+    deactivate DB
+
+    PermSvc -> PermSvc: invalidate_permission_scan_cache_for_app_under_user\n(user_uuid, app_uid, permission)
+    note right of PermSvc
+      actorUid = 'app-under-user:{user_uuid}:{app_uid}'
+      cacheKey = actorUid + ':' + permission
+    end note
+    PermSvc -> Redis: deleteRedisKeys(cacheKey)
+    activate Redis
+    Redis --> PermSvc: ok
+    deactivate Redis
+
+    PermSvc --> Router: void
+end
+
+deactivate PermSvc
+Router --> App: res.json({})
+deactivate Router
+
+== PERMISSION SCAN (Validation) ==
+
+activate PermSvc
+[-> PermSvc: scan(actor, permission_options)
+PermSvc -> PermSvc: #scan(actor, permission_options, state)
+
+PermSvc -> Redis: GET cacheKey\n(actorUid + permissionOptions hash)
+activate Redis
+Redis --> PermSvc: cache result?
+deactivate Redis
+
+alt Cache HIT
+    PermSvc --> [: return parsed JSON (readings[])
+else Cache MISS
+    PermSvc -> Scanners: scan-permission.mjs\n.call(this, {actor, permission_options, reading, state})
+    activate Scanners
+
+    group Scanner: implied
+        Scanners -> Scanners: check _permission_implicators\n.matches / .check
+    end
+
+    group Scanner: user-user
+        Scanners -> PermSvc: validateUserPerms({actor, permissions})
+        activate PermSvc
+
+        PermSvc -> PermSvc: #flat_validateUserPerms(\n  {actor, permissions})
+        PermSvc -> KV: get({key: ['PERM_KEY_PREFIX:{user_id}:{perm}', ...]})
+        activate KV
+        KV --> PermSvc: kv result (hit / miss / deleted)
+        deactivate KV
+
+        alt KV hit (not deleted)
+            PermSvc --> Scanners: [{$:'option', via:'user',\n  has_terminal:true, permission, ...}]
+        else KV hit (deleted)
+            PermSvc --> Scanners: [{deleted:true}]
+        else KV miss (flat empty)
+            PermSvc -> PermSvc: #linked_validateUserPerms(\n  {actor, permissions, state})
+            PermSvc -> DB: SELECT * FROM user_to_user_permissions\nWHERE holder_user_id=? AND permission=?
+            activate DB
+            DB --> PermSvc: rows
+            deactivate DB
+
+            loop for each row (anti-cycle check)
+                PermSvc -> PermSvc: scan(issuer_actor, row.permission, state)\n[recursive issuer check]
+                note right of PermSvc
+                  Anti-cycle: skip if issuer
+                  is already in anti_cycle_actors
+                end note
+            end
+
+            PermSvc -> KV: set({key: PERM_KEY_PREFIX:{user_id}:{perm},\n  value: {permission, issuer_user_id, data}})
+            activate KV
+            KV --> PermSvc: ok
+            deactivate KV
+
+            PermSvc --> Scanners: [{$:'path', via:'user',\n  has_terminal, issuer_username, reading[]}]
+        end
+        deactivate PermSvc
+    end
+
+    group Scanner: user-app
+        Scanners -> DB: SELECT FROM user_to_app_permissions\nWHERE user_id=? AND app_id=? AND permission=?
+        activate DB
+        DB --> Scanners: rows
+        deactivate DB
+    end
+
+    group Scanner: dev-app
+        Scanners -> DB: SELECT FROM dev_to_app_permissions\nWHERE app_id=? AND permission=?
+        activate DB
+        DB --> Scanners: rows
+        deactivate DB
+    end
+
+    Scanners --> PermSvc: reading[]
+    deactivate Scanners
+
+    PermSvc -> Redis: SET cacheKey = JSON.stringify(reading)\n[with TTL]
+    activate Redis
+    Redis --> PermSvc: ok
+    deactivate Redis
+
+    PermSvc --> [: return reading[]
+end
+deactivate PermSvc
+
+@enduml

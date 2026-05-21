@@ -1,0 +1,165 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #198754
+    EndColor #DC3545
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleBackgroundColor #E9ECEF
+}
+
+title Gen3C Checkpoint Download & Conversion
+
+' ─────────────────────────────────────────────
+' MAIN FLOW  (download_gen3c_checkpoints.py)
+' ─────────────────────────────────────────────
+
+|Script|
+start
+
+:Parse CLI arguments\n<i>--checkpoint_dir</i>  (default = "checkpoints");
+
+:Initialize\n• ORG_NAME = "nvidia"\n• extra_models = [\n    "Cosmos-Tokenize1-CV8x8x8-720p",\n    "google-t5/t5-11b" ]\n• checkpoints_dir = Path(args.checkpoint_dir)\n• download_kwargs: allow_patterns =\n    README.md, model.pt, mean_std.pt,\n    image_mean_std.pt, config.json, *.jit, guardrail/*;
+
+' ── Gen3C-Cosmos-7B ──────────────────────────
+:model_name = "Gen3C-Cosmos-7B"\nrepo_id = "nvidia/Gen3C-Cosmos-7B";
+
+|MD5 Verifier|
+:get_md5_checksum(checkpoints_dir, "Gen3C-Cosmos-7B")\nFilter MD5_CHECKSUM_LOOKUP for prefix "Gen3C-Cosmos-7B/";
+
+if (Expected files found\nin MD5 lookup?) then (yes)
+  :For each matching key:\ncheck file exists on disk\ncompute hashlib.md5 digest;
+  if (All hashes match\nlookup values?) then (all match)
+    :Return <b>True</b> — checksums valid;
+  else (mismatch or file missing)
+    :Return <b>False</b>;
+  endif
+else (no entries in lookup)
+  if (model_dir exists\nand is non-empty?) then (yes)
+    :Return <b>True</b>\n(dir has content, no MD5 entries);
+  else (no)
+    :Return <b>False</b>\n(dir missing or empty);
+  endif
+endif
+
+|Script|
+if (Gen3C-Cosmos-7B\nchecksum valid?) then (valid — skip)
+  :Checkpoint already present\nskip download;
+else (invalid / missing — download)
+  |HuggingFace Hub|
+  :mkdir checkpoints/Gen3C-Cosmos-7B;
+  :snapshot_download\n  repo_id = "nvidia/Gen3C-Cosmos-7B"\n  local_dir = checkpoints/Gen3C-Cosmos-7B\n  allow_patterns:\n    README.md, model.pt, mean_std.pt,\n    image_mean_std.pt, config.json,\n    *.jit, guardrail/*;
+endif
+
+' ── Extra Models Loop ─────────────────────────
+|Script|
+:Begin extra_models iteration\n["Cosmos-Tokenize1-CV8x8x8-720p", "google-t5/t5-11b"];
+
+repeat
+
+  if (model_name == "google-t5/t5-11b"?) then (yes)
+    :repo_id = "google-t5/t5-11b"\n(use model name directly, no org prefix);
+  else (no)
+    :repo_id = "nvidia/" + model_name;
+  endif
+
+  |MD5 Verifier|
+  :get_md5_checksum(checkpoints_dir, model_name)\nVerify per-file MD5 or check dir non-empty\n(google-t5/t5-11b checks pytorch_model.bin & tf_model.h5);
+
+  if (Checksum valid?) then (valid — skip)
+    |Script|
+    :Model already downloaded\nskip;
+  else (invalid / missing — download)
+    |HuggingFace Hub|
+    :mkdir local_dir for model;
+    :snapshot_download\n  repo_id = repo_id\n  local_dir = checkpoints/<model_name>\n  <i>no allow_patterns</i> — full repo download;
+    |Script|
+  endif
+
+repeat while (More models\nin extra_models?) is (yes)
+->no;
+
+:All Gen3C model checkpoints\ndownloaded successfully;
+stop
+
+
+' ─────────────────────────────────────────────
+' STANDALONE UTILITY  (NOT called by main())
+' ─────────────────────────────────────────────
+
+|Pixtral Converter|
+start
+note right
+  <b>convert_pixtral_checkpoint()</b>
+  Standalone utility — <u>NOT called by main()</u>
+  Converts Pixtral-12B-2409 weights into
+  the Gen3C / Lyra VLM checkpoint format.
+  Args: checkpoint_dir, checkpoint_name, vit_type
+end note
+
+:Resolve save_path =\ncheckpoint_dir / checkpoint_name / model.pt;
+
+if (save_path exists\nand size > 0?) then (yes — already done)
+  :Return early\n(skip re-conversion);
+  stop
+else (no — proceed)
+  :Create pixtral_ckpt_dir =\ncheckpoint_dir / Pixtral-12B-2409;
+
+  |HuggingFace Hub|
+  :snapshot_download\n  repo_id = "mistralai/Pixtral-12B-2409"\n  allow_patterns:\n    params.json\n    consolidated.safetensors;
+
+  |Pixtral Converter|
+  :Set torch default dtype = bfloat16;
+
+  :load_file(*.safetensors)\n<i>assert exactly 1 .safetensors file present</i>;
+
+  :Split checkpoint keys into three dicts:\n• <b>vit_ckpt</b>        — prefix "vision_encoder."\n• <b>projector_ckpt</b>  — prefix "vision_language_adapter."\n• <b>llm_ckpt</b>        — all remaining keys;
+
+  :Remap projector keys:\n  w_in.  →  projector.0.\n  w_out. →  projector.2.;
+
+  :Assemble vlm_ckpt:\n  model.*          ← llm_ckpt\n  mm_projector.*   ← projector_ckpt\n  vision_encoder.* ← vit_ckpt;
+
+  :Load params.json\nExtract vision_encoder_config:\ndim, num_channels, image_size, patch_size,\nrope_theta, n_layers, n_heads, n_kv_heads, etc.;
+
+  if (vision_encoder_config matches\nexpected 400M ViT spec?\n(dim=1024, patch_size=16,\nn_layers=24, n_heads=16)) then (yes — config valid)
+    :Build llm_config from pixtral_config\n(hidden_dim → ffn_hidden_size,\nembed vit_type string for vision_encoder key);
+
+    :torch.save(\n  { "model":          vlm_ckpt,\n    "mm_projector":   projector_ckpt,\n    "vision_encoder": vit_ckpt }\n  → save_path / model.pt);
+
+    :json.dump(llm_config)\n→ save_path / config.json;
+
+    :Reset torch default dtype\n(restore original dtype);
+
+    :shutil.rmtree(pixtral_ckpt_dir)\n(remove original Pixtral-12B-2409 download);
+
+    stop
+  else (no — mismatch)
+    :Raise AssertionError\n(ViT config does not match\nexpected 400M ViT configuration);
+    stop
+  endif
+endif
+
+@enduml

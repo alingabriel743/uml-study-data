@@ -1,0 +1,108 @@
+{
+  "scope": "heartbeat_signal_flow",
+  "title": "Heartbeat and Signal Channel Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "BinlogClient",
+    "BinlogStreamingChangeEventSource",
+    "EventDispatcher",
+    "HeartbeatImpl",
+    "ChangeEventQueue",
+    "SourceSignalChannel",
+    "SignalProcessor",
+    "SignalAction",
+    "BinlogHeartbeatErrorHandler"
+  ],
+  "interaction_flow": [
+    "=== HEARTBEAT SETUP ===",
+    "CommonConnectorConfig → HeartbeatFactory: getScheduledHeartbeat(config, null, null, queue)",
+    "HeartbeatFactory → HeartbeatImpl: new HeartbeatImpl(heartbeatInterval, topicName, logicalName, schemaNameAdjuster, queue)",
+    "HeartbeatImpl: heartbeatTimeout = Threads.timer(Clock.SYSTEM, heartbeatInterval)",
+    "EventDispatcher: stores ScheduledHeartbeat; sets heartbeatIntervalFactor=0.8f on BinlogClient",
+    "BinlogClient: setHeartbeatInterval(keepAliveInterval * 0.8f)",
+
+    "=== BINLOG SERVER HEARTBEAT EVENT (EventType.HEARTBEAT) ===",
+    "BinlogClient → BinlogStreamingChangeEventSource: emit(Event[EventType.HEARTBEAT])",
+    "BinlogStreamingChangeEventSource: eventHandlers[HEARTBEAT].accept(event) → handleServerHeartbeat(partition, offsetContext, event)",
+    "BinlogStreamingChangeEventSource → EventDispatcher: dispatchServerHeartbeatEvent(partition, offsetContext)",
+    "EventDispatcher → IncrementalSnapshotChangeEventSource: processHeartbeat(partition, offset) [if present]",
+    "Note: server HEARTBEAT events update milliSecondsBehindSource metric but do NOT emit to Kafka topic",
+
+    "=== PERIODIC DEBEZIUM HEARTBEAT EMISSION (per binlog event) ===",
+    "BinlogClient → BinlogStreamingChangeEventSource: emit(Event[any type])",
+    "BinlogStreamingChangeEventSource: eventHandlers[eventType].accept(event) [normal event processing]",
+    "BinlogStreamingChangeEventSource → EventDispatcher: dispatchHeartbeatEvent(partition, offsetContext)",
+    "EventDispatcher → HeartbeatImpl: emitWithDelay(partition.getSourcePartition(), offsetContext)",
+    "HeartbeatImpl: if heartbeatTimeout.expired() → call emit(partition, offset)",
+    "HeartbeatImpl: heartbeatTimeout = resetHeartbeat() [Threads.timer reset]",
+    "HeartbeatImpl → ChangeEventQueue: enqueue(new DataChangeEvent(SourceRecord to '__debezium-heartbeat.<logicalName>' topic))",
+    "SourceRecord key: Struct{serverName=logicalName}, value: Struct{ts_ms=Instant.now().toEpochMilli()}",
+
+    "=== FORCED HEARTBEAT (alwaysDispatchHeartbeatEvent) ===",
+    "EventDispatcher → HeartbeatImpl: emit(partition, offset) [unconditional, no timer check]",
+    "HeartbeatImpl → ChangeEventQueue: enqueue(DataChangeEvent)",
+
+    "=== HEARTBEAT ERROR HANDLING ===",
+    "HeartbeatImpl: on SQLException during heartbeat action query",
+    "HeartbeatImpl → BinlogHeartbeatErrorHandler: onError(SQLException)",
+    "BinlogHeartbeatErrorHandler: switch(sqlState) → '42000' or '3D000' → throw DebeziumException",
+    "BinlogHeartbeatErrorHandler: default → no-op (ignore)",
+
+    "=== SIGNAL TABLE POLLING (scheduled) ===",
+    "SignalProcessor: scheduleAtFixedRate(process(), 0, signalPollInterval [default 5000ms])",
+    "SignalProcessor.process() → forEach(enabledChannelReader): SignalChannelReader.read() → List<SignalRecord>",
+    "SignalProcessor: forEach(signalRecord) → processSignal(signalRecord, null)",
+    "SignalProcessor.processSignal() → signalActions.get(signalRecord.getType()) → SignalAction",
+    "SignalProcessor → SignalAction: action.arrived(SignalPayload{partition, id, type, data, offset})",
+
+    "=== SIGNAL VIA SOURCE (signal table CDC event) ===",
+    "BinlogClient → BinlogStreamingChangeEventSource: emit(Event for signal data collection)",
+    "BinlogStreamingChangeEventSource → EventDispatcher: dispatchDataChangeEvent(partition, changeRecordEmitter)",
+    "EventDispatcher: isASignalEventToProcess(dataCollectionId, operation) == true",
+    "EventDispatcher → SourceSignalChannel: process(Struct value)",
+    "SourceSignalChannel: SignalRecord.buildSignalRecordFromChangeEventSource(value, config) → signals.add(signalRecord)",
+    "EventDispatcher → SignalProcessor: processSourceSignal(partition) [immediate, synchronous]",
+    "SignalProcessor.processSourceSignal() → SourceSignalChannel.read() → List<SignalRecord>",
+    "SignalProcessor → SignalAction: action.arrived(SignalPayload) [dispatches action immediately]"
+  ],
+  "key_relationships": [
+    "BinlogSourceTask.BinlogHeartbeatErrorHandler implements HeartbeatErrorHandler",
+    "BinlogStreamingChangeEventSource depends_on EventDispatcher (dispatchHeartbeatEvent, dispatchServerHeartbeatEvent)",
+    "EventDispatcher composes ScheduledHeartbeat (HeartbeatImpl instance)",
+    "EventDispatcher composes SignalProcessor",
+    "EventDispatcher composes SourceSignalChannel (retrieved from SignalProcessor)",
+    "HeartbeatImpl implements Heartbeat.ScheduledHeartbeat and Heartbeat",
+    "HeartbeatImpl writes_to ChangeEventQueue<DataChangeEvent>",
+    "SignalProcessor contains List<SignalChannelReader> (SourceSignalChannel, KafkaSignalChannel, FileSignalChannel, JmxSignalChannel, InProcessSignalChannel)",
+    "SignalProcessor contains Map<String, SignalAction> (keyed by signal type)",
+    "SourceSignalChannel implements SignalChannelReader; holds ConcurrentLinkedQueue<SignalRecord>",
+    "CommonConnectorConfig provides heartbeatInterval, heartbeatTopicsPrefix, signalPollInterval, signalingDataCollectionIds, signalEnabledChannels"
+  ],
+  "config_fields": {
+    "heartbeat.interval.ms": "default 0 (disabled); defines HeartbeatImpl timer period",
+    "heartbeat.topics.prefix": "default '__debezium-heartbeat'; prefix for heartbeat Kafka topic",
+    "signal.data.collection": "LIST; fully-qualified signal table name(s); empty = signaling disabled",
+    "signal.poll.interval.ms": "default 5000ms; scheduled poll rate for non-source signal channels",
+    "signal.enabled.channels": "LIST; e.g. 'source', 'kafka', 'file', 'jmx', 'in-process'"
+  },
+  "important_notes": [
+    "BinlogClient.heartbeatInterval = keepAliveInterval * 0.8 (heartbeatIntervalFactor) — server-level keep-alive heartbeat, separate from Debezium heartbeat topic",
+    "EventType.HEARTBEAT from server does NOT emit to Kafka; it only updates lag metric and triggers IncrementalSnapshot heartbeat",
+    "dispatchHeartbeatEvent is called AFTER every binlog event but HeartbeatImpl only emits when timer expires",
+    "Source signal channel is synchronous: signal table CDC event → SourceSignalChannel.process() → SignalProcessor.processSourceSignal() all in same event loop iteration",
+    "Scheduled SignalProcessor polls all non-source channels (Kafka, File, JMX, InProcess) at fixed rate",
+    "BinlogHeartbeatErrorHandler handles SQL errors 42000 (access denied) and 3D000 (no DB) by throwing DebeziumException; other SQL errors are silently ignored",
+    "HeartbeatImpl.emit() requires queue constructor (2-arg); older forcedBeat/heartbeat methods use BlockingConsumer pattern (deprecated)"
+  ],
+  "source_files_analyzed": [
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogSourceTask.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogStreamingChangeEventSource.java",
+    "debezium-connector-common/src/main/java/io/debezium/config/CommonConnectorConfig.java",
+    "debezium-connector-common/src/main/java/io/debezium/heartbeat/Heartbeat.java",
+    "debezium-connector-common/src/main/java/io/debezium/heartbeat/HeartbeatImpl.java",
+    "debezium-connector-common/src/main/java/io/debezium/heartbeat/HeartbeatErrorHandler.java",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/EventDispatcher.java",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/signal/SignalProcessor.java",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/signal/channels/SourceSignalChannel.java"
+  ]
+}

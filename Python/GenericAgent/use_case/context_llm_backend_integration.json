@@ -1,0 +1,270 @@
+{
+  "scope": "llm_backend_integration",
+  "title": "LLM Backend Integration",
+  "diagram_type": "use_case",
+  "description": "Agent sends prompts to multiple LLM backends (Anthropic, OAI-compatible, MiniMax); manages streaming, token counting, history compression, and thinking modes",
+
+  "actors": [
+    {
+      "name": "Agent",
+      "type": "primary",
+      "description": "The orchestrating agent (via ToolClient or NativeToolClient) that submits prompts and processes responses"
+    },
+    {
+      "name": "Developer",
+      "type": "primary",
+      "description": "Configures API credentials and session parameters via mykey.py / mykey.json"
+    },
+    {
+      "name": "Anthropic API",
+      "type": "external_system",
+      "description": "Claude API — reached by ClaudeSession (text protocol) or NativeClaudeSession (native tool protocol) via /messages endpoint"
+    },
+    {
+      "name": "OAI-Compatible API",
+      "type": "external_system",
+      "description": "OpenAI-style /chat/completions or /responses endpoint — used by LLMSession and NativeOAISession; covers GPT, OpenRouter, Kimi/Moonshot, MiniMax OAI path"
+    },
+    {
+      "name": "MiniMax API",
+      "type": "external_system",
+      "description": "MiniMax endpoint — accessible via both OAI path (/v1 → LLMSession) and Anthropic path (/anthropic → NativeClaudeSession)"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC01",
+      "name": "Load API Credentials",
+      "actor": "Developer",
+      "description": "Load mykey.py (import) or mykey.json (file fallback) to populate mykeys dict and global proxies. Triggered lazily via module __getattr__.",
+      "function": "_load_mykeys()",
+      "notes": "Raises Exception if neither mykey.py nor mykey.json found"
+    },
+    {
+      "id": "UC02",
+      "name": "Configure Session",
+      "actor": "Developer",
+      "description": "Instantiate a session class (ClaudeSession, LLMSession, NativeClaudeSession, NativeOAISession) from a config dict with apikey, apibase, model, context_win, temperature, max_tokens, stream, thinking_type, thinking_budget_tokens, reasoning_effort, api_mode",
+      "function": "BaseSession.__init__(cfg)",
+      "notes": "api_mode: 'chat_completions' (default) or 'responses'. reasoning_effort validated against {none,minimal,low,medium,high,xhigh}. thinking_type validated against {adaptive,enabled,disabled}"
+    },
+    {
+      "id": "UC03",
+      "name": "Send Prompt & Stream Response",
+      "actor": "Agent",
+      "description": "Submit a user message, trim history, build messages list, call raw_ask() generator, yield text chunks, and append assistant reply to history.",
+      "function": "BaseSession.ask(prompt, stream=False) → str or generator",
+      "call_chain": [
+        "ask() → trim_messages_history(history, context_win)",
+        "ask() → make_messages(history)",
+        "ask() → raw_ask(messages) [generator]",
+        "raw_ask() yields text chunks + returns content_blocks",
+        "ask() appends assistant content to self.history"
+      ]
+    },
+    {
+      "id": "UC04",
+      "name": "Send Prompt to Anthropic API (Text Protocol)",
+      "actor": "Agent",
+      "description": "ClaudeSession.raw_ask() builds Anthropic-protocol payload with prompt caching headers, posts to /messages, parses SSE stream.",
+      "function": "ClaudeSession.raw_ask(messages)",
+      "backend": "Anthropic API",
+      "call_chain": [
+        "raw_ask() → _apply_claude_thinking(payload) [adds thinking/output_config fields]",
+        "raw_ask() → auto_make_url(api_base, 'messages')",
+        "raw_ask() → requests.post(..., stream=True)",
+        "raw_ask() → _parse_claude_sse(resp.iter_lines()) [yields chunks, returns content_blocks]"
+      ],
+      "notes": "Header: x-api-key + anthropic-version + prompt-caching-2024-07-31 beta. make_messages() stamps last 2 user msgs with cache_control: ephemeral"
+    },
+    {
+      "id": "UC05",
+      "name": "Send Prompt to OAI-Compatible API (Text Protocol)",
+      "actor": "Agent",
+      "description": "LLMSession.raw_ask() converts messages Claude→OAI format and delegates to _openai_stream().",
+      "function": "LLMSession.raw_ask(messages)",
+      "backend": "OAI-Compatible API",
+      "call_chain": [
+        "raw_ask() → _msgs_claude2oai(messages)",
+        "raw_ask() → _openai_stream(api_base, api_key, msgs, model, api_mode, ...)",
+        "_openai_stream() → auto_make_url(api_base, 'chat/completions') or 'responses'",
+        "_openai_stream() → requests.post(...) with retry on {408,409,425,429,500-504}",
+        "_openai_stream() → _parse_openai_sse(resp.iter_lines(), api_mode)"
+      ],
+      "notes": "Kimi/Moonshot temperature forced to 1.0; MiniMax temperature clamped to (0.01, 1.0]. model name 'minimax' triggers temp clamp."
+    },
+    {
+      "id": "UC06",
+      "name": "Send Prompt to Anthropic API (Native Tool Protocol)",
+      "actor": "Agent",
+      "description": "NativeClaudeSession.raw_ask() sends native API tool-calling payload with full Claude Code beta headers, handles streaming or non-streaming mode.",
+      "function": "NativeClaudeSession.raw_ask(messages)",
+      "backend": "Anthropic API",
+      "call_chain": [
+        "raw_ask() → _fix_messages(messages) [repair alternating roles, tool_use/tool_result pairing]",
+        "raw_ask() → openai_tools_to_claude(self.tools) [convert tool schema]",
+        "raw_ask() → _apply_claude_thinking(payload)",
+        "raw_ask() → requests.post(url + '?beta=true', stream=self.stream)",
+        "stream=True: → _parse_claude_sse(); stream=False: → resp.json() content_blocks"
+      ],
+      "notes": "beta headers: claude-code-20250219, interleaved-thinking, redact-thinking, prompt-caching-scope. [1m] suffix triggers context-1m-2025-08-07 beta. fake_cc_system_prompt=True inserts system into first user message for CC-relay channels. sk-ant- key → x-api-key header; others → Bearer"
+    },
+    {
+      "id": "UC07",
+      "name": "Send Prompt to OAI API (Native Tool Protocol)",
+      "actor": "Agent",
+      "description": "NativeOAISession.raw_ask() converts messages and calls _openai_stream() with native tools.",
+      "function": "NativeOAISession.raw_ask(messages)",
+      "backend": "OAI-Compatible API",
+      "call_chain": [
+        "raw_ask() → _msgs_claude2oai(messages)",
+        "raw_ask() → _openai_stream(..., tools=self.tools, reasoning_effort=self.reasoning_effort, ...)"
+      ],
+      "notes": "Inherits NativeClaudeSession.ask() — returns MockResponse with thinking, content, tool_calls, raw"
+    },
+    {
+      "id": "UC08",
+      "name": "Fail Over Across Multiple Backends",
+      "actor": "Agent",
+      "description": "MixinSession wraps multiple session backends (all Native or all non-Native), tries them in order on error, with exponential backoff and optional spring-back to primary.",
+      "function": "MixinSession._raw_ask(*args, **kwargs)",
+      "call_chain": [
+        "_raw_ask() → _pick() [spring-back: return to primary after spring_back seconds]",
+        "loop attempts: _orig_raw_asks[idx](*args, **kwargs)",
+        "on error chunk: advance to next session idx",
+        "full round exhausted: sleep(base_delay * 1.5^round)",
+        "on success after failover: self._cur_idx = idx; self._switched_at = time.time()"
+      ],
+      "notes": "Broadcasts system/tools/temperature/max_tokens/reasoning_effort setattr to all sessions. All sessions must be same group (all Native or all non-Native)."
+    },
+    {
+      "id": "UC09",
+      "name": "Compress History to Save Tokens",
+      "actor": "Agent",
+      "description": "Truncate <thinking>, <think>, <tool_use>, <tool_result>, <history>, <key_info> tags in older messages. Runs every 5th call by default, or forced.",
+      "function": "compress_history_tags(messages, keep_recent=10, max_len=800, force=False)",
+      "call_chain": [
+        "compress_history_tags() → throttle: runs every 5th call (_cd % 5 == 0) or when force=True",
+        "Truncates tag content in messages[:-keep_recent] to max_len chars",
+        "Reports before/after byte savings"
+      ],
+      "notes": "Called automatically from trim_messages_history(). Regex patterns for: thinking, think, tool_use, tool_result, history, key_info tags."
+    },
+    {
+      "id": "UC10",
+      "name": "Trim Message History",
+      "actor": "Agent",
+      "description": "Keep context within window by compressing then dropping oldest messages until cost < context_win * 3 * 0.6.",
+      "function": "trim_messages_history(history, context_win)",
+      "call_chain": [
+        "trim_messages_history() → compress_history_tags(history)",
+        "if cost > context_win*3: compress_history_tags(history, keep_recent=4, force=True)",
+        "while cost > target: history.pop(0); sanitize leading user msg"
+      ]
+    },
+    {
+      "id": "UC11",
+      "name": "Optimize Token Budget (Tool Prompt Deduplication)",
+      "actor": "Agent",
+      "description": "ToolClient tracks last tools JSON; if unchanged and auto_save_tokens=True, substitutes abbreviated tool instruction to avoid re-sending full tool schemas. Token counter resets after 9000 tokens.",
+      "function": "ToolClient._prepare_tool_instruction(tools) [auto_save_tokens logic]",
+      "notes": "This is what 'save_token' refers to in the scope — ToolClient.auto_save_tokens feature, not a standalone function/class"
+    },
+    {
+      "id": "UC12",
+      "name": "Apply Thinking Mode",
+      "actor": "Developer",
+      "description": "Configure and apply Claude thinking/reasoning: thinking_type (adaptive/enabled/disabled), thinking_budget_tokens, reasoning_effort (mapped to output_config.effort for Claude).",
+      "function": "BaseSession._apply_claude_thinking(payload)",
+      "notes": "xhigh → 'max' in output_config.effort. none/minimal unsupported for Claude, logged as WARN. Applies to both ClaudeSession and NativeClaudeSession."
+    },
+    {
+      "id": "UC13",
+      "name": "Parse Streaming SSE Response (Anthropic)",
+      "actor": "Anthropic API",
+      "description": "Parse Anthropic SSE event stream: message_start (cache stats), content_block_start/delta/stop (text, thinking, tool_use blocks), message_delta (stop_reason, output_tokens).",
+      "function": "_parse_claude_sse(resp_lines) → yields text, returns content_blocks list"
+    },
+    {
+      "id": "UC14",
+      "name": "Parse Streaming SSE Response (OAI)",
+      "actor": "OAI-Compatible API",
+      "description": "Parse OpenAI SSE stream for chat_completions or responses API mode. Handles function_call delta accumulation and usage stats.",
+      "function": "_parse_openai_sse(resp_lines, api_mode) → yields text, returns content_blocks list"
+    },
+    {
+      "id": "UC15",
+      "name": "Chat via Text Protocol Wrapper",
+      "actor": "Agent",
+      "description": "ToolClient.chat() builds a full text-protocol prompt embedding tools as JSON in system text, dispatches to backend.ask(), parses mixed response for tool_use XML tags.",
+      "function": "ToolClient.chat(messages, tools=None) → generator, returns MockResponse",
+      "call_chain": [
+        "chat() → _build_protocol_prompt(messages, tools)",
+        "_build_protocol_prompt() → _prepare_tool_instruction(tools) [auto_save_tokens]",
+        "chat() → backend.ask(full_prompt, stream=True)",
+        "chat() → _parse_mixed_response(raw_text) → MockResponse"
+      ]
+    },
+    {
+      "id": "UC16",
+      "name": "Chat via Native Tool Protocol Wrapper",
+      "actor": "Agent",
+      "description": "NativeToolClient.chat() assembles structured user message dict with tool_result blocks, injects thinking-prompt into system, calls backend.ask(merged_dict).",
+      "function": "NativeToolClient.chat(messages, tools=None) → generator, returns MockResponse",
+      "call_chain": [
+        "chat() → set_system(extra_system) [prepend thinking prompt]",
+        "chat() → backend.tools = tools",
+        "chat() → backend.ask(merged_user_message) [structured dict]",
+        "returns MockResponse with thinking, content, tool_calls"
+      ]
+    }
+  ],
+
+  "session_class_hierarchy": [
+    "BaseSession (abstract base: __init__, ask, _apply_claude_thinking, make_messages)",
+    "ClaudeSession(BaseSession): raw_ask→Anthropic /messages SSE, make_messages→prompt cache stamps",
+    "LLMSession(BaseSession): raw_ask→_openai_stream, make_messages→_msgs_claude2oai",
+    "NativeClaudeSession(BaseSession): raw_ask→Anthropic native tool /messages?beta=true, ask→MockResponse",
+    "NativeOAISession(NativeClaudeSession): raw_ask→_openai_stream with tools",
+    "MixinSession (wraps list of sessions, provides fallback raw_ask with retry)"
+  ],
+
+  "client_wrappers": [
+    "ToolClient (wraps BaseSession subclass, text-protocol tool calling, auto_save_tokens)",
+    "NativeToolClient (wraps NativeClaudeSession/NativeOAISession, native API tool calling)"
+  ],
+
+  "key_relationships": [
+    "ToolClient depends_on BaseSession (ClaudeSession or LLMSession)",
+    "NativeToolClient depends_on NativeClaudeSession or NativeOAISession",
+    "NativeOAISession extends NativeClaudeSession (shares ask() returning MockResponse)",
+    "MixinSession composes multiple BaseSession instances",
+    "All sessions use auto_make_url() to normalize apibase + path",
+    "_load_mykeys() provides credentials used in all session __init__",
+    "compress_history_tags() called by trim_messages_history() called by every ask()"
+  ],
+
+  "key_data_objects": [
+    "MockResponse: {thinking: str, content: str, tool_calls: [MockToolCall], raw: str, stop_reason: str}",
+    "MockToolCall: {function: MockFunction{name, arguments}, id: str}",
+    "content_block: {type: 'text'|'thinking'|'tool_use', text/thinking/name/input/id}",
+    "mykeys dict: loaded from mykey.py or mykey.json — contains apikey, apibase, model, proxy, etc."
+  ],
+
+  "important_notes": [
+    "save_token in the IR/plan is NOT a standalone class — it refers to ToolClient.auto_save_tokens=True feature that deduplicates tool schema injection to save tokens",
+    "ApiBase is not a class — auto_make_url() handles URL normalization: host:port → +/v1/path, host/v1 → +/path, host/v1/path → as-is",
+    "_load_mykeys lazy-loads via module __getattr__ — mykeys and proxies are cached in globals after first access",
+    "MiniMax accessible via two protocols: OAI path (LLMSession) returns <think> tags; Anthropic path (NativeClaudeSession) is cleaner",
+    "Prompt cache: ClaudeSession stamps last 2 user msgs with cache_control:ephemeral; NativeClaudeSession uses prompt-caching-scope-2026-01-05 beta",
+    "Streaming is generator-based throughout — raw_ask() is a generator that yields chunks and returns content_blocks via StopIteration.value",
+    "fake_cc_system_prompt=True required for CC-switch/relay channels — inserts system into first user message content instead of system field",
+    "compress_history_tags throttled: only runs every 5th call unless force=True; force resets counter"
+  ],
+
+  "source_files_analyzed": [
+    "llmcore.py",
+    "mykey_template.py"
+  ]
+}

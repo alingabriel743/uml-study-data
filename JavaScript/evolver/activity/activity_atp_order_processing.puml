@@ -1,0 +1,150 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activityBackgroundColor #F8F9FA
+skinparam activityBorderColor #495057
+skinparam activityArrowColor #495057
+skinparam activityFontColor #212529
+skinparam activityDiamondBackgroundColor #FFF3CD
+skinparam activityDiamondBorderColor #856404
+skinparam activityStartColor #212529
+skinparam activityEndColor #212529
+skinparam swimlaneBorderColor #6C757D
+skinparam swimlaneBackgroundColor #E9ECEF
+skinparam noteBorderColor #6C757D
+skinparam noteBackgroundColor #FFFDE7
+
+title ATP Order Processing
+
+|Caller|
+start
+:Receive ATP Order\n(title, signals, budget);
+
+|#E3F2FD|defaultHandler|
+:getAtpMode()\nRead EVOLVER_ATP env var;
+
+if (mode == 'off' / 'false' / '0'?) then (yes)
+  :Skip ATP processing;
+  stop
+else (no)
+endif
+
+:resolveAtpServices();
+
+if (EVOLVER_ATP_SERVICES env var set?) then (yes)
+  if (JSON.parse succeeds\nand result is array?) then (yes)
+    :Use parsed service list\n{title, description, capabilities,\nuseCases, pricePerTask, maxConcurrent};
+  else (parse error)
+    :Warn: "EVOLVER_ATP_SERVICES\nis not valid JSON"\nFall back to default service;
+    :Build default service from\nEVOLVER_AGENT_NAME\nor EVOLVER_MODEL_NAME\n(fallback: 'Evolver Agent');
+  endif
+else (not set)
+  :Build default service from\nEVOLVER_AGENT_NAME\nor EVOLVER_MODEL_NAME\n(fallback: 'Evolver Agent');
+endif
+
+note right
+  Service descriptor shape:
+  { title, description,
+    capabilities, useCases,
+    pricePerTask, maxConcurrent }
+end note
+
+:defaultOrderHandler(order)\nRead order.title (lowercase)\n+ order.signals (lowercase);
+
+if (title includes 'review'\nOR signal: code_review / bug?) then (yes)
+  :result = 'Code review\nprocessed by evolver.';
+elseif (title includes 'translat'\nOR signal: translation / localization?) then (yes)
+  :result = 'Translation\nprocessed by evolver.';
+elseif (title includes 'summar'\nOR signal: summarization / digest?) then (yes)
+  :result = 'Summarization\nprocessed by evolver.';
+else (default)
+  :result = 'Task processed\nby evolver agent.';
+endif
+
+:Return handler response\n{result, output,\npass_rate: 1.0,\nprocessed_at: ISO timestamp,\nprocessor: 'evolver-default'};
+
+|#FFF8E1|consumerAgent|
+:orderService(opts)\nPrepare order parameters\nbudget = max(1, round(opts.budget || 10))\nroutingMode = 'fastest' (default)\nverifyMode = 'auto' (default);
+
+:ensureInitialized();
+
+if (Already initialized?\n(_initialized == true)) then (no)
+  |#E8F5E9|hubClient|
+  :sendHelloToHub()\n(via gep/a2aProtocol);
+  if (hello.ok?) then (no)
+    :Throw Error:\n'Failed to register with Hub';
+    stop
+  endif
+  |#FFF8E1|consumerAgent|
+  :Set _initialized = true;
+endif
+
+|#E8F5E9|hubClient|
+:placeOrder({\n  capabilities, budget,\n  routingMode, verifyMode,\n  question, signals,\n  minReputation\n});
+
+|#FFF8E1|consumerAgent|
+if (order placement ok?) then (no)
+  :Return {ok: false, error};
+  |Caller|
+  :Receive placement error;
+  stop
+endif
+
+:Log order_id + merchant.node_id;
+
+note right
+  orderAndWait() — full polling lifecycle
+  pollMs = opts.pollIntervalMs || 10 000 ms
+  timeoutMs = opts.timeoutMs || 300 000 ms
+end note
+
+:Extract orderId from order.data.order_id;
+:Initialize deadline =\nDate.now() + timeoutMs;
+
+repeat
+  :Wait pollMs milliseconds;
+  |#E8F5E9|hubClient|
+  :getOrderStatus(orderId)\n(checkOrder → getOrderStatus);
+  |#FFF8E1|consumerAgent|
+  if (status.ok?) then (no)
+    :Skip — continue polling;
+  else (yes)
+    if (proof_status == 'settled'?) then (yes)
+      :Mark terminal: SUCCESS (settled);
+    elseif (proof_status == 'verified'\nAND verify_mode == 'auto'?) then (yes)
+      :Mark terminal: SUCCESS (verified);
+    elseif (proof_status == 'disputed'?) then (yes)
+      :Mark terminal: FAILURE (disputed);
+    else (still pending)
+      :Continue polling;
+    endif
+  endif
+repeat while (no terminal status\nand Date.now() < deadline?) is (yes)
+-> deadline exceeded or terminal status reached;
+
+if (terminal == SUCCESS?) then (yes)
+  :Return {\n  ok: true,\n  order,\n  finalStatus\n};
+elseif (terminal == FAILURE (disputed)?) then (yes)
+  :Return {\n  ok: false,\n  error: 'order_disputed'\n};
+else (timeout)
+  :Return {\n  ok: false,\n  error: 'order_timeout'\n};
+endif
+
+|Caller|
+:Receive final result;
+stop
+
+@enduml

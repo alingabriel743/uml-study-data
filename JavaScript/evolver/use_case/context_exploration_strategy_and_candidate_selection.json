@@ -1,0 +1,234 @@
+{
+  "scope": "exploration_strategy_and_candidate_selection",
+  "title": "Exploration, Strategy & Candidate Selection",
+  "diagram_type": "use_case",
+  "description": "GEP subsystem that explores the problem space, devises an improvement strategy, and evaluates/selects candidate genes and capsules for execution.",
+
+  "actors": [
+    {
+      "name": "GEP Orchestrator",
+      "type": "primary",
+      "description": "Internal automated actor that drives the GEP evolution loop; calls all use cases in sequence."
+    },
+    {
+      "name": "Operator / CI",
+      "type": "secondary",
+      "description": "Human or CI process that sets env vars (EVOLVE_STRATEGY, FORCE_INNOVATION, EVOLVE_FORCE_INNOVATION) to steer strategy selection."
+    },
+    {
+      "name": "Memory Graph",
+      "type": "external_system",
+      "description": "Supplies memoryAdvice (preferredGeneId, bannedGeneIds, memoryEvidence) to guide selection."
+    },
+    {
+      "name": "Asset Store (JSONL)",
+      "type": "external_system",
+      "description": "Persists and reads candidate records (candidates.jsonl, external_candidates.jsonl, failed capsules)."
+    },
+    {
+      "name": "Workspace Filesystem",
+      "type": "external_system",
+      "description": "Source tree scanned by explore.js for context extraction."
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Explore Workspace",
+      "module": "explore.js",
+      "actor": "GEP Orchestrator",
+      "description": "Scan the project filesystem for source files (.js/.ts/.py/.mjs/.cjs/.jsx/.tsx), excluding noise paths (node_modules, .git/, dist/, build/, *.min.js, *.lock, *.map). Collects workspace context for downstream signal/candidate generation.",
+      "key_behaviors": [
+        "Filter files by extension regex: /\\.(js|ts|py|mjs|cjs|jsx|tsx)$/",
+        "Exclude paths matching: /node_modules|\\.git\\/|dist\\/|build\\/|\\.min\\.js|package-lock|\\.lock$|\\.map$/",
+        "Async file reading and context assembly"
+      ]
+    },
+    {
+      "id": "UC2",
+      "name": "Resolve Evolution Strategy",
+      "module": "strategy.js",
+      "actor": "GEP Orchestrator",
+      "influenced_by": "Operator / CI",
+      "description": "Determine the current improvement strategy (weights for repair/optimize/innovate/explore) from env vars and runtime signals.",
+      "exports": ["STRATEGIES", "resolveStrategy({signals?})", "getStrategyNames()"],
+      "strategy_presets": ["balanced", "innovate", "harden", "repair-only", "early-stabilize", "steady-state"],
+      "strategy_fields": "repair, optimize, innovate, explore (ratios summing to 1.0), repairLoopThreshold, label, description",
+      "key_behaviors": [
+        "Reads EVOLVE_STRATEGY, FORCE_INNOVATION, EVOLVE_FORCE_INNOVATION env vars",
+        "FORCE_INNOVATION=true or EVOLVE_FORCE_INNOVATION=true → 'innovate' strategy",
+        "Explicit EVOLVE_STRATEGY takes precedence over FORCE_INNOVATION",
+        "Signal 'evolution_saturation' or 'force_steady_state' → 'steady-state' strategy",
+        "EVOLVE_STRATEGY='auto' or unknown → falls back to 'balanced' / 'early-stabilize' heuristic",
+        "Returns strategy object with .name property"
+      ]
+    },
+    {
+      "id": "UC3",
+      "name": "Expand Signals",
+      "module": "candidates.js",
+      "actor": "GEP Orchestrator",
+      "description": "Derive structured learning tags from weak/raw signals to enrich the candidate search space.",
+      "exports": ["expandSignals(signals, transcript)"],
+      "key_behaviors": [
+        "Maps weak signal 'perf_bottleneck' → ['problem:performance', 'action:optimize']",
+        "Maps 'stable_success_plateau' → ['problem:stagnation']",
+        "Returns enriched tag array for downstream scoring"
+      ]
+    },
+    {
+      "id": "UC4",
+      "name": "Extract Capability Candidates",
+      "module": "candidates.js",
+      "actor": "GEP Orchestrator",
+      "description": "Generate improvement candidates from recent session transcript, runtime signals, and recently failed capsules.",
+      "exports": ["extractCapabilityCandidates({recentSessionTranscript, signals, recentFailedCapsules})"],
+      "key_behaviors": [
+        "Accepts transcript (string), signals (array), recentFailedCapsules (array)",
+        "Creates failure-driven candidates (source='failed_capsules') when capsules repeat failures",
+        "Attaches derived tags (via expandSignals) to each candidate",
+        "Returns array of candidate objects with {source, tags, ...}"
+      ]
+    },
+    {
+      "id": "UC5",
+      "name": "Evaluate & Score Candidates",
+      "module": "candidateEval.js",
+      "actor": "GEP Orchestrator",
+      "description": "Orchestrate candidate lifecycle: generate new candidates, persist them, read recent/external candidates from store, score against current signals, and return ranked previews.",
+      "main_function": "evaluateCandidates({signals, recentSessionTranscript})",
+      "imports": [
+        "assetStore: readRecentCandidates, readRecentExternalCandidates, readRecentFailedCapsules, appendCandidateJsonl",
+        "candidates.js: extractCapabilityCandidates, renderCandidatesPreview",
+        "selector.js: matchPatternToSignals"
+      ],
+      "flow": [
+        "1. Call extractCapabilityCandidates({recentSessionTranscript, signals, recentFailedCapsules: readRecentFailedCapsules(N)})",
+        "2. Persist each new candidate via appendCandidateJsonl(candidate)",
+        "3. Read readRecentCandidates() and readRecentExternalCandidates()",
+        "4. Partition external candidates: type='Gene' vs type='Capsule'",
+        "5. Score each candidate: matchPatternToSignals(pattern, signals) across signals_match/triggers",
+        "6. Filter score > 0, sort descending, slice top N",
+        "7. Return {recentCapabilityCandidatePreview, externalCandidatesPreview, newCandidates}"
+      ],
+      "returns": "{recentCapabilityCandidatePreview, externalCandidatesPreview, newCandidates}"
+    },
+    {
+      "id": "UC6",
+      "name": "Match Pattern to Signals",
+      "module": "selector.js",
+      "actor": "GEP Orchestrator",
+      "description": "Score how well a gene/capsule's signal patterns match the current active signals (supports baseName:snippet format).",
+      "exports": ["matchPatternToSignals(pattern, signals)"],
+      "key_behaviors": [
+        "Supports exact signal match",
+        "Supports baseName:snippet partial match (e.g., 'user_feature_request:add dark mode')",
+        "Returns numeric score"
+      ]
+    },
+    {
+      "id": "UC7",
+      "name": "Compute Drift Intensity",
+      "module": "selector.js",
+      "actor": "GEP Orchestrator",
+      "description": "Calculate genetic drift randomness factor based on gene pool size and accumulated memory evidence.",
+      "exports": ["computeDriftIntensity({driftEnabled, genePoolSize, memoryEvidence})"],
+      "key_behaviors": [
+        "Base drift: min(1, 1/sqrt(genePoolSize))",
+        "When driftEnabled: adds offset (max 0.3) that decays as memoryEvidence grows towards genePoolSize*10",
+        "Floor offset at full maturity: ~0.02",
+        "When !driftEnabled: returns population-dependent base only"
+      ]
+    },
+    {
+      "id": "UC8",
+      "name": "Select Gene",
+      "module": "selector.js",
+      "actor": "GEP Orchestrator",
+      "influenced_by": "Memory Graph",
+      "description": "Select the best-matching gene from the gene pool based on signal match scores, drift, and memory advice.",
+      "exports": ["selectGene(genes, signals, options)"],
+      "options": "{ preferredGeneId, bannedGeneIds, effectivePopulationSize }",
+      "returns": "{ selected, alternatives, driftIntensity, reason, selectionPath }",
+      "key_behaviors": [
+        "Score each gene via signal match count",
+        "Downweight genes with repeated hard-fail anti_patterns",
+        "Apply score multiplier for preferredGeneId (memory-guided)",
+        "Use drift to allow non-top-scoring gene selection (exploration)",
+        "Returns null selected when no signals match",
+        "Returns alternatives[] when multiple genes match"
+      ]
+    },
+    {
+      "id": "UC9",
+      "name": "Select Capsule",
+      "module": "selector.js",
+      "actor": "GEP Orchestrator",
+      "description": "Select a previously successful capsule whose triggers match the current signals.",
+      "exports": ["selectCapsule(capsules, signals)"],
+      "returns": "capsule object | null",
+      "key_behaviors": [
+        "Matches capsule.trigger[] against active signals",
+        "Returns highest-matching capsule or null"
+      ]
+    },
+    {
+      "id": "UC10",
+      "name": "Select Gene and Capsule (Combined)",
+      "module": "selector.js",
+      "actor": "GEP Orchestrator",
+      "influenced_by": "Memory Graph",
+      "description": "Unified selection: runs gene selection and capsule candidate identification together, incorporating memory advice for both.",
+      "exports": ["selectGeneAndCapsule({genes, capsules, signals, memoryAdvice, driftEnabled})"],
+      "returns": "{ selectedGene, selector: {selected, reason[], selectionPath}, selectionPath, memoryUsed, memoryEvidence }",
+      "key_behaviors": [
+        "Applies bannedGeneIds and preferredGeneId from memoryAdvice",
+        "Emits memoryUsed (boolean) and memoryEvidence (number) telemetry",
+        "Combines gene + capsule candidates into unified selector decision"
+      ]
+    }
+  ],
+
+  "module_dependencies": [
+    "candidateEval.js → candidates.js (extractCapabilityCandidates, renderCandidatesPreview)",
+    "candidateEval.js → assetStore.js (readRecentCandidates, readRecentExternalCandidates, readRecentFailedCapsules, appendCandidateJsonl)",
+    "candidateEval.js → selector.js (matchPatternToSignals)",
+    "selector.js → (self-contained: computeDriftIntensity, selectGene, selectCapsule, matchPatternToSignals)",
+    "strategy.js → (self-contained: resolveStrategy reads process.env + signals)",
+    "explore.js → (self-contained: filesystem scan via Node.js fs module)",
+    "GEP Orchestrator → explore.js, strategy.js, candidateEval.js, selector.js"
+  ],
+
+  "data_objects": [
+    "Gene: { type:'Gene', id, category, signals_match[], strategy[], validation[], anti_patterns?, learning_history? }",
+    "Capsule: { type:'Capsule', id, trigger[], gene, summary, confidence, outcome?, blast_radius?, success_streak? }",
+    "Strategy: { name, repair, optimize, innovate, explore, repairLoopThreshold, label, description }",
+    "Candidate: { source, tags[], type, id, category?, signals_match?, a2a? }",
+    "SelectorResult: { selected, alternatives[], driftIntensity, reason[], selectionPath }",
+    "MemoryAdvice: { bannedGeneIds: Set, preferredGeneId, totalAttempts }"
+  ],
+
+  "key_relationships": [
+    "GEP Orchestrator initiates all use cases in exploration phase",
+    "Operator/CI influences strategy via EVOLVE_STRATEGY, FORCE_INNOVATION env vars",
+    "Memory Graph provides preferredGeneId + bannedGeneIds to selectGene / selectGeneAndCapsule",
+    "Asset Store is read/written by candidateEval.js (JSONL persistence)",
+    "candidateEval.js orchestrates candidates.js and selector.js (matchPatternToSignals)",
+    "selector.js is used standalone for gene/capsule selection AND as scoring utility in candidateEval.js"
+  ],
+
+  "important_notes": "All source files (explore.js, strategy.js, candidates.js, candidateEval.js, selector.js) are obfuscated single-line bundles. Analysis derived from test files (selector.test.js, candidates.test.js, strategy.test.js), IR function bodies, and the deobfuscated candidateEval.js content visible from the file read. Strategy ratios always sum to ~1.0. Drift uses 1/sqrt(N) formula with adaptive memory-evidence decay.",
+
+  "source_files_analyzed": [
+    "src/gep/explore.js (obfuscated — partial IR analysis)",
+    "src/gep/strategy.js (obfuscated — test + IR analysis)",
+    "src/gep/candidates.js (obfuscated — test + IR analysis)",
+    "src/gep/candidateEval.js (partially readable)",
+    "src/gep/selector.js (obfuscated — test + IR analysis)",
+    "test/selector.test.js",
+    "test/candidates.test.js",
+    "test/strategy.test.js",
+    "ir_postprocessed.json"
+  ]
+}

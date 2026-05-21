@@ -1,0 +1,134 @@
+{
+  "scope": "offset_management_flow",
+  "title": "Offset Management and Persistence Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "KafkaConnect",
+    "BaseSourceTask",
+    "ChangeEventSourceCoordinator",
+    "BinlogStreamingChangeEventSource",
+    "BinlogOffsetContext",
+    "BinlogPartition",
+    "MySqlOffsetContext.Loader",
+    "OffsetReader",
+    "BinlogSourceInfo",
+    "TransactionContext",
+    "IncrementalSnapshotContext"
+  ],
+
+  "interaction_flow": [
+    "=== STARTUP / RECOVERY ===",
+    "KafkaConnect → BaseSourceTask: start(config)",
+    "BaseSourceTask → BaseSourceTask: getPreviousOffsets(BinlogPartition.Provider, MySqlOffsetContext.Loader)",
+    "BaseSourceTask → OffsetReader: new OffsetReader(context.offsetStorageReader(), loader)",
+    "BaseSourceTask → OffsetReader: offsets(partitions)",
+    "OffsetReader → BinlogPartition: getSourcePartition() → Map{server → serverName}",
+    "OffsetReader → KafkaConnect(offsetStorageReader): read stored offset map by partition key",
+    "OffsetReader → MySqlOffsetContext.Loader: load(Map<String,?> offset)",
+    "MySqlOffsetContext.Loader → BinlogOffsetContext: new MySqlOffsetContext(snapshot, snapshotCompleted, TransactionContext.load(offset), IncrementalSnapshotContext.load(offset), new SourceInfo)",
+    "MySqlOffsetContext.Loader → BinlogOffsetContext: setBinlogStartPoint(binlogFilename, binlogPosition)",
+    "MySqlOffsetContext.Loader → BinlogOffsetContext: setInitialSkips(eventsToSkip, rowsToSkip)",
+    "MySqlOffsetContext.Loader → BinlogOffsetContext: setCompletedGtidSet(gtidSet)",
+    "BaseSourceTask → ChangeEventSourceCoordinator: start with recovered BinlogOffsetContext",
+    "ChangeEventSourceCoordinator → BinlogStreamingChangeEventSource: execute(context, partition, offsetContext)",
+
+    "=== PER-EVENT OFFSET UPDATE (streaming) ===",
+    "BinlogStreamingChangeEventSource → BinlogOffsetContext: setEventPosition(positionOfCurrentEvent, eventSizeInBytes)",
+    "BinlogOffsetContext → BinlogOffsetContext: [if NOT inTransaction] restartBinlogPosition = pos + size; restartRowsToSkip=0; restartEventsToSkip=0",
+    "BinlogStreamingChangeEventSource → BinlogOffsetContext: event(tableId, timestamp)",
+    "BinlogOffsetContext → BinlogSourceInfo: setSourceTime(timestamp); tableEvent(tableId)",
+    "BinlogStreamingChangeEventSource → BinlogOffsetContext: setRowNumber(eventRowNumber, totalNumberOfRows)",
+    "BinlogOffsetContext → BinlogSourceInfo: setRowNumber(eventRowNumber)",
+    "BinlogOffsetContext → BinlogOffsetContext: [if not last row] restartRowsToSkip = eventRowNumber+1; else restartRowsToSkip = total",
+    "BinlogStreamingChangeEventSource → BinlogOffsetContext: getOffset()",
+    "BinlogOffsetContext → BinlogOffsetContext: offsetUsingPosition(restartRowsToSkip) → Map{server_id, gtids, file, pos, event, row, ts_sec}",
+    "BinlogOffsetContext → TransactionContext: store(offset) [adds tx metadata if not snapshot]",
+    "BinlogOffsetContext → IncrementalSnapshotContext: store(offset) [adds incremental snapshot state]",
+    "BinlogStreamingChangeEventSource → KafkaConnect: emit SourceRecord(partition=BinlogPartition.getSourcePartition(), offset=getOffset())",
+
+    "=== TRANSACTION BOUNDARIES ===",
+    "BinlogStreamingChangeEventSource → BinlogOffsetContext: startGtid(gtid, gtidSet) [GTID event]",
+    "BinlogOffsetContext → BinlogOffsetContext: restartGtidSet = currentGtidSet; currentGtidSet = trimmedGtidSet",
+    "BinlogStreamingChangeEventSource → BinlogOffsetContext: startNextTransaction() [BEGIN event]",
+    "BinlogOffsetContext → BinlogOffsetContext: restartBinlogFilename = sourceInfo.binlogFilename(); restartBinlogPosition = sourceInfo.binlogPosition(); inTransaction=true; setTransactionId()",
+    "BinlogStreamingChangeEventSource → BinlogOffsetContext: completeEvent() [after each event in tx]",
+    "BinlogOffsetContext → BinlogOffsetContext: ++restartEventsToSkip",
+    "BinlogStreamingChangeEventSource → BinlogOffsetContext: changeEventCompleted() [after row event]",
+    "BinlogOffsetContext → BinlogOffsetContext: restartRowsToSkip = 0",
+    "BinlogStreamingChangeEventSource → BinlogOffsetContext: commitTransaction() [COMMIT event]",
+    "BinlogOffsetContext → BinlogOffsetContext: restartGtidSet=currentGtidSet; restartBinlogPosition=pos+eventSize; restartRowsToSkip=0; restartEventsToSkip=0; inTransaction=false",
+
+    "=== PERIODIC FLUSH TO KAFKA CONNECT OFFSET STORAGE ===",
+    "KafkaConnect → BaseSourceTask: commitRecord(SourceRecord, RecordMetadata) [called after record ack]",
+    "BaseSourceTask → BaseSourceTask: updateLastOffset(record.sourcePartition(), record.sourceOffset())",
+    "KafkaConnect → BaseSourceTask: commit() [periodic flush trigger]",
+    "BaseSourceTask → BaseSourceTask: shouldPerformCommit.set(true)",
+    "KafkaConnect → BaseSourceTask: poll()",
+    "BaseSourceTask → BaseSourceTask: performCommit() [if shouldPerformCommit]",
+    "BaseSourceTask → ChangeEventSourceCoordinator: commitOffset(partition, lastOffset) [for each partition in lastOffsets map]",
+    "ChangeEventSourceCoordinator → BinlogStreamingChangeEventSource: commitOffset(partition, offset) [if not locked and streamingSource non-null]",
+    "BinlogStreamingChangeEventSource → KafkaConnect(offsetStorageWriter): persist offset"
+  ],
+
+  "key_relationships": [
+    "MySqlOffsetContext extends BinlogOffsetContext<SourceInfo>",
+    "BinlogOffsetContext extends CommonOffsetContext<T extends BinlogSourceInfo>",
+    "BinlogOffsetContext implements OffsetContext",
+    "BinlogOffsetContext.Loader (abstract) implements OffsetContext.Loader<O>",
+    "MySqlOffsetContext.Loader extends BinlogOffsetContext.Loader<MySqlOffsetContext>",
+    "BinlogPartition extends AbstractPartition implements Partition",
+    "BinlogTaskContext extends CdcSourceTaskContext<BinlogConnectorConfig>",
+    "BinlogOffsetContext composes TransactionContext",
+    "BinlogOffsetContext composes IncrementalSnapshotContext<TableId>",
+    "BinlogOffsetContext composes BinlogSourceInfo (sourceInfo)",
+    "BaseSourceTask uses ChangeEventSourceCoordinator to forward commitOffset",
+    "ChangeEventSourceCoordinator delegates commitOffset to BinlogStreamingChangeEventSource"
+  ],
+
+  "offset_map_keys": [
+    "file (BinlogSourceInfo.BINLOG_FILENAME_OFFSET_KEY) → restartBinlogFilename",
+    "pos (BinlogSourceInfo.BINLOG_POSITION_OFFSET_KEY) → restartBinlogPosition",
+    "event (EVENTS_TO_SKIP_OFFSET_KEY) → restartEventsToSkip",
+    "row (BinlogSourceInfo.BINLOG_ROW_IN_EVENT_OFFSET_KEY) → restartRowsToSkip",
+    "gtids (GTID_SET_KEY) → restartGtidSet",
+    "server_id → sourceInfo.getServerId()",
+    "ts_sec (TIMESTAMP_KEY) → sourceInfo.timestamp().getEpochSecond()",
+    "snapshot → SnapshotType string (only when snapshotting)",
+    "transaction/incremental_snapshot → delegated to TransactionContext.store() / IncrementalSnapshotContext.store()"
+  ],
+
+  "recovery_logic": {
+    "loader_class": "MySqlOffsetContext.Loader (extends BinlogOffsetContext.Loader)",
+    "load_method": "load(Map<String,?> offset)",
+    "steps": [
+      "1. Extract binlogFilename (required, throws ConnectException if missing)",
+      "2. Extract binlogPosition via longOffsetValue()",
+      "3. Reconstruct TransactionContext.load(offset)",
+      "4. Reconstruct IncrementalSnapshotContext.load(offset) (SignalBased or ReadOnly)",
+      "5. Call setBinlogStartPoint(filename, position)",
+      "6. Call setInitialSkips(eventsToSkip, rowsToSkip) — allows mid-transaction resume",
+      "7. Call setCompletedGtidSet(gtidSet) — null-safe"
+    ]
+  },
+
+  "important_notes": [
+    "restartBinlogFilename/restartBinlogPosition always point to the SAFE restart position, not current position",
+    "When inTransaction=true, setEventPosition does NOT advance restartBinlogPosition (only committed transactions are safe restart points)",
+    "restartEventsToSkip+restartRowsToSkip enable mid-transaction recovery by skipping already-processed events/rows",
+    "GTID mode: restartGtidSet trails currentGtidSet until commitTransaction()",
+    "BinlogPartition.getSourcePartition() returns Map{server → serverName}, used as the Kafka Connect partition key",
+    "commitRecord() is called by Kafka Connect framework after Kafka producer ack, not after binlog read",
+    "performCommit() is called inside poll() (not in a separate thread) to serialize with task lifecycle",
+    "BinlogTaskContext is minimal: just wires rawConfig + BinlogConnectorConfig to CdcSourceTaskContext"
+  ],
+
+  "source_files_analyzed": [
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogOffsetContext.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogPartition.java",
+    "debezium-connector-binlog/src/main/java/io/debezium/connector/binlog/BinlogTaskContext.java",
+    "debezium-connector-mysql/src/main/java/io/debezium/connector/mysql/MySqlOffsetContext.java",
+    "debezium-connector-common/src/main/java/io/debezium/connector/common/BaseSourceTask.java",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/ChangeEventSourceCoordinator.java",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/spi/OffsetContext.java"
+  ]
+}

@@ -1,0 +1,159 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipantBackgroundColor #F8F9FA
+skinparam sequenceParticipantBorderColor #495057
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceGroupBackgroundColor #E9ECEF
+skinparam sequenceGroupBorderColor #6C757D
+skinparam sequenceGroupFontColor #212529
+skinparam sequenceBoxBackgroundColor #F1F3F5
+skinparam sequenceBoxBorderColor #ADB5BD
+skinparam noteBorderColor #ADB5BD
+skinparam noteBackgroundColor #FFF9C4
+
+title Extension Tab Scan Flow
+
+actor "Trigger\n(DevToolsPort / PanelPort\n/ PopupMsg / NavEvent)" as Trigger
+participant "ServiceWorker\n(service-worker.js)" as SW
+participant "tabState\n(Map<tabId,…>)" as TabState
+participant "chrome.storage.sync" as Storage
+participant "chrome.scripting" as Scripting
+participant "ContentScript\n(content/content-script.js)" as CS
+participant "chrome.tabs" as Tabs
+participant "chrome.action\n(badge)" as Badge
+participant "PanelPort\n(panel / sidebar)" as Panel
+participant "chrome.runtime\n(popup broadcast)" as Runtime
+
+== Scan Triggered ==
+
+alt Port message: 'scan' (DevTools or Panel port)
+    Trigger -> SW: port.onMessage('scan', { tabId })
+else runtime.onMessage {action:'scan'} from Popup
+    Trigger -> SW: runtime.onMessage({ action:'scan', tabId })
+else webNavigation.onCompleted (frameId=0, wasActive)
+    Trigger -> SW: webNavigation.onCompleted\n→ setTimeout(sendScanToTab, 300ms)
+end
+
+activate SW
+
+== sendScanToTab(tabId) ==
+
+SW -> SW: sendScanToTab(tabId)
+activate SW
+
+SW -> SW: ensureContentScriptInjected(tabId)
+activate SW
+
+SW -> TabState: getState(tabId) — read csInjected flag
+TabState --> SW: { csInjected: bool, … }
+
+alt Content script NOT yet injected (csInjected === false)
+    SW -> Scripting: executeScript({\n  target: { tabId },\n  files: ['content/content-script.js'],\n  injectImmediately: true\n})
+    activate Scripting
+    Scripting -> CS: inject content-script.js into tab
+    activate CS
+    Scripting --> SW: injection complete
+    deactivate Scripting
+    SW -> TabState: state.csInjected = true
+end
+
+SW --> SW: return (csInjected ensured)
+deactivate SW
+
+== buildScanConfig() ==
+
+SW -> SW: buildScanConfig()
+activate SW
+
+SW -> Storage: get({\n  disabledRules, lineLengthMode,\n  spotlightBlur, autoScan\n})
+activate Storage
+Storage --> SW: settings { disabledRules:[],\n  lineLengthMode:'strict',\n  spotlightBlur:true, autoScan:'panel' }
+deactivate Storage
+
+note right of SW
+  Maps lineLengthMode →
+  lineLengthMax: lax=120, strict=80
+end note
+
+SW --> SW: return config {\n  disabledRules?,\n  lineLengthMax (80|120),\n  spotlightBlur\n}
+deactivate SW
+
+== Deliver Scan to Tab ==
+
+SW -> Tabs: sendMessage(tabId,\n  { action:'scan', config })
+activate Tabs
+Tabs -> CS: deliver { action:'scan', config }
+Tabs --> SW: (ack / silent catch)
+deactivate Tabs
+
+== Content Script Runs Scan ==
+
+CS -> CS: run page quality checks\nwith config
+note right of CS
+  Async — runs inside
+  the inspected tab
+end note
+
+CS -> Runtime: runtime.sendMessage({\n  action: 'findings',\n  findings: [...]\n})
+deactivate CS
+
+== Service Worker Handles Findings ==
+
+Runtime --> SW: onMessage { action:'findings', findings }
+
+SW -> TabState: state.findings = findings\nstate.injected = true
+
+SW -> Badge: chrome.action.setBadgeText({\n  text: String(findings.length), tabId\n})
+activate Badge
+Badge --> SW: ok
+deactivate Badge
+
+SW -> Badge: chrome.action.setBadgeBackgroundColor({\n  color: '#…', tabId\n})
+activate Badge
+Badge --> SW: ok
+deactivate Badge
+
+SW -> SW: notifyPanels(tabId,\n  { action:'findings', findings })
+activate SW
+
+loop for each port in panelPorts.get(tabId)
+    SW -> Panel: port.postMessage({\n  action:'findings', findings\n})
+    activate Panel
+    note right of Panel
+      Covers both
+      panel.js and
+      sidebar pane ports
+    end note
+    Panel --> SW: (async — disconnected\nports silently swallowed)
+    deactivate Panel
+end
+
+deactivate SW
+
+SW -> Runtime: sendMessage({\n  action: 'findings-updated',\n  tabId, findings\n})
+note right of Runtime
+  Broadcast for
+  popup.js to
+  refresh its view
+end note
+
+deactivate SW
+deactivate SW
+
+@enduml

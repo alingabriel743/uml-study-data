@@ -1,0 +1,276 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+    ArrowColor #495057
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #212529
+    EndColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam noteBackgroundColor #FFF9C4
+skinparam noteBorderColor #F9A825
+
+title JSON Encoding & Decoding Flow\n<size:11><i>Services_JSON — WordPress JSON serialization (deprecated since WP 5.3.0)</i></size>
+
+|Encode Path|
+start
+:Caller invokes **encode($var)**;
+note right
+  Sets Content-Type: application/json
+  header as a side effect.
+  Use encodeUnsafe() to skip header
+  (XSS warning applies).
+end note
+:Set Content-type header\n<i>application/json</i>;
+:Call **encodeUnsafe($var)**;
+:Save current LC_NUMERIC locale;
+:Force LC_NUMERIC to **'C'**\n<i>(prevent locale decimal separator issues)</i>;
+:Call **_encode($var)** — Type Dispatch;
+
+|Encode Path|
+if (Type of $var?) then (boolean)
+    :Emit **'true'** or **'false'**;
+elseif (null) then
+    :Emit **'null'**;
+elseif (integer) then
+    :Emit cast int;
+elseif (double / float) then
+    :Emit cast float;
+elseif (string) then
+    :Iterate bytes via **strlen8()** / **substr8()**;
+    if (Byte range?) then (ASCII ctrl\n0x08–0x0D)
+        :Emit escape sequence\n<i>\\b \\t \\n \\f \\r</i>;
+    elseif (quote / slash /\nbackslash) then
+        :Emit escaped char;
+    elseif (ASCII printable\n0x20–0x7F) then
+        :Emit byte as-is;
+    else (multibyte UTF-8\n2–6 byte sequences)
+        |UTF Conversion|
+        :Pack multibyte bytes;
+        :Call **utf82utf16($utf8)**\n<i>mb_convert_encoding or manual bit-shift</i>;
+        :sprintf **'\\uXXXX'** escape;
+        |Encode Path|
+        :Append Unicode escape to output;
+    endif
+    if (Incomplete multibyte\nsequence at end?) then (yes)
+        :Emit replacement char **'?'**;
+    else (no)
+    endif
+    :Return **'"'** + $ascii + **'"'**;
+elseif (array — sequential) then
+    :array_map **_encode()** on each element\n<i>[recursive]</i>;
+    |Error Handling|
+    if (Any element isError()?) then (yes)
+        :Return error immediately\n<i>bubble up</i>;
+        |Encode Path|
+    else (no)
+        |Encode Path|
+        :Return **'['** + join(',') + **']'**;
+    endif
+elseif (array — associative\nor object) then
+    if (SERVICES_JSON_USE_TO_JSON flag\nAND toJSON() exists?) then (yes)
+        :Call **$var->toJSON()**;
+        if (Result also has toJSON()?\n<i>recursion guard</i>) then (yes)
+            |Error Handling|
+            if (SUPPRESS_ERRORS flag?) then (yes)
+                :Return **'null'**;
+                |Encode Path|
+            else (no)
+                :Return **Services_JSON_Error**\n<i>infinite recursion detected</i>;
+                |Encode Path|
+            endif
+        else (no)
+            :Recursively call **_encode($recode)**;
+        endif
+    else (no)
+        :get_object_vars($var)\nor use array keys/values;
+    endif
+    :array_map **name_value()** on\neach key-value pair;
+    |Error Handling|
+    if (Any property isError()?) then (yes)
+        :Return error immediately\n<i>bubble up</i>;
+        |Encode Path|
+    else (no)
+        |Encode Path|
+        :Return **'{'** + join(',') + **'}'**;
+    endif
+else (unsupported type)
+    |Error Handling|
+    if (SERVICES_JSON_SUPPRESS_ERRORS?) then (yes)
+        :Return literal **'null'**;
+        |Encode Path|
+    else (no)
+        :Return **new Services_JSON_Error**\n<i>'type cannot be encoded'</i>;
+        |Encode Path|
+    endif
+endif
+
+:Restore LC_NUMERIC locale;
+:Return encoded JSON string;
+stop
+
+|Encode Path|
+note
+  **name_value($name, $value):**
+  1. _encode($value) → if isError: return error
+  2. Return _encode(strval($name)) + ':' + encoded_value
+end note
+
+|Decode Path|
+start
+:Caller invokes **decode($str)**;
+:Call **reduce_string($str)**\n<i>strip // comments, /* */ block comments, trim()</i>;
+
+if (Literal value?\n<i>strtolower comparison</i>) then ('true')
+    :Return PHP **true**;
+    stop
+elseif ('false') then
+    :Return PHP **false**;
+    stop
+elseif ('null') then
+    :Return PHP **null**;
+    stop
+else (not a literal)
+endif
+
+if (**is_numeric($str)**?) then (yes)
+    :Return **int** or **float**\n<i>prefers int when float == int</i>;
+    stop
+else (no)
+endif
+
+if (Matches string pattern\n**/^([\"']).*\\1$/s**?) then (yes)
+    :Extract inner chars via **substr8()**;
+    :Iterate each byte;
+    if (Byte type?) then (escape sequence\n\\b \\t \\n \\f \\r \\\" \\' \\\\ \\/)
+        :Emit decoded char;
+    elseif (Unicode escape\n\\uXXXX) then
+        |UTF Conversion|
+        :chr(hexdec) + chr(hexdec);
+        :Call **utf162utf8($utf16)**\n<i>mb_convert_encoding or manual bit-shift</i>;
+        |Decode Path|
+        :Append UTF-8 char to $utf8;
+    elseif (ASCII printable\n0x20–0x7F) then
+        :Pass through as-is;
+    else (multibyte UTF-8\nmasks 0xC0/0xE0/0xF0...)
+        :substr8($chrs, $c, N)\npass through sequence;
+    endif
+    :Return $utf8 decoded string;
+    stop
+else (no)
+endif
+
+if (Matches array/object pattern\n**/^\\[.*\\]$/** or **/^\\{.*\\}$/**?) then (yes)
+    :Initialize stack and container;
+    if (Opening char?) then ('[')
+        :Push **SERVICES_JSON_IN_ARR**\n$arr = [];
+        note right: SERVICES_JSON_IN_ARR = 3
+    else ('{')
+        if (SERVICES_JSON_LOOSE_TYPE flag?) then (yes)
+            :Push **SERVICES_JSON_IN_OBJ**\n$obj = [] <i>(associative array)</i>;
+        else (no)
+            :Push **SERVICES_JSON_IN_OBJ**\n$obj = new stdClass();
+        endif
+        note right: SERVICES_JSON_IN_OBJ = 4
+    endif
+    :Push initial SLICE marker\n<i>{what: SLICE, where: 0, delim: false}</i>;
+    :reduce_string() on inner content;
+    if (Empty content?) then (yes)
+        :Return $arr or $obj immediately;
+        stop
+    else (no)
+    endif
+
+    :Begin **character-by-character state machine**;
+    repeat
+        if (Current state & char?) then (comma at SLICE level\nor end-of-string)
+            :Extract slice = substr8(chrs, top.where, len);
+            :Push new SLICE marker;
+            if (Stack context?) then (IN_ARR)
+                :array_push($arr, **decode($slice)**)\n<i>[recursive decode]</i>;
+            else (IN_OBJ)
+                if (Quoted key?) then (yes)
+                    :key = decode(quoted_name)\nval = decode(trim(value));
+                else (no / unquoted)
+                    :key = raw_name\nval = decode(trim(value));
+                endif
+                if (LOOSE_TYPE?) then (yes)
+                    :$obj[$key] = val;
+                else (no)
+                    :$obj->$key = val;
+                endif
+            endif
+        elseif (quote char, not IN_STR) then
+            :Push **IN_STR** with delimiter;
+            note right: SERVICES_JSON_IN_STR = 2
+        elseif (quote char, IN_STR,\nnot escaped) then
+            :Pop **IN_STR**;
+        elseif ('[' in SLICE/ARR/OBJ) then
+            :Push **IN_ARR**;
+        elseif (']' in IN_ARR) then
+            :Pop **IN_ARR**;
+        elseif ('{' in SLICE/ARR/OBJ) then
+            :Push **IN_OBJ**;
+        elseif ('}' in IN_OBJ) then
+            :Pop **IN_OBJ**;
+        elseif ('/*' in SLICE/ARR/OBJ) then
+            :Push **IN_CMT**;
+            note right: SERVICES_JSON_IN_CMT = 5
+        elseif ('*/' in IN_CMT) then
+            :Pop **IN_CMT**\nBlank out comment chars in $chrs;
+        else (other char)
+            :Advance position;
+        endif
+    repeat while (more chars?) is (yes)
+    -> no;
+    if (Final stack context?) then (IN_ARR)
+        :Return **$arr** (PHP array);
+    else (IN_OBJ)
+        :Return **$obj** (stdClass or array);
+    endif
+    stop
+else (no match)
+    |Error Handling|
+    :Return **Services_JSON_Error**\n<i>unrecognized input structure</i>;
+    stop
+endif
+
+|Error Handling|
+note
+  **Services_JSON_Error:**
+  - Extends PEAR_Error if PEAR is available,
+    otherwise standalone class
+  - **isError($data)** checks instanceof
+    Services_JSON_Error or PEAR::isError()
+  - Errors bubble up immediately from
+    arrays and objects on first failure
+  - SERVICES_JSON_SUPPRESS_ERRORS (flag=32):
+    encode returns 'null' instead of error
+end note
+
+@enduml

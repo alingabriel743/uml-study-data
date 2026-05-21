@@ -1,0 +1,136 @@
+{
+  "scope": "training_pipeline_main",
+  "title": "Main Training Pipeline",
+  "diagram_type": "activity",
+  "source_files_analyzed": ["Lyra-1/train.py"],
+
+  "entry_point": "__main__ block → main(config, wandb_run_name, wandb_group_name, app_start_time)",
+
+  "startup_phase": [
+    "Parse CLI args: --config, --config_default, --wandb_run_name, --wandb_group_name",
+    "Load YAML schema (config_default) and merge with config YAML + CLI dotlist overrides via OmegaConf",
+    "Call main(config, ...)"
+  ],
+
+  "main_function_flow": [
+    "1. prepare_config(config): set LOCAL_RANK from env, set vae_path default, set use_lora default",
+    "2. Build Accelerator: configure DDP kwargs, AutocastKwargs, optionally FSDP plugin (use_fsdp) or DeepSpeed plugin (use_deepspeed, zero_stage=2)",
+    "3. Set logging verbosity (main vs. non-main process)",
+    "4. [Optional] set_seed(config.seed) if seed provided",
+    "5. [Main process] mkdir output_dir, save config.yaml via OmegaConf.save",
+    "6. Load VAE: load_vae(config.vae_backbone, config.vae_path) inside deepspeed_zero_init_disabled context",
+    "7. Determine weight_dtype (fp16 / bf16) from accelerator.mixed_precision",
+    "8. Instantiate transformer: LatentRecon(config)",
+    "9. [Optional] Load LPIPS loss module if lambda_lpips > 0",
+    "10. [Optional] Load pretrained ckpt into transformer if resume_pretrained_model_ckpt set",
+    "11. Freeze/unfreeze modules: transformer.train(), transformer.requires_grad_(False); cast VAE/modules to weight_dtype",
+    "12. [Optional] torch.compile(vae.encode) if compile_frozen_modules",
+    "13. [Optional] Add LoRA adapter via peft.LoraConfig if use_lora",
+    "14. Define save_model_hook(models, weights, output_dir): saves transformer (+ EMA, + LoRA weights if applicable)",
+    "15. Define load_model_hook(models, input_dir): loads transformer from pretrained subfolder",
+    "16. Register hooks with accelerator (skip for FSDP/DeepSpeed distributed types)",
+    "17. [Optional] Enable TF32 if allow_tf32",
+    "18. [Optional] Scale LR by batch_size * grad_accum * num_processes if scale_lr",
+    "19. Select optimizer class: AdamW8bit (bitsandbytes) or torch.optim.AdamW",
+    "20. Build parameters_list: either selective modules (transformer_trainable_modules) or all params",
+    "21. [FSDP] accelerator.prepare(transformer) before optimizer creation",
+    "22. Create optimizer with lr, betas, weight_decay, eps",
+    "23. Create lr_scheduler via get_scheduler(config.lr_scheduler, warmup, max_train_steps)",
+    "24. [non-FSDP] accelerator.prepare(transformer, optimizer, lr_scheduler)",
+    "25. [Main process] Init trackers (wandb) with experiment_name and run/group names",
+    "26. resume_from_ckpt(config, accelerator, transformer) → initial_global_step, global_step, first_epoch, loaded_accelerator",
+    "27. [Optional] Overwrite LR and recreate lr_scheduler if lr_overwrite",
+    "28. [Optional] Reset seed (device_specific=True) for data loading if first run",
+    "29. Create dataloaders: get_multi_dataloader(config, accelerator) → train_dataloader, test_dataloader"
+  ],
+
+  "training_loop": {
+    "outer_loop": "while True (break_loop flag)",
+    "inner_loop": "for step, batch in enumerate(train_dataloader)",
+    "accumulation_context": "accelerator.accumulate(transformer)",
+    "per_step": [
+      "train_step(batch, train_loss, config.num_input_multi_views)",
+      "if accelerator.sync_gradients: update progress_bar, increment global_step, log train_loss + lr",
+      "if global_step % checkpointing_steps == 0: manage checkpoint rotation (remove oldest if over limit), accelerator.save_state(checkpoint-{step}), optionally save_random_state per process",
+      "if global_step % job_stop_steps == 0: set break_loop=True, break",
+      "if global_step >= max_train_steps: set break_loop=True, break",
+      "update progress_bar postfix with step_loss, lr, dir, overflow flag if grad skipped"
+    ],
+    "termination": "break_loop → accelerator.wait_for_everyone() → accelerator.end_training()"
+  },
+
+  "train_step_function": {
+    "signature": "train_step(batch, train_loss, num_input_multi_views) -> train_loss",
+    "flow": [
+      "Move batch tensors to accelerator.device; cast to weight_dtype (except camera intrinsics/c2ws)",
+      "Read gt_images = batch['images_output'], gt_depths = batch.get('depths_output')",
+      "Handle variable num_input_multi_views from batch if present",
+      "Encode input video: if 'rgb_latents' in batch use directly; else encode via encode_multi_view_video(vae, video, ...); store as batch['images_input_embed']",
+      "Compute Plucker embeddings on GPU: get_plucker_embedding_and_rays(intrinsics, c2ws, img_size, patch_size, flip_flag) if compute_plucker_cuda",
+      "[Optional] encode_latent_time_vae if use_time_embedding + time_embedding_vae",
+      "[Optional] encode_plucker_vae if plucker_embedding_vae",
+      "Forward pass: model_output = transformer(batch)",
+      "Extract pred_images, pred_depths, pred_opacity from model_output",
+      "Compute losses: compute_loss(accelerator, train_loss, pred_images, gt_images, pred_depths, gt_depths, pred_opacity, config, lpips_loss_module, ...)",
+      "accelerator.backward(loss)",
+      "if accelerator.sync_gradients: accelerator.clip_grad_norm_(transformer.parameters(), max_grad_norm); check inf/NaN scaler",
+      "optimizer.step() → lr_scheduler.step() → optimizer.zero_grad()",
+      "return train_loss"
+    ]
+  },
+
+  "save_model_hook_flow": [
+    "Guard: only run on main process",
+    "[Optional] ema_transformer.save_pretrained(output_dir/transformer_ema) if use_ema",
+    "For each model: model.save_pretrained(output_dir/transformer)",
+    "[Optional] save LoRA weights via get_peft_model_state_dict + model.save_lora_weights if use_lora",
+    "weights.pop() to prevent double-save"
+  ],
+
+  "load_model_hook_flow": [
+    "For each model in models list: models.pop()",
+    "Load from disk: GSLRMLatent.from_pretrained(input_dir, subfolder='transformer')",
+    "model.register_to_config(**load_model.config)",
+    "model.load_state_dict(load_model.state_dict())",
+    "del load_model"
+  ],
+
+  "resume_from_ckpt_flow": [
+    "If resume_from_checkpoint is set: resolve path (explicit or 'latest' via get_most_recent_checkpoint)",
+    "If path found: accelerator.load_state(path_ckpt) [preferred]; fallback: load_model_weights(path_ckpt, transformer); fallback: log warning, optionally shutil.rmtree broken ckpt, exit(1)",
+    "Parse global_step from checkpoint folder name (checkpoint-{N})",
+    "Return initial_global_step, global_step, first_epoch, loaded_accelerator flag"
+  ],
+
+  "key_conditions": [
+    "use_fsdp → FSDP plugin, prepare transformer before optimizer, no EMA",
+    "use_deepspeed → DeepSpeed plugin zero_stage=2",
+    "use_lora → LoraConfig added to transformer; LoRA layers saved in hooks",
+    "use_ema → EMA transformer saved in save_model_hook",
+    "use_8bit_adam → bitsandbytes AdamW8bit optimizer",
+    "scale_lr → LR *= grad_accum * batch_size * num_processes",
+    "resume_from_checkpoint → load state or model-only weights",
+    "checkpoints_total_limit → rotate/delete old checkpoints",
+    "job_stop_steps → early exit for job scheduling",
+    "lambda_lpips > 0 → LPIPS perceptual loss enabled",
+    "compile_frozen_modules → torch.compile(vae.encode)",
+    "transformer_trainable_modules → selective parameter training"
+  ],
+
+  "key_dependencies": [
+    "LatentRecon (src.models.recon.model_latent_recon) — main diffusion transformer",
+    "load_vae (src.models.utils.model) — VAE backbone loader",
+    "encode_multi_view_video, encode_video, encode_latent_time_vae, encode_plucker_vae (src.models.utils.model)",
+    "get_plucker_embedding_and_rays (src.models.utils.render)",
+    "compute_loss (src.models.utils.loss)",
+    "get_multi_dataloader (src.models.data)",
+    "get_most_recent_checkpoint (src.models.utils.train)",
+    "Accelerator (accelerate) — distributed training, mixed precision, checkpointing",
+    "get_scheduler (diffusers.optimization)",
+    "LPIPS (kiui.lpips), fused_ssim — perceptual/structural losses",
+    "OmegaConf — config loading and merging",
+    "peft.LoraConfig — optional LoRA fine-tuning"
+  ],
+
+  "important_notes": "Training loop is epoch-free (while True over batches, terminated by max_train_steps or job_stop_steps). Checkpoints are named checkpoint-{global_step}. Permanent checkpoints at permanent_checkpointing_steps intervals are excluded from rotation. Random states per-process optionally saved for reproducible resumption. Gradient overflow detection via scaler._check_inf_per_device."
+}

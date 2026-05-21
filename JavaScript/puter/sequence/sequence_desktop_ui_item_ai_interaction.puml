@@ -1,0 +1,129 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #DEE2E6
+    GroupHeaderFontColor #212529
+    DividerBorderColor #6C757D
+    DividerBackgroundColor #E9ECEF
+}
+skinparam note {
+    BackgroundColor #FFF3CD
+    BorderColor #856404
+    FontColor #212529
+}
+
+title Desktop UI Item AI Interaction Flow
+
+actor User as user
+participant "UIItem\n(ContextMenu)" as ctxmenu
+participant "sendSelectionToAIApp" as sendFn
+participant "buildAIPayloadFromItems" as buildFn
+participant "parseItemMetadataForAI" as parseFn
+participant "ensureAIAppIframe" as ensureFn
+participant "launch_app" as launchFn
+participant "AIApp\n(contentWindow)" as aiFrame
+participant "UIAlert" as alert
+
+' ─── Trigger ───────────────────────────────────────────────────────────────────
+user -> ctxmenu : right-click file(s)
+activate ctxmenu
+user -> ctxmenu : click "Open in AI"
+
+alt multi-select
+    ctxmenu -> sendFn : sendSelectionToAIApp($selected_items)
+else single-item right-click
+    ctxmenu -> sendFn : sendSelectionToAIApp($(el_item))
+end
+deactivate ctxmenu
+
+activate sendFn
+
+' ─── Build payload ─────────────────────────────────────────────────────────────
+sendFn -> buildFn : buildAIPayloadFromItems($elements)
+activate buildFn
+
+loop for each DOM element
+    buildFn -> parseFn : parseItemMetadataForAI(element.attr('data-metadata'))
+    activate parseFn
+    alt metadata is valid JSON
+        parseFn --> buildFn : parsed JSON object
+    else parse failure
+        parseFn --> buildFn : undefined\n(console.warn logged)
+    end
+    deactivate parseFn
+end
+
+buildFn --> sendFn : items[]\n[{uid, path, name, is_dir, is_shortcut,\n shortcut_to, shortcut_to_path, size,\n type, modified, metadata}]
+deactivate buildFn
+
+' ─── Early-exit guard ──────────────────────────────────────────────────────────
+alt items.length === 0
+    note over sendFn : No valid items — return early.\nNo further action taken.
+    deactivate sendFn
+else items.length > 0
+
+    ' ─── Ensure AI app iframe ────────────────────────────────────────────────────
+    sendFn -> ensureFn : ensureAIAppIframe()
+    activate ensureFn
+
+    ensureFn -> ensureFn : check DOM for\n$('.window[data-app="ai"]')
+
+    alt AI window NOT found in DOM
+        ensureFn -> launchFn : launch_app({ name: 'ai' })
+        activate launchFn
+        launchFn --> ensureFn : resolves (app launched)\nor throws on failure
+        deactivate launchFn
+
+        ensureFn -> ensureFn : re-check DOM for AI window
+        alt window still not found
+            ensureFn --> sendFn : null
+        end
+    end
+
+    ensureFn -> ensureFn : $aiWindow.makeWindowVisible()
+    ensureFn --> sendFn : HTMLIFrameElement | null
+    deactivate ensureFn
+
+    ' ─── Error path: iframe unavailable ─────────────────────────────────────────
+    alt aiIframe === null || !aiIframe.contentWindow
+        sendFn -> alert : UIAlert({ message: i18n('ai_app_unavailable') })
+        activate alert
+        alert --> user : shows error alert\n"AI app unavailable"
+        deactivate alert
+        note over sendFn : Flow terminates here.\nNo postMessage sent.
+
+    ' ─── Happy path: send selection to AI app ────────────────────────────────────
+    else iframe is valid
+        sendFn -> aiFrame : contentWindow.postMessage(\n  { msg: 'ai:openFsEntries',\n    items: items[],\n    source: 'desktop-context-menu' },\n  '*'\n)
+        note over aiFrame : Cross-frame postMessage\n(fire-and-forget, no return value)
+    end
+
+    deactivate sendFn
+end
+
+@enduml

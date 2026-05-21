@@ -1,0 +1,281 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #6C757D
+    GroupBackgroundColor #E3F2FD
+    GroupBorderColor #1565C0
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title GitHub VCS Driver: API Interaction
+
+participant "VcsRepository" as repo
+participant "GitHubDriver" as ghd
+participant "VcsDriver\n(parent)" as vcs
+participant "Cache" as cache
+participant "HttpDownloader" as http
+participant "GitHub API" as api
+participant "GitHub (Util)" as ghutil
+participant "GitDriver\n(fallback)" as gitdrv
+
+' ──────────────────────────────────────────────
+== Initialization ==
+' ──────────────────────────────────────────────
+
+repo -> ghd : initialize()
+activate ghd
+
+ghd -> cache : new Cache(io, cacheDir/{originUrl}/{owner}/{repo})
+activate cache
+cache --> ghd : cache instance
+deactivate cache
+
+ghd -> cache : setReadOnly(config[cache-read-only])
+
+note right of ghd
+  fetchRootIdentifier()
+  — determines default branch,
+    privacy & issue-tracker flags
+end note
+
+ghd -> vcs : getContents(apiUrl + "/repos/{owner}/{repo}")
+activate vcs
+vcs -> http : get(url, options)
+activate http
+http -> api : GET /repos/{owner}/{repo}
+activate api
+api --> http : repoData JSON\n(default_branch, private,\nhas_issues, archived)
+deactivate api
+http --> vcs : Response
+deactivate http
+vcs --> ghd : repoData
+deactivate vcs
+
+ghd -> ghd : set rootIdentifier, isPrivate,\nhasIssues, isArchived
+
+deactivate ghd
+
+' ──────────────────────────────────────────────
+== getComposerInformation(identifier) ==
+' ──────────────────────────────────────────────
+
+repo -> ghd : getComposerInformation(identifier)
+activate ghd
+
+ghd -> vcs : shouldCache(identifier)\n[regex: 40-char hex SHA?]
+activate vcs
+vcs --> ghd : bool
+deactivate vcs
+
+alt Cache HIT (identifier is a 40-char SHA)
+    ghd -> cache : read(identifier)
+    activate cache
+    cache --> ghd : raw JSON string
+    deactivate cache
+    ghd -> ghd : JsonFile::parseJson(res)
+
+else Cache MISS
+    ghd -> vcs : getBaseComposerInformation(identifier)
+    activate vcs
+
+    vcs -> ghd : getFileContent("composer.json", identifier)
+    activate ghd
+    ghd -> http : get(apiUrl + "/repos/{owner}/{repo}/\ncontents/composer.json?ref={identifier}")
+    activate http
+    http -> api : GET /repos/{owner}/{repo}/contents/composer.json?ref={id}
+    activate api
+    api --> http : base64-encoded file content\n(or encoding=none + git_url if > 1 MB)
+    deactivate api
+    http --> ghd : Response
+    deactivate http
+
+    alt File > 1 MB (encoding = none, git_url present)
+        ghd -> http : get(git_url) [raw blob endpoint]
+        activate http
+        http -> api : GET {git_url}
+        activate api
+        api --> http : raw file bytes
+        deactivate api
+        http --> ghd : raw content
+        deactivate http
+    end
+
+    ghd -> ghd : base64_decode(content)
+    ghd --> vcs : file content string
+    deactivate ghd
+
+    vcs --> ghd : composerData (parsed)
+    deactivate vcs
+
+    ghd -> cache : write(identifier, JsonFile::encode(composer))
+    activate cache
+    cache --> ghd : ok
+    deactivate cache
+end
+
+ghd -> ghd : enrich composer\n(support.source, support.issues,\nabandoned, funding)
+ghd --> repo : composerData array
+deactivate ghd
+
+' ──────────────────────────────────────────────
+== getTags() ==
+' ──────────────────────────────────────────────
+
+repo -> ghd : getTags()
+activate ghd
+
+loop paginate via Link header "next"
+    ghd -> http : get(apiUrl + "/repos/{owner}/{repo}/tags?per_page=100")
+    activate http
+    http -> api : GET /repos/{owner}/{repo}/tags?per_page=100
+    activate api
+    api --> http : [{name, commit.sha}, ...]\n+ Link header (next page)
+    deactivate api
+    http --> ghd : Response
+    deactivate http
+    ghd -> ghd : getNextPage(response)\nparse Link header
+end
+
+ghd --> repo : map[ tagName => sha ]
+deactivate ghd
+
+' ──────────────────────────────────────────────
+== getBranches() ==
+' ──────────────────────────────────────────────
+
+repo -> ghd : getBranches()
+activate ghd
+
+loop paginate via Link header "next"
+    ghd -> http : get(apiUrl + "/repos/{owner}/{repo}/git/refs/heads?per_page=100")
+    activate http
+    http -> api : GET /repos/{owner}/{repo}/git/refs/heads?per_page=100
+    activate api
+    api --> http : [{ref, object.sha}, ...]\n(skips "gh-pages" branch)
+    deactivate api
+    http --> ghd : Response
+    deactivate http
+    ghd -> ghd : getNextPage(response)\nparse Link header
+end
+
+ghd --> repo : map[ branchName => sha ]
+deactivate ghd
+
+' ──────────────────────────────────────────────
+== getDist(identifier) ==
+' ──────────────────────────────────────────────
+
+repo -> ghd : getDist(identifier)
+activate ghd
+note right of ghd
+  No HTTP call — URL is
+  constructed and returned directly
+end note
+ghd --> repo : { type: "zip",\n  url: apiUrl+"/repos/{owner}/{repo}/zipball/{id}",\n  reference: identifier,\n  shasum: "" }
+deactivate ghd
+
+' ──────────────────────────────────────────────
+== getSource(identifier) ==
+' ──────────────────────────────────────────────
+
+repo -> ghd : getSource(identifier)
+activate ghd
+note right of ghd
+  No HTTP call — URL chosen
+  based on isPrivate flag
+end note
+alt isPrivate
+    ghd --> repo : { type: "git", url: SSH url, reference: identifier }
+else public
+    ghd --> repo : { type: "git", url: HTTPS url, reference: identifier }
+end
+deactivate ghd
+
+' ──────────────────────────────────────────────
+== getContents() — Error Handling ==
+' ──────────────────────────────────────────────
+
+ghd -> vcs : parent::getContents(url)\n→ httpDownloader.get(url, options)
+activate vcs
+activate http
+http -> api : HTTP Request
+activate api
+
+alt TransportException 401 / 404
+    api --> http : 401 or 404
+    deactivate api
+    http --> vcs : TransportException
+    deactivate http
+    vcs --> ghd : exception
+    deactivate vcs
+
+    ghd -> ghutil : authorizeOAuth(originUrl)
+    activate ghutil
+    ghutil --> ghd : result
+    deactivate ghutil
+
+    alt not interactive (no TTY)
+        ghd -> ghd : attemptCloneFallback()\n→ setupGitDriver(sshUrl)
+        ghd -> gitdrv : new GitDriver([url], io, config,\n  httpDownloader, process)
+        activate gitdrv
+        ghd -> gitdrv : initialize()
+        gitdrv --> ghd : ready
+        note right of gitdrv
+          All subsequent VCS calls
+          are delegated to GitDriver
+        end note
+    else interactive (TTY available)
+        ghd -> ghutil : authorizeOAuthInteractively(originUrl, message)
+        activate ghutil
+        ghutil --> ghd : token stored
+        deactivate ghutil
+        ghd -> vcs : parent::getContents(url) [retry]
+        activate vcs
+        vcs --> ghd : content
+        deactivate vcs
+    end
+
+else TransportException 403 (rate limit)
+    api --> http : 403
+    deactivate api
+    http --> vcs : TransportException
+    deactivate http
+    vcs --> ghd : exception
+    deactivate vcs
+
+    ghd -> ghutil : isRateLimited(headers)\n/ getRateLimit(headers)
+    activate ghutil
+    ghutil --> ghd : rateLimitInfo
+    deactivate ghutil
+    ghd -> ghd : IOInterface::writeError(rate limit message)
+end
+
+deactivate gitdrv
+
+@enduml

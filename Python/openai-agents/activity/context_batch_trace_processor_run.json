@@ -1,0 +1,150 @@
+{
+  "scope": "batch_trace_processor_run",
+  "title": "Batch Trace Processor Run Loop",
+  "diagram_type": "activity",
+  "description": "Background daemon thread loop in BatchTraceProcessor: collects spans/traces into batches, exports completed batches via TracingExporter, flushes all on shutdown.",
+
+  "key_actors": [
+    "BatchTraceProcessor",
+    "background_worker_thread (_run)",
+    "Queue (thread-safe, maxsize=8192)",
+    "TracingExporter (BackendSpanExporter)",
+    "_export_lock (threading.Lock)",
+    "_shutdown_event (threading.Event)"
+  ],
+
+  "initialization": {
+    "class": "BatchTraceProcessor.__init__",
+    "params": {
+      "exporter": "TracingExporter",
+      "max_queue_size": 8192,
+      "max_batch_size": 128,
+      "schedule_delay": 5.0,
+      "export_trigger_ratio": 0.7
+    },
+    "derived": "_export_trigger_size = max(1, int(max_queue_size * export_trigger_ratio)) = 5734",
+    "thread_start": "Lazy — thread started on first on_trace_start() or on_span_end() call"
+  },
+
+  "entry_points": [
+    "on_trace_start(trace) → _ensure_thread_started() → queue.put_nowait(trace)",
+    "on_span_end(span)   → _ensure_thread_started() → queue.put_nowait(span)",
+    "on_trace_end(trace) → no-op",
+    "on_span_start(span) → no-op"
+  ],
+
+  "_ensure_thread_started": [
+    "Fast path: if worker_thread is alive → return immediately",
+    "Acquire _thread_start_lock (double-checked locking)",
+    "If still not alive → create daemon Thread(target=_run)",
+    "thread.start()"
+  ],
+
+  "main_loop_activity": {
+    "method": "_run(self)",
+    "steps": [
+      "WHILE _shutdown_event NOT set:",
+      "  Read current_time = time.time()",
+      "  Read queue_size = _queue.qsize()",
+      "  IF current_time >= _next_export_time OR queue_size >= _export_trigger_size:",
+      "    CALL _export_batches(force=False)",
+      "    RESET _next_export_time = time.time() + schedule_delay",
+      "  ELSE:",
+      "    time.sleep(0.2)  [short poll to avoid busy-wait]",
+      "EXIT LOOP (shutdown_event set)",
+      "CALL _export_batches(force=True)  [final drain of remaining items]"
+    ],
+    "conditions": {
+      "scheduled_export": "current_time >= _next_export_time  (every schedule_delay seconds, default 5s)",
+      "threshold_export": "queue_size >= _export_trigger_size  (70% of max_queue_size = 5734 items)",
+      "sleep_interval": "0.2 seconds when neither condition met"
+    }
+  },
+
+  "_export_batches_activity": {
+    "method": "_export_batches(self, force: bool)",
+    "steps": [
+      "Acquire _export_lock",
+      "LOOP:",
+      "  Collect items from queue up to max_batch_size (or all items if force=True)",
+      "  Handle queue.Empty exception (race condition between threads)",
+      "  IF items_to_export is empty → BREAK",
+      "  CALL _exporter.export(items_to_export)",
+      "  REPEAT loop until queue empty",
+      "Release _export_lock"
+    ],
+    "notes": "force=True ignores max_batch_size limit; force=False caps each batch at max_batch_size (128)"
+  },
+
+  "force_flush_activity": {
+    "method": "force_flush(self)",
+    "steps": [
+      "CALL _export_batches(force=True)",
+      "Acquires _export_lock → waits for any in-flight background export to finish first",
+      "Drains entire queue synchronously"
+    ]
+  },
+
+  "shutdown_activity": {
+    "method": "shutdown(self, timeout=None)",
+    "steps": [
+      "SET _shutdown_event",
+      "IF worker_thread is alive:",
+      "  worker_thread.join(timeout=timeout)  [wait for _run to finish final drain]",
+      "ELSE (thread never started):",
+      "  CALL _export_batches(force=True)  [synchronous flush]"
+    ]
+  },
+
+  "queue_overflow_handling": [
+    "on_trace_start: queue.Full → logger.warning('Queue is full, dropping trace.')",
+    "on_span_end:    queue.Full → logger.warning('Queue is full, dropping span.')"
+  ],
+
+  "exporter_retry_logic": {
+    "class": "BackendSpanExporter.export",
+    "endpoint": "https://api.openai.com/v1/traces/ingest",
+    "retry_conditions": ["5xx server errors", "httpx.RequestError (network failure)"],
+    "no_retry_conditions": ["4xx client errors"],
+    "backoff": "Exponential with 10% jitter, base_delay=1.0s, max_delay=30.0s, max_retries=3",
+    "grouping": "Items grouped by tracing_api_key before export",
+    "sanitization": "Input/output fields truncated to 100,000 bytes for OpenAI endpoint; usage keys filtered"
+  },
+
+  "threading_model": {
+    "daemon_thread": true,
+    "locks": ["_thread_start_lock (thread creation)", "_export_lock (export serialization)"],
+    "events": ["_shutdown_event (signals _run loop to stop)"],
+    "concurrency_note": "force_flush() and _run() both call _export_batches(); _export_lock ensures mutual exclusion"
+  },
+
+  "global_singletons": {
+    "_global_exporter": "BackendSpanExporter, lazily initialized",
+    "_global_processor": "BatchTraceProcessor wrapping global exporter, lazily initialized",
+    "default_exporter()": "Returns/creates _global_exporter",
+    "default_processor()": "Returns/creates _global_processor"
+  },
+
+  "key_relationships": [
+    "BatchTraceProcessor implements TracingProcessor",
+    "BackendSpanExporter implements TracingExporter",
+    "BatchTraceProcessor composes TracingExporter (injected)",
+    "BatchTraceProcessor composes queue.Queue[Trace | Span]",
+    "BatchTraceProcessor creates and owns background threading.Thread",
+    "TraceProvider registers BatchTraceProcessor; calls on_trace_start/on_span_end/force_flush/shutdown"
+  ],
+
+  "important_notes": [
+    "Traces enqueued on on_trace_start; Spans enqueued on on_span_end only (start is no-op)",
+    "Thread is daemon so process can exit without explicit shutdown",
+    "flush_traces() public API → DefaultTraceProvider.force_flush() → BatchTraceProcessor.force_flush()",
+    "Long-running workers (Celery, FastAPI) should call flush_traces() after each job for immediate delivery",
+    "Tracing disabled via OPENAI_AGENTS_DISABLE_TRACING=1 or set_tracing_disabled(True)"
+  ],
+
+  "source_files_analyzed": [
+    "src/agents/tracing/processors.py",
+    "tests/test_trace_processor.py",
+    "docs/tracing.md"
+  ]
+}

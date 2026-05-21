@@ -1,0 +1,230 @@
+{
+  "scope": "incremental_snapshot_execution",
+  "title": "Incremental Snapshot Execution",
+  "diagram_type": "activity",
+  "description": "Incremental snapshot chunked table scanning, watermark management, and signal-driven control flow",
+
+  "key_participants": [
+    "SignalProcessor",
+    "SignalChannelReader",
+    "SignalAction",
+    "AbstractIncrementalSnapshotChangeEventSource",
+    "IncrementalSnapshotContext",
+    "IncrementalSnapshotNotificationService",
+    "ChunkQueryBuilder",
+    "JdbcConnection",
+    "EventDispatcher",
+    "SnapshotProgressListener"
+  ],
+
+  "activity_flows": [
+    {
+      "flow": "SignalProcessor Lifecycle",
+      "steps": [
+        "start() → scheduleAtFixedRate(process(), pollInterval)",
+        "process() → acquireSemaphore(10s) → read all enabled channels → forEach: processSignal(record, null)",
+        "processSourceSignal(partition) → filter SourceSignalChannel only → processSignal(record, partition)",
+        "processSignal → lookup SignalAction by type → parse JSON data → getOffsets(partition, data) → executeSignal()",
+        "executeSignal → build SignalPayload(partition, id, type, data, offsetCtx, additionalData) → action.arrived(payload)",
+        "stop() → submit close of channels → shutdown executor → await termination → shutdownNow if timeout"
+      ]
+    },
+    {
+      "flow": "Snapshot Initialization (init)",
+      "steps": [
+        "init(partition, offsetContext)",
+        "[offsetContext == null] → postIncrementalSnapshotCompleted(); return",
+        "[!context.snapshotRunning()] → postIncrementalSnapshotCompleted(); return",
+        "preIncrementalSnapshotStart()",
+        "progressListener.snapshotStarted(partition)",
+        "readChunk(partition, offsetContext)"
+      ]
+    },
+    {
+      "flow": "Add Collections / Start Snapshot via Signal",
+      "steps": [
+        "addDataCollectionNamesToSnapshot(signalPayload, snapshotConfig)",
+        "expandAndDedupeDataCollectionIds(dataCollections) — expand regex patterns against schema",
+        "context.addDataCollectionNamesToSnapshot(correlationId, expandedIds, additionalConditions, surrogateKey)",
+        "validateSignalTableConfiguration(newDataCollections) — warn on cross-DB signal table",
+        "[shouldReadChunk=!context.snapshotRunning()] → progressListener.snapshotStarted()",
+        "→ notificationService.notifyStarted(context, partition, offsetContext)",
+        "→ progressListener.monitoredDataCollectionsDetermined()",
+        "→ readChunk(partition, offsetContext)"
+      ]
+    },
+    {
+      "flow": "Core Chunk Read Loop (readChunk)",
+      "steps": [
+        "readChunk(partition, offsetContext)",
+        "checkAndProcessStopFlag() — process pending stop requests",
+        "[!context.snapshotRunning()] → postIncrementalSnapshotCompleted(); return",
+        "[context.isSnapshotPaused()] → return (wait for resume signal)",
+        "preReadChunk(context) — validate/reconnect JDBC connection",
+        "jdbcConnection.commit()",
+        "context.startNewChunk()",
+        "emitWindowOpen(partition, offsetContext) — write low watermark to DB [abstract]",
+        "LOOP while context.snapshotRunning():",
+        "  isTableInvalid()? → [null schema] attempt retrieveAndRefreshSchema(); if still null → warnAndSkip(UNKNOWN_SCHEMA) → nextDataCollection(); continue",
+        "  isTableInvalid()? → [no PK cols] → warnAndSkip(NO_PRIMARY_KEY) → nextDataCollection(); continue",
+        "  [schemaChangesEnabled && !schemaHistoryIsUpToDate()] → break (recheck in next window)",
+        "  [context.maximumKey().isEmpty()] → query MAX PK: chunkQueryBuilder.buildMaxPrimaryKeyQuery()",
+        "    [SQLException] → notifyTableScanCompleted(SQL_EXCEPTION) → nextDataCollection(); continue",
+        "    [null result] → notifyTableScanCompleted(EMPTY) → nextDataCollection(); continue",
+        "    → context.maximumKey(maximumKey)",
+        "  createDataEventsForTable(partition):",
+        "    build selectStatement via chunkQueryBuilder.buildChunkQuery()",
+        "    execute PreparedStatement → iterate ResultSet → fill window{keyStruct→row}",
+        "    context.nextChunkPosition(lastKey)",
+        "    [returns false — schema changed] → context.revertChunk(); break",
+        "    [returns true, window empty] → notifyTableScanCompleted(SUCCEEDED) → tableScanCompleted() → nextDataCollection(); continue",
+        "    [returns true, window not empty] → notifyInProgress(context, partition, offsetContext); break",
+        "    [SQLException] → notifyTableScanCompleted(SQL_EXCEPTION) → nextDataCollection(); continue",
+        "emitWindowClose(partition, offsetContext) — write high watermark to DB [abstract]",
+        "finally: postReadChunk(context); [!snapshotRunning()] → postIncrementalSnapshotCompleted()"
+      ]
+    },
+    {
+      "flow": "Window Close / Watermark Processing",
+      "steps": [
+        "Signal 'snapshot-window-close' arrives → CloseIncrementalSnapshotWindow.arrived()",
+        "→ dispatcher.getIncrementalSnapshotChangeEventSource().closeWindow(partition, id, offsetContext)",
+        "closeWindow: context.closeWindow(id) → [false: window id mismatch] return",
+        "sendWindowEvents(partition, offsetContext):",
+        "  offsetContext.incrementalSnapshotEvents()",
+        "  for each row in window: sendEvent() → context.sendEvent(key) → dispatcher.dispatchSnapshotEvent()",
+        "  offsetContext.postSnapshotCompletion()",
+        "  window.clear()",
+        "readChunk(partition, offsetContext) — advance to next chunk"
+      ]
+    },
+    {
+      "flow": "Window Open Signal",
+      "steps": [
+        "Signal 'snapshot-window-open' arrives → OpenIncrementalSnapshotWindow.arrived()",
+        "→ signalPayload.offsetContext.getIncrementalSnapshotContext().openWindow(signalPayload.id)"
+      ]
+    },
+    {
+      "flow": "Pause Snapshot",
+      "steps": [
+        "Signal 'pause-snapshot' arrives → PauseIncrementalSnapshot.arrived()",
+        "→ source.pauseSnapshot(partition, offsetContext)",
+        "[context.snapshotRunning() && !context.isSnapshotPaused()] →",
+        "  context.pauseSnapshot()",
+        "  progressListener.snapshotPaused(partition)",
+        "  notificationService.notifyPaused(context, partition, offsetContext)"
+      ]
+    },
+    {
+      "flow": "Resume Snapshot",
+      "steps": [
+        "Signal 'resume-snapshot' arrives → ResumeIncrementalSnapshot.arrived()",
+        "→ source.resumeSnapshot(partition, offsetContext)",
+        "[context.snapshotRunning() && context.isSnapshotPaused()] →",
+        "  context.resumeSnapshot()",
+        "  progressListener.snapshotResumed(partition)",
+        "  notificationService.notifyResumed(context, partition, offsetContext)",
+        "  readChunk(partition, offsetContext)"
+      ]
+    },
+    {
+      "flow": "Stop Snapshot",
+      "steps": [
+        "requestStopSnapshot(partition, offsetContext, additionalData, dataCollectionIds)",
+        "→ context.requestSnapshotStop(dataCollectionIds)",
+        "checkAndProcessStopFlag() called on next readChunk():",
+        "  expandAndDedupeDataCollectionIds(dataCollectionsToStop)",
+        "  [current table in stop list] → tableScanCompleted(); stop current; [no more tables] → snapshotAborted()",
+        "  [other tables] → context.removeDataCollectionFromSnapshot(id)",
+        "  notifyAborted(context, partition, offsetContext, stoppedList)"
+      ]
+    },
+    {
+      "flow": "Schema Change Handling",
+      "steps": [
+        "processSchemaChange(partition, offsetContext, dataCollectionId)",
+        "[dataCollectionId == currentDataCollectionId] → rereadChunk(partition, offsetContext)",
+        "rereadChunk: [!snapshotRunning || !deduplicationNeeded || window empty] → return",
+        "window.clear() → context.revertChunk() → readChunk()"
+      ]
+    },
+    {
+      "flow": "nextDataCollection / Completion",
+      "steps": [
+        "nextDataCollection(partition, offsetContext)",
+        "context.nextDataCollection()",
+        "[!context.snapshotRunning()] → progressListener.snapshotCompleted(partition)",
+        "→ notificationService.notifyCompleted(context, partition, offsetContext)",
+        "→ context.unsetCorrelationId()"
+      ]
+    }
+  ],
+
+  "notification_states": [
+    "STARTED — on addDataCollectionNamesToSnapshot when snapshot begins; payload: data_collections",
+    "IN_PROGRESS — after each non-empty chunk; payload: data_collections, current_collection_in_progress, maximum_key, last_processed_key",
+    "TABLE_SCAN_COMPLETED — per-table finish; payload: scanned_collection, data_collections, total_rows_scanned, status(EMPTY|SUCCEEDED|SQL_EXCEPTION|NO_PRIMARY_KEY|UNKNOWN_SCHEMA)",
+    "PAUSED — on pauseSnapshot signal",
+    "RESUMED — on resumeSnapshot signal",
+    "ABORTED — on stop signal; payload: data_collections (stopped IDs)",
+    "COMPLETED — when all data collections exhausted"
+  ],
+
+  "signal_actions_registry": [
+    "snapshot-window-open → OpenIncrementalSnapshotWindow → context.openWindow(id)",
+    "snapshot-window-close → CloseIncrementalSnapshotWindow → source.closeWindow(partition, id, offsetCtx)",
+    "pause-snapshot → PauseIncrementalSnapshot → source.pauseSnapshot()",
+    "resume-snapshot → ResumeIncrementalSnapshot → source.resumeSnapshot()",
+    "execute-snapshot → (registered externally) → source.addDataCollectionNamesToSnapshot()",
+    "stop-snapshot → (registered externally) → source.requestStopSnapshot()"
+  ],
+
+  "key_relationships": [
+    "SignalProcessor aggregates List<SignalChannelReader> (enabled/all)",
+    "SignalProcessor aggregates Map<String,SignalAction> (registered by name)",
+    "SignalProcessor uses ScheduledExecutorService + Semaphore(1) for thread-safe polling",
+    "CloseIncrementalSnapshotWindow/PauseIncrementalSnapshot/ResumeIncrementalSnapshot depend_on EventDispatcher",
+    "AbstractIncrementalSnapshotChangeEventSource depends_on IncrementalSnapshotContext (state)",
+    "AbstractIncrementalSnapshotChangeEventSource depends_on ChunkQueryBuilder (SQL generation)",
+    "AbstractIncrementalSnapshotChangeEventSource depends_on JdbcConnection (query execution)",
+    "AbstractIncrementalSnapshotChangeEventSource depends_on NotificationService (lifecycle events)",
+    "AbstractIncrementalSnapshotChangeEventSource depends_on EventDispatcher (emit snapshot records)",
+    "IncrementalSnapshotNotificationService wraps NotificationService<P,O>",
+    "emitWindowOpen/emitWindowClose are abstract — implemented per connector (writes watermark rows to signaling table)"
+  ],
+
+  "branching_conditions": [
+    "offsetContext null → skip init entirely",
+    "!snapshotRunning → skip chunk / complete",
+    "isSnapshotPaused → halt readChunk until resume signal",
+    "isTableInvalid (null schema / no PK) → skip table, move to next",
+    "schemaChangesEnabled && !schemaHistoryUpToDate → close window, retry schema check",
+    "maximumKey empty → determine max PK first (SQL error or empty table → skip table)",
+    "createDataEventsForTable returns false (schema changed mid-chunk) → revertChunk",
+    "window empty after data query → table fully scanned, move to next",
+    "window not empty → emit IN_PROGRESS, break and wait for window-close signal",
+    "stopCurrentTableId != null → stop current table scan first, then others",
+    "!context.snapshotRunning() after nextDataCollection → COMPLETED"
+  ],
+
+  "important_notes": [
+    "Chunk watermarks: emitWindowOpen writes low watermark row, emitWindowClose writes high watermark row to signaling DB table",
+    "Window deduplication: CDC events arriving between open/close watermarks are deduplicated against the window buffer via deduplicateWindow()",
+    "Schema verification: two-window process — capture schema in window N, verify unchanged in window N+1",
+    "Multi-partition support: SignalProcessor maps signals to partitions via data-collections field or broadcasts to all",
+    "Semaphore(1) in SignalProcessor prevents concurrent process() and processSourceSignal() calls",
+    "correlationId from signal payload is threaded through all notifications for correlation",
+    "Signal channel types: SourceSignalChannel (in-stream), Kafka/JMX/File (external, polled)"
+  ],
+
+  "source_files_analyzed": [
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/notification/IncrementalSnapshotNotificationService.java",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/signal/SignalProcessor.java",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/source/snapshot/incremental/AbstractIncrementalSnapshotChangeEventSource.java",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/signal/actions/snapshotting/OpenIncrementalSnapshotWindow.java",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/signal/actions/snapshotting/CloseIncrementalSnapshotWindow.java",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/signal/actions/snapshotting/PauseIncrementalSnapshot.java",
+    "debezium-connector-common/src/main/java/io/debezium/pipeline/signal/actions/snapshotting/ResumeIncrementalSnapshot.java"
+  ]
+}

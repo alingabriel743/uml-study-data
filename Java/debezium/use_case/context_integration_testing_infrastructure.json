@@ -1,0 +1,158 @@
+{
+  "scope": "integration_testing_infrastructure",
+  "title": "Integration Testing Infrastructure",
+  "diagram_type": "use_case",
+  "description": "Test engineer spins up containerized databases, Schema Registry, and Kafka for integration tests using Testcontainers + Quarkus lifecycle managers.",
+
+  "actors": [
+    {
+      "name": "TestEngineer",
+      "type": "primary",
+      "description": "Runs Quarkus integration test suite; triggers container lifecycle via @QuarkusTestResource annotations"
+    },
+    {
+      "name": "QuarkusTestFramework",
+      "type": "system",
+      "description": "Calls start()/stop() on all registered QuarkusTestResourceLifecycleManager implementations before/after test runs"
+    },
+    {
+      "name": "Docker/Testcontainers",
+      "type": "external",
+      "description": "Underlying container runtime; provisions and destroys container instances"
+    }
+  ],
+
+  "system_boundary": "Integration Test Infrastructure (debezium-testing-testcontainers + binlog test utilities)",
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Start PostgreSQL Container",
+      "actor": "QuarkusTestFramework",
+      "manager": "PostgresTestResourceLifecycleManager",
+      "description": "Starts a GenericContainer with quay.io/debezium/example-postgres, waits for 'database system is ready' log (2 occurrences, 30s timeout), exposes port 5432, returns debezium.source.database.* config params.",
+      "method": "start(): Map<String,String>",
+      "config_params": [
+        "debezium.source.database.hostname=localhost",
+        "debezium.source.database.port=<mapped>",
+        "debezium.source.database.user=postgres",
+        "debezium.source.database.password=postgres",
+        "debezium.source.database.dbname=postgres"
+      ],
+      "container_image": "quay.io/debezium/example-postgres",
+      "container_port": 5432
+    },
+    {
+      "id": "UC2",
+      "name": "Stop PostgreSQL Container",
+      "actor": "QuarkusTestFramework",
+      "manager": "PostgresTestResourceLifecycleManager",
+      "description": "Calls container.stop(); exceptions are swallowed.",
+      "method": "stop(): void"
+    },
+    {
+      "id": "UC3",
+      "name": "Start Apicurio Schema Registry Container",
+      "actor": "QuarkusTestFramework",
+      "manager": "ApicurioTestResourceLifeCycleManager",
+      "description": "Starts ApicurioRegistryContainer (quay.io/apicurio/apicurio-registry-mem), waits for 'apicurio-registry-app.*started in' log. Returns Apicurio URL config params.",
+      "method": "start(): Map<String,String>",
+      "config_params": [
+        "debezium.format.apicurio.registry.url=http://<host>:<port>/apis/registry/v2",
+        "debezium.format.apicurio.registry.auto-register=true",
+        "debezium.format.apicurio.registry.find-latest=true"
+      ],
+      "container_image": "quay.io/apicurio/apicurio-registry-mem:<version>",
+      "container_port": 8080,
+      "version_resolution": "System property debezium.test.apicurio.version OR ContainerImageVersions.getStableVersion()"
+    },
+    {
+      "id": "UC4",
+      "name": "Stop Apicurio Container",
+      "actor": "QuarkusTestFramework",
+      "manager": "ApicurioTestResourceLifeCycleManager",
+      "description": "Calls container.stop(); exceptions are swallowed.",
+      "method": "stop(): void"
+    },
+    {
+      "id": "UC5",
+      "name": "Start Kafka + Schema Registry Containers",
+      "actor": "QuarkusTestFramework",
+      "manager": "SchemaRegistryTestResourceLifecycleManager",
+      "description": "Starts KafkaContainer (quay.io/debezium/confluentinc-cp-kafka:7.2.10) and SchemaRegistryContainer on a shared Docker network. Uses Startables.deepStart() to start both in parallel. SchemaRegistry depends on Kafka, 90s timeout. Returns Schema Registry URL.",
+      "method": "start(): Map<String,String>",
+      "config_params": [
+        "debezium.format.schema.registry.url=http://<host>:<port>"
+      ],
+      "container_images": {
+        "kafka": "quay.io/debezium/confluentinc-cp-kafka:7.2.10 (as confluentinc/cp-kafka substitute)",
+        "schema_registry": "SchemaRegistryContainer (custom)"
+      },
+      "network": "shared Docker network",
+      "startup": "Startables.deepStart(Stream.of(kafkaContainer, schemaRegistryContainer)).join()",
+      "schema_registry_port": 8081,
+      "kafka_startup_timeout": "90s"
+    },
+    {
+      "id": "UC6",
+      "name": "Stop Schema Registry Container",
+      "actor": "QuarkusTestFramework",
+      "manager": "SchemaRegistryTestResourceLifecycleManager",
+      "description": "Calls schemaRegistryContainer.stop() only (Kafka container not explicitly stopped here). Exceptions swallowed.",
+      "method": "stop(): void"
+    },
+    {
+      "id": "UC7",
+      "name": "Obtain Binlog Test Database Connection",
+      "actor": "TestEngineer",
+      "manager": "TestConnectionService",
+      "description": "Uses ServiceLoader<TestConnectionProvider> to discover the first registered provider (MySQL or MariaDB via META-INF/services). Delegates to provider.forTestDatabase(databaseName). Default database name is 'mysql'.",
+      "methods": [
+        "forTestDatabase(String databaseName): BinlogTestConnection",
+        "forTestDatabase(): BinlogTestConnection  // defaults to 'mysql'"
+      ],
+      "spi_providers": [
+        "MySqlTestConnectionProvider (debezium-connector-mysql)",
+        "MariaDbTestConnectionProvider (debezium-connector-mariadb)"
+      ]
+    },
+    {
+      "id": "UC8",
+      "name": "Resolve Apicurio Registry URL",
+      "actor": "TestEngineer",
+      "manager": "ApicurioTestResourceLifeCycleManager",
+      "description": "Static helper method returns the running Apicurio container's URL for use in test assertions or manual config.",
+      "method": "getApicurioUrl(): String  // http://<host>:<mappedPort>/apis/registry/v2"
+    }
+  ],
+
+  "key_relationships": [
+    "PostgresTestResourceLifecycleManager implements QuarkusTestResourceLifecycleManager",
+    "ApicurioTestResourceLifeCycleManager implements QuarkusTestResourceLifecycleManager",
+    "SchemaRegistryTestResourceLifecycleManager implements QuarkusTestResourceLifecycleManager",
+    "ApicurioTestResourceLifeCycleManager composes ApicurioRegistryContainer",
+    "ApicurioRegistryContainer extends GenericContainer<ApicurioRegistryContainer>",
+    "PostgresTestResourceLifecycleManager composes GenericContainer<?>",
+    "SchemaRegistryTestResourceLifecycleManager composes KafkaContainer + SchemaRegistryContainer",
+    "SchemaRegistryContainer depends_on KafkaContainer (Testcontainers dependsOn + shared network)",
+    "TestConnectionService uses ServiceLoader<TestConnectionProvider> (SPI pattern)",
+    "TestConnectionProvider implementations: MySqlTestConnectionProvider, MariaDbTestConnectionProvider",
+    "TestConnectionProvider produces BinlogTestConnection"
+  ],
+
+  "include_exclude_notes": [
+    "All three lifecycle managers are static singletons (static final container fields) — shared across test instances",
+    "PostgresTestResourceLifecycleManager exposes getContainer() static accessor for direct container access",
+    "ApicurioRegistryContainer version resolved at runtime from system property or ContainerImageVersions utility",
+    "SchemaRegistryTestResourceLifecycleManager uses Slf4jLogConsumer for container logs",
+    "TestConnectionService is stateless utility; actual connection logic is in BinlogTestConnection (not analysed here)"
+  ],
+
+  "source_files_analyzed": [
+    "debezium-testing/debezium-testing-testcontainers/src/main/java/io/debezium/testing/testcontainers/PostgresTestResourceLifecycleManager.java",
+    "debezium-testing/debezium-testing-testcontainers/src/main/java/io/debezium/testing/testcontainers/ApicurioTestResourceLifeCycleManager.java",
+    "debezium-testing/debezium-testing-testcontainers/src/main/java/io/debezium/testing/testcontainers/SchemaRegistryTestResourceLifecycleManager.java",
+    "debezium-testing/debezium-testing-testcontainers/src/main/java/io/debezium/testing/testcontainers/ApicurioRegistryContainer.java",
+    "debezium-connector-binlog/src/test/java/io/debezium/connector/binlog/util/TestConnectionService.java"
+  ]
+}

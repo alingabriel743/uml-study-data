@@ -1,0 +1,151 @@
+{
+  "scope": "wp_rest_base_controller_flow",
+  "title": "WordPress REST Base Controller Lifecycle",
+  "diagram_type": "activity",
+  "source_files_analyzed": [
+    "tests/Frameworks/WordPress/Version_6_1/wp-includes/rest-api/endpoints/class-wp-rest-controller.php"
+  ],
+
+  "class_overview": {
+    "name": "WP_REST_Controller",
+    "type": "abstract class",
+    "since": "4.7.0",
+    "php_attribute": "#[AllowDynamicProperties]",
+    "protected_properties": ["$namespace", "$rest_base", "$schema"],
+    "role": "Core base controller for managing and interacting with REST API items. All CRUD stubs return WP_Error('invalid-method', 405) — subclasses must override."
+  },
+
+  "activity_phases": [
+    {
+      "phase": "1. Route Registration",
+      "method": "register_routes()",
+      "behavior": "STUB — calls _doing_it_wrong() if not overridden. Subclass must call register_rest_route() here.",
+      "output": "Routes registered with WP REST server"
+    },
+    {
+      "phase": "2. Permission Gate (per CRUD operation)",
+      "methods": [
+        "get_items_permissions_check($request) → true|WP_Error",
+        "get_item_permissions_check($request) → true|WP_Error",
+        "create_item_permissions_check($request) → true|WP_Error",
+        "update_item_permissions_check($request) → true|WP_Error",
+        "delete_item_permissions_check($request) → true|WP_Error"
+      ],
+      "behavior": "All stubs return WP_Error(status=405). Subclass overrides check current_user_can() or custom auth logic. REST server calls permission check BEFORE action method.",
+      "branch": "If WP_Error returned → REST server rejects request with error response. If true → proceed to action."
+    },
+    {
+      "phase": "3. CRUD Action",
+      "methods": [
+        "get_items($request) → WP_REST_Response|WP_Error",
+        "get_item($request) → WP_REST_Response|WP_Error",
+        "create_item($request) → WP_REST_Response|WP_Error",
+        "update_item($request) → WP_REST_Response|WP_Error",
+        "delete_item($request) → WP_REST_Response|WP_Error"
+      ],
+      "behavior": "All stubs return WP_Error(status=405). Subclass implements DB query/write logic."
+    },
+    {
+      "phase": "4a. Prepare for Database (write path only)",
+      "method": "prepare_item_for_database($request) → object|WP_Error",
+      "visibility": "protected",
+      "behavior": "STUB — maps WP_REST_Request fields to DB object structure. Called internally by create_item/update_item in subclasses before DB insert/update.",
+      "internal_call_chain": "create_item/update_item → prepare_item_for_database($request) → [DB write]"
+    },
+    {
+      "phase": "4b. Prepare for Response (read path)",
+      "method": "prepare_item_for_response($item, $request) → WP_REST_Response|WP_Error",
+      "behavior": "STUB — maps DB/model object to REST response shape. Must be overridden. Subclass calls add_additional_fields_to_object() and filter_response_by_context() here.",
+      "internal_call_chain": "prepare_item_for_response → add_additional_fields_to_object($prepared, $request) → filter_response_by_context($data, $context)"
+    },
+    {
+      "phase": "5. Context Filtering",
+      "method": "filter_response_by_context($data, $context) → array",
+      "behavior": "CONCRETE — calls get_item_schema() then rest_filter_response_by_context($data, $schema, $context). Removes fields whose schema 'context' array does not include the request context (view/edit/embed).",
+      "internal_call_chain": "filter_response_by_context → get_item_schema() → rest_filter_response_by_context()"
+    },
+    {
+      "phase": "6. Collection Assembly",
+      "method": "prepare_response_for_collection($response) → array",
+      "behavior": "CONCRETE — unwraps WP_REST_Response: calls $response->get_data(), rest_get_server(), WP_REST_Server::get_compact_response_links($response). Injects '_links' key if present.",
+      "used_by": "get_items() in subclasses iterates items, calls prepare_item_for_response(), then prepare_response_for_collection() per item."
+    }
+  ],
+
+  "supporting_methods": [
+    "get_item_schema() → calls add_additional_fields_schema([]); returns JSON Schema array; result cached in $schema",
+    "get_public_item_schema() → calls get_item_schema(), strips 'arg_options' from each property",
+    "get_collection_params() → returns context, page (default=1, min=1), per_page (default=10, min=1, max=100), search",
+    "get_context_param($args=[]) → builds context enum from schema properties; merges with $args",
+    "get_fields_for_response($request) → filters schema properties by context + _fields param; always includes _links/_embedded",
+    "get_endpoint_args_for_item_schema($method=CREATABLE) → calls rest_get_endpoint_args_for_schema(get_item_schema(), $method)",
+    "add_additional_fields_to_object($prepared, $request) → protected; reads $wp_rest_additional_fields global; calls get_callback per registered field",
+    "update_additional_fields_for_object($object, $request) → protected; calls update_callback per registered additional field",
+    "add_additional_fields_schema($schema) → protected; merges registered field schemas into main schema",
+    "get_additional_fields($object_type=null) → protected; reads global $wp_rest_additional_fields",
+    "get_object_type() → protected; returns $schema['title']",
+    "sanitize_slug($slug) → calls sanitize_title($slug)"
+  ],
+
+  "key_flows": [
+    {
+      "flow": "READ collection (GET /namespace/base)",
+      "steps": [
+        "REST server → get_items_permissions_check($request)",
+        "[WP_Error?] → reject 403/401 OR continue",
+        "→ get_items($request)",
+        "  loop: prepare_item_for_response($item, $request)",
+        "    → add_additional_fields_to_object($prepared, $request)",
+        "    → filter_response_by_context($data, $context)",
+        "      → get_item_schema() → rest_filter_response_by_context()",
+        "  → prepare_response_for_collection($response)",
+        "    → $response->get_data() + WP_REST_Server::get_compact_response_links()",
+        "→ return WP_REST_Response (collection)"
+      ]
+    },
+    {
+      "flow": "WRITE (POST/PUT/PATCH /namespace/base)",
+      "steps": [
+        "REST server → create_item_permissions_check($request) / update_item_permissions_check($request)",
+        "[WP_Error?] → reject OR continue",
+        "→ create_item($request) / update_item($request)",
+        "  → prepare_item_for_database($request) → [DB insert/update]",
+        "  → update_additional_fields_for_object($object, $request)",
+        "  → prepare_item_for_response($saved_item, $request)",
+        "→ return WP_REST_Response (single item)"
+      ]
+    },
+    {
+      "flow": "DELETE (DELETE /namespace/base/id)",
+      "steps": [
+        "REST server → delete_item_permissions_check($request)",
+        "[WP_Error?] → reject OR continue",
+        "→ delete_item($request) → [DB delete]",
+        "→ return WP_REST_Response (deleted item or empty)"
+      ]
+    }
+  ],
+
+  "decision_points": [
+    "permission_check returns WP_Error → REST server returns error response (no action called)",
+    "permission_check returns true → action method is invoked",
+    "prepare_item_for_database returns WP_Error → create/update aborts",
+    "filter_response_by_context: field schema has 'context' array → field included only if request context is in that array",
+    "get_fields_for_response: _fields param present → intersect with schema fields; absent → return all schema fields for context",
+    "prepare_response_for_collection: $response not WP_REST_Response instance → return as-is",
+    "add_additional_fields_schema: schema has no 'title' → return schema unchanged"
+  ],
+
+  "context_values": ["view", "edit", "embed"],
+  "error_type": "WP_Error with code 'invalid-method', HTTP status 405 for all unimplemented stubs",
+
+  "known_subclasses": [
+    "WP_REST_Posts_Controller", "WP_REST_Users_Controller", "WP_REST_Terms_Controller",
+    "WP_REST_Attachments_Controller", "WP_REST_Revisions_Controller", "WP_REST_Themes_Controller",
+    "WP_REST_Taxonomies_Controller", "WP_REST_Post_Types_Controller", "WP_REST_Post_Statuses_Controller",
+    "WP_REST_Settings_Controller", "WP_REST_Blocks_Controller", "WP_REST_Block_Renderer_Controller",
+    "WP_REST_Search_Controller"
+  ],
+
+  "important_notes": "Abstract class since WP 4.7.0. $schema property (since 5.3.0) caches get_item_schema() result for performance. All CRUD methods + permission checks are template stubs (405 WP_Error). Only prepare_response_for_collection, filter_response_by_context, get_collection_params, get_context_param, get_fields_for_response, sanitize_slug are concrete implementations. The REST server enforces permission-check → action ordering externally."
+}

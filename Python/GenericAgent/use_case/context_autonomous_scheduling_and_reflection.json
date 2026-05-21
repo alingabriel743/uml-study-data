@@ -1,0 +1,139 @@
+{
+  "scope": "autonomous_scheduling_and_reflection",
+  "title": "Autonomous Scheduling & Reflection",
+  "diagram_type": "use_case",
+  "actors": [
+    {
+      "name": "Scheduler",
+      "type": "system",
+      "description": "Time-driven trigger that polls every 120s (INTERVAL=120); uses socket port-lock (127.0.0.1:45762) to prevent duplicate instances"
+    },
+    {
+      "name": "AutonomousMonitor",
+      "type": "system",
+      "description": "Idle-time watcher that fires every 1800s (INTERVAL=1800, ONCE=False) when user has been absent >30 minutes"
+    },
+    {
+      "name": "Agent",
+      "type": "primary",
+      "description": "LLM agent that receives trigger prompts and executes scheduled or autonomous tasks"
+    },
+    {
+      "name": "TaskFileSystem",
+      "type": "external",
+      "description": "sche_tasks/ directory holding JSON task definitions; sche_tasks/done/ for completion records"
+    },
+    {
+      "name": "L4ArchiveSystem",
+      "type": "external",
+      "description": "compress_session.batch_process() called silently every 12h from within scheduler.check()"
+    }
+  ],
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Trigger Scheduled Task",
+      "actor": "Scheduler",
+      "source": "reflect/scheduler.py :: check()",
+      "description": "Scheduler.check() scans sche_tasks/*.json, evaluates enabled flag, schedule time (HH:MM), repeat cadence, max_delay_hours window, and cooldown period; returns a prompt string or None",
+      "steps": [
+        "Read all .json files in TASKS dir",
+        "Skip if task.enabled == False",
+        "Parse schedule HH:MM and repeat field",
+        "Skip weekday tasks on weekends",
+        "Skip if current time < scheduled time",
+        "Skip if elapsed time > max_delay_hours (default 6h)",
+        "Compute cooldown via _parse_cooldown(repeat)",
+        "Check _last_run() against done/ filenames",
+        "If cooldown not expired: skip",
+        "Return prompt string: '[定时任务] {tid}\\n[报告路径] {rpt}\\n\\n先读 scheduled_task_sop...{prompt}'"
+      ]
+    },
+    {
+      "id": "UC2",
+      "name": "Trigger Autonomous Mode",
+      "actor": "AutonomousMonitor",
+      "source": "reflect/autonomous.py :: check()",
+      "description": "Returns fixed instruction string after 30-minute user-absence threshold, directing Agent to read autonomous SOP and run self-directed tasks",
+      "return_value": "[AUTO]🤖 用户已经离开超过30分钟，作为自主智能体，请阅读自动化sop，执行自动任务。"
+    },
+    {
+      "id": "UC3",
+      "name": "Archive L4 Sessions",
+      "actor": "Scheduler",
+      "source": "reflect/scheduler.py :: check() (embedded cron)",
+      "description": "Every 12h, silently calls compress_session.batch_process(raw_dir, dry_run=False) on temp/model_responses/; independent of task scheduling"
+    },
+    {
+      "id": "UC4",
+      "name": "Read Task TODO",
+      "actor": "Agent",
+      "source": "memory/autonomous_operation_sop/helper.py :: get_todo()",
+      "description": "Agent reads temp/TODO.txt to discover pending autonomous tasks; returns file contents or 'not found' message"
+    },
+    {
+      "id": "UC5",
+      "name": "Read Task History",
+      "actor": "Agent",
+      "source": "memory/autonomous_operation_sop/helper.py :: get_history(n=20)",
+      "description": "Agent reads first n lines of autonomous_reports/history.txt (newest-first) to review prior executions"
+    },
+    {
+      "id": "UC6",
+      "name": "Get TODO File Path",
+      "actor": "Agent",
+      "source": "memory/autonomous_operation_sop/helper.py :: set_todo()",
+      "description": "Returns absolute path of TODO.txt so agent or sub-agent can directly read/write it"
+    },
+    {
+      "id": "UC7",
+      "name": "Complete Autonomous Task",
+      "actor": "Agent",
+      "source": "memory/autonomous_operation_sop/helper.py :: complete_task(taskname, historyline, report_path)",
+      "description": "Atomic task completion: (1) moves report → autonomous_reports/R{N}_{taskname}.md, (2) prepends R{N}|date|historyline to history.txt, (3) returns instruction for agent to mark TODO done",
+      "steps": [
+        "Validate historyline is single-line",
+        "Resolve and verify report_path exists",
+        "Call _next_report_number() → scan history.txt for max R{N}",
+        "shutil.move(report → R{N}_{safe_name}.md)",
+        "Prepend formatted line to history.txt (rollback on failure)",
+        "Return success message + '👉 请在TODO.txt中将对应任务标记为 [x] R{N}'"
+      ]
+    }
+  ],
+  "relationships": [
+    "Scheduler includes UC3 (L4 archive runs inside every check() call)",
+    "Scheduler triggers UC1 → Agent executes scheduled task (reads scheduled_task_sop)",
+    "AutonomousMonitor triggers UC2 → Agent executes autonomous task (reads autonomous_operation_sop)",
+    "Agent uses UC4 (get_todo) during autonomous workflow",
+    "Agent uses UC5 (get_history) during autonomous workflow",
+    "Agent uses UC6 (set_todo) to locate task list",
+    "Agent uses UC7 (complete_task) after finishing any autonomous task",
+    "UC1 extends UC7: scheduled tasks also write to done/ dir (different path from autonomous reports)"
+  ],
+  "key_data_flows": [
+    "scheduler.check() → JSON task files (sche_tasks/*.json) → returns prompt string to agent harness",
+    "autonomous.check() → fixed string → agent harness invokes agent with SOP instruction",
+    "helper.complete_task() → moves .md report → autonomous_reports/R{N}_*.md",
+    "helper.complete_task() → prepends line → autonomous_reports/history.txt",
+    "scheduler.check() L4 branch → compress_session.batch_process() → temp/model_responses/"
+  ],
+  "task_json_schema": {
+    "fields": ["enabled (bool)", "repeat (once|daily|weekday|weekly|monthly|every_Nh|every_Nm|every_Nd)", "schedule (HH:MM)", "max_delay_hours (int, default 6)", "prompt (str)"],
+    "done_filename_pattern": "YYYY-MM-DD_HHMM_{tid}.md"
+  },
+  "repeat_cadences": {
+    "once": "999999 days cooldown",
+    "daily": "20h cooldown",
+    "weekday": "20h cooldown, skip Sat/Sun",
+    "weekly": "6 days cooldown",
+    "monthly": "27 days cooldown",
+    "every_Nh/m/d": "N hours/minutes/days cooldown"
+  },
+  "important_notes": "Scheduler uses port-lock (socket bind 127.0.0.1:45762) to enforce single-instance. autonomous.py is minimal (6 lines) — all SOP logic lives in helper.py and external SOP files. complete_task() has rollback: if history write fails, report is moved back. Both modules use INTERVAL+ONCE pattern for agent harness polling.",
+  "source_files_analyzed": [
+    "reflect/scheduler.py",
+    "reflect/autonomous.py",
+    "memory/autonomous_operation_sop/helper.py"
+  ]
+}

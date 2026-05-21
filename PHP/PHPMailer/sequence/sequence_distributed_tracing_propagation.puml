@@ -1,0 +1,173 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Distributed Tracing Propagation Flow
+
+participant "Upstream\nService" as upstream #D0E8FF
+participant "Server\nIntegration\n(e.g. Swoole)" as serverInt #F8F9FA
+participant "DDTrace\nExtension" as ddtrace #C8E6C9
+participant "SpanContext" as spanCtx #F3E5F5
+participant "Application\nCode" as appCode #FFF9C4
+participant "Client\nIntegration\n(e.g. Guzzle)" as clientInt #F8F9FA
+participant "Downstream\nService" as downstream #D0E8FF
+
+== INBOUND: Distributed Trace Header Extraction ==
+
+upstream -> serverInt : HTTP request\n[x-datadog-trace-id, x-datadog-parent-id,\nx-datadog-sampling-priority, x-datadog-origin,\nx-datadog-tags, traceparent, tracestate, baggage]
+activate serverInt
+
+serverInt -> serverInt : extract headers\nfrom request into map
+note right of serverInt
+  Callable form (Swoole):
+  fn($key) => $headers[$key] ?? null
+  Null form: reads $_SERVER directly
+  (auto-instrumentation)
+end note
+
+serverInt -> ddtrace : consume_distributed_tracing_headers(\n  array|callable|null $headersOrCallback)
+activate ddtrace
+
+ddtrace -> ddtrace : parse x-datadog-* headers\n(trace-id, parent-id, sampling-priority,\norigin, tags)
+ddtrace -> ddtrace : parse W3C headers\n(traceparent, tracestate)
+ddtrace -> ddtrace : parse baggage header
+ddtrace -> ddtrace : set internal distributed\ntrace context
+
+ddtrace --> serverInt : [void — context stored internally]
+deactivate ddtrace
+deactivate serverInt
+
+== OPENTRACING PATH: Extract (alternative to native DDTrace) ==
+
+note over serverInt, spanCtx
+  OpenTracing Propagator::extract() wraps the same
+  underlying consume_distributed_tracing_headers mechanism
+end note
+
+serverInt -> spanCtx : Propagator::extract($carrier)
+activate spanCtx
+
+spanCtx -> ddtrace : consume_distributed_tracing_headers equivalent
+activate ddtrace
+ddtrace --> spanCtx : distributed context applied
+deactivate ddtrace
+
+spanCtx -> spanCtx : new SpanContext(\n  traceId, spanId, parentId,\n  baggageItems,\n  isDistributedTracingActivationContext=true)
+
+alt isDistributedTracingActivationContext && no active_span
+    spanCtx -> ddtrace : set_distributed_tracing_context(\n  traceId, spanId, origin)
+    activate ddtrace
+    ddtrace --> spanCtx : bool (success)
+    deactivate ddtrace
+
+    spanCtx -> ddtrace : start_span()
+    activate ddtrace
+    ddtrace --> spanCtx : new span started
+    deactivate ddtrace
+end
+
+spanCtx -> spanCtx : setPropagatedPrioritySampling(\n  parentContext.getPropagatedPrioritySampling())
+
+spanCtx --> serverInt : SpanContextInterface
+deactivate spanCtx
+
+== CONTEXT INSPECTION ==
+
+appCode -> ddtrace : current_context()
+activate ddtrace
+ddtrace --> appCode : array{ trace_id, span_id,\n  version, env }
+deactivate ddtrace
+
+note over appCode, ddtrace
+  Useful for log correlation and manual
+  instrumentation scenarios
+end note
+
+== OUTBOUND: Distributed Trace Header Injection ==
+
+appCode -> clientInt : HTTP client call\n(e.g. GuzzleHttp\\Client::transfer)
+activate clientInt
+
+clientInt -> ddtrace : ddtrace_config_distributed_tracing_enabled()
+activate ddtrace
+ddtrace --> clientInt : bool
+deactivate ddtrace
+
+note over clientInt
+  Style selection controlled by
+  DD_TRACE_PROPAGATION_STYLE_INJECT env var.
+  WARNING: try_drop_span() will FAIL if
+  generate_distributed_tracing_headers()
+  was already called on that span.
+end note
+
+clientInt -> ddtrace : generate_distributed_tracing_headers(\n  array|null $inject_styles)
+activate ddtrace
+ddtrace --> clientInt : array{\n  x-datadog-trace-id,\n  x-datadog-parent-id,\n  x-datadog-sampling-priority,\n  x-datadog-origin,\n  x-datadog-tags,\n  traceparent,\n  tracestate,\n  baggage\n}
+deactivate ddtrace
+
+loop for each dt header not already present
+    clientInt -> clientInt : withHeader(name, value)
+end
+
+clientInt -> downstream : HTTP request\nwith injected tracing headers
+deactivate clientInt
+
+== OPENTRACING PATH: Inject (alternative to native DDTrace) ==
+
+note over appCode, clientInt
+  OpenTracing Propagator::inject() wraps the same
+  underlying generate_distributed_tracing_headers mechanism
+end note
+
+appCode -> spanCtx : Propagator::inject(\n  SpanContextInterface $spanContext, &$carrier)
+activate spanCtx
+
+spanCtx -> ddtrace : generate_distributed_tracing_headers equivalent
+activate ddtrace
+ddtrace --> spanCtx : headers written into carrier map
+deactivate ddtrace
+
+spanCtx --> appCode : [carrier populated with trace headers]
+deactivate spanCtx
+
+== MANUAL CONTEXT RESET ==
+
+appCode -> ddtrace : set_distributed_tracing_context('0', '0')
+activate ddtrace
+note right of ddtrace
+  Resets distributed trace context.
+  traceId='0', parentId='0' signals
+  a clean context with no parent.
+end note
+ddtrace --> appCode : bool (true on success)
+deactivate ddtrace
+
+@enduml

@@ -1,0 +1,129 @@
+{
+  "scope": "sampling_inference_pipeline",
+  "title": "Sampling / Inference Pipeline",
+  "diagram_type": "activity",
+  "source_files_analyzed": ["Lyra-1/sample.py"],
+
+  "entry_point": "__main__ → main(config)",
+
+  "activities": [
+    {
+      "function": "__main__",
+      "steps": [
+        "Parse CLI args: --config, --config_default",
+        "load_and_merge_configs([config_default, config])",
+        "OmegaConf.from_dotlist(unknown) → merge CLI overrides",
+        "Call main(config)"
+      ]
+    },
+    {
+      "function": "main(config, **kwargs)",
+      "steps": [
+        "Read config.target_index_manual",
+        "[BRANCH] If target_index_manual is None AND start_idx set → build range list",
+        "[BRANCH] If target_index_manual is a list (batch bullet-time mode):",
+        "  → LOOP over each target_index_manual_i",
+        "     → Set config.target_index_manual = i",
+        "     → Call main_single(config, **kwargs)",
+        "     → Cache returned transformer, vae, distributed_state, ckpt_path in kwargs (model reuse)",
+        "[ELSE] Single bullet-time or static: Call main_single(config, **kwargs)"
+      ]
+    },
+    {
+      "function": "load_model(ckpt_path, config, weight_dtype)",
+      "steps": [
+        "PartialState() → get distributed device",
+        "load_vae(config.vae_backbone, config.vae_path) → vae",
+        "LatentRecon(config) → transformer",
+        "torch.load(ckpt_path) → data",
+        "transformer.load_state_dict(data['module'])",
+        "Cast transformer + vae to (device, weight_dtype)",
+        "transformer.eval(); vae.eval()",
+        "Return (transformer, vae, distributed_state)"
+      ]
+    },
+    {
+      "function": "main_single(config, seed, transformer, vae, distributed_state, ckpt_path)",
+      "steps": [
+        "Set weight_dtype = bfloat16, init Generator, seed_everything(seed)",
+        "Load / merge main_config via OmegaConf.load or load_and_merge_configs",
+        "[BRANCH] Resolve ckpt_path:",
+        "  → If ckpt_path None and config.ckpt_path None: get_most_recent_checkpoint(ckpts_path)",
+        "  → Else: use config.ckpt_path directly",
+        "Extract ckpt_name from path via regex (checkpoint-N pattern)",
+        "Append ckpt_name / dataset_name / bullet_time index to outdir",
+        "[GUARD] Raise ValueError if ckpt file not found",
+        "Apply config overrides to main_config (set_manual_time_idx, static_view_indices_fixed, target_index_subsample, num_test_images, use_depth, data_mode)",
+        "get_multi_dataloader(main_config) → (train_dataloader, test_dataloader)",
+        "[BRANCH] If transformer/vae/distributed_state are None: load_model(ckpt_path, main_config, weight_dtype)",
+        "Create output dirs: outdir, raw, meta, grid, full_output, main_gaussians_renderings",
+        "LOOP over test_dataloader (batch_test):",
+        "  [SKIP] If meta JSON already exists and skip_existing → continue",
+        "  [SKIP] If do_eval and all view mp4 files exist and skip_existing → continue",
+        "  Move tensors to device, cast to weight_dtype",
+        "  [COND] compute_plucker_cuda → get_plucker_embedding_and_rays(intrinsics_input, c2ws_input, ...)",
+        "  [COND] rgb_latents already in batch → use directly; else encode_multi_view_video(vae, video, ...)",
+        "  [COND] time_embedding_vae → encode_latent_time_vae(...)",
+        "  [COND] plucker_embedding_vae → encode_plucker_vae(...)",
+        "  torch.no_grad(): model_output = transformer(batch_test)",
+        "  pred_images = model_output['images_pred'].cpu()",
+        "  pred_depths = create_depth_visu(model_output['depths_pred']).cpu()",
+        "  [COND] save_rgb_decoding: decode_multi_view_latents(vae, model_input, ...) → reconstructed_latents",
+        "  [COND] save_gaussians: save_ply(model_output['gaussians'], path, scale_factor)",
+        "  [COND] save_gaussians_orig: save_ply_orig(model_output['gaussians'], path, scale_factor)",
+        "  del model_output['gaussians']",
+        "  Rearrange pred_images_views: 'b (v t) c h w → v b t c h w'",
+        "  [BRANCH] NOT do_eval:",
+        "     generate_wave_video(images_pred, depths_pred, wave_length, ...)",
+        "     save_video(wave+rgb concat, outdir_3dgs, name=rgb_N)",
+        "     save_video(wave only, outdir_raw, name=rgb_wave_N)",
+        "     save_video per view (outdir_raw)",
+        "  [BRANCH] do_eval:",
+        "     save_video per view to outdir/<view_idx>/<file_name>.mp4",
+        "  Build images_grid_list: pred_images + optional gt_images + optional video_norm + pred_depths + optional gt_depths",
+        "  pred_images_out = torch.cat(images_grid_list, dim=-1)",
+        "  [COND] save_grid → accumulate test_video_out, test_video_out_rgb",
+        "  [COND] NOT do_eval: save_video(pred_images_out, outdir_full); write_dict_to_json(meta)",
+        "  [COND] step_test_sum >= num_grid_samples:",
+        "     save_video(test_video_out, outdir_grid, sample_grid_N)",
+        "     save_video(test_video_out_rgb, outdir_grid, rgb_grid_N)",
+        "     save_video(test_video_in, outdir_grid, input_grid_N) if non-empty",
+        "     Reset counters and lists",
+        "Return (transformer, vae, distributed_state, ckpt_path)"
+      ]
+    }
+  ],
+
+  "key_decisions": [
+    "Batch vs single bullet-time: list vs scalar target_index_manual",
+    "Model reuse across bullet-time iterations (kwargs caching)",
+    "Checkpoint resolution: auto-detect most recent vs explicit path",
+    "Pre-encoded latents (rgb_latents key) vs on-the-fly VAE encoding",
+    "Plucker embeddings: precomputed CPU vs on-the-fly CUDA",
+    "Eval mode vs visualization mode (do_eval flag): controls all output save flags",
+    "Skip-existing gate for both meta JSON and per-view mp4",
+    "Grid accumulation: flush when step_test_sum >= num_grid_samples"
+  ],
+
+  "key_outputs": [
+    "outdir/raw/ — per-sample videos (rgb, wave, per-view)",
+    "outdir/full_output/ — concatenated grid per sample",
+    "outdir/grid/ — multi-sample grid videos",
+    "outdir/main_gaussians_renderings/ — wave+rgb combined",
+    "outdir/gaussians/*.ply — 3DGS tensors (optional)",
+    "outdir/gaussians_orig/*.ply — original-format 3DGS (optional)",
+    "outdir/meta/sample_N.json — metadata per sample",
+    "outdir/<view_idx>/<file_name>.mp4 — eval mode per-view renders"
+  ],
+
+  "key_dependencies": [
+    "load_model → LatentRecon, load_vae, PartialState",
+    "main_single → get_multi_dataloader, load_model, encode_multi_view_video, encode_latent_time_vae, encode_plucker_vae",
+    "main_single → transformer(batch_test) [LatentRecon forward pass]",
+    "main_single → create_depth_visu, generate_wave_video, save_video, save_ply, save_ply_orig, write_dict_to_json",
+    "main_single → get_plucker_embedding_and_rays (conditional)",
+    "main → main_single (1..N times)"
+  ],
+
+  "important_notes": "Model runs in bfloat16; plucker computed in float64 then cast. batch_size forced to 1 for inference. Model weights frozen (eval + no_grad). Distributed via HuggingFace Accelerate PartialState."
+}

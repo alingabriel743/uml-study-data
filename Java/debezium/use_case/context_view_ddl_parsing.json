@@ -1,0 +1,171 @@
+{
+  "scope": "view_ddl_parsing",
+  "title": "View DDL Parsing",
+  "diagram_type": "use_case",
+  "description": "ANTLR listener actors parse SQL VIEW definitions (CREATE/ALTER/DROP) and extract column metadata from SELECT clauses.",
+
+  "actors": [
+    {
+      "name": "ANTLRParserEngine",
+      "type": "external_system",
+      "description": "ANTLR v4 runtime that walks the parse tree and fires enter/exit events to registered listeners"
+    },
+    {
+      "name": "MySqlAntlrDdlParser",
+      "type": "primary_actor",
+      "description": "Central parser coordinating listeners; holds skipViews flag, databaseTables registry, and signals view lifecycle events"
+    },
+    {
+      "name": "DatabaseTables",
+      "type": "data_store",
+      "description": "In-memory table/view schema registry; supports editTable, editOrCreateTable, overwriteTable, removeTable, forTable"
+    },
+    {
+      "name": "DDLEventConsumer",
+      "type": "external_system",
+      "description": "Downstream consumer receiving signalCreateView / signalAlterView / signalDropView notifications"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Parse CREATE VIEW",
+      "actor": "ANTLRParserEngine",
+      "listener": "CreateViewParserListener",
+      "entry_point": "enterCreateView(CreateViewContext)",
+      "exit_point": "exitCreateView(CreateViewContext)",
+      "steps": [
+        "Check parser.skipViews(); skip entire body if true",
+        "editOrCreateTable(parseQualifiedTableId(ctx.fullId())) → opens TableEditor",
+        "If uidList present: add named columns via Column.editor().name(columnName).create()",
+        "Instantiate ViewSelectedColumnsParserListener(tableEditor, parser) and add to listeners",
+        "On exit: addColumns(selectColumnsListener.getSelectedColumns())",
+        "Set default charset if absent via parser.charsetForTable(tableEditor.tableId())",
+        "databaseTables().overwriteTable(tableEditor.create())",
+        "Remove selectColumnsListener from listeners",
+        "Signal: parser.signalCreateView(tableId, ctx)"
+      ],
+      "guard": "!parser.skipViews()"
+    },
+    {
+      "id": "UC2",
+      "name": "Parse ALTER VIEW",
+      "actor": "ANTLRParserEngine",
+      "listener": "AlterViewParserListener",
+      "entry_point": "enterAlterView(AlterViewContext)",
+      "exit_point": "exitAlterView(AlterViewContext)",
+      "steps": [
+        "Check parser.skipViews(); skip body if true",
+        "editTable(parseQualifiedTableId(ctx.fullId())) → throws ParsingException if view does not exist",
+        "Remove all existing columns: tableEditor.columnNames().forEach(tableEditor::removeColumn)",
+        "If uidList present: add fresh named columns",
+        "Instantiate ViewSelectedColumnsParserListener and add to listeners",
+        "On exit: addColumns(selectColumnsListener.getSelectedColumns())",
+        "Set default charset if absent via parser.currentDatabaseCharset()",
+        "databaseTables().overwriteTable(tableEditor.create())",
+        "Remove selectColumnsListener from listeners",
+        "Signal always: parser.signalAlterView(tableId, null, ctx)"
+      ],
+      "guard": "!parser.skipViews()",
+      "error_path": "ParsingException if target view does not exist in databaseTables"
+    },
+    {
+      "id": "UC3",
+      "name": "Parse DROP VIEW",
+      "actor": "ANTLRParserEngine",
+      "listener": "DropViewParserListener",
+      "entry_point": "enterDropView(DropViewContext)",
+      "steps": [
+        "Check parser.skipViews(); skip if true",
+        "For each fullId in ctx: parseQualifiedTableId → tableId",
+        "databaseTables().removeTable(tableId)",
+        "parser.signalDropView(tableId, ctx)"
+      ],
+      "guard": "!parser.skipViews()",
+      "note": "Supports multi-view DROP (iterates ctx.fullId() stream)"
+    },
+    {
+      "id": "UC4",
+      "name": "Extract VIEW Selected Columns",
+      "actor": "ANTLRParserEngine",
+      "listener": "ViewSelectedColumnsParserListener",
+      "description": "Sub-listener dynamically added by Create/AlterViewParserListener to resolve columns from the VIEW's SELECT body",
+      "entry_points": [
+        "exitQuerySpecification(QuerySpecificationContext) — if fromClause != null",
+        "exitQuerySpecificationNointo(QuerySpecificationNointoContext) — if fromClause != null",
+        "exitAtomTableItem(AtomTableItemContext) — resolves table/alias mappings",
+        "exitSubqueryTableItem(SubqueryTableItemContext) — handles subselect alias"
+      ],
+      "internal_steps": [
+        "exitAtomTableItem: parseQualifiedTableId → lookup table in databaseTables or tableByAlias; store alias mapping",
+        "exitSubqueryTableItem: parse alias uid → store selectTableEditor snapshot under alias",
+        "exitQuerySpecification: call parseSelectElements(selectElementsContext)",
+        "parseSelectElements: handle SELECT * (all cols from all aliased tables), SELECT tbl.* (all cols from one table), SELECT col [AS alias] (single column with optional rename)",
+        "Column resolution: match column by name from selectedTable, rename if alias present",
+        "Return via getSelectedColumns() → selectTableEditor.columns()"
+      ],
+      "data_structures": [
+        "tableByAlias: Map<TableId, Table> — alias-to-table mapping cleared after each query spec",
+        "selectTableEditor: TableEditor — accumulates resolved columns"
+      ]
+    },
+    {
+      "id": "UC5",
+      "name": "Skip View Processing",
+      "actor": "MySqlAntlrDdlParser",
+      "description": "All three DDL listeners check parser.skipViews() flag; if true they skip schema mutation but CREATE/ALTER still signal the event",
+      "note": "DropViewParserListener skips signalling when skipViews=true; Create/AlterView always signal regardless"
+    },
+    {
+      "id": "UC6",
+      "name": "Signal View Lifecycle Event",
+      "actor": "MySqlAntlrDdlParser",
+      "methods": [
+        "signalCreateView(TableId, ParserRuleContext) → signalCreateView(id, getText(ctx))",
+        "signalAlterView(TableId, TableId previousId, ParserRuleContext) → signalAlterView(id, previousId, getText(ctx))",
+        "signalDropView(TableId, ParserRuleContext) → signalDropView(id, getText(ctx))"
+      ],
+      "consumer": "DDLEventConsumer"
+    }
+  ],
+
+  "key_relationships": [
+    "CreateViewParserListener extends MySqlParserBaseListener",
+    "AlterViewParserListener extends MySqlParserBaseListener",
+    "DropViewParserListener extends MySqlParserBaseListener",
+    "ViewSelectedColumnsParserListener extends MySqlParserBaseListener",
+    "CreateViewParserListener depends_on ViewSelectedColumnsParserListener (instantiates & registers dynamically)",
+    "AlterViewParserListener depends_on ViewSelectedColumnsParserListener (instantiates & registers dynamically)",
+    "CreateViewParserListener depends_on MySqlAntlrDdlParser (parser, skipViews, databaseTables, signalCreateView)",
+    "AlterViewParserListener depends_on MySqlAntlrDdlParser (parser, skipViews, databaseTables, signalAlterView)",
+    "DropViewParserListener depends_on MySqlAntlrDdlParser (parser, skipViews, databaseTables, signalDropView)",
+    "MySqlAntlrDdlParserListener registers all three top-level listeners at initialization (lines 65-67)",
+    "ViewSelectedColumnsParserListener depends_on DatabaseTables (forTable lookup)",
+    "ViewSelectedColumnsParserListener produces List<Column> consumed by Create/AlterViewParserListener"
+  ],
+
+  "listener_registration": {
+    "registrar": "MySqlAntlrDdlParserListener",
+    "static_listeners": ["CreateViewParserListener", "AlterViewParserListener", "DropViewParserListener"],
+    "dynamic_listeners": ["ViewSelectedColumnsParserListener (added on enterCreate/AlterView, removed on exitCreate/AlterView)"]
+  },
+
+  "important_notes": [
+    "Both MySQL and MariaDB have parallel implementations (connector-mysql vs connector-mariadb packages) with identical structure",
+    "ViewSelectedColumnsParserListener is transient — lives only during CREATE/ALTER VIEW parsing",
+    "ALTER VIEW throws ParsingException if target view does not pre-exist in databaseTables",
+    "DROP VIEW iterates a list: single statement can drop multiple views",
+    "signalAlterView always fires (even when skipViews=true) so downstream consumers stay in sync",
+    "Column aliasing is fully resolved: SELECT col AS alias maps the column under the alias name in the view schema"
+  ],
+
+  "source_files_analyzed": [
+    "debezium-connector-mysql/src/main/java/io/debezium/connector/mysql/antlr/listener/CreateViewParserListener.java",
+    "debezium-connector-mysql/src/main/java/io/debezium/connector/mysql/antlr/listener/AlterViewParserListener.java",
+    "debezium-connector-mysql/src/main/java/io/debezium/connector/mysql/antlr/listener/DropViewParserListener.java",
+    "debezium-connector-mysql/src/main/java/io/debezium/connector/mysql/antlr/listener/ViewSelectedColumnsParserListener.java",
+    "debezium-connector-mysql/src/main/java/io/debezium/connector/mysql/antlr/listener/MySqlAntlrDdlParserListener.java",
+    "debezium-ddl-parser/src/main/java/io/debezium/antlr/AntlrDdlParser.java"
+  ]
+}

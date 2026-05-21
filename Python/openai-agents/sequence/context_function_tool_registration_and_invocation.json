@@ -1,0 +1,104 @@
+{
+  "scope": "function_tool_registration_and_invocation",
+  "title": "Function Tool Registration & Invocation",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Developer",
+    "function_tool (decorator)",
+    "function_schema",
+    "FuncSchema",
+    "_build_wrapped_function_tool",
+    "_build_handled_function_tool_error_handler",
+    "_FailureHandlingFunctionToolInvoker",
+    "FunctionTool",
+    "Runner / run loop",
+    "execute_function_tool_calls",
+    "ToolContext",
+    "invoke_function_tool",
+    "_on_invoke_tool_impl",
+    "PythonFunction"
+  ],
+
+  "phase_1_registration": [
+    "Developer → function_tool(func): applies @function_tool decorator (with optional name_override, description_override, failure_error_function, strict_mode, is_enabled, needs_approval, timeout, defer_loading)",
+    "function_tool → function_schema(func, name_override, description_override, docstring_style, use_docstring_info, strict_json_schema): parse signature via inspect + docstring via griffe + build pydantic model",
+    "function_schema → FuncSchema: returns {name, description, params_pydantic_model, params_json_schema, signature, takes_context}",
+    "function_tool: defines async _on_invoke_tool_impl(ctx: ToolContext, input: str) closure referencing FuncSchema",
+    "function_tool → _build_wrapped_function_tool(name, description, params_json_schema, invoke_tool_impl=_on_invoke_tool_impl, on_handled_error=..., failure_error_function, strict_json_schema, is_enabled, needs_approval, timeout_seconds, timeout_behavior, defer_loading, sync_invoker)",
+    "_build_wrapped_function_tool → _build_handled_function_tool_error_handler(span_message, log_label, span_message_for_json_decode_error): returns _on_handled_error closure",
+    "_build_wrapped_function_tool → with_function_tool_failure_error_handler(invoke_tool_impl, on_handled_error): returns _FailureHandlingFunctionToolInvoker",
+    "_build_wrapped_function_tool → FunctionTool(name, description, params_json_schema, on_invoke_tool=_FailureHandlingFunctionToolInvoker, strict_json_schema, is_enabled, needs_approval, timeout_seconds, timeout_behavior, defer_loading)",
+    "FunctionTool.__post_init__: calls ensure_strict_json_schema(params_json_schema) if strict_json_schema=True; calls _validate_function_tool_timeout_config(self)",
+    "FunctionTool.__post_init__: if on_invoke_tool has __agents_bind_function_tool__, rebinds invoker to self",
+    "_build_wrapped_function_tool → set_function_tool_failure_error_function(function_tool, failure_error_function): stores _failure_error_function and _use_default_failure_error_function on tool",
+    "function_tool → Developer: returns FunctionTool"
+  ],
+
+  "phase_2_invocation": [
+    "Runner/run loop → execute_function_tool_calls(bindings, tool_runs: list[ToolRunFunction], hooks, context_wrapper, config)",
+    "execute_function_tool_calls: for each ToolRunFunction(function_tool, tool_call)",
+    "execute_function_tool_calls → ToolContext.from_agent_context(context_wrapper, tool_call.call_id, tool_call=raw_tool_call, tool_namespace, agent, run_config): creates ToolContext inheriting RunContextWrapper",
+    "execute_function_tool_calls: opens function_span(trace_tool_name) for tracing",
+    "execute_function_tool_calls → invoke_function_tool(function_tool, context=tool_context, arguments=tool_call.arguments)",
+    "invoke_function_tool: checks timeout_seconds; if None → await function_tool.on_invoke_tool(invoke_context, arguments) directly",
+    "invoke_function_tool: if timeout set → asyncio.wait_for(on_invoke_tool(...), timeout=timeout_seconds); on TimeoutError raises ToolTimeoutError or returns timeout message",
+    "invoke_function_tool → _FailureHandlingFunctionToolInvoker.__call__(ctx, input)",
+    "_FailureHandlingFunctionToolInvoker → _on_invoke_tool_impl(ctx, input)",
+    "_on_invoke_tool_impl: _parse_function_tool_json_input(tool_name, input_json) → json.loads(input) or raises ModelBehaviorError",
+    "_on_invoke_tool_impl: schema.params_pydantic_model(**json_data) → parsed; raises ModelBehaviorError on ValidationError",
+    "_on_invoke_tool_impl → FuncSchema.to_call_args(parsed): returns (args, kwargs_dict)",
+    "_on_invoke_tool_impl → PythonFunction: if async → await the_func(ctx, *args, **kwargs) or await the_func(*args, **kwargs); if sync → asyncio.to_thread(the_func, ...)",
+    "_on_invoke_tool_impl → _FailureHandlingFunctionToolInvoker: returns result"
+  ],
+
+  "phase_3_error_handling": [
+    "_FailureHandlingFunctionToolInvoker: on Exception from _invoke_tool_impl",
+    "_FailureHandlingFunctionToolInvoker → maybe_invoke_function_tool_failure_error_function(function_tool, context, error)",
+    "maybe_invoke_function_tool_failure_error_function → resolve_function_tool_failure_error_function(function_tool): returns configured formatter or default_tool_error_function",
+    "resolve_function_tool_failure_error_function: if _use_default_failure_error_function=True → returns default_tool_error_function; else returns _failure_error_function",
+    "maybe_invoke_function_tool_failure_error_function → failure_error_function(context, error): returns error string for LLM",
+    "_FailureHandlingFunctionToolInvoker: if result not None → calls _on_handled_error(function_tool, error, input_json)",
+    "_on_handled_error: attach_error_to_current_span(SpanError) + logger.error(...); if result is None → re-raises exception",
+    "_build_handled_function_tool_error_handler._on_handled_error: extracts json_decode_error via _extract_tool_argument_json_error; logs with tool_name and error detail"
+  ],
+
+  "key_classes": {
+    "FunctionTool": "dataclass with name, description, params_json_schema, on_invoke_tool: Callable[[ToolContext, str], Awaitable[Any]], strict_json_schema, is_enabled, needs_approval, timeout_seconds, timeout_behavior, timeout_error_function, defer_loading, _failure_error_function, _use_default_failure_error_function",
+    "ToolContext": "extends RunContextWrapper[TContext]; adds tool_name, tool_call_id, tool_arguments, tool_call: ResponseFunctionToolCall, tool_namespace, agent, run_config; factory: from_agent_context(context, tool_call_id, ...)",
+    "FuncSchema": "dataclass with name, description, params_pydantic_model, params_json_schema, signature, takes_context, strict_json_schema; method to_call_args(BaseModel) -> (args, kwargs)",
+    "_FailureHandlingFunctionToolInvoker": "callable wrapping invoke_tool_impl + on_handled_error; supports __agents_bind_function_tool__ for copy rebinding; async __call__(ctx, input)"
+  },
+
+  "key_relationships": [
+    "function_tool decorator depends_on function_schema (FuncSchema extraction)",
+    "function_tool creates FunctionTool via _build_wrapped_function_tool",
+    "_build_wrapped_function_tool wraps invoke_tool_impl with _FailureHandlingFunctionToolInvoker",
+    "_build_wrapped_function_tool uses _build_handled_function_tool_error_handler for error span/log reporting",
+    "FunctionTool.on_invoke_tool holds _FailureHandlingFunctionToolInvoker (set at construction)",
+    "ToolContext extends RunContextWrapper (composition); created from RunContextWrapper + tool_call metadata",
+    "execute_function_tool_calls calls invoke_function_tool which calls FunctionTool.on_invoke_tool",
+    "invoke_function_tool handles timeout via asyncio.wait_for + ToolTimeoutError",
+    "_on_invoke_tool_impl closure captures FuncSchema + original Python function"
+  ],
+
+  "important_notes": [
+    "Two usage forms: @function_tool (no parens) or @function_tool(...) (with config args)",
+    "Sync functions are run in asyncio.to_thread; async functions awaited directly",
+    "If function first arg is RunContextWrapper/ToolContext, ctx is injected automatically (takes_context=True on FuncSchema)",
+    "strict_json_schema=True (default) calls ensure_strict_json_schema on params_json_schema",
+    "failure_error_function=None → exceptions re-raised to caller; default → LLM gets friendly error string",
+    "timeout only supported for async @function_tool handlers; timeout_behavior='error_as_result' (default) or 'raise_exception'",
+    "defer_loading=True hides tool from LLM until ToolSearchTool loads it (Responses API only)",
+    "FunctionTool.__post_init__ rebinds on_invoke_tool if it exposes __agents_bind_function_tool__ (copy-awareness pattern)",
+    "_build_handled_function_tool_error_handler returns closure that attaches SpanError to tracing + logs; different messages for JSON decode vs runtime errors",
+    "ToolContext.from_agent_context propagates context fields from RunContextWrapper and inherits agent_tool_state_scope"
+  ],
+
+  "source_files_analyzed": [
+    "src/agents/tool.py",
+    "src/agents/tool_context.py",
+    "src/agents/function_schema.py",
+    "src/agents/run_internal/tool_execution.py",
+    "docs/tools.md"
+  ]
+}

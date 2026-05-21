@@ -1,0 +1,132 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam ArrowColor #495057
+skinparam NoteBackgroundColor #FFF9C4
+skinparam NoteBorderColor #F0C040
+
+title Tokenizer Encoding & Decoding Flow\n<size:11><i>Cosmos-Tokenize1-CV8x8x8-720p  |  8× temporal · 8×8 spatial compression</i></size>
+
+|#E3F2FD|Pipeline|
+start
+:Initialize Pipeline\n<b>offload_tokenizer</b>: bool;
+
+if (offload_tokenizer == False?) then (yes — eager load)
+    :_load_tokenizer()\nload_tokenizer_model(model,\n"Cosmos-Tokenize1-CV8x8x8-720p");
+    note right
+        Tokenizer stays on GPU
+        for the entire session
+    end note
+else (no — defer)
+    :Tokenizer load deferred\n(on-demand before encoding);
+endif
+
+|Pipeline|
+:_run_model_with_offload\n(image_or_video_path);
+
+if (offload_tokenizer == True?) then (yes)
+    :_load_tokenizer() on demand\nload Cosmos-Tokenize1-CV8x8x8-720p;
+endif
+
+' ─── ENCODING PHASE ──────────────────────────────
+if (Pipeline type?) then (Text-to-World  T2W)
+    :Skip encoding phase\n<i>(pure text → video, no conditioning input)</i>;
+    note right
+        T2W pipeline does NOT
+        call _run_tokenizer_encoding
+    end note
+
+elseif (Video-to-World  V2W) then (yes)
+    |#E8F5E9|Tokenizer|
+    :_run_tokenizer_encoding\n(image_or_video_path);
+    :get_condition_latent\n(model, path, num_input_frames, state_shape);
+    :model.tokenizer.encode(video frames);
+    :Return condition_latent\n<b>torch.Tensor</b>;
+    |Pipeline|
+
+elseif (Multiview V2W) then (yes)
+    |Tokenizer|
+    :_run_tokenizer_encoding\n(image_or_video_path, state_shape);
+    :get_condition_latent_multiview\n(model, path, num_input_frames, state_shape);
+    :model.tokenizer.encode(multi-view frames);
+    :Return (condition_latent, condition_frames)\n<b>Tuple[torch.Tensor, torch.Tensor]</b>;
+    |Pipeline|
+
+else (Interpolator)
+    |Tokenizer|
+    :_run_tokenizer_encoding\n(image_or_video_path, frame_index, frame_stride);
+    repeat
+        :get_condition_latent\n(model, path, num_input_frames, state_shape,\nframe_index, frame_stride);
+        :Encode frame pair → latent segment\n<b>torch.Tensor</b>;
+    repeat while (More frame pairs?) is (yes)
+    ->no (all pairs done);
+    :Concatenate latent segments\n<i>(skip duplicate first frame of each subsequent segment)</i>;
+    :Return condition_latent\n<b>torch.Tensor</b>;
+    |Pipeline|
+endif
+
+:condition_latent → diffusion model conditioning;
+
+' ─── DIFFUSION PHASE ─────────────────────────────
+|#FFF3E0|Diffusion Model|
+:_run_model(text_embedding, condition_latent);
+:Iterative denoising steps\n<i>(guided by text + video conditioning)</i>;
+:Return sample\n<b>torch.Tensor  [B, C, T, H, W]</b>;
+
+' ─── DECODING PHASE ──────────────────────────────
+|Pipeline|
+:Pass sample to _run_tokenizer_decoding(sample);
+
+|Tokenizer|
+:self.model.decode(sample)\n<i>latent → raw video tensor</i>;
+:Normalize:\n(1.0 + raw).clamp(0, 2) / 2\n→ <b>[B, 3, T, H, W]</b>  range [0, 1];
+:Reshape / Permute:\nvideo[0].permute(1, 2, 3, 0)\n→ <b>[T, H, W, C]</b>;
+:Convert:\n× 255 → torch.uint8 → .cpu().numpy();
+
+if (Multiview pipeline?) then (yes)
+    :einops rearrange into\n<b>2 × 3 view grid</b>;
+    :Return <b>[grid_video, video]</b>\nnp.ndarray uint8;
+else (no)
+    :Return video\n<b>np.ndarray uint8  [T, H, W, C]</b>\nrange [0, 255];
+endif
+
+' ─── OFFLOAD PHASE ───────────────────────────────
+|Pipeline|
+if (offload_tokenizer == True?) then (yes)
+    :_offload_tokenizer()\ndel self.model.tokenizer\ngc.collect()\ntorch.cuda.empty_cache();
+    note right
+        Frees GPU memory
+        after decoding completes
+    end note
+endif
+
+stop
+
+@enduml

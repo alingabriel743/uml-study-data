@@ -1,0 +1,108 @@
+{
+  "scope": "entity_storage_upsert_select",
+  "title": "Entity Storage Upsert and Select Pipeline",
+  "diagram_type": "activity",
+  "key_participants": [
+    "Caller",
+    "EntityStoreService",
+    "SubdomainES",
+    "SQLES",
+    "Database",
+    "PermissionService",
+    "Context"
+  ],
+  "layer_chain": "EntityStoreService → SubdomainES (middleware) → SQLES (terminal) → Database",
+
+  "upsert_flow": [
+    "START: Caller calls EntityStoreService.upsert(entity, id, options)",
+    "EntityStoreService reads entity by primary identifier → upstream.read(uid)",
+    "IF old_entity not found: check IdentifierUtil.detect_identifier(entity)",
+    "  IF alternate identifier found: upstream.select({ predicate, limit:1 }) → set old_entity",
+    "  IF still no old_entity: treat as INSERT (old_entity = null)",
+    "EntityStoreService calls upstream.upsert(entity, { old_entity, options }) → enters SubdomainES",
+    "SubdomainES.upsert(entity, extra):",
+    "  IF extra.old_entity is null/undefined (new record): call _check_max_subdomains()",
+    "    _check_max_subdomains: db.read('SELECT COUNT(id) AS subdomain_count FROM subdomains WHERE user_id=?', [user.id])",
+    "    IF count >= max_subdomains (user.max_subdomains ?? config.max_subdomains_per_user):",
+    "      THROW APIError('subdomain_limit_reached', { limit })",
+    "    ELSE: continue",
+    "  SubdomainES delegates to this.upstream.upsert(entity, extra) → enters SQLES",
+    "SQLES.upsert(entity, extra):",
+    "  FOR each property with unique constraint: SELECT COUNT(*) to check uniqueness",
+    "    IF count > 0: THROW APIError('already_in_use', { what, value })",
+    "  IF old_entity exists: call update_(entity, old_entity)",
+    "    update_: build UPDATE SET sql, db.write(), clone+apply old_entity → return { data, entity }",
+    "  ELSE: call create_(entity)",
+    "    create_: build INSERT INTO sql, db.write() → return { data, entity, insert_id }",
+    "END: return upsert result to caller"
+  ],
+
+  "select_flow": [
+    "START: Caller calls EntityStoreService.select({ predicate, limit, offset, params })",
+    "IF predicate is an Array: destructure [p_op, ...p_args]",
+    "  upstream.create_predicate(p_op, ...p_args) → SubdomainES.create_predicate(id)",
+    "  SubdomainES.create_predicate: IF id === 'user-can-edit': return new Eq({ key:'owner', value: Context.user.id })",
+    "  ELSE delegate to upstream (SQLES) create_predicate",
+    "IF predicate is null after resolution: predicate = new Null()",
+    "EntityStoreService calls upstream.select({ predicate, ...rest }) → enters SubdomainES",
+    "SubdomainES.select(options):",
+    "  Get actor from Context.get('actor'), extract user",
+    "  Call svc_permission.check(actor, 'read-all-subdomains')",
+    "  IF NOT has_permission_to_read_all:",
+    "    options.predicate = options.predicate.and(new Eq({ key:'owner', value: user.id }))",
+    "  SubdomainES delegates to this.upstream.select(options) → enters SQLES",
+    "SQLES.select({ predicate, limit, offset }):",
+    "  IF predicate instanceof Predicate: call om_to_sql_condition_(predicate) → RawCondition",
+    "    om_to_sql_condition_ handles: Null, And (recursive), Or (recursive), Eq, StartsWith, IsNotNull, Like",
+    "  Build SQL: SELECT * FROM <table> [WHERE <condition>] [LIMIT n] [OFFSET m]",
+    "  db.read(stmt, values) → rows[]",
+    "  FOR each row: sql_row_to_entity_(row) → Entity (with property dereferencing, JSON parsing)",
+    "  Return entities[]",
+    "BaseES.select (wrapper): IF read_transform defined: map entities through read_transform",
+    "EntityStoreService maps entities → entity.get_client_safe()",
+    "END: return client-safe entity array to caller"
+  ],
+
+  "create_predicate_flow": [
+    "Caller passes predicate as array e.g. ['user-can-edit']",
+    "EntityStoreService resolves via upstream.create_predicate('user-can-edit')",
+    "SubdomainES.create_predicate('user-can-edit'): return Eq({ key:'owner', value: Context.user.id })",
+    "Predicate used in subsequent select call with owner filter applied"
+  ],
+
+  "key_conditions": [
+    "UPSERT guard: old_entity null → check subdomain limit before insert",
+    "UPSERT guard: unique properties → SQL COUNT check before write",
+    "SELECT guard: missing 'read-all-subdomains' permission → force owner=user.id filter",
+    "SQLES: offset requires limit (else throws Error)",
+    "SQLES: delete throws entity_not_found if no rows affected"
+  ],
+
+  "key_classes": [
+    "SubdomainES extends BaseES — middleware: adds subdomain-specific auth/limit logic",
+    "BaseES extends AdvancedBase — base with METHODS static map, call_on_impl_ dispatcher, upstream chain",
+    "SQLES extends BaseES — terminal: all SQL operations (read/select/upsert/delete/create_/update_)",
+    "EntityStoreService extends BaseService — public API, predicate resolution, entity lifecycle",
+    "Eq/And/Or/Null/Like/StartsWith/IsNotNull extend Predicate — query DSL nodes",
+    "RawCondition — internal SQLES DTO: { sql: string, values: any[] }"
+  ],
+
+  "key_relationships": [
+    "EntityStoreService depends_on SubdomainES (via upstream chain)",
+    "SubdomainES depends_on SQLES (via upstream chain)",
+    "SQLES depends_on Database service (DB_WRITE for writes, SubdomainES uses DB_READ for count check)",
+    "SubdomainES depends_on PermissionService (check 'read-all-subdomains')",
+    "SubdomainES depends_on Context (get actor, user)",
+    "SQLES depends_on om (object model: properties, sql.table_name, primary_identifier)"
+  ],
+
+  "important_notes": "BaseES uses a middleware/chain-of-responsibility pattern. Each ES layer overrides only the methods it cares about; all others fall through to upstream via call_on_impl_. SubdomainES only overrides upsert, select, and create_predicate. SQLES is always the terminal layer with actual DB access. DB_READ used for count/select queries, DB_WRITE for mutations. Permission constant: 'read-all-subdomains'. Max subdomain config key: config.max_subdomains_per_user.",
+
+  "source_files_analyzed": [
+    "src/backend/src/om/entitystorage/SubdomainES.js",
+    "src/backend/src/om/entitystorage/BaseES.js",
+    "src/backend/src/om/entitystorage/SQLES.js",
+    "src/backend/src/services/EntityStoreService.js",
+    "src/backend/src/om/query/query.js"
+  ]
+}

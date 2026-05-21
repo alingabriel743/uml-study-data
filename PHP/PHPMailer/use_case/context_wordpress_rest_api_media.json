@@ -1,0 +1,193 @@
+{
+  "scope": "wordpress_rest_api_media",
+  "title": "WordPress REST API — Media & Attachments",
+  "diagram_type": "use_case",
+  "description": "API consumer uploads, processes, and retrieves media attachments; oEmbed endpoint proxying",
+
+  "actors": [
+    {
+      "name": "API Consumer",
+      "type": "primary",
+      "description": "Any REST client (browser, mobile app, headless CMS) calling WP REST API"
+    },
+    {
+      "name": "Authenticated Editor",
+      "type": "primary",
+      "description": "WordPress user with 'upload_files' capability (required for media upload) or 'edit_posts' (required for oEmbed proxy)"
+    },
+    {
+      "name": "WordPress File System",
+      "type": "secondary",
+      "description": "wp_handle_upload / wp_handle_sideload / wp_tempnam — physical file storage"
+    },
+    {
+      "name": "getID3 Library",
+      "type": "secondary",
+      "description": "Extracts audio/video/image metadata from uploaded files; base class getid3_handler, concrete handlers: getid3_mp3, getid3_id3v2, getid3_ogg, getid3_flac, getid3_riff, getid3_quicktime, getid3_matroska, getid3_asf, getid3_ac3, getid3_dts"
+    },
+    {
+      "name": "External oEmbed Provider",
+      "type": "secondary",
+      "description": "Third-party services (YouTube, Twitter, etc.) queried via WP_oEmbed::get_data() during proxy requests"
+    },
+    {
+      "name": "WordPress Transient Cache",
+      "type": "secondary",
+      "description": "get_transient / set_transient — caches oEmbed proxy responses (default TTL: DAY_IN_SECONDS)"
+    }
+  ],
+
+  "use_cases": [
+    {
+      "id": "UC1",
+      "name": "Upload Media Attachment",
+      "actor": "Authenticated Editor",
+      "endpoint": "POST /wp/v2/media",
+      "controller": "WP_REST_Attachments_Controller::create_item()",
+      "preconditions": ["User has 'upload_files' capability", "If attaching to post: user has 'edit_post' on parent"],
+      "steps": [
+        "create_item_permissions_check() — verify upload_files cap + optional parent post edit cap",
+        "insert_attachment() — dispatch to upload_from_file($_FILES) or upload_from_data(raw POST body)",
+        "upload_from_file/upload_from_data — validate Content-MD5 hash, check upload size (multisite quota), call wp_handle_upload / wp_handle_sideload",
+        "get_filename_from_disposition() — parse RFC6266 Content-Disposition header for filename",
+        "wp_read_image_metadata() — read EXIF/IPTC data for title/caption defaults",
+        "prepare_item_for_database() — map request fields to WP_Post (caption→post_excerpt, description→post_content, post→post_parent)",
+        "wp_insert_attachment() — persist attachment post record in DB",
+        "wp_generate_attachment_metadata() — calls getID3 for AV files, generates image sub-sizes",
+        "wp_update_attachment_metadata() — save metadata to postmeta",
+        "prepare_item_for_response() — build response with media_details, sizes, source_url, alt_text",
+        "Return HTTP 201 with Location header and X-WP-Upload-Attachment-ID header"
+      ],
+      "error_codes": ["rest_cannot_create (400)", "rest_upload_no_data (400)", "rest_upload_hash_mismatch (412)", "rest_upload_limited_space (400)", "rest_upload_file_too_big (400)", "rest_upload_user_quota_exceeded (400)", "rest_upload_sideload_error (500)"]
+    },
+    {
+      "id": "UC2",
+      "name": "List Media Attachments",
+      "actor": "API Consumer",
+      "endpoint": "GET /wp/v2/media",
+      "controller": "WP_REST_Attachments_Controller (inherits get_items from WP_REST_Posts_Controller)",
+      "notes": "prepare_items_query() forces post_status=inherit; filters by media_type (image/video/audio/application) or exact mime_type; filename search via _filter_query_attachment_filenames hook"
+    },
+    {
+      "id": "UC3",
+      "name": "Retrieve Single Attachment",
+      "actor": "API Consumer",
+      "endpoint": "GET /wp/v2/media/{id}",
+      "controller": "WP_REST_Attachments_Controller::prepare_item_for_response()",
+      "notes": "Returns: alt_text, caption{raw,rendered}, description{raw,rendered}, media_type(image|file), mime_type, media_details (sizes with source_url per size), post (parent ID), source_url, missing_image_sizes"
+    },
+    {
+      "id": "UC4",
+      "name": "Update Attachment Metadata",
+      "actor": "Authenticated Editor",
+      "endpoint": "PUT/PATCH /wp/v2/media/{id}",
+      "controller": "WP_REST_Attachments_Controller::update_item()",
+      "notes": "Delegates to parent update_item(), then updates alt_text postmeta (_wp_attachment_image_alt), fires rest_after_insert_attachment action"
+    },
+    {
+      "id": "UC5",
+      "name": "Post-Process Attachment",
+      "actor": "Authenticated Editor",
+      "endpoint": "POST /wp/v2/media/{id}/post-process",
+      "controller": "WP_REST_Attachments_Controller::post_process_item()",
+      "preconditions": ["User can edit the attachment (update_item_permissions_check)"],
+      "notes": "action=create-image-subsizes → calls wp_update_image_subsizes(id). Used to resume image sub-size generation after PHP fatal (client receives X-WP-Upload-Attachment-ID header to retry)"
+    },
+    {
+      "id": "UC6",
+      "name": "Get oEmbed Data for WP Post",
+      "actor": "API Consumer",
+      "endpoint": "GET /oembed/1.0/embed?url=&format=json|xml&maxwidth=",
+      "controller": "WP_oEmbed_Controller::get_item()",
+      "notes": "url_to_postid() resolves URL → post ID; get_oembed_response_data(post_id, maxwidth) builds response. Returns WP_Error 404 if URL not a valid WP post. No auth required."
+    },
+    {
+      "id": "UC7",
+      "name": "Proxy External oEmbed Request",
+      "actor": "Authenticated Editor",
+      "endpoint": "GET /oembed/1.0/proxy?url=&format=&maxwidth=&maxheight=&discover=",
+      "controller": "WP_oEmbed_Controller::get_proxy_item()",
+      "preconditions": ["User has 'edit_posts' capability"],
+      "steps": [
+        "get_proxy_item_permissions_check() — verify edit_posts cap",
+        "Check transient cache: get_transient('oembed_' + md5(args))",
+        "get_oembed_response_data_for_url() — short-circuit for current-site URLs",
+        "_wp_oembed_get_object()->get_data(url, args) — fetch from external provider",
+        "WP_oEmbed::data2html() — convert response to embed HTML",
+        "Apply rest_oembed_ttl filter (default DAY_IN_SECONDS)",
+        "set_transient(cache_key, data, ttl)",
+        "Return oEmbed data object with html property"
+      ],
+      "error_codes": ["rest_forbidden (401/403)", "oembed_invalid_url (404)"]
+    }
+  ],
+
+  "include_extend_relationships": [
+    "UC1 <<include>> Validate Upload Permissions (upload_files + optional edit_post on parent)",
+    "UC1 <<include>> Check Upload Size (multisite quota enforcement)",
+    "UC1 <<include>> Parse Content-Disposition Header (RFC6266)",
+    "UC1 <<include>> Extract Image EXIF/IPTC Metadata (wp_read_image_metadata)",
+    "UC1 <<include>> Generate Attachment Metadata (wp_generate_attachment_metadata → getID3)",
+    "UC1 <<include>> Create Image Sub-sizes",
+    "UC5 <<include>> Validate Update Permissions",
+    "UC5 <<extend>> UC1 (retry sub-size generation after fatal)",
+    "UC7 <<include>> Validate oEmbed Proxy Permissions (edit_posts)",
+    "UC7 <<include>> Cache oEmbed Response (transient, TTL configurable via rest_oembed_ttl filter)",
+    "UC7 <<extend>> UC6 (proxy handles external URLs, UC6 handles internal WP URLs)"
+  ],
+
+  "key_classes": [
+    {
+      "name": "WP_REST_Attachments_Controller",
+      "extends": "WP_REST_Posts_Controller",
+      "source": "wp-includes/rest-api/endpoints/class-wp-rest-attachments-controller.php",
+      "key_methods": ["register_routes", "create_item", "insert_attachment", "upload_from_file", "upload_from_data", "upload_from_data", "get_filename_from_disposition (static)", "post_process_item", "prepare_item_for_response", "get_media_types", "check_upload_size"]
+    },
+    {
+      "name": "WP_oEmbed_Controller",
+      "extends": "none (final class)",
+      "source": "wp-includes/class-wp-oembed-controller.php",
+      "key_methods": ["register_routes", "get_item", "get_proxy_item", "get_proxy_item_permissions_check"]
+    },
+    {
+      "name": "getid3_handler",
+      "extends": "none (abstract base)",
+      "source": "wp-includes/ID3/getid3.php",
+      "key_attributes": ["$getid3 (reference to parent getID3 instance)"],
+      "subclasses": ["getid3_mp3", "getid3_id3v2", "getid3_id3v1", "getid3_ogg", "getid3_flac", "getid3_riff", "getid3_quicktime", "getid3_matroska", "getid3_asf", "getid3_ac3", "getid3_dts", "getid3_apetag", "getid3_lyrics3"]
+    }
+  ],
+
+  "rest_routes": [
+    "GET    /wp/v2/media                     — list attachments",
+    "POST   /wp/v2/media                     — upload new attachment",
+    "GET    /wp/v2/media/{id}                — get single attachment",
+    "PUT    /wp/v2/media/{id}                — update attachment",
+    "DELETE /wp/v2/media/{id}                — delete attachment",
+    "POST   /wp/v2/media/{id}/post-process   — trigger image sub-size creation",
+    "GET    /oembed/1.0/embed                — get oEmbed data for WP post URL",
+    "GET    /oembed/1.0/proxy                — proxy oEmbed request to external provider"
+  ],
+
+  "business_rules": [
+    "Uploaders must have 'upload_files' WordPress capability",
+    "Attaching to a parent post requires 'edit_post' on that parent",
+    "oEmbed proxy requires 'edit_posts' capability (prevents SSRF abuse by anonymous users)",
+    "Multisite enforces per-site upload space quotas and per-user quotas",
+    "Content-MD5 header optionally validates upload integrity (returns 412 on mismatch)",
+    "Image sub-size generation may fail due to PHP memory/time limits; X-WP-Upload-Attachment-ID header enables client-side retry via post-process endpoint",
+    "oEmbed proxy responses cached as WordPress transients (default 24h, filterable via rest_oembed_ttl)",
+    "oEmbed discover=true allows non-whitelisted providers (autodiscovery); requires edit_posts",
+    "Attachment filenames parsed per RFC2388/RFC6266 from Content-Disposition header",
+    "Media types grouped as: image, video, audio, application (file)"
+  ],
+
+  "important_notes": "WP_REST_Attachments_Controller extends WP_REST_Posts_Controller — inherits list/get/delete/update base use cases. Two upload paths: multipart $_FILES (upload_from_file→wp_handle_upload) or raw POST body (upload_from_data→wp_handle_sideload). getID3 library provides format-specific metadata extraction (MP3/OGG/FLAC/RIFF/QuickTime/Matroska/ASF/etc.) called indirectly via wp_generate_attachment_metadata(). WP_oEmbed_Controller is declared 'final'.",
+
+  "source_files_analyzed": [
+    "dockerfiles/testing-environment/Wordpress5/app/wp-includes/rest-api/endpoints/class-wp-rest-attachments-controller.php",
+    "dockerfiles/testing-environment/Wordpress5/app/wp-includes/class-wp-oembed-controller.php",
+    "dockerfiles/testing-environment/Wordpress5/app/wp-includes/ID3/getid3.php",
+    "ir_postprocessed.json (lines 64993-65045, 121028-121285, 100109-100416)"
+  ]
+}

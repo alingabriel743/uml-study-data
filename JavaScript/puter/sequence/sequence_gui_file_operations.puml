@@ -1,0 +1,221 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 2
+skinparam sequenceParticipant underline
+skinparam sequenceBoxBackgroundColor #E9ECEF
+skinparam sequenceBoxBorderColor #6C757D
+skinparam sequenceLifeLineBorderColor #495057
+skinparam sequenceGroupBorderColor #868E96
+skinparam sequenceGroupBackgroundColor #F1F3F5
+skinparam noteBorderColor #868E96
+skinparam noteBackgroundColor #FFF9DB
+
+title GUI File Operations (Create, Rename, Shortcut)
+
+actor User as user
+participant "GUI\n(helpers.js)" as gui
+participant "puter.fs\n(SDK)" as fs
+participant "DOM /\nUIItem" as dom
+participant "actions_history\n(window global)" as history
+participant "UIAlert" as alert
+
+' ─────────────────────────────────────────────
+' 1. CREATE FOLDER
+' ─────────────────────────────────────────────
+box "Create Folder" #EEF4FF
+    user -> gui : create_folder(basedir, appendto_element)
+    activate gui
+
+    note right of gui
+      Allocates operation_id
+      Sets operation_cancelled[id] = false
+    end note
+
+    gui -> fs : mkdir({ path: basedir/"New Folder",\n        rename: true, overwrite: false })
+    activate fs
+
+    alt Success
+        fs --> gui : callback(data)
+        deactivate fs
+        gui -> dom : find .item[data-path=dirname/data.name]\n→ el_created_dir
+        activate dom
+        dom --> gui : el_created_dir
+        deactivate dom
+        gui -> gui : activate_item_name_editor(el_created_dir)
+        note right of gui : Inline rename editor opens\nso user can immediately rename
+        gui -> history : push({ operation: 'create_folder',\n              data: el_created_dir })
+    else Error — directory_depth_limit_exceeded
+        fs --> gui : error(err)
+        deactivate fs
+        gui -> alert : show i18n depth-limit message
+        activate alert
+        alert --> gui : (dismissed)
+        deactivate alert
+    end
+
+    deactivate gui
+end box
+
+' ─────────────────────────────────────────────
+' 2. CREATE FILE
+' ─────────────────────────────────────────────
+box "Create File" #EEFFF4
+    user -> gui : create_file(options{ dirname, append_to_element,\n                         name, content })
+    activate gui
+
+    gui -> fs : upload(new File(content, filename),\n          dirname, { generateThumbnails: true })
+    activate fs
+    fs --> gui : callback(data)
+    deactivate fs
+
+    gui -> dom : find .item[data-path=dirname/data.name]\n→ created_file
+    activate dom
+    dom --> gui : created_file
+    deactivate dom
+
+    gui -> gui : activate_item_name_editor(created_file)
+    note right of gui : Inline rename editor opens
+    gui -> history : push({ operation: 'create_file',\n              data: created_file })
+
+    deactivate gui
+end box
+
+' ─────────────────────────────────────────────
+' 3. CREATE SHORTCUT
+' ─────────────────────────────────────────────
+box "Create Shortcut" #FFFBEE
+    user -> gui : create_shortcut(filename, is_dir, basedir,\n                  appendto_element, shortcut_to,\n                  shortcut_to_path)
+    activate gui
+
+    note right of gui
+      Computes:
+      shortcutName = basename(filename)
+                     + ' - Shortcut' + extname
+    end note
+
+    gui -> fs : upload(new File([], shortcutName), basedir,\n          { overwrite: false,\n            shortcutTo: shortcut_to_path ?? shortcut_to,\n            dedupeName: true })
+    activate fs
+
+    alt Success
+        fs --> gui : success
+        deactivate fs
+        note right of gui : No undo entry —\nnot pushed to actions_history
+    else Error
+        fs --> gui : error (logged to console)
+        deactivate fs
+    end
+
+    deactivate gui
+end box
+
+' ─────────────────────────────────────────────
+' 4. RENAME FILE
+' ─────────────────────────────────────────────
+box "Rename File" #FFF0F0
+    user -> gui : rename_file(options, new_name, old_name,\n               old_path, el_item, ..., is_undo=false)
+    activate gui
+
+    gui -> fs : rename({ uid, new_name, excludeSocketID })
+    activate fs
+
+    alt Success
+        fs --> gui : callback(fsentry)
+        deactivate fs
+
+        alt !is_undo
+            gui -> history : push({ operation: 'rename',\n                  data: { options, new_name, old_name, ... } })
+        end
+
+        alt Extension changed
+            gui -> dom : suggest_apps_for_fsentry(uid)
+        end
+
+        gui -> dom : update item-name text, data-name,\n         data-path, title, item-name-editor value\n         on all matching elements
+        activate dom
+        dom --> gui : updated
+        deactivate dom
+
+        gui -> dom : update window titles and paths\n         for windows matching uid / old_path prefix
+        activate dom
+        dom --> gui : updated
+        deactivate dom
+
+        alt data-has_website == 1
+            gui -> dom : update_sites_cache()
+        end
+
+        gui -> dom : sort_items on all parent item-containers
+
+    else Error
+        fs --> gui : error callback(err)
+        deactivate fs
+        gui -> dom : reset item name in DOM to old_name
+        gui -> alert : UIAlert(err.message)
+        activate alert
+        alert --> gui : (dismissed)
+        deactivate alert
+    end
+
+    deactivate gui
+end box
+
+' ─────────────────────────────────────────────
+' 5. UNDO (Create File / Folder / Rename)
+' ─────────────────────────────────────────────
+box "Undo Last Action" #F5F0FF
+    user -> gui : undo_last_action()
+    activate gui
+
+    gui -> history : pop() → { operation, data }
+    activate history
+    history --> gui : { operation, data }
+    deactivate history
+
+    alt operation == 'create_file' or 'create_folder'
+        gui -> gui : undo_create_file_or_folder(data)
+        note right of gui
+          delete_item(el_item):
+          • fadeOut .item[data-uid]
+          • close matching windows
+        end note
+        gui -> dom : fadeOut .item[data-uid] +\n         close matching windows
+        gui -> fs : delete({ paths: data-path, recursive: true })
+        activate fs
+
+        alt Delete Success
+            fs --> gui : success
+            deactivate fs
+            gui -> dom : removeItems from DOM,\n         update explorer footer counts,\n         clear shortcut references
+        else Delete Error
+            fs --> gui : error
+            deactivate fs
+            gui -> alert : UIAlert(err.responseText)
+            activate alert
+            alert --> gui : (dismissed)
+            deactivate alert
+        end
+
+    else operation == 'rename'
+        gui -> gui : rename_file(..., is_undo=true)\n[swaps new_name ↔ old_name]
+        note right of gui : Reuses rename_file with\nis_undo=true — no new\nhistory entry pushed
+    end
+
+    deactivate gui
+end box
+
+@enduml

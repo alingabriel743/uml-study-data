@@ -1,0 +1,268 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #6C757D
+    GroupBackgroundColor #F1F3F5
+    GroupBorderColor #868E96
+    NoteBackgroundColor #FFF9DB
+    NoteBorderColor #F08C00
+}
+
+title Anti-CSRF and Request Security Validation Flow
+
+actor "Browser / Client" as Client
+participant "GUI_AntiCSRFService\n(frontend)" as GUIAntiCSRF
+participant "eggspress\n(router)" as Router
+participant "configurable_auth\n(auth2 middleware)" as Auth2
+participant "AuthService" as AuthSvc
+participant "anticsrf\n(middleware)" as AntiCSRFMW
+participant "Backend_AntiCSRFService" as BackendAntiCSRF
+participant "CircularQueue\n(capacity=10)" as Queue
+participant "crypto" as Crypto
+participant "Route Handler" as Handler
+participant "helpers\n(validate_signature_auth\n/ sign_file)" as Helpers
+
+' ============================================================
+== FLOW 1: CSRF Token Acquisition (GUI → Backend) ==
+' ============================================================
+
+Client -> GUIAntiCSRF : token()
+activate GUIAntiCSRF
+
+GUIAntiCSRF -> Router : GET /get-anticsrf-token\n[Authorization: Bearer <auth_token>]
+activate Router
+
+Router -> Auth2 : run auth2 middleware
+activate Auth2
+
+Auth2 -> AuthSvc : authenticate_from_token(token)
+activate AuthSvc
+AuthSvc --> Auth2 : Actor
+deactivate AuthSvc
+
+Auth2 -> Auth2 : set req.user, req.actor
+Auth2 --> Router : next()
+deactivate Auth2
+
+Router -> Handler : route handler
+activate Handler
+
+alt subdomain === 'api'
+    Handler --> Router : res.status(404).send("Hey, stop that!") [ABORT]
+    note right of Handler
+        Blocked on 'api.' subdomain to
+        prevent cross-origin token harvest
+    end note
+else req.user missing
+    Handler --> Router : res.status(403) [ABORT]
+else valid request
+    Handler -> BackendAntiCSRF : create_token(req.user.uuid)
+    activate BackendAntiCSRF
+
+    opt no queue for this user yet
+        BackendAntiCSRF -> Queue : new CircularQueue(10)
+        activate Queue
+        note right of Queue
+            map_session_to_tokens[uuid] = queue
+        end note
+    end
+
+    BackendAntiCSRF -> Crypto : randomBytes(32).toString('hex')
+    activate Crypto
+    Crypto --> BackendAntiCSRF : token (hex string)
+    deactivate Crypto
+
+    BackendAntiCSRF -> Queue : push(token)
+    Queue --> BackendAntiCSRF : (oldest evicted if capacity exceeded)
+    deactivate Queue
+
+    BackendAntiCSRF --> Handler : return token
+    deactivate BackendAntiCSRF
+
+    Handler --> Router : res.send({ token })
+end
+
+deactivate Handler
+Router --> GUIAntiCSRF : { token }
+deactivate Router
+
+GUIAntiCSRF --> Client : return anti_csrf token
+deactivate GUIAntiCSRF
+
+' ============================================================
+== FLOW 2: CSRF Token Validation on Protected Endpoint ==
+' ============================================================
+
+Client -> Router : POST /secure-endpoint\n{ anti_csrf: <token>, ...body }
+activate Router
+
+Router -> Auth2 : run auth2 middleware
+activate Auth2
+
+Auth2 -> AuthSvc : authenticate_from_token(token)
+activate AuthSvc
+AuthSvc --> Auth2 : Actor
+deactivate AuthSvc
+
+Auth2 -> Auth2 : set req.user, req.actor
+Auth2 --> Router : next()
+deactivate Auth2
+
+Router -> AntiCSRFMW : run anticsrf middleware
+activate AntiCSRFMW
+
+alt req.body.anti_csrf missing
+    AntiCSRFMW --> Router : APIError.create('anti-csrf-incorrect').write(res) [ABORT]
+else token present
+    AntiCSRFMW -> BackendAntiCSRF : consume_token(req.user.uuid, req.body.anti_csrf)
+    activate BackendAntiCSRF
+
+    BackendAntiCSRF -> Queue : maybe_consume(token)
+    activate Queue
+    Queue --> BackendAntiCSRF : boolean (true if found & removed)
+    deactivate Queue
+
+    BackendAntiCSRF --> AntiCSRFMW : has (true / false)
+    deactivate BackendAntiCSRF
+
+    alt !has (invalid or replayed token)
+        AntiCSRFMW --> Router : APIError.create('anti-csrf-incorrect').write(res) [ABORT]
+    else valid token (one-time use consumed)
+        AntiCSRFMW --> Router : next()
+        deactivate AntiCSRFMW
+
+        Router -> Handler : execute route handler
+        activate Handler
+        Handler --> Router : response
+        deactivate Handler
+    end
+end
+
+Router --> Client : HTTP response
+deactivate Router
+
+' ============================================================
+== FLOW 3a: URL Signature Generation (sign_file) ==
+' ============================================================
+
+participant "Caller" as Caller
+
+Caller -> Helpers : sign_file(fsentry, action)
+activate Helpers
+
+Helpers -> Helpers : uid = fsentry.uuid ?? fsentry.uid ?? fsentry._id
+Helpers -> Helpers : expires = Math.ceil(Date.now()/1000) + 9999999999999
+note right of Helpers
+    Very large TTL (~317 years) —
+    signatures are effectively permanent
+    unless secret changes
+end note
+Helpers -> Helpers : signature = sha256(\`${uid}/${action}/${secret}/${expires}\`)
+
+Helpers --> Caller : { uid, expires, signature,\nurl, read_url, write_url,\nmetadata_url, ... }
+deactivate Helpers
+
+' ============================================================
+== FLOW 3b: URL Signature Validation (validate_signature_auth) ==
+' ============================================================
+
+Caller -> Helpers : validate_signature_auth(url, action, options?)
+activate Helpers
+
+Helpers -> Helpers : parse URL searchParams\n→ uid, expires, signature
+
+alt any of uid | action | expires | signature missing
+    Helpers --> Caller : throw Error (missing parameter)
+else options.uid provided && uid !== options.uid
+    Helpers --> Caller : throw 'uid does not match'
+else expires < Date.now() / 1000
+    Helpers --> Caller : throw 'Signature expired'
+else check write-permission signature
+    Helpers -> Helpers : expected_write =\nsha256(\`${uid}/write/${secret}/${expires}\`)
+    alt signature === expected_write
+        note right of Helpers
+            'write' is a super-permission:
+            grants ALL actions
+        end note
+        Helpers --> Caller : return true
+    else check action-specific signature
+        Helpers -> Helpers : expected_action =\nsha256(\`${uid}/${action}/${secret}/${expires}\`)
+        alt signature === expected_action
+            Helpers --> Caller : return true
+        else
+            Helpers --> Caller : throw 'Authentication failed'
+        end
+    end
+end
+
+deactivate Helpers
+
+' ============================================================
+== FLOW 4: Auth2 Middleware — Token Extraction & Delegation ==
+' ============================================================
+
+participant "Incoming Request" as Req
+
+Req -> Auth2 : HTTP request
+activate Auth2
+
+alt req.actor already set (PreAuthService short-circuit)
+    Auth2 --> Req : next() [skip re-auth]
+else extract token
+    Auth2 -> Auth2 : token from:\nbody.auth_token | Authorization header\n| cookie | query.auth_token\n| socket.handshake
+
+    alt no token && optional mode
+        Auth2 --> Req : next()
+    else no token && required
+        Auth2 --> Req : APIError 'token_missing'
+    else token found
+        Auth2 -> AuthSvc : authenticate_from_token(token)
+        activate AuthSvc
+
+        alt LegacyTokenError on /whoami
+            AuthSvc --> Auth2 : LegacyTokenError
+            Auth2 -> AuthSvc : svc_auth.check_session(token,\n{ req, from_upgrade: true })
+            note right of Auth2
+                Session upgrade: issues
+                new cookie + new token
+            end note
+            AuthSvc --> Auth2 : Actor (upgraded)
+        else normal auth
+            AuthSvc --> Auth2 : Actor
+        end
+        deactivate AuthSvc
+
+        Auth2 -> Auth2 : set context actor/user,\nreq.actor, req.user, req.token
+        Auth2 --> Req : next()
+    end
+end
+
+deactivate Auth2
+
+@enduml

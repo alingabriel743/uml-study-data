@@ -1,0 +1,155 @@
+@startuml activity_code_execution_flow
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #495057
+    EndColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+
+title Code Execution Activity (code_run)
+
+|Handler (do_code_run)|
+start
+
+:Receive args & response;
+:Extract code_type (default='python')\nExtract code from args['code'] or args['script'];
+
+if (code is None?) then (yes)
+    :Extract code from response\nmarkdown code block;
+endif
+
+if (code still None?) then (yes)
+    :Return StepOutcome('[Error] Code missing');
+    stop
+endif
+
+:Extract timeout (default=60), cwd, code_cwd from args;
+
+if (inline_eval=True AND code_type='python'?) then (yes)
+    :exec/eval code directly in-process\nwith os.chdir(cwd);
+    :Return StepOutcome(result);
+    stop
+else (no)
+    :Call code_run(code, code_type, timeout,\ncwd, code_cwd, stop_signal);
+endif
+
+|code_run Function|
+
+:yield '[Action] Running {code_type}...' status;
+
+if (code_type == 'python'?) then (yes)
+    :Create NamedTemporaryFile(suffix='.ai.py')\nin code_cwd;
+    :Prepend code_run_header.py\n(subprocess.run patch + excepthook);
+    :Write user code to temp file;
+    :Close temp file;
+    :cmd = [sys.executable, '-X', 'utf8', '-u', tmp_path];
+elseif (code_type in ['powershell', 'bash']?) then (yes)
+    if (os.name == 'nt' (Windows)?) then (yes)
+        :cmd = ['powershell', '-NoProfile',\n'-NonInteractive', '-Command', code];
+        :Configure STARTUPINFO (SW_HIDE window);
+    else (Linux/Mac)
+        :cmd = ['bash', '-c', code];
+    endif
+else (unsupported)
+    :Return {'status': 'error',\n'msg': 'unsupported type'};
+    stop
+endif
+
+:Initialize full_stdout = [];
+:subprocess.Popen(cmd, stdout=PIPE,\nstderr=STDOUT, bufsize=0, cwd=cwd);
+:Record start_t = time.time();
+
+fork
+    |stream_reader Thread|
+    :Start daemon threading.Thread\n(target=stream_reader);
+    repeat
+        :readline() from proc.stdout;
+        :Decode bytes (UTF-8, fallback GBK);
+        :Append decoded line to full_stdout[];
+        :Print line to stdout;
+    repeat while (more output from process?) is (yes)
+    -> no (EOF);
+    :Thread exits;
+
+fork again
+    |code_run Function|
+    repeat
+        if (time.time() - start_t > timeout?) then (yes)
+            :process.kill();
+            :Append '[Timeout Error]' to full_stdout;
+            break
+        elseif (len(stop_signal) > 0?) then (yes)
+            :process.kill();
+            :Append '[Stopped]' to full_stdout;
+            break
+        else (continue)
+            :time.sleep(1);
+        endif
+    repeat while (stream_reader thread is_alive?) is (yes)
+    -> no;
+
+end fork
+
+:t.join(timeout=1);
+:exit_code = process.poll();
+:stdout_str = ''.join(full_stdout);
+
+if (exit_code == 0?) then (yes)
+    :status = 'success'\nicon = '✅';
+elseif (exit_code is None?) then (yes)
+    :icon = '⏳' (still running);
+else (non-zero)
+    :status = 'error'\nicon = '❌';
+endif
+
+:yield '[Status] {icon} Exit Code: {exit_code}\n[Stdout]\n{snippet}';
+:Start background thread to close process.stdout;
+
+note right
+  Exception path:
+  process.kill()
+  return {'status': 'error', 'msg': str(e)}
+end note
+
+|code_run Function|
+
+:Return {'status': status,\n'stdout': stdout_str (max 10000 chars),\n'exit_code': exit_code};
+
+' finally block — always executes
+if (code_type == 'python' AND tmp_path exists?) then (yes)
+    :os.remove(tmp_path)\n[Cleanup temp .ai.py file];
+endif
+
+|Handler (do_code_run)|
+
+:next_prompt = _get_anchor_prompt(skip=...);
+:Return StepOutcome(result, next_prompt=next_prompt);
+
+stop
+
+@enduml

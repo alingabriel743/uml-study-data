@@ -1,0 +1,184 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #212529
+    EndColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam ArrowColor #495057
+skinparam NoteBackgroundColor #FFF3CD
+skinparam NoteBorderColor #856404
+
+title Application Startup & Initialization\nPlatform-specific launch sequence through to game-ready state
+
+|Android|
+start
+:AndroidLauncher.onCreate(Bundle) called by Android OS;
+:Set uncaught exception handler\n→ CrashHandler.log();
+:super.onCreate();
+if (isTablet?) then (yes)
+    :Scl.setAddition(+0.5f)\n[double UI scale];
+else (no)
+endif
+:initialize(ClientLauncher,\nAndroidApplicationConfiguration)\nuseImmersiveMode=true, hideStatusBar=true, useGL30=true;
+:checkFiles(getIntent())\n[handle deep-linked save/map files];
+:Set external data directory\n(getExternalFilesDir);
+:Delete unused cache folder;
+if (files_moved marker absent?) then (yes)
+    :Migrate files from internal\nto external storage;
+else (no)
+endif
+
+|iOS|
+:IOSLauncher.main() called;
+:NSAutoreleasePool created;
+:UIApplication.main(argv, null, IOSLauncher.class);
+:IOSLauncher.createApplication() called;
+if (Device idiom?) then (iPad)
+    :Scl.setAddition(+0.5f);
+else (iPhone)
+    :Scl.setAddition(-0.5f);
+endif
+:new IOSApplication(ClientLauncher,\nIOSApplicationConfiguration)\nuseGL30=true;
+:didFinishLaunching()\n[check URL launch options];
+:Register ClientLoadEvent\n→ add landscape-rotation warning overlay;
+
+|Desktop|
+:DesktopLauncher.main(String[] args) called;
+:Version.init() — load version info;
+:Vars.loadLogger() — init console logger;
+:Vars.loadFileLogger(saves/last_log.txt);
+if (32-bit Windows?) then (yes)
+    :Show error dialog;
+    stop
+else (no)
+endif
+if (Java < 17?) then (yes)
+    :Show error dialog;
+    stop
+else (no)
+endif
+fork
+    :DiscordRPC.connect(discordID)\non daemon thread\n[if not disabled];
+fork again
+    if (Version.isSteam?) then (yes)
+        :SteamAPI.loadLibraries();
+        :SteamAPI.init();
+        :SVars.net, SVars.stats,\nSVars.workshop, SVars.user initialized;
+        :Register ClientLoadEvent\n→ set Steam player name\n+ handle lobby connect;
+    else (no)
+    endif
+end fork
+if (Intel GPU detected?) then (yes)
+    :Disable GL3, use GL 2.x;
+elseif (macOS?) then (yes)
+    :Use GL 4.1 max;
+else (default)
+endif
+:new SdlApplication(DesktopLauncher, SdlConfig)\ntitle='Mindustry', maximized;
+
+|ClientLauncher|
+:ClientLauncher.init() called\nby framework after GL context created;
+:nextFrame = Time.nanos();
+:setup();
+:Check MINDUSTRY_DATA_DIR env/property\n→ set data directory if present;
+:Vars.checkLaunch()\n[read launchIDFile, set failedToLaunch flag,\nwrite new launch ID];
+:Vars.loadLogger() — init console logger (idempotent);
+:new LoadRenderer() — create loading screen;
+:Events.fire(ClientCreateEvent)\n[notify platform-specific listeners];
+:Vars.loadFileLogger() — init file logger\n→ saves/last_log.txt;
+:maxTextureSize = Gl.getInt(Gl.maxTextureSize);
+:IntelGpuCheck.init()\n[detect Intel GPU];
+:Log GL version, max texture size, RAM info;
+:Set Time.deltaProvider (clamped 60fps delta);
+:UI.loadColors();
+:batch = new SpriteBatch();
+:assets = new AssetManager();
+:Register loaders:\nMapPreviewLoader, async Sound, async Music;
+:assets.load('sprites/error.png');
+:atlas = TextureAtlas.blankAtlas();
+:Vars.net = new Net(platform.getNet());
+:MapPreviewLoader.setupLoaders();
+:mods = new Mods();
+:schematics = new Schematics();
+:Fonts.loadSystemCursors();
+:assets.load(new Vars())\n[async: game variables & content registry];
+:Fonts.loadDefaultFont();
+if (maxTextureSize >= 4096?) then (yes)
+    :Load sprites.aatls;
+else (no)
+    :Load fallback/sprites.aatls\n[low-end device atlas];
+endif
+:assets.loadRun('maps')\n→ maps.loadPreviews();
+:Musics.load(), Sounds.load();
+:assets.loadRun('contentcreate'):\n- createBaseContent(), loadColors()\n- mods.loadScripts()\n- content.createModContent();
+:assets.load(mods) — load mod files;
+:assets.loadRun('mergeUI')\n→ Fonts.mergeFontAtlas(atlas);
+:Instantiate core modules:\nLogic, Control, Renderer, UI,\nNetServer, NetClient;
+:assets.load(schematics);
+:assets.loadRun('contentinit')\n→ content.init() then content.load();
+:assets.loadRun('baseparts')\n→ bases.load();
+note right
+  All modules queued as
+  Loadable via assets.load()
+end note
+
+:— ASSET LOADING LOOP —\nupdate() called every frame;
+
+repeat
+    :loader.draw()\n[render loading screen at max 20 FPS];
+    :assets.update(1000/20)\n[advance async asset loading];
+repeat while (assets fully loaded?) is (no)
+-> yes;
+
+:loader.dispose(), loader = null;
+:SoundPriority.init();
+:for each module: listener.init();
+:mods.eachClass(Mod::init)\n[initialize all mod classes];
+:finished = true;
+:Events.fire(ClientLoadEvent)\n[game-ready signal];
+:Log total load time;
+:clientLoaded = true;
+:super.resize() — layout UI;
+:app.post x4:\n→ super.resize() + finishLaunch();
+
+:Vars.finishLaunch():\n- save lastBuild + lastBuildString to settings\n- delete launchIDFile\n  [marks successful boot];
+
+:asyncCore.begin();
+:super.update()\n[normal game loop starts];
+:asyncCore.end();
+
+if (limitFps enabled?) then (yes)
+    :Sleep until nextFrame;
+else (no)
+endif
+
+stop
+
+@enduml

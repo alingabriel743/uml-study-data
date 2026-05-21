@@ -1,0 +1,222 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    GroupBackgroundColor #DEE2E6
+    GroupBorderColor #6C757D
+    NoteBackgroundColor #FFF3CD
+    NoteBorderColor #FFC107
+}
+
+title Pathfinding Update and Cluster Management
+
+' ─── Participants ───────────────────────────────────────────────────
+participant "Tile" as Tile
+participant "Events\n(EventBus)" as Events
+participant "Pathfinder\n(flow-field)" as Pathfinder
+participant "ControlPathfinder\n(HPA* thread)" as ControlPF
+participant "TaskQueue" as TaskQueue
+participant "Cluster" as Cluster
+participant "FieldCache" as FieldCache
+participant "PathRequest" as PathRequest
+participant "GroundAI /\nAIController" as GroundAI
+participant "CommandAI" as CommandAI
+participant "Unit" as Unit
+
+' ════════════════════════════════════════════════════════════════════
+group TILE CHANGE TRIGGER [Tile modification propagates to both pathfinders]
+
+    note over Tile: Block placement or\nfloor type change
+
+    alt setBlock() — fires TileChangeEvent
+        Tile -> Events: fire(TileChangeEvent)
+        activate Events
+        Events -> ControlPF: updateTile(tile)\n[via registered listener]
+        deactivate Events
+    else setFloor() — direct call
+        Tile -> Pathfinder: updateTile(tile)
+        activate Pathfinder
+        Pathfinder -> ControlPF: updateTile(tile)\n[line 316, Pathfinder.java]
+        deactivate Pathfinder
+    end
+
+end
+
+' ════════════════════════════════════════════════════════════════════
+group UPDATE TILE — Cluster Invalidation [Main Thread → TaskQueue → BG Thread]
+
+    activate ControlPF
+    ControlPF -> ControlPF: getLinkedTiles(this::updateSingleTile)
+
+    loop for each linked tile t
+        ControlPF -> ControlPF: updateSingleTile(t)\ncompute cx, cy, clusterIndex
+
+        alt tile on cluster EDGE
+            ControlPF -> TaskQueue: post(() → clustersToUpdate.add(cx±1, cy))
+            ControlPF -> TaskQueue: post(() → clustersToUpdate.add(cx, cy±1))
+            ControlPF -> TaskQueue: post(() → clustersToUpdate.add(cx, cy))
+        else tile in cluster INTERIOR
+            ControlPF -> TaskQueue: post(() → clustersToInnerUpdate.add(cluster))
+        end
+    end
+    deactivate ControlPF
+
+    note over TaskQueue: Lambdas queued here bridge\nmain thread → BG pathfinding thread
+
+end
+
+' ════════════════════════════════════════════════════════════════════
+group BACKGROUND THREAD LOOP [~30 fps, MIN_PRIORITY]
+
+    note over ControlPF: Thread: "Control Pathfinder"\nsleeps 33 ms between iterations
+
+    loop every ~33 ms
+        ControlPF -> TaskQueue: queue.run()\n[drain lambdas]
+        activate TaskQueue
+        TaskQueue --> ControlPF: populates clustersToUpdate\n& clustersToInnerUpdate
+        deactivate TaskQueue
+
+        ControlPF -> ControlPF: clustersToUpdate.each(\n  cluster → updateClustersComplete(cluster))
+        activate ControlPF
+
+        loop for each dirty cluster (full rebuild)
+            ControlPF -> ControlPF: updateClustersComplete(clusterIndex)
+            note right of ControlPF: iterates [team][costType]
+
+            ControlPF -> ControlPF: updateCluster(team, pathCost, cx, cy)
+            activate ControlPF
+            ControlPF -> Cluster: create / reset Cluster
+            activate Cluster
+            Cluster --> ControlPF: cluster ref
+            deactivate Cluster
+
+            ControlPF -> ControlPF: scan border tiles → detect passable spans\ncreate/share portals (IntSeq) with neighbor
+
+            ControlPF -> ControlPF: updateInnerEdges(team, cost, cx, cy, cluster)
+            note right of ControlPF: innerAstar per portal pair\n→ IntraEdge stored in\ncluster.portalConnections
+            deactivate ControlPF
+        end
+
+        ControlPF -> ControlPF: clustersToInnerUpdate.each(\n  cluster → updateClustersInner(cluster))
+        note right of ControlPF: inner-edge-only rebuild\n(portals unchanged)
+
+        ControlPF -> ControlPF: clustersToUpdate.clear()\nclustersToInnerUpdate.clear()
+
+        opt every 1000 ms — stale field invalidation
+            ControlPF -> ControlPF: iterate invalidRequests
+            alt field.frontier.isEmpty()
+                ControlPF -> FieldCache: fields.remove(field.mapKey)
+                ControlPF -> TaskQueue: post(recalculatePath(request))
+            end
+        end
+
+        ControlPF -> FieldCache: updateFields(cache, maxUpdate=12 ms)
+        activate FieldCache
+        note right of FieldCache: BFS outward from goalPos\nthrough cluster graph\npopulates clusterIdx → int[] costs
+        FieldCache --> ControlPF: updated cost arrays
+        deactivate FieldCache
+
+        deactivate ControlPF
+    end
+
+end
+
+' ════════════════════════════════════════════════════════════════════
+group LAZY CLUSTER CREATION [getCreateCluster]
+
+    ControlPF -> ControlPF: getCreateCluster(team, pathCost, cx, cy)
+    activate ControlPF
+    ControlPF -> ControlPF: getCluster(team, pathCost, cx, cy)
+    alt cluster == null
+        ControlPF -> ControlPF: updateCluster(team, pathCost, cx, cy)
+        note right of ControlPF: on-demand creation\nfor first access
+    end
+    ControlPF --> ControlPF: cluster
+    deactivate ControlPF
+
+end
+
+' ════════════════════════════════════════════════════════════════════
+group PATH QUERY — CommandAI (HPA* / ControlPathfinder) [Main Thread]
+
+    Unit -> CommandAI: (unit movement tick)
+    activate CommandAI
+    CommandAI -> ControlPF: getPathPosition(unit, vecMovePos, vecOut, noFound)
+    activate ControlPF
+
+    ControlPF -> ControlPF: costId = unit.type.pathCostId\ntileOn = unit.tileOn()
+
+    ControlPF -> ControlPF: raycast(team, cost, tileX, tileY, destX, destY)
+    alt line-of-sight clear
+        ControlPF --> CommandAI: out.set(destination); return true
+    else no LOS
+        ControlPF -> PathRequest: unitRequests.get(unit)\n[create PathRequest if absent]
+        activate PathRequest
+        PathRequest --> ControlPF: request
+        deactivate PathRequest
+
+        ControlPF -> FieldCache: fields.get(FieldIndex(destPos, costId, team))
+        activate FieldCache
+        FieldCache --> ControlPF: fieldCache (or null)
+        deactivate FieldCache
+
+        ControlPF -> ControlPF: traverse fieldCache\nfind lowest-cost neighbor tile\n(up to 30 iterations)
+        ControlPF --> CommandAI: out.set(nextTile.worldx, worldy)\nreturn true/false
+    end
+
+    deactivate ControlPF
+    CommandAI --> Unit: move toward out position
+    deactivate CommandAI
+
+end
+
+' ════════════════════════════════════════════════════════════════════
+group PATH QUERY — GroundAI / AIController (Dijkstra Flow-Field) [Main Thread]
+
+    Unit -> GroundAI: (unit movement tick)
+    activate GroundAI
+    GroundAI -> GroundAI: updateMovement()
+    GroundAI -> GroundAI: pathfind(Pathfinder.fieldCore, true,\n  stuckTime >= stuckThreshold)
+    activate GroundAI
+
+    GroundAI -> Pathfinder: getField(team, costType, fieldType)
+    activate Pathfinder
+    alt cache miss
+        Pathfinder -> Pathfinder: create Flowfield
+        Pathfinder -> TaskQueue: queue.post(registerPath(field))
+    end
+    Pathfinder --> GroundAI: Flowfield
+    deactivate Pathfinder
+
+    GroundAI -> GroundAI: flowfield.getNextTile(tile, avoidanceId)\nscan d4/d8 neighbors → lowest weights[] tile
+
+    GroundAI -> Unit: movePref(vec.trns(angleTo(targetTile), prefSpeed()))
+    deactivate GroundAI
+    deactivate GroundAI
+
+end
+
+@enduml

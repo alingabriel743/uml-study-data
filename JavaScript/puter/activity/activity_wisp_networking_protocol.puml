@@ -1,0 +1,152 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #212529
+    EndColor #212529
+    BarColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title WISP Networking Protocol Flow\n<size:11><i>PWispHandler — WebSocket multiplexed stream management</i></size>
+
+|Caller / Application|
+start
+:Instantiate PWispHandler\n(wispURL, puterAuth);
+
+|PWispHandler|
+:Call setup();\n:Create new WebSocket(wispURL);\n:Set binaryType = 'arraybuffer';
+:Register ws.onmessage handler;
+:Register ws.onclose handler\n→ setTimeout(setup, 1000);
+
+|WebSocket / Server|
+:Connection established;\n:Server sends INFO packet;
+
+|PWispHandler|
+if (puterAuth token available?) then (yes)
+    :Send INFO packet\n(streamID=0, puterAuth token);
+else (no)
+    :Skip authentication;
+endif
+
+|WebSocket / Server|
+:Server sends CONTINUE\n(streamID = 0, remainingBuffer);
+
+|PWispHandler|
+:Set this._bufferMax = remainingBuffer\n<i>(initial handshake complete)</i>;
+:Call this.onReady() if set;
+note right
+  Global buffer capacity
+  is now established
+end note
+
+|Caller / Application|
+:Call register(host, port,\n { dataCallBack, closeCallBack });
+
+|PWispHandler|
+:Allocate streamID = _nextStreamID++;
+:Store in streamMap:\n{ queue:[], streamID,\n  buffer:_bufferMax,\n  dataCallBack, closeCallBack };
+:Send CONNECT packet\n(TCP, streamID, host, port);
+:Return streamID to caller;
+
+|Caller / Application|
+:Call write(streamID, data);
+
+|PWispHandler|
+if (streamData.buffer > 0?) then (yes)
+    :Decrement stream buffer;
+    :Send DATA packet\n(streamID, payload: data);
+else (no)
+    :Push data onto\nstreamData.queue\n<i>(backpressure applied)</i>;
+endif
+
+|WebSocket / Server|
+:Server sends DATA packet\n(for an open stream);
+
+|PWispHandler|
+:Lookup stream in streamMap;
+:Call stream.dataCallBack(payload);
+
+|WebSocket / Server|
+:Server sends CONTINUE\n(streamID > 0, remainingBuffer);
+
+|PWispHandler|
+:Update stream.buffer\n= remainingBuffer;
+:Call _continue(streamID);
+fork
+    :Get queued payloads\nfrom stream.queue;
+    while (queue not empty?) is (yes)
+        :Dequeue next payload\n(queue.shift());
+        :Call write(streamID, payload)\n<i>(drains backpressure)</i>;
+    endwhile (no)
+    :Queue drained;
+fork again
+    note right
+      Parallel: new writes from
+      caller may still arrive
+    end note
+end fork
+
+|Caller / Application|
+:Call close(streamID);
+
+|PWispHandler|
+:Send CLOSE packet\n(streamID, reason: 0x02);
+note right
+  No local streamMap cleanup —
+  entry persists until server
+  sends CLOSE back
+end note
+
+|WebSocket / Server|
+:Server sends CLOSE\n(streamID != 0, reason);
+
+|PWispHandler|
+:Lookup stream in streamMap;
+:Call stream.closeCallBack(reason);
+note right
+  Stream lifecycle ends;
+  entry can now be discarded
+end note
+
+|WebSocket / Server|
+:WebSocket connection closed\n(network error / server shutdown);
+
+|PWispHandler|
+:ws.onclose fires;
+:Schedule reconnect:\nsetTimeout(setup, 1000ms);
+note right
+  Full re-initialisation:
+  new WebSocket, new handshake,
+  _bufferMax reset on next
+  CONTINUE (streamID=0)
+end note
+
+stop
+
+@enduml

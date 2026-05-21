@@ -1,0 +1,239 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam actor {
+    BackgroundColor #E9ECEF
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #F1F3F5
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #DEE2E6
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #6C757D
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Feishu / Lark Bot Message Flow
+
+actor "Lark Platform" as larkplatform
+
+box "Bot Process (fsapp.py)" #F1F3F5
+    participant "lark.ws.Client\n(WebSocket)" as wsClient
+    participant "EventDispatcher\nHandler" as dispatcher
+    participant "handle_message" as handleMsg
+    participant "_build_user\nMessage" as buildMsg
+    participant "_download_and\nsave_media" as dlMedia
+    participant "handle_command" as handleCmd
+    participant "run_agent\n[Thread]" as runAgent
+    participant "send_message /\nupdate_message" as sendMsg
+end box
+
+participant "GeneraticAgent\n(agent)" as agent
+participant "Lark Open API\n(client.im.v1)" as larkApi
+
+== Startup ==
+
+[-> wsClient : main() → create_client()\n  lark.Client.builder().app_id().app_secret().build()
+activate wsClient
+
+wsClient -> dispatcher : register_p2_im_message_receive_v1(handle_message)
+wsClient -> larkplatform : lark.ws.Client.start()\n[establish long-connection WebSocket]
+activate larkplatform
+
+== Incoming Message Event ==
+
+larkplatform -> wsClient : im.message.receive_v1 event (WebSocket frame)
+wsClient -> dispatcher : dispatch event
+activate dispatcher
+dispatcher -> handleMsg : handle_message(data)
+activate handleMsg
+deactivate dispatcher
+
+handleMsg -> handleMsg : extract open_id, chat_id\nfrom data.event.sender / data.event.message
+
+alt Unauthorized user
+    handleMsg --> larkplatform : (drop — no reply)
+else Authorized
+    handleMsg -> buildMsg : _build_user_message(message)
+    activate buildMsg
+
+    alt msg_type == "text"
+        buildMsg -> buildMsg : parse JSON content['text']
+    else msg_type == "post"
+        buildMsg -> buildMsg : _extract_post_content()\n→ _parse_block(block)\n→ collect text + image_keys
+        loop for each image_key in post blocks
+            buildMsg -> dlMedia : _download_and_save_media('image', image_key, message_id)
+            activate dlMedia
+            dlMedia -> larkApi : message_resource.get(\nGetMessageResourceRequest type='image')
+            activate larkApi
+            larkApi --> dlMedia : binary image data
+            deactivate larkApi
+            dlMedia -> dlMedia : save to MEDIA_DIR
+            dlMedia --> buildMsg : (file_path, filename)
+            deactivate dlMedia
+        end
+    else msg_type in {image, audio, file, media}
+        buildMsg -> dlMedia : _download_and_save_media(msg_type, content_json, message_id)
+        activate dlMedia
+        dlMedia -> larkApi : message_resource.get(\nGetMessageResourceRequest type=file/image)
+        activate larkApi
+        larkApi --> dlMedia : binary media data
+        deactivate larkApi
+        dlMedia -> dlMedia : save to MEDIA_DIR
+        dlMedia --> buildMsg : (file_path, filename)
+        deactivate dlMedia
+    else msg_type in {share_chat, share_user, interactive}
+        buildMsg -> buildMsg : _extract_share_card_content()\n→ _extract_interactive_content()\n→ _extract_element_content()
+    end
+
+    buildMsg --> handleMsg : (user_input, image_paths)
+    deactivate buildMsg
+
+    alt user_input is empty
+        handleMsg -> sendMsg : send_message(chat_id|open_id, warning_text)
+        activate sendMsg
+        sendMsg -> larkApi : im.v1.message.create(\nCreateMessageRequestBody)
+        activate larkApi
+        larkApi --> sendMsg : message_id
+        deactivate larkApi
+        sendMsg --> handleMsg : message_id
+        deactivate sendMsg
+    else user_input starts with '/'
+        handleMsg -> handleCmd : handle_command(open_id, cmd, chat_id)
+        activate handleCmd
+        alt /stop
+            handleCmd -> agent : abort()
+            handleCmd -> handleCmd : user_tasks[open_id]['running'] = False
+        else /new
+            handleCmd -> agent : abort()
+            handleCmd -> agent : history = []
+        else /restore
+            handleCmd -> handleCmd : format_restore()\nagent.history.extend(restored)
+        else /status or /help
+            handleCmd -> handleCmd : format informational reply
+        end
+        handleCmd -> sendMsg : send_message(chat_id|open_id, reply)
+        activate sendMsg
+        sendMsg -> larkApi : im.v1.message.create(...)
+        activate larkApi
+        larkApi --> sendMsg : message_id
+        deactivate larkApi
+        sendMsg --> handleCmd
+        deactivate sendMsg
+        deactivate handleCmd
+    else Normal message → spawn agent thread
+        handleMsg -> runAgent : threading.Thread(target=run_agent).start()
+        activate runAgent
+
+        == Agent Reply Streaming ==
+
+        runAgent -> sendMsg : send_message(chat_id|open_id,\n'思考中...', use_card=True)
+        activate sendMsg
+        sendMsg -> larkApi : im.v1.message.create(\ninteractive card JSON)
+        activate larkApi
+        larkApi --> sendMsg : msg_id
+        deactivate larkApi
+        sendMsg --> runAgent : msg_id
+        deactivate sendMsg
+
+        runAgent -> agent : put_task(user_input,\nsource='feishu', images=image_paths)
+        activate agent
+        agent --> runAgent : deque dq (async queue)
+
+        loop polling every 3 s — dq.get_nowait()
+            runAgent -> runAgent : _display_text(raw)\n→ _strip_files(_clean(raw))
+
+            alt display text > 3500 chars
+                runAgent -> sendMsg : send_message(new card '继续...')
+                activate sendMsg
+                sendMsg -> larkApi : im.v1.message.create(new card)
+                activate larkApi
+                larkApi --> sendMsg : new_msg_id
+                deactivate larkApi
+                sendMsg --> runAgent : new_msg_id (reset msg_id)
+                deactivate sendMsg
+            end
+
+            runAgent -> sendMsg : update_message(msg_id, display_text)
+            activate sendMsg
+            sendMsg -> larkApi : im.v1.message.patch(\nPatchMessageRequest — card markdown)
+            activate larkApi
+            larkApi --> sendMsg : ok
+            deactivate larkApi
+            sendMsg --> runAgent
+            deactivate sendMsg
+
+            alt item['done'] == True
+                runAgent -> agent : (task complete)
+                deactivate agent
+                note over runAgent : exit polling loop
+            end
+        end
+
+        == Send Generated Files ==
+
+        opt Generated files present in response
+            runAgent -> runAgent : _extract_files(raw)\n→ list of [FILE:...] paths
+            loop for each file_path
+                alt extension in IMAGE_EXTS
+                    runAgent -> larkApi : im.v1.image.create(image bytes)\n_upload_image_sync()
+                    activate larkApi
+                    larkApi --> runAgent : image_key
+                    deactivate larkApi
+                    runAgent -> sendMsg : send_message(..., msg_type='image', image_key)
+                    activate sendMsg
+                    sendMsg -> larkApi : im.v1.message.create(image)
+                    activate larkApi
+                    larkApi --> sendMsg : ok
+                    deactivate larkApi
+                    deactivate sendMsg
+                else audio/video/other file
+                    runAgent -> larkApi : im.v1.file.create(file bytes)\n_upload_file_sync()
+                    activate larkApi
+                    larkApi --> runAgent : file_key
+                    deactivate larkApi
+                    runAgent -> sendMsg : send_message(..., msg_type='file'|'media', file_key)
+                    activate sendMsg
+                    sendMsg -> larkApi : im.v1.message.create(file)
+                    activate larkApi
+                    larkApi --> sendMsg : ok
+                    deactivate larkApi
+                    deactivate sendMsg
+                end
+            end
+        end
+
+        deactivate runAgent
+    end
+
+    deactivate handleMsg
+end
+
+@enduml

@@ -1,0 +1,148 @@
+{
+  "scope": "text_generation_flow",
+  "title": "Text Generation Flow",
+  "diagram_type": "activity",
+  "description": "TextProvider gateway request construction, message mapping, tool attachment, API call, and response parsing",
+
+  "key_participants": [
+    "TextProvider (interface)",
+    "GeneratesText (trait)",
+    "HasTextGateway (trait)",
+    "TextGateway (interface)",
+    "OpenAiGateway (concrete)",
+    "BuildsTextRequests (trait)",
+    "MapsMessages (trait)",
+    "ParsesTextResponses (trait)",
+    "InvokesTools (trait)"
+  ],
+
+  "activity_flow": [
+    "START: AgentPrompt received by TextProvider::prompt(AgentPrompt)",
+    "ACTIVITY: Generate invocation UUID via Str::uuid7()",
+    "ACTIVITY: gatherMiddlewareFor(agent) — collect pipeline middleware",
+    "FORK: [is FakeGateway?] → record prompt via Ai::recordPrompt(prompt)",
+    "FORK: [agent uses RemembersConversations AND has participant?] → push RememberConversation middleware",
+    "FORK: [agent instanceof HasMiddleware?] → merge agent-defined middleware",
+    "ACTIVITY: Send AgentPrompt through pipeline()",
+    "ACTIVITY: Dispatch PromptingAgent event",
+    "DECISION: [agent instanceof Conversational?] → YES: load prior messages from agent.messages() | NO: messages = []",
+    "ACTIVITY: Append UserMessage(prompt.prompt, prompt.attachments) to messages",
+    "ACTIVITY: Register tool callbacks via textGateway()->onToolInvocation(invoking, invoked)",
+    "DECISION: [agent instanceof HasStructuredOutput?] → YES: schema = agent.schema(JsonSchemaTypeFactory) | NO: schema = null",
+    "ACTIVITY: Resolve TextGenerationOptions via TextGenerationOptions::forAgent(agent)",
+    "ACTIVITY: Call textGateway()->generateText(provider, model, instructions, messages, tools, schema, options, timeout)",
+
+    "--- SUB-FLOW: TextGateway::generateText ---",
+    "ACTIVITY: buildTextRequestBody(provider, model, instructions, messages, tools, schema, options)",
+    "ACTIVITY: mapMessagesToInput(messages, instructions) → iterate messages by role",
+    "  FORK: [MessageRole::User] → mapUserMessage() + mapAttachments()",
+    "  FORK: [MessageRole::Assistant] → mapAssistantMessage() + map toolCalls + reasoningBlocks",
+    "  FORK: [MessageRole::ToolResult] → mapToolResultMessage() → function_call_output entries",
+    "DECISION: [tools filled?] → YES: mapTools(tools, provider) + set tool_choice='auto'",
+    "DECISION: [schema filled?] → YES: buildSchemaFormat(schema) → json_schema format (OpenAI) OR output_config (Anthropic native) OR buildStructuredOutputTool() synthetic tool (Anthropic fallback)",
+    "ACTIVITY: Apply provider-specific options (maxTokens, temperature, providerOptions)",
+    "ACTIVITY: HTTP POST to API endpoint ('responses' for OpenAI) via withErrorHandling()",
+    "ACTIVITY: response.json() → raw data",
+    "ACTIVITY: validateTextResponse(data)",
+    "DECISION: [data has error OR status='failed'?] → YES: throw AiException | NO: continue",
+
+    "--- SUB-FLOW: ParsesTextResponses::processResponse (recursive) ---",
+    "ACTIVITY: extractText(output) → last output content text",
+    "ACTIVITY: extractToolCalls(output) → filter function_call items",
+    "ACTIVITY: extractReasonings(output) → filter reasoning items",
+    "ACTIVITY: extractCitations(output) → filter url_citation annotations",
+    "ACTIVITY: extractUsage(data) → Usage(inputTokens, outputTokens, cached, reasoning)",
+    "ACTIVITY: extractFinishReason(data) → FinishReason enum (Stop|ToolCalls|Length|Error)",
+    "ACTIVITY: mapToolCallsWithReasoning(toolCalls, reasonings) → ToolCall[]",
+    "ACTIVITY: Create Step(text, toolCalls, [], finishReason, usage, Meta)",
+    "ACTIVITY: Push AssistantMessage to messages collection",
+
+    "DECISION: [finishReason == ToolCalls AND filled(toolCalls) AND steps.count < maxSteps?]",
+    "  YES BRANCH → executeToolCalls(toolCalls, tools):",
+    "    LOOP per toolCall:",
+    "      ACTIVITY: findTool(toolCall.name, tools) by class_basename",
+    "      DECISION: [tool found?] → NO: skip | YES:",
+    "        ACTIVITY: Fire invokingToolCallback → dispatch InvokingTool event",
+    "        ACTIVITY: tool.handle(new Request(arguments))",
+    "        ACTIVITY: Fire toolInvokedCallback → dispatch ToolInvoked event",
+    "        ACTIVITY: Create ToolResult(id, name, arguments, result, resultId)",
+    "    ACTIVITY: Update Step with toolResults",
+    "    ACTIVITY: Push ToolResultMessage to messages",
+    "    ACTIVITY: continueWithToolResults() → build follow-up body {model, previous_response_id, tool_results_input}",
+    "    ACTIVITY: HTTP POST to API (again)",
+    "    ACTIVITY: validateTextResponse()",
+    "    ACTIVITY: RECURSE processResponse(depth+1) → [LOOP BACK]",
+
+    "  NO BRANCH → build final response:",
+    "    DECISION: [structured?] → YES: return StructuredTextResponse(structuredData, text, combinedUsage, Meta).withToolCallsAndResults().withSteps()",
+    "    NO: return TextResponse(text, combinedUsage, Meta).withMessages().withSteps()",
+
+    "--- BACK IN GeneratesText::prompt ---",
+    "DECISION: [schema filled?] → YES: wrap as StructuredAgentResponse | NO: wrap as AgentResponse",
+    "ACTIVITY: Attach toolCallsAndResults, steps to AgentResponse",
+    "ACTIVITY: Dispatch AgentPrompted event",
+    "END: Return AgentResponse"
+  ],
+
+  "key_decision_points": [
+    "Is agent Conversational? → load message history",
+    "Is agent HasStructuredOutput? → attach schema",
+    "Are tools provided? → attach mapTools + tool_choice",
+    "Is schema provided? → attach schema format (varies by gateway)",
+    "Does Anthropic provider support native structured output? → output_config vs synthetic tool",
+    "finishReason == ToolCalls AND below maxSteps? → enter tool execution loop",
+    "Tool found by name? → execute or skip",
+    "Is response structured? → StructuredTextResponse vs TextResponse",
+    "API returns error? → throw AiException"
+  ],
+
+  "key_method_signatures": {
+    "TextProvider.prompt": "prompt(AgentPrompt $prompt): AgentResponse",
+    "TextProvider.stream": "stream(AgentPrompt $prompt): StreamableAgentResponse",
+    "TextGateway.generateText": "generateText(TextProvider, string $model, ?string $instructions, Message[] $messages, Tool[] $tools, ?array $schema, ?TextGenerationOptions, ?int $timeout): TextResponse",
+    "TextGateway.onToolInvocation": "onToolInvocation(Closure $invoking, Closure $invoked): self",
+    "BuildsTextRequests.buildTextRequestBody": "buildTextRequestBody(Provider, string $model, ?string $instructions, array $messages, array $tools, ?array $schema, ?TextGenerationOptions): array",
+    "MapsMessages.mapMessagesToInput": "mapMessagesToInput(array $messages, ?string $instructions): array",
+    "ParsesTextResponses.processResponse": "processResponse(array $data, Provider, bool $structured, array $tools, ?array $schema, Collection $steps, Collection $messages, int $depth, ?int $maxSteps, ...): TextResponse",
+    "InvokesTools.executeTool": "executeTool(Tool $tool, array $arguments): string",
+    "InvokesTools.findTool": "findTool(string $name, array $tools): ?Tool"
+  },
+
+  "key_relationships": [
+    "TextProvider (interface) implemented_by concrete providers (e.g. OpenAiProvider)",
+    "GeneratesText (trait) uses HasTextGateway to get TextGateway instance",
+    "OpenAiGateway implements Gateway (which extends TextGateway)",
+    "OpenAiGateway uses BuildsTextRequests, MapsMessages, ParsesTextResponses, InvokesTools, MapsTools, MapsAttachments traits",
+    "AnthropicGateway uses its own BuildsTextRequests with different schema strategy",
+    "ParsesTextResponses::processResponse is recursive (tool loop) until FinishReason::Stop or maxSteps reached",
+    "InvokesTools dispatches InvokingTool/ToolInvoked events via callbacks registered by GeneratesText"
+  ],
+
+  "response_types": {
+    "TextResponse": "text, usage, meta, messages, steps, toolCalls, toolResults",
+    "StructuredTextResponse": "extends TextResponse + structured (decoded JSON)",
+    "AgentResponse": "invocationId, text, usage, meta, messages, toolCalls, toolResults, steps",
+    "StructuredAgentResponse": "extends AgentResponse + structured data"
+  },
+
+  "important_notes": [
+    "Tool loop is bounded by options.maxSteps (defaults to round(tools.count * 1.5))",
+    "OpenAI uses 'responses' endpoint with previous_response_id for stateful tool continuation",
+    "Anthropic uses Messages API; structured output either via output_config (beta) or synthetic 'output_structured_data' tool",
+    "Pipeline middleware supports: FakeGateway recording, RememberConversation, custom agent middleware",
+    "Events fired: PromptingAgent (pre), InvokingTool (per tool call), ToolInvoked (post tool), AgentPrompted (post completion)"
+  ],
+
+  "source_files_analyzed": [
+    "src/Contracts/Providers/TextProvider.php",
+    "src/Providers/Concerns/GeneratesText.php",
+    "src/Providers/Concerns/HasTextGateway.php",
+    "src/Contracts/Gateway/TextGateway.php",
+    "src/Gateway/OpenAi/OpenAiGateway.php",
+    "src/Gateway/OpenAi/Concerns/BuildsTextRequests.php",
+    "src/Gateway/OpenAi/Concerns/MapsMessages.php",
+    "src/Gateway/OpenAi/Concerns/ParsesTextResponses.php",
+    "src/Gateway/Anthropic/Concerns/BuildsTextRequests.php",
+    "src/Gateway/Concerns/InvokesTools.php"
+  ]
+}

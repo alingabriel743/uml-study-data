@@ -1,0 +1,138 @@
+{
+  "scope": "skill_distillation_and_publishing",
+  "title": "Skill Distillation and Publishing Flow",
+  "diagram_type": "sequence",
+  "key_participants": [
+    "Caller/GEP",
+    "skillDistiller",
+    "sanitize (sanitize.js)",
+    "llmReview (llmReview.js)",
+    "policyCheck (policyCheck.js)",
+    "skillPublisher (skillPublisher.js)",
+    "a2aProtocol",
+    "Hub API"
+  ],
+  "interaction_flow": [
+    "Caller/GEP → skillDistiller: autoDistill() OR shouldDistill() check",
+    "skillDistiller → FileSystem: collectDistillationData() — reads capsules.json, genes.json, events.jsonl from GEP_ASSETS_DIR",
+    "skillDistiller → skillDistiller: analyzePatterns(data) — identifies high_frequency (count>=5), strategy_drift, coverage_gaps",
+    "skillDistiller → skillDistiller: shouldDistill() — checks SKILL_DISTILLER env, min capsule threshold, interval since last distillation",
+    "skillDistiller → skillDistiller: synthesizeGeneFromPatterns(data, analysis, genes) — builds distilled Gene object",
+    "skillDistiller → sanitize: sanitizePayload(capsule) — deep-clones & redacts tokens/keys/paths/emails from payload; returns sanitized copy",
+    "sanitize → sanitize: redactString(str) — applies REDACT_PATTERNS (Bearer tokens, sk-*, AWS, GitHub, npm, private keys, emails, .env refs)",
+    "sanitize → skillDistiller: return sanitizedCapsule",
+    "skillDistiller → llmReview: runLlmReview({diff, gene, signals, mutation})",
+    "llmReview → llmReview: isLlmReviewEnabled() — checks EVOLVER_LLM_REVIEW env var",
+    "llmReview → llmReview: buildReviewPrompt({diff, gene, signals, mutation}) — builds structured review prompt with criteria",
+    "llmReview → child_process: execFileSync(node, ['-e', reviewScript, tmpFile]) — timeout 30s",
+    "llmReview → skillDistiller: return {approved: bool, confidence: 0.0-1.0, concerns: [], summary: string}",
+    "skillDistiller → skillDistiller: [alt] if !approved → abort distillation",
+    "skillDistiller → policyCheck: checkConstraints(gene, ...) — checks blast radius, forbidden_paths, max_files, validation commands",
+    "policyCheck → policyCheck: isForbiddenPath(), isConstraintCountedPath(), isValidationCommandAllowed() — strips unsafe commands (rm -rf, node -e/--eval)",
+    "policyCheck → skillDistiller: return constraints result (pass/fail)",
+    "skillDistiller → skillDistiller: [alt] if policy fails → abort with reason",
+    "skillDistiller → skillDistiller: validateSynthesizedGene(gene, existingGenes) — validates type/id/signals_match/strategy; auto-prefixes id with gene_distilled_; caps max_files; deduplicates id; strips unsafe validation cmds",
+    "skillDistiller → skillDistiller: writeDistillerState({last_distillation_at, last_data_hash, distillation_count}) — persists state",
+    "skillDistiller → skillPublisher: publishSkillToHub(gene, opts) — {category, tags}",
+    "skillPublisher → skillDistiller: sanitizeSignalsMatch(signals_match) — lazy require, sanitizes signal tags",
+    "skillPublisher → skillPublisher: geneToSkillMd(gene) — renders SKILL.md content (name, description, When to Use, Trigger Signals, Preconditions, Strategy, Constraints, Validation, Metadata)",
+    "skillPublisher → skillPublisher: sanitizeSkillName(gene.id) — strips gene_distilled_ prefix, timestamps, converts to kebab-case",
+    "skillPublisher → a2aProtocol: getHubUrl(), getNodeId(), buildHubHeaders()",
+    "skillPublisher → Hub API: POST /a2a/skill/store/publish {sender_id, skill_id, content, category, tags} — timeout 15s",
+    "Hub API → skillPublisher: return HTTP 201/200 (created) OR 409 (conflict/already exists)",
+    "skillPublisher → skillPublisher: [alt 409] updateSkillOnHub(nodeId, skillId, content, opts, gene)",
+    "skillPublisher → Hub API: PUT /a2a/skill/store/update {sender_id, skill_id, content, category, tags, changelog: 'Iterative evolution update'} — timeout 15s",
+    "Hub API → skillPublisher: return HTTP 200-299",
+    "skillPublisher → skillDistiller: return {ok: boolean, result?: object, error?: string}",
+    "skillDistiller → Caller/GEP: return {ok: boolean, gene: Gene, reason?: string}"
+  ],
+  "key_relationships": [
+    "skillDistiller depends_on sanitize (sanitizePayload, sanitizeSignalsMatch)",
+    "skillDistiller depends_on llmReview (runLlmReview) — optional gated by EVOLVER_LLM_REVIEW env",
+    "skillDistiller depends_on policyCheck (checkConstraints, isForbiddenPath, isValidationCommandAllowed)",
+    "skillDistiller depends_on skillPublisher (publishSkillToHub)",
+    "skillPublisher lazy_requires skillDistiller (sanitizeSignalsMatch)",
+    "skillPublisher depends_on a2aProtocol (getHubUrl, getNodeId, buildHubHeaders)",
+    "skillPublisher calls Hub API via fetch POST/PUT"
+  ],
+  "function_signatures": {
+    "skillDistiller": [
+      "autoDistill() → {ok: bool, gene?: Gene, reason?: string}",
+      "shouldDistill() → boolean",
+      "collectDistillationData() → {successCapsules, allCapsules, grouped}",
+      "analyzePatterns(data) → {high_frequency, strategy_drift, coverage_gaps}",
+      "synthesizeGeneFromPatterns(data, analysis, genes) → Gene",
+      "validateSynthesizedGene(gene, existingGenes) → {valid: bool, gene: Gene, errors: string[]}",
+      "prepareDistillation() → {ok: bool, promptPath?, requestPath?, reason?}",
+      "completeDistillation(llmResponseText) → {ok: bool, gene?: Gene, reason?}",
+      "buildDistillationPrompt(analysis, genes, caps) → string",
+      "extractJsonFromLlmResponse(text) → Gene|null",
+      "computeDataHash(capsules) → string",
+      "readDistillerState() → object",
+      "writeDistillerState(state) → void",
+      "sanitizeSignalsMatch(signals) → string[]"
+    ],
+    "sanitize": [
+      "sanitizePayload(capsule) → object — deep-clone + redact, does NOT modify original",
+      "redactString(str) → string — replaces sensitive patterns with [REDACTED]",
+      "scanForLeaks(content) → {found: bool, leaks: [{type, value, suggestion}]}",
+      "detectEnvValueLeaks(content) → [{type, envKey, value, suggestion}]",
+      "fullLeakCheck(content) → {found: bool, leaks: []}"
+    ],
+    "llmReview": [
+      "runLlmReview({diff, gene, signals, mutation}) → {approved, confidence, concerns, summary} | null",
+      "isLlmReviewEnabled() → boolean — checks process.env.EVOLVER_LLM_REVIEW",
+      "buildReviewPrompt({diff, gene, signals, mutation}) → string"
+    ],
+    "policyCheck": [
+      "checkConstraints(gene, ...) → {ok: bool, reason?: string}",
+      "isForbiddenPath(path, forbiddenPaths) → boolean",
+      "isConstraintCountedPath(path, policy) → boolean",
+      "isValidationCommandAllowed(cmd) → boolean — blocks rm -rf, node -e, node --eval, node -p",
+      "classifyBlastSeverity(...) → string",
+      "buildFailureReason(...) → string",
+      "classifyFailureMode(...) → string"
+    ],
+    "skillPublisher": [
+      "publishSkillToHub(gene, opts) → Promise<{ok: bool, result?, error?}>",
+      "updateSkillOnHub(nodeId, skillId, content, opts, gene) → Promise<{ok: bool, result?, error?}>",
+      "geneToSkillMd(gene) → string — SKILL.md markdown content",
+      "sanitizeSkillName(rawName) → string|null — kebab-case, strips timestamps/gene_ prefix",
+      "toTitleCase(kebabName) → string"
+    ]
+  },
+  "conditional_branches": [
+    "EVOLVER_LLM_REVIEW !== 'true' → runLlmReview returns null (review skipped)",
+    "llmReview.approved === false → distillation aborted",
+    "policyCheck fails → distillation aborted with reason",
+    "validateSynthesizedGene invalid → distillation aborted",
+    "Hub API returns 409 → publishSkillToHub delegates to updateSkillOnHub (PUT instead of POST)",
+    "shouldDistill() false → no distillation (SKILL_DISTILLER=false, insufficient capsules, or interval not met)",
+    "idempotent_skip: same data hash as last run → prepareDistillation returns ok=false, reason='idempotent_skip'"
+  ],
+  "data_objects": {
+    "Gene": "{ type:'Gene', id:'gene_distilled_*', category, signals_match:[], strategy:[], preconditions?, constraints:{max_files, forbidden_paths}, validation?:[], summary?, schema_version, _distilled_meta:{source_capsule_count} }",
+    "Capsule": "{ type:'Capsule', id, gene, trigger:[], summary, outcome:{status:'success'|'failed', score:0-1} }",
+    "LlmReviewResult": "{ approved:bool, confidence:0.0-1.0, concerns:[], summary:string }",
+    "DistillationRequest": "{ type:'DistillationRequest', input_capsule_count:number }",
+    "HubPublishBody": "{ sender_id, skill_id:'skill_*', content:SKILL.md, category, tags:[] }",
+    "HubUpdateBody": "{ sender_id, skill_id, content, category, tags, changelog:'Iterative evolution update' }"
+  },
+  "important_notes": [
+    "skillDistiller.js is obfuscated (hex-encoded identifiers) — API surface reconstructed from test file exports",
+    "sanitizePayload does NOT modify original; returns deep-cloned sanitized copy",
+    "policyCheck enforces BLAST_RADIUS_HARD_CAP_FILES and BLAST_RADIUS_HARD_CAP_LINES constants",
+    "Distillation threshold: >= ~10-12 successful capsules (score >= threshold), interval-gated",
+    "skillPublisher lazy-requires skillDistiller to call sanitizeSignalsMatch — circular dep guard",
+    "Hub endpoints: POST /a2a/skill/store/publish, PUT /a2a/skill/store/update — both via a2aProtocol headers, 15s timeout",
+    "SKILL.md includes license footer referencing EvoMap Skill License (ESL-1.0)"
+  ],
+  "source_files_analyzed": [
+    "src/gep/sanitize.js",
+    "src/gep/llmReview.js",
+    "src/gep/skillPublisher.js",
+    "test/skillDistiller.test.js",
+    "test/solidify-helpers.test.js (policyCheck exports)",
+    "ir_postprocessed.json (IR entries for all four modules)"
+  ]
+}

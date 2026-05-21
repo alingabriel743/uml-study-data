@@ -2,7 +2,7 @@
 
 This folder contains all PlantUML diagrams generated as part of the empirical evaluation for the research paper:
 
-> **Agentic architecture with context engineering for automated UML diagram generation from source code repositories**
+> **Code2UML: Agentic LLMs with context engineering for scalable software visualization**
 
 ## Contents
 

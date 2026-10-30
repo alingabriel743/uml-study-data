@@ -1,9 +1,5 @@
 # Code2UML replication package
 
-This package accompanies the revised manuscript "Code2UML: Agentic LLMs with context engineering for scalable
-software visualization". It contains everything needed to recompute every number in the Results from the released
-data, and to re-run the generation experiments.
-
 ## Contents
 
 | Folder | Content |

@@ -1,0 +1,224 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #212529
+    EndColor #212529
+    BarColor #495057
+}
+skinparam swimlane {
+    BackgroundColor #FEFEFE
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+
+title Wave Spawning and Enemy Management
+
+|WaveSpawner|
+start
+
+:WorldLoadEvent received;
+:reset(): clear spawns[];
+:Scan world tiles for overlay == Blocks.spawn;
+:Populate spawns[] with spawn tiles;
+
+note right
+  TileOverlayChangeEvent can
+  dynamically add/remove spawn tiles
+end note
+
+:spawnEnemies() called;
+:Set spawning = true;
+
+:eachGroundSpawn(-1): doShockwave at each spawn tile;
+note right
+  Fx.spawnShockwave + Damage.damage
+  on drop zone radius — prevents spawn camping
+end note
+
+:Iterate state.rules.spawns (SpawnGroup[]);
+
+|SpawnGroup|
+repeat
+    if (group.type == null\nOR spawned == 0?) then (yes)
+        :Skip this SpawnGroup;
+    else (no)
+        :spawned = group.getSpawned(wave - 1);
+
+        if (state.isCampaign()?) then (yes)
+            if (group is boss unit?) then (yes)
+                :Apply floor(spawned * difficultyMultiplier);
+            else (no)
+                :Apply round(spawned * difficultyMultiplier);
+            endif
+        endif
+
+        |WaveSpawner|
+        if (group.type.flying?) then (yes — flyer)
+            :eachFlyerSpawn(group.spawn);
+            if (airUseSpawns?) then (yes)
+                :Use spawn tile position directly;
+            else (no)
+                :Project spawn tile to map edge\nvia angle-to-center;
+            endif
+            if (wavesSpawnAtCores AND attackMode?) then (yes)
+                :Use waveTeam core positions as\nflyer spawn points;
+            endif
+        else (no — ground)
+            :eachGroundSpawn(group.spawn);
+            if (state.hasSpawns?) then (yes)
+                :Iterate spawns[] tiles → accept (worldX, worldY, shockwave=true);
+            endif
+            if (wavesSpawnAtCores AND attackMode\nAND waveTeam active?) then (yes)
+                :For each waveTeam CoreBuild:;
+                if (core.commandPos != null?) then (yes)
+                    :cons.accept(commandPos, shockwave=false);
+                else (no)
+                    :Walk toward playerCore\n(max 30 steps, step = tilesize * 1.1);
+                    :Find position with no solid tiles\nin 3-tile radius;
+                    :cons.accept(valid pos, shockwave=false);
+                endif
+            endif
+        endif
+
+        :for i in spawned: spawnUnit(group, x + spread, y + spread);
+
+        |SpawnGroup|
+        :group.createUnit(team, x, y, angle_to_center, wave-1, callback=spawnEffect);
+
+        |WaveSpawner|
+        fork
+            :unit.apply(StatusEffects.unmoving, 30f);
+            :unit.apply(StatusEffects.invincible, 60f);
+            :unit.unloaded();
+        fork again
+            :Events.fire(UnitSpawnEvent);
+            :Call.spawnEffect(x, y, rotation, type)\n[Fx.unitSpawn + Time.run(30f → Fx.spawn)];
+        end fork
+    endif
+repeat while (more SpawnGroups?) is (yes)
+-> (no);
+
+:Time.run(121f): set spawning = false;
+
+|RtsAI|
+:RtsAI.update() [every 120 ticks];
+
+fork
+    :assignSquads();
+    :Clear assignedTargets, used;
+    :Move damagedSet → damaged;
+
+    :For each unit in data.units:;
+    repeat
+        if (used.add(unit.id) AND\ncontroller is CommandAI AND\n!hasCommand AND !isAttacking?) then (yes)
+            :BFS expand squad via\ndata.tree().intersect(squadRadius=60f);
+            :Collect nearby idle same-flag\nCommandAI units → squad;
+
+            :handleSquad(squad, !didDefend);
+
+            :Compute squad stats:\nhealth, dps, centroid (ax,ay),\ntargetAir, targetGround;
+
+            if (damaged.size > 0 AND !naval?) then (yes — defend first)
+                :Find best = damaged.min(dst);
+                note right
+                  CoreBuild gets -999999 priority
+                  (immediate defense)
+                end note
+                if (best is valid?) then (yes)
+                    :Set defend = best;
+                    :Find aggressor: Units.closestEnemy\n(checkRange = 350f);
+                    if (aggressor found?) then (yes)
+                        :CommandPosition(defendPos);
+                    else (no)
+                        :Find closest turret within range → defendTarget;
+                        :CommandTarget(turret);
+                    endif
+                endif
+            else (no — attack)
+                :findTarget(ax, ay, size, dps, health,\nflagCheck, flying, naval);
+
+                if (total < rtsMinSquad?) then (yes)
+                    :Return null — squad too small;
+                else (no)
+                    :Collect candidate targets:\n[naval] core only\n[else] generator+factory+core+battery+drill;
+                    :Remove already assigned / invalid targets;
+                    :Shuffle, truncate to maxTargetsChecked=15;
+                    :Score each: estimateStats(from, to, dps, health, air);
+                    :Sort by (1-weight + dst/10000), then dist²;
+                    if (checkWeight AND weight < rtsMinWeight\nAND size < rtsMaxSquad?) then (yes)
+                        :Hold — return null (squad below weight threshold);
+                    else (no)
+                        :assignedTargets.add(result.id);
+                        :Return target building;
+                    endif
+                endif
+            endif
+
+            :For each unit in squad:\n commandTarget(target) OR commandPosition(pos);
+            if (not defending core?) then (yes)
+                :unit.flag = 1 (mobilized);
+            endif
+        endif
+    repeat while (more units?) is (yes)
+    -> (no);
+
+fork again
+    :checkBuilding();
+    if (aiCoreSpawn timer AND\nhasCore AND coreUnits < cores.size?) then (yes)
+        :Create unit from block.unitType;
+        :Place at random core position;
+        :unit.add() → register unit in world;
+    endif
+end fork
+
+|UnitGroup|
+:calculateFormation(dest, collisionLayer)\n[async on Vars.mainExecutor];
+:valid = false (computing...);
+:Compute centroid; store relative positions[];
+:Set groupIndex on each unit;
+
+repeat
+    if (compress phase active?) then (yes)
+        :Lerp all positions toward center (factor 0.3);
+        :Compute spaceUsed = totalArea / boundingArea;
+        if (spaceUsed > maxSpaceUsage(0.7)\nOR compressionIters >= 20?) then (yes)
+            :Disable compress phase;
+        endif
+    endif
+    if (!compress OR spaceUsed > 0.5?) then (yes)
+        :Quadtree intersect — find overlapping units;
+        :Push overlapping units apart (mass-weighted);
+    endif
+repeat while (iters < 40 AND physics iters < 6?) is (yes)
+-> (no);
+
+:originalPositions = positions.clone();
+:For each unit: updateRaycast(index, dest);
+:ControlPathfinder.raycastFastAvoid → adjust positions\nto avoid walls;
+:valid = true — formation ready;
+
+stop
+
+@enduml

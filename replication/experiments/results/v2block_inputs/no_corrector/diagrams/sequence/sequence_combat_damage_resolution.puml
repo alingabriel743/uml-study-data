@@ -1,0 +1,202 @@
+@startuml
+
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    GroupBackgroundColor #E9ECEF
+    GroupBorderColor #6C757D
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #ADB5BD
+}
+skinparam note {
+    BackgroundColor #FFF3CD
+    BorderColor #FFC107
+}
+
+title Combat and Damage Resolution
+
+participant "EntityCollisions" as ec
+participant "Bullet" as bullet
+participant "BulletType" as bt
+participant "Unit" as unit
+participant "Building" as build
+participant "Damage" as dmg
+participant "Lightning" as lightning
+participant "Fires" as fires
+participant "UnitController" as ctrl
+participant "Events" as events
+
+== Collision Detection ==
+
+ec -> ec: updatePhysics(group)\ninsert entities into QuadTree
+activate ec
+loop per entity (solid)
+    ec -> bullet: updateCollision(solid)\ngetCollisions(treeCons) from QuadTree
+    activate bullet
+    bullet -> ec: checkCollide(a, b)\nsweep-based AABB test
+    alt a.collides(b) && b.collides(a) && rects overlap
+        ec -> bullet: a.collision(b, x, y)
+        ec -> unit: b.collision(a, x, y)
+    end
+    deactivate bullet
+end
+deactivate ec
+
+== Unit Hit by Bullet ==
+
+unit -> ctrl: hit(bullet)\nvia UnitComp.collision(bullet, x, y)
+activate ctrl
+ctrl --> unit: hit registered
+deactivate ctrl
+
+bullet -> bt: hitEntity(bullet, unit, health)
+activate bt
+
+bt -> bt: calculate damage\nmaxDamageFraction + shield check
+alt armorMult != 1.0
+    bt -> unit: damageArmorMult(amount, armorMult)
+else piercing bullet
+    bt -> unit: damagePierce(amount)
+else standard hit
+    bt -> unit: damage(amount)
+end
+
+bt -> unit: impulse(knockback vector)
+bt -> unit: apply(status, statusDuration)
+bt -> events: fire(UnitDamageEvent(unit, bullet))
+activate events
+events --> bt: dispatched
+deactivate events
+
+alt unit just died
+    bt -> events: fire(UnitBulletDestroyEvent(unit, bullet))
+end
+
+opt piercing bullet (handlePierce)
+    bt -> bt: reduce b.damage *= pierceDamageFactor
+    note right: remove bullet if\nremoveAfterPierce && damage <= 0
+end
+deactivate bt
+
+== Building Hit by Bullet ==
+
+dmg -> build: collideLine(hitter, sorted tile list)
+activate dmg
+build --> dmg: tile.collision(hitter)
+dmg -> bt: hitTile(bullet, build, x, y, initialHealth, direct)
+activate bt
+
+alt makeFire
+    bt -> fires: Fires.create(build.tile)
+end
+
+alt heals && same team
+    bt -> build: heal(amount)
+else enemy && direct hit
+    bt -> bt: hit(bullet)\nhitEffect + hitSound + shake
+    opt fragOnHit
+        bt -> bt: createFrags(bullet, x, y)
+    end
+    opt createIncend
+        bt -> dmg: createIncend(x, y, range, amount)
+        dmg -> fires: Fires.create(tile) [random positions]
+    end
+    opt suppressionRange > 0
+        bt -> dmg: applySuppression(team, x, y, radius)
+    end
+end
+deactivate bt
+deactivate dmg
+
+== Area / Explosion Damage ==
+
+[-> dmg: damage(team, x, y, radius, amount)
+activate dmg
+note over dmg: Units.nearbyEnemies(team, rect)\nfilter: checkTarget / hittable / within radius
+
+loop per nearby enemy unit
+    dmg -> dmg: calculateDamage(dist, radius)\nlinear falloff * 0.4 factor
+    alt armorMult != 1
+        dmg -> unit: damageArmorMult(amount, armorMult)
+    else
+        dmg -> unit: damage(amount)
+    end
+    dmg -> events: fire(UnitDamageEvent)
+    dmg -> ctrl: hit(source)
+    alt unit just died
+        dmg -> events: fire(UnitBulletDestroyEvent)
+    end
+    dmg -> unit: vel.add(knockback vector)
+end
+
+opt ground damage
+    dmg -> dmg: tileDamage(team, tx, ty, radius)\nraycast from center; accumulate IntFloatMap
+    dmg -> build: damage(source, team, val)
+end
+deactivate dmg
+
+== Dynamic Explosion ==
+
+[-> dmg: dynamicExplosion(x, y, power, flammability, radius)
+activate dmg
+
+loop power-based arcs (Time.run delayed)
+    dmg -> lightning: Lightning.create(bullet, color, dmg, x, y, angle, length)
+    activate lightning
+    loop length/2 arc steps
+        lightning -> bt: hitCreate.create(null, team, x, y, rot, dmg*mult)
+        note right: spawns damage bullet\nat each arc step
+    end
+    lightning -> lightning: World.raycastEach()\nsnap + break if insulated tile
+    lightning -> unit: nearbyEnemies(hitRange=30f)\nchain to furthest; add to hit set\n(max 8 chains)
+    lightning -> lightning: Fx.lightning.at(x, y, rot, color, lines)
+    deactivate lightning
+end
+
+opt flammable
+    dmg -> bt: createBullet(Bullets.fireball, ...) [per flammability]
+end
+
+loop per explosive wave
+    dmg -> dmg: damage(ignoreTeam, x, y, radius, damagePerWave)
+end
+
+dmg -> dmg: Effect.shake(); explosionFx.at(x, y)
+deactivate dmg
+
+== Status Effect Application ==
+
+[-> dmg: status(team, x, y, radius, effect, duration)
+activate dmg
+loop per enemy unit in radius
+    dmg -> unit: apply(effect, duration)
+end
+deactivate dmg
+
+== Unit Death ==
+
+unit -> unit: kill()\nif !dead && !net.client() && killable()
+activate unit
+unit -> ctrl: Call.unitDeath(id) [synced RPC]
+deactivate unit
+
+ctrl -> unit: killed()
+activate unit
+unit -> unit: health = min(health, 0)\ndead = true
+alt !flying || !createWreck
+    unit -> unit: destroy()
+else flying wreck
+    unit -> unit: play wreckSound
+end
+deactivate unit
+
+@enduml

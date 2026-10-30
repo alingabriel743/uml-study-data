@@ -1,0 +1,168 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #EEF2F8
+    GroupBorderColor #6C757D
+    GroupHeaderFontColor #212529
+    NoteBackgroundColor #FFF3CD
+    NoteBorderColor #856404
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #6C757D
+}
+
+title Unit AI Pathfinding and Movement
+
+box "Main Thread" #EFF3FB
+  actor "Unit" as unit
+  participant "ControlPathfinder\n(main thread)" as cp_main
+  participant "Pathfinder\n(main thread)" as pf_main
+end box
+
+participant "FieldCache\n(shared state)" as fc
+participant "TaskQueue" as queue
+
+box "Pathfinding Thread (MIN_PRIORITY)" #FFF0F5
+  participant "ControlPathfinder\n(pathfind thread)" as cp_thread
+  participant "Cluster" as cluster
+end box
+
+== Unit Requests Path Position (each game tick) ==
+
+unit -> cp_main : getPathPosition(unit, destination, out)
+activate cp_main
+
+cp_main -> cp_main : raycast(team, cost, tileX, tileY, destX, destY)
+
+alt Direct Line of Sight
+  cp_main --> unit : out.set(destination); return true
+
+else Existing FieldCache for Same Destination
+  cp_main -> fc : fields.get(FieldIndex.get(destPos, costId, team))
+  activate fc
+  fc --> cp_main : int[] clusterWeights
+  deactivate fc
+  cp_main -> cp_main : getCost(fieldCache, tileX, tileY, requeue)
+  cp_main -> cp_main : iterate d4 neighbors,\npick lowest-cost tile toward goal
+  cp_main --> unit : out.set(nextTile.worldx(), worldy()); return true
+
+else No Request or Destination Changed
+  cp_main -> cp_main : new PathRequest(unit, team, costId, destPos)\nunitRequests.put(unit, request)
+  cp_main -> queue : post(() -> threadPathRequests.add(req);\nrecalculatePath(request))
+  activate queue
+  queue --> cp_main : task posted
+  deactivate queue
+  cp_main --> unit : return false (path not yet ready)
+end
+
+deactivate cp_main
+
+== Pathfinding Thread — Compute Path (30 FPS / ~33 ms interval) ==
+
+queue -> cp_thread : queue.run() — drain posted tasks
+activate cp_thread
+
+cp_thread -> cp_thread : recalculatePath(request)
+
+note over cp_thread
+  **Two-level HPA*:** cluster portal A* (high-level)
+  then flow-field BFS within each cluster (low-level)
+end note
+
+cp_thread -> cp_thread : initializePathRequest(\n  request, team, costId,\n  unitX, unitY, goalX, goalY)
+
+cp_thread -> cp_thread : findClosestNode(unit side)\n[innerAstar within cluster to nearest portal]
+
+cp_thread -> cp_thread : findClosestNode(goal side)\n[innerAstar within cluster to nearest portal]
+
+cp_thread -> cp_thread : clusterAstar(\n  request, costId,\n  startNodeIndex, endNodeIndex)
+
+loop for each cluster in HPA* node path
+  cp_thread -> cluster : getCreateCluster(team, pathCost, cx, cy)
+  activate cluster
+  cluster --> cp_thread : Cluster (portals[], intra-connections)
+  cp_thread -> cluster : checkEdges(request, team, pathCost,\n  current, goal, cx, cy, connections)
+  cluster --> cp_thread : IntraEdge costs (per portal pair)
+  deactivate cluster
+end
+
+cp_thread --> cp_thread : IntSeq nodePath\n(ordered cluster portal node indices)
+
+cp_thread -> fc : fields.get(FieldIndex.get(goalPos, costId, team))
+activate fc
+alt FieldCache miss — first unit targeting this tile
+  cp_thread -> fc : new FieldCache(cost, costId, team, goalPos)
+  note right of fc : frontier.addFirst(goalPos)\npost to main: fieldList.add(cache)
+end
+fc --> cp_thread : FieldCache (new or existing)
+deactivate fc
+
+cp_thread -> cp_thread : addFlowCluster(cache,\n  unitClusterX, unitClusterY, addingFrontier)\n[for each cluster in nodePath]
+
+note right of cp_thread
+  Creates int[] weight array per cluster
+  in FieldCache.fields; seeds BFS frontier
+  from adjacent already-initialized clusters
+end note
+
+deactivate cp_thread
+
+== Flow Field Update (each pathfinding thread iteration) ==
+
+cp_thread -> cp_thread : updateFields(cache, maxUpdate=12ms)
+activate cp_thread
+
+cp_thread -> fc : read/write fields (BFS/Dijkstra)
+activate fc
+note over cp_thread, fc
+  BFS / Dijkstra expands outward from goalPos;
+  writes int[] weights into FieldCache.fields cluster arrays.
+  Each step calls PathCost.getCost(team, tiles[pos]) per neighbor.
+  Partial fields are usable — all units sharing a goal tile
+  share one FieldCache (written on pathfind thread,
+  read on main thread — acknowledged race condition).
+end note
+fc --> cp_thread : weights updated incrementally
+deactivate fc
+deactivate cp_thread
+
+== World Tile Change — Cluster Invalidation and Requeue ==
+
+pf_main -> pf_main : updateTile(tile)\n[on TileChangeEvent]
+activate pf_main
+pf_main -> pf_main : packTile(tile) → update tiles[] array
+pf_main -> cp_main : controlPath.updateTile(tile)
+activate cp_main
+cp_main -> cp_main : updateSingleTile(t)\n→ queueClusterUpdate(cx, cy)
+deactivate cp_main
+deactivate pf_main
+
+cp_thread -> cp_thread : updateClustersComplete(clusterIndex)
+activate cp_thread
+cp_thread -> cp_thread : updateCluster(team, pathCost, cx, cy)
+cp_thread -> cp_thread : updateInnerEdges(team, cost, cx, cy, cluster)\n[recompute intra-cluster portal edges via innerAstar]
+cp_thread -> cp_thread : clusterChanged(team, pathCost, cx, cy)\n→ marks affected PathRequests as invalidated
+cp_thread -> cp_thread : recalculatePath(invalidRequest)
+
+note right of cp_thread
+  PathRequest.oldCache provides
+  continuity during recalculation —
+  unit keeps moving on stale field
+  until new path is ready
+end note
+
+deactivate cp_thread
+
+@enduml

@@ -1,0 +1,233 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+
+title Show / List Command Workflow\n(composer show / composer info)
+
+|ShowCommand|
+
+start
+
+:User runs **composer show** [package] [version] [options];
+
+:Initialize: new VersionParser()\ngetIO() → $io\ntryComposer() → $composer (nullable);
+
+if (--tree?) then (yes)
+  :initStyles(output);
+endif
+
+' ─── OPTION VALIDATION ────────────────────────────────────────────
+:Validate option combinations;
+
+if (--installed flag present?) then (yes)
+  :Warn: --installed is deprecated;
+endif
+
+if (--outdated?) then (yes)
+  :Force --latest = true;
+endif
+
+if (--direct + (--all|--available|--platform)?) then (conflict)
+  :Error: incompatible flag combination\nreturn 1;
+  stop
+endif
+
+if (--tree + (--all|--available)?) then (conflict)
+  :Error: --tree incompatible with --all/--available\nreturn 1;
+  stop
+endif
+
+if (--tree + --latest?) then (conflict)
+  :Error: --tree incompatible with --latest\nreturn 1;
+  stop
+endif
+
+if (multiple semver filters\n(--major-only/--minor-only/--patch-only)?) then (conflict)
+  :Error: only one semver filter allowed\nreturn 1;
+  stop
+endif
+
+if (format not in [text, json]?) then (invalid)
+  :Error: unsupported output format\nreturn 1;
+  stop
+endif
+
+' ─── BUILD PLATFORM REPO ──────────────────────────────────────────
+:new PlatformRepository([], $platformOverrides);
+
+' ─── BUILD REPOSITORY SET ─────────────────────────────────────────
+|Repository Layer|
+
+if (--self?) then
+  :InstalledRepository([RootPackageRepository(clone rootPkg)]);
+elseif (--platform?) then
+  :InstalledRepository([platformRepo]);
+elseif (--available?) then
+  if (composer available?) then (yes)
+    :CompositeRepository(\n  RepositoryManager::getRepositories())\n+ localRepo added to installedRepo;
+  else (no)
+    :RepositoryFactory::\ndefaultReposWithDefaultManager(io);
+  endif
+elseif (--all?) then
+  if (composer available?) then (yes)
+    :CompositeRepository(\n  [FilterRepository(installedRepo)]\n  + RepositoryManager::getRepositories());
+    if (locker exists?) then (yes)
+      :Add lockedRepo to composite;
+    endif
+  else (no)
+    :CompositeRepository([installedRepo] + defaultRepos);
+  endif
+elseif (--locked?) then
+  :Locker::getLockedRepository(!no-dev)\n→ InstalledRepository([lockedRepo]);
+else (default / --installed)
+  :InstalledRepository([RootPackageRepository, localRepo]);
+  if (--no-dev?) then (yes)
+    :RepositoryUtils::filterRequiredPackages();
+  endif
+endif
+
+|ShowCommand|
+
+:Dispatch CommandEvent\n(PluginEvents::COMMAND, 'show') via EventDispatcher;
+
+if (--latest && no composer?) then (yes)
+  :Disable --latest flag (no remote repos available);
+endif
+
+' ─── ROUTE: SINGLE PACKAGE vs LIST MODE ──────────────────────────
+if (single package argument\n(no wildcard present)?) then (yes)
+
+  ' === SINGLE PACKAGE MODE ===
+  |Repository Layer|
+
+  :getPackage(installedRepo, repos, name, version):\nnew RepositorySet('dev')\nallowInstalledRepositories()\nisPlatformPackage → createPoolWithAllPackages()\nelse → createPoolForPackage(name)\npool.whatProvides(name, constraint) → candidates\nDefaultPolicy::selectPreferredPackages(pool, literals);
+
+  |ShowCommand|
+
+  if (--direct && package\nnot in getRootRequires()?) then (yes)
+    :Throw InvalidArgumentException\n(not a direct dependency);
+    stop
+  endif
+
+  if (package not found in pool?) then (yes)
+    :Throw InvalidArgumentException\n+ hints (similar package names);
+    stop
+  endif
+
+  if (--tree?) then (yes)
+    :generatePackageTree(package, installedRepo, remoteRepos):\npackage.getRequires() → foreach req\naddTree(name, link, installedRepo, remoteRepos, visited)\naddTree() resolves children recursively\ndetects circular deps via $packagesInTree visited list;
+
+    |Output / IO|
+
+    if (format = json?) then (yes)
+      :JsonFile::encode(['installed' => [arrayTree]])\nio.write(json);
+    else (text)
+      :displayPackageTree([arrayTree])\n→ recursive displayTree()\nASCII ├── └── │ characters\n5-color cycle for depth levels\ncircular deps labeled with warning;
+    endif
+    stop
+  endif
+
+  if (--path?) then (yes)
+    :io.write(\n  package.getName()\n  + installationManager.getInstallPath(package));
+  endif
+
+  if (--latest?) then (yes)
+    |Repository Layer|
+    :getRepositorySet(composer)\n→ lazy-init RepositorySet (cached in $repositorySet)\nCompositeRepository(allRemoteRepos)\nnew VersionSelector(repositorySet, platformRepo)\ndetermine targetVersion from semver filter flags\nversionSelector.findBestCandidate(\n  name, targetVersion, stability, platformReqFilter);
+    |ShowCommand|
+  endif
+
+  |Output / IO|
+
+  if (format = json?) then (yes)
+    :printPackageInfoAsJson(\n  package, versions, installedRepo, latestPackage):\nbuild JSON struct\nappendVersions(); appendLicenses()\nappendAutoload(); appendLinks()\nio.write(JsonFile::encode(json));
+  else (text)
+    :printPackageInfo(\n  package, versions, installedRepo, latestPackage):\nprintMeta() → name, description, keywords\nprintVersions(), released, latest, type\nprintLicenses(), homepage, source, dist, path\nprintLinks(REQUIRE)\nprintLinks(DEV_REQUIRE)\nsuggests, PROVIDE / CONFLICT / REPLACE;
+  endif
+
+else (list / wildcard mode)
+
+  ' === LIST MODE ===
+  |ShowCommand|
+
+  if (--tree?) then (yes)
+    :Collect rootRequires; sort packages\nforEach root package → generatePackageTree();
+
+    |Output / IO|
+
+    if (format = json?) then (yes)
+      :JsonFile::encode(trees)\nio.write(json);
+    else (text)
+      :displayPackageTree() per root package\nwith ASCII tree characters;
+    endif
+    stop
+  endif
+
+  |Repository Layer|
+
+  :RepositoryUtils::flattenRepositories(repos):\nclassify each repo → type:\n  platform | locked | available | installed\nComposerRepository → getPackageNames(filter) as strings\nother repos → getPackages()\n  → filter AliasPackages\n  → apply packageFilterRegex (wildcard)\n  → apply packageListFilter (--direct)\nplatformRepo.getDisabledPackages() also collected;
+
+  |ShowCommand|
+
+  :ksort packages[] per type group\n(platform, locked, available, installed);
+
+  if (--latest && showVersion?) then (yes)
+    |Repository Layer|
+    :findLatestPackage() for each object package:\nnew VersionSelector(repositorySet, platformRepo)\nversionSelector.findBestCandidate()\n→ latestPackages[];
+    |ShowCommand|
+  endif
+
+  if (--sort-by-age?) then (yes)
+    :usort packages by getReleaseDate() ascending;
+  endif
+
+  :Build viewData[type][] per package:\nname\ndirect-dependency (in rootRequires?)\nhomepage, source (PackageInfo::getViewSourceUrl)\nversion (if writeVersion)\nrelease-age / release-date (if writeReleaseDate)\nlatest + latest-status: getUpdateStatus()\n  → up-to-date | semver-safe-update | update-possible\ndescription (if CompletePackageInterface)\npath (if --path)\nwarning + abandoned flag (if isAbandoned());
+
+  if (--strict && outdated\npackages found?) then (yes)
+    :exitCode = 1;
+  endif
+
+  |Output / IO|
+
+  if (format = json?) then (yes)
+    :io.write(JsonFile::encode(viewData));
+  else (text)
+    if (--latest?) then (yes)
+      :Print color legend to stderr\n(green=up-to-date, yellow=semver-safe, red=update-possible);
+    endif
+
+    :Compute column widths:\nnameLength, versionLength\nlatestLength, releaseDateLength\nCheck terminal width:\nversionFits, latestFits\nreleaseDateFits, descriptionFits;
+
+    if (--latest && !--direct?) then (yes)
+      :Split packages into\ndirectDeps / transitiveDeps\nprint each group with header separately;
+    endif
+
+    :printPackages(io, packages, indent,\n  writeVersion, writeLatest,\n  writeDescription, widths, versionLength):\nforeach pkg:\n  pad name to nameLength\n  write version (if versionFits)\n  write latest with style (if latestFits)\n  write release-age (if releaseDateFits)\n  write description truncated via mb_strimwidth\n    to remaining terminal width\n  write path (if --path)\n  write abandoned warning;
+  endif
+
+endif
+
+|ShowCommand|
+
+:Return exitCode (0 or 1);
+
+stop
+
+@enduml

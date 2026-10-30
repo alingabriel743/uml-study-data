@@ -1,0 +1,244 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    GroupBackgroundColor #E9ECEF
+    GroupBorderColor #6C757D
+    DividerBackgroundColor #DEE2E6
+}
+
+title Lyra — Text-to-World Video Generation & Training Sequence
+
+actor User
+participant "DiffusionText2World\nGenerationPipeline" as Pipeline
+participant "Guardrail" as Guard
+participant "PromptUpsampler" as Upsampler
+participant "CosmosT5\nTextEncoder" as T5
+participant "DiffusionT2WModel" as T2WModel
+participant "GeneralConditioner" as Conditioner
+participant "Sampler" as Sampler
+participant "GeneralDIT" as DIT
+participant "EDMScaling" as Scaling
+participant "BaseVAE\n(Tokenizer)" as VAE
+
+== Inference: Text-to-World Generation ==
+
+User -> Pipeline: generate(prompt, negative_prompt)
+activate Pipeline
+
+    opt Guardrail Enabled
+        Pipeline -> Guard: _run_guardrail_on_prompt_with_offload(prompt)
+        activate Guard
+        Guard --> Pipeline: is_safe: bool
+        deactivate Guard
+
+        alt Prompt Not Safe
+            Pipeline --> User: None
+        end
+    end
+
+    opt Prompt Upsampler Enabled
+        Pipeline -> Upsampler: _run_prompt_upsampler_on_prompt_with_offload(prompt)
+        activate Upsampler
+        Upsampler -> Upsampler: run_chat_completion(prompt)
+        Upsampler --> Pipeline: upsampled_prompt
+        deactivate Upsampler
+
+        opt Guardrail on Upsampled Prompt
+            Pipeline -> Guard: _run_guardrail_on_prompt_with_offload(upsampled_prompt)
+            activate Guard
+            Guard --> Pipeline: is_safe: bool
+            deactivate Guard
+        end
+    end
+
+    Pipeline -> Pipeline: _run_text_embedding_on_prompt_with_offload(prompts)
+    activate Pipeline
+        Pipeline -> T5: encode_prompts([prompt])
+        activate T5
+        T5 --> Pipeline: (embedding, mask)
+        deactivate T5
+        opt Negative Prompt Provided
+            Pipeline -> T5: encode_prompts([negative_prompt])
+            activate T5
+            T5 --> Pipeline: (neg_embedding, neg_mask)
+            deactivate T5
+        end
+    deactivate Pipeline
+
+    Pipeline -> Pipeline: _run_model_with_offload(embedding, neg_embedding)
+    activate Pipeline
+
+        opt Offload Network Enabled
+            Pipeline -> T2WModel: _load_network()
+        end
+        opt Offload Tokenizer Enabled
+            Pipeline -> T2WModel: _load_tokenizer()
+        end
+
+        Pipeline -> Pipeline: _run_model(embedding, neg_embedding)
+        activate Pipeline
+
+            Pipeline -> Pipeline: get_video_batch(model, embedding, H, W, fps, num_frames)
+            note right: Prepares data_batch\nand state_shape
+
+            Pipeline -> T2WModel: generate_samples_from_batch(data_batch, guidance, seed, num_steps)
+            activate T2WModel
+
+                T2WModel -> T2WModel: get_x0_fn_from_batch(data_batch, guidance)
+                activate T2WModel
+                    T2WModel -> Conditioner: get_condition_uncondition(data_batch)
+                    activate Conditioner
+                    Conditioner -> Conditioner: _forward(batch) per embedder
+                    Conditioner --> T2WModel: (condition, uncondition)
+                    deactivate Conditioner
+                T2WModel --> T2WModel: x0_fn closure
+                deactivate T2WModel
+
+                T2WModel -> T2WModel: create x_sigma_max\n(random noise * sigma_max)
+
+                T2WModel -> Sampler: __call__(x0_fn, x_sigma_max, sigma_max, num_steps)
+                activate Sampler
+
+                    loop For each denoising step t in [sigma_max ... 0]
+                        Sampler -> T2WModel: x0_fn(xt, sigma)
+                        activate T2WModel
+                            T2WModel -> T2WModel: denoise(xt, sigma, condition)
+                            activate T2WModel
+                                T2WModel -> Scaling: __call__(sigma)
+                                activate Scaling
+                                Scaling --> T2WModel: c_skip, c_out, c_in, c_noise
+                                deactivate Scaling
+
+                                T2WModel -> DIT: forward(x=c_in*xt, timesteps=c_noise,\ncrossattn_emb, crossattn_mask)
+                                activate DIT
+                                    DIT -> DIT: forward_before_blocks(x, timesteps, crossattn_emb)
+                                    note right: Patchify + position\nembedding + timestep embed
+                                    DIT -> DIT: forward_blocks_regular(x, emb, crossattn)
+                                    note right: Transformer blocks\nwith self-attention\nand cross-attention
+                                    DIT -> DIT: decoder_head(x, emb)
+                                DIT --> T2WModel: net_output
+                                deactivate DIT
+
+                                T2WModel -> T2WModel: x0_pred = c_skip*xt + c_out*net_output
+                            T2WModel --> T2WModel: DenoisePrediction(x0, eps, logvar)
+                            deactivate T2WModel
+
+                            T2WModel -> T2WModel: denoise(xt, sigma, uncondition)
+                            note right: Same flow for\nunconditional prediction
+
+                            T2WModel --> T2WModel: cond_x0 + guidance*(cond_x0 - uncond_x0)
+                        T2WModel --> Sampler: x0_prediction
+                        deactivate T2WModel
+                    end
+
+                Sampler --> T2WModel: denoised_sample
+                deactivate Sampler
+
+            T2WModel --> Pipeline: sample (latent tensor)
+            deactivate T2WModel
+
+        deactivate Pipeline
+
+        Pipeline -> Pipeline: _run_tokenizer_decoding(sample)
+        activate Pipeline
+            Pipeline -> VAE: decode(sample / sigma_data)
+            activate VAE
+            VAE --> Pipeline: decoded_video [B,3,T,H,W]
+            deactivate VAE
+            Pipeline -> Pipeline: clamp + permute + to_uint8
+        deactivate Pipeline
+
+        opt Offload Network Enabled
+            Pipeline -> T2WModel: _offload_network()
+        end
+        opt Offload Tokenizer Enabled
+            Pipeline -> T2WModel: _offload_tokenizer()
+        end
+
+    deactivate Pipeline
+
+    opt Guardrail Enabled
+        Pipeline -> Guard: _run_guardrail_on_video_with_offload(video)
+        activate Guard
+        Guard -> Guard: run_video_guardrail(video)
+        Guard --> Pipeline: video (or None if unsafe)
+        deactivate Guard
+    end
+
+Pipeline --> User: (video [T,H,W,C], final_prompt)
+deactivate Pipeline
+
+== Training: Diffusion Model Training Step ==
+
+participant "Trainer" as Trainer
+
+Trainer -> T2WModel: training_step(data_batch, iteration)
+activate T2WModel
+
+    T2WModel -> T2WModel: get_data_and_condition(data_batch)
+    activate T2WModel
+        T2WModel -> VAE: encode(raw_state)
+        activate VAE
+        VAE --> T2WModel: latent_state (x0)
+        deactivate VAE
+
+        T2WModel -> Conditioner: __call__(data_batch)
+        activate Conditioner
+        Conditioner -> Conditioner: _forward(batch) per embedder
+        Conditioner --> T2WModel: condition (CosmosCondition)
+        deactivate Conditioner
+    T2WModel --> T2WModel: (raw_state, x0, condition)
+    deactivate T2WModel
+
+    T2WModel -> T2WModel: draw_training_sigma_and_epsilon(x0.size)
+    note right: Sample noise level sigma\nand Gaussian noise epsilon
+
+    T2WModel -> T2WModel: compute_loss_with_epsilon_and_sigma(\ndata_batch, raw, x0, condition, epsilon, sigma)
+    activate T2WModel
+        T2WModel -> T2WModel: xt = mean + std * epsilon\n(add noise via SDE)
+
+        T2WModel -> T2WModel: denoise(xt, sigma, condition)
+        activate T2WModel
+            T2WModel -> Scaling: __call__(sigma)
+            activate Scaling
+            Scaling --> T2WModel: c_skip, c_out, c_in, c_noise
+            deactivate Scaling
+
+            T2WModel -> DIT: forward(c_in*xt, c_noise, crossattn_emb, ...)
+            activate DIT
+            DIT --> T2WModel: net_output
+            deactivate DIT
+
+            T2WModel -> T2WModel: x0_pred = c_skip*xt + c_out*net_output
+        T2WModel --> T2WModel: DenoisePrediction(x0_pred, eps_pred, logvar)
+        deactivate T2WModel
+
+        T2WModel -> T2WModel: pred_mse = (x0 - x0_pred)^2 * loss_mask
+        T2WModel -> T2WModel: edm_loss = mse * sigma_weights * sample_weights
+    T2WModel --> T2WModel: (output_batch, kendall_loss, mse, edm_loss)
+    deactivate T2WModel
+
+    T2WModel -> T2WModel: loss = kendall_loss.mean() * loss_scale
+
+T2WModel --> Trainer: (output_batch, loss)
+deactivate T2WModel
+
+@enduml

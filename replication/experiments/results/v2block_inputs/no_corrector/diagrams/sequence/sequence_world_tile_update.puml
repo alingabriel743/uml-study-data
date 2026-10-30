@@ -1,0 +1,185 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #495057
+    LifeLineBackgroundColor #F8F9FA
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ParticipantFontColor #212529
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    NoteBackgroundColor #FFF3CD
+    NoteBorderColor #856404
+}
+
+title World Tile Update Cycle\n<size:11>(Per-tick tile updates: block logic, building production, conveyor transport, floor effects)</size>
+
+participant "Logic" as logic
+participant "EntityGroup\n(Groups.build)" as egroup
+participant "Building\n(BuildingComp)" as building
+participant "Consumer\n(Block)" as consumer
+participant "ConveyorBuild" as conveyor
+participant "DownstreamBuilding" as downstream
+participant "JunctionBuild" as junction
+participant "DirectionalItemBuffer" as dirbuf
+participant "UnitComp" as unit
+participant "Floor" as floor
+
+== Game Tick: Logic.update() ==
+
+logic -> logic : fire(Trigger.beforeGameUpdate)
+activate logic
+logic -> logic : Time.update()
+logic -> egroup : update()
+activate egroup
+
+loop for each Building entity in Groups.build
+    egroup -> building : update()
+    activate building
+
+    building -> building : timeScaleDuration decay
+    note right: reset timeScale=1 if\nduration<=0 || !block.canOverdrive
+
+    building -> building : sound.loop() [ambient]
+
+    building -> building : updateConsumption()
+    activate building #A8D8EA
+
+    loop for each nonOptionalConsumer
+        building -> consumer : efficiency(building)
+        activate consumer
+        consumer --> building : efficiencyValue
+        deactivate consumer
+    end
+
+    building -> building : set efficiency / optionalEfficiency
+
+    opt update == true && efficiency > 0
+        loop for each updateConsumer
+            building -> consumer : update(building)
+            activate consumer
+            consumer --> building
+            deactivate consumer
+        end
+    end
+    deactivate building
+
+    alt enabled || !block.noUpdateDisabled
+        building -> building : updateTile()
+        note right: Empty in base Building;\ndispatched to block-specific\nBuild subclass override
+    else disabled && block.noUpdateDisabled
+        note over building: updateTile() skipped
+    end
+
+    deactivate building
+end
+
+deactivate egroup
+deactivate logic
+
+== ConveyorBuild.updateTile() — Item Transport ==
+
+activate conveyor
+note over conveyor: Overrides Building.updateTile();\ninline parallel arrays: ids[], xs[], ys[]
+
+opt len == 0 or all items at max position
+    conveyor -> conveyor : sleep() [skip until item added]
+end
+
+loop for each item slot i in [0..len)
+    conveyor -> conveyor : ys[i] += speed * edelta()
+
+    alt ys[i] >= 1.0f (item reached exit)
+        conveyor -> conveyor : pass(ids[i])
+        activate conveyor #A8D8EA
+
+        alt next != null && next.team == team
+            conveyor -> downstream : acceptItem(conveyor, item)
+            activate downstream
+            downstream --> conveyor : accepted
+            deactivate downstream
+
+            alt accepted == true
+                conveyor -> downstream : handleItem(conveyor, item)
+                activate downstream
+                note right: compute entry angle;\nadd to ids[]/xs[]/ys[];\nitems.add(item, 1); noSleep()
+                downstream --> conveyor
+                deactivate downstream
+
+                conveyor -> conveyor : remove from ids[]/ys[]; len--
+            end
+        end
+        deactivate conveyor
+    end
+end
+deactivate conveyor
+
+== JunctionBuild.updateTile() — Directional Buffering ==
+
+activate junction
+note over junction: Uses DirectionalItemBuffer:\n4 directional queues, capacity=6 each
+
+loop for each direction i in [0..3]
+    junction -> dirbuf : peek buffers[i][0]
+    activate dirbuf
+    dirbuf --> junction : item (id+timestamp packed as long)
+    deactivate dirbuf
+
+    alt item != null && Time.time >= bufferTime + speed/timeScale
+        junction -> junction : nearby(i) → dest building
+
+        alt dest != null && dest.team == team && dest.acceptItem()
+            junction -> downstream : handleItem(junction, item)
+            activate downstream
+            downstream --> junction
+            deactivate downstream
+
+            junction -> dirbuf : remove(i)
+            activate dirbuf
+            note right: System.arraycopy shift-left;\nindexes[i]--
+            dirbuf --> junction
+            deactivate dirbuf
+        end
+    end
+end
+
+note over junction, dirbuf: Incoming items are enqueued via handleItem():
+junction -> junction : source.relativeTo(tile) → relativeDir
+junction -> dirbuf : accept(relativeDir, item)
+activate dirbuf
+note right: buffers[dir][indexes[dir]++] =\nBufferItem.get(item.id, Time.time)
+dirbuf --> junction
+deactivate dirbuf
+
+deactivate junction
+
+== Floor Effects — UnitComp.updateDrowning() ==
+
+activate unit
+note over unit: Floor effects are applied by unit logic,\nnot by the building/tile tick
+
+unit -> unit : drownFloor() → floor reference
+unit -> floor : read isLiquid, drownTime, speedMultiplier
+activate floor
+floor --> unit : floor properties
+deactivate floor
+
+alt floor.isLiquid && floor.drownTime > 0 && canDrown()
+    unit -> unit : drownTime += delta()
+
+    alt drownTime >= 1.0f
+        unit -> unit : kill()
+        note right: Unit drowns;\nfloor drownTime controls\nhow fast drowning occurs
+    end
+else floor not liquid or unit immune
+    unit -> unit : drownTime = 0 [reset]
+end
+
+deactivate unit
+
+@enduml

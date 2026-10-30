@@ -1,0 +1,279 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipantBorderColor #495057
+skinparam sequenceParticipantBackgroundColor #F8F9FA
+skinparam sequenceLifeLineBorderColor #ADB5BD
+skinparam sequenceGroupBorderColor #6C757D
+skinparam sequenceGroupBackgroundColor #E9ECEF
+skinparam noteBackgroundColor #FFF3CD
+skinparam noteBorderColor #FFC107
+
+title Package Download and Install Flow
+
+participant "Caller\n(Installer)" as Caller
+participant "InstallationManager" as IM
+participant "LibraryInstaller" as LI
+participant "DownloadManager" as DM
+participant "FileDownloader" as FD
+participant "HttpDownloader" as HD
+participant "Cache" as Cache
+participant "Filesystem" as FS
+participant "EventDispatcher" as ED
+participant "ConsoleIO" as IO
+participant "Loop" as Loop
+participant "InstalledRepository" as IR
+
+Caller -> IM: execute(repo, operations[], devMode, runScripts, downloadOnly)
+activate IM
+
+note over IM
+  Split operations into batches
+  (composer-plugins with
+  plugin-modifies-downloads=true
+  get their own batch first)
+end note
+
+IM -> IM: downloadAndExecuteBatch(repo, batch, cleanupPromises, ...)
+activate IM #D0E8FF
+
+== PHASE 1: Downloads ==
+
+loop for each install/update operation in batch
+    IM -> LI: download(package, prevPackage): Promise
+    activate LI
+    LI -> DM: download(package, downloadPath, prevPackage)
+    activate DM
+    DM -> FD: download(package, path, prevPackage): PromiseInterface
+    activate FD
+
+    FD -> ED: dispatch(PRE_FILE_DOWNLOAD, preFileDownloadEvent)
+    activate ED
+    ED --> FD: event dispatched
+    deactivate ED
+
+    FD -> FS: ensureDirectoryExists(path)
+    activate FS
+    FS --> FD: ok
+    deactivate FS
+
+    alt cache hit: cache.sha1(cacheKey) matches checksum
+        FD -> Cache: copyTo(cacheKey, fileName): bool
+        activate Cache
+        Cache --> FD: true
+        deactivate Cache
+        FD -> IO: writeError('Loading <pkg> from cache')
+        FD --> FD: resolve(fileName)
+    else cache miss
+        FD -> IO: writeError('Downloading <pkg>')
+        FD -> HD: addCopy(url, fileName, transportOptions): Promise
+        activate HD
+        HD --> FD: accept(Response)
+        deactivate HD
+        FD -> Cache: copyFrom(cacheKey, fileName)
+        activate Cache
+        Cache --> FD: ok
+        deactivate Cache
+        note right of FD
+          Collect GH Actions response headers
+          Record downloadMetadata[packageName] = fileSize
+        end note
+    end
+
+    FD -> ED: dispatch(POST_FILE_DOWNLOAD, postFileDownloadEvent)
+    activate ED
+    ED --> FD: event dispatched
+    deactivate ED
+
+    FD -> FD: verify sha1 checksum
+    FD --> DM: resolved Promise<fileName>
+    deactivate FD
+    DM --> LI: promise
+    deactivate DM
+    LI --> IM: Promise
+    deactivate LI
+end
+
+note over IM
+  Collect all download Promises
+end note
+
+IM -> IM: waitOnPromises(promises)
+
+alt outputProgress && ConsoleIO && !CI && !debug && >1 promise
+    IM -> IO: getProgressBar()
+    activate IO
+    IO --> IM: progressBar
+    deactivate IO
+    IM -> Loop: wait(promises, progressBar)
+    activate Loop
+    Loop --> IM: resolved
+    deactivate Loop
+    IM -> IO: progressBar.clear()
+else
+    IM -> Loop: wait(promises)
+    activate Loop
+    Loop --> IM: resolved
+    deactivate Loop
+end
+
+alt downloadOnly == true
+    IM -> IM: runCleanup(cleanupPromises)
+    note right of IM: Loop.abortJobs() + cleanup closures
+    IM --> Caller: return (download-only mode)
+end
+
+== PHASE 2: Execute (install / update / uninstall) ==
+
+note over IM
+  Re-batch operations:
+  composer-plugin and composer-installer
+  types each in own sub-batch
+end note
+
+IM -> IM: executeBatch(repo, subBatch, cleanupPromises, ...)
+activate IM #D0FFD0
+
+loop for each operation in sub-batch
+    IM -> ED: dispatchPackageEvent(PRE_PACKAGE_INSTALL|UPDATE|UNINSTALL)
+    activate ED
+    ED --> IM: dispatched
+    deactivate ED
+
+    IM -> LI: prepare(type, package, prevPackage): Promise
+    activate LI
+    LI -> DM: prepare(type, package, downloadPath, prevPackage)
+    activate DM
+    DM -> FD: prepare(type, package, path): resolve(null)
+    activate FD
+    FD --> DM: null
+    deactivate FD
+    DM --> LI: ok
+    deactivate DM
+    LI --> IM: Promise
+    deactivate LI
+
+    alt opType == install
+        IM -> IM: install(repo, InstallOperation)
+        IM -> LI: install(repo, package): Promise
+        activate LI
+        LI -> LI: installCode(package)
+        LI -> DM: install(package, downloadPath)
+        activate DM
+        DM -> FD: install(package, path): PromiseInterface
+        activate FD
+        FD -> IO: writeError('- Installing <pkg>')
+        FD -> FS: emptyDirectory(path)
+        activate FS
+        FS --> FD: ok
+        deactivate FS
+        FD -> FS: ensureDirectoryExists(path)
+        activate FS
+        FS --> FD: ok
+        deactivate FS
+        FD -> FS: rename(tmpFile, path/distBasename)
+        activate FS
+        FS --> FD: ok
+        deactivate FS
+        note right of FD: chmod binaries if executable missing
+        FD --> DM: resolve(null)
+        deactivate FD
+        DM --> LI: ok
+        deactivate DM
+        LI -> LI: installBinaries(package, installPath)
+        LI -> IR: addPackage(clone package)
+        activate IR
+        IR --> LI: ok
+        deactivate IR
+        LI --> IM: Promise
+        deactivate LI
+
+    else opType == update
+        IM -> IM: update(repo, UpdateOperation)
+        IM -> LI: update(repo, initial, target): Promise
+        activate LI
+        LI -> LI: removeBinaries(initial)
+        LI -> DM: update(initial, target, downloadPath)
+        activate DM
+        DM -> FD: update(initial, target, path)
+        activate FD
+        FD -> IO: writeError('- Updating <pkg>')
+        FD -> FD: remove(initial, path)\n→ Filesystem.removeDirectoryAsync(path)
+        FD -> FD: install(target, path)
+        FD --> DM: resolve(null)
+        deactivate FD
+        DM --> LI: ok
+        deactivate DM
+        LI -> LI: installBinaries(target, installPath)
+        LI -> IR: removePackage(initial) + addPackage(target)
+        activate IR
+        IR --> LI: ok
+        deactivate IR
+        LI --> IM: Promise
+        deactivate LI
+    end
+
+    IM -> LI: cleanup(type, package, prevPackage)
+    activate LI
+    LI -> DM: cleanup(type, package, downloadPath, prevPackage)
+    activate DM
+    DM -> FD: cleanup(type, package, path)
+    activate FD
+    FD -> FS: unlink(tmpFile)
+    activate FS
+    FS --> FD: ok
+    deactivate FS
+    FD -> FS: removeDirectoryPhp(emptyDirs)
+    activate FS
+    FS --> FD: ok
+    deactivate FS
+    FD --> DM: ok
+    deactivate FD
+    DM --> LI: ok
+    deactivate DM
+    LI --> IM: ok
+    deactivate LI
+
+    IM -> IR: write(devMode, installationManager)
+    activate IR
+    IR --> IM: ok
+    deactivate IR
+end
+
+IM -> IM: waitOnPromises(executionPromises)
+note right of IM: Platform.workaroundFilesystemIssues()
+
+deactivate IM
+
+loop postExecCallbacks
+    IM -> ED: dispatchPackageEvent(POST_PACKAGE_INSTALL|UPDATE|UNINSTALL)
+    activate ED
+    ED --> IM: dispatched
+    deactivate ED
+end
+
+IM -> IR: write(devMode, this) [final write]
+activate IR
+IR --> IM: ok
+deactivate IR
+
+deactivate IM
+IM --> Caller: done
+deactivate IM
+
+@enduml

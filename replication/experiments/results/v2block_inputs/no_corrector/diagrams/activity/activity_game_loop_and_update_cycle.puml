@@ -1,0 +1,155 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    BarColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+
+title Game Loop and Update Cycle
+
+|Main Thread (AsyncCore)|
+start
+
+:Game Frame Begins;
+
+:AsyncCore.begin();
+
+if (state.isPlaying()?) then (yes)
+
+    :Snapshot phase — for each AsyncProcess.begin();
+
+    :PhysicsProcess.begin()\nRemove stale PhysicRef entities;\
+
+    if (physics == null?) then (yes)
+        :Early return (not yet initialized);
+    else (no)
+        :Assign new PhysicsBodies to\nentities where entity.type.physics == true;
+        :Snapshot x/y positions\ninto PhysicRefs;
+    endif
+
+    :AvoidanceProcess.begin();
+
+    if (AvoidanceProcess.active?) then (no)
+        :Skip — avoidance not active\n(getAvoidance() never called);
+    else (yes)
+        :Clear avoidance requests;\
+        :Swap double-buffer pointer\n(volatile flag);
+        if (team.isAI() && !rtsAi\n&& unit.collisionLayer() == GROUND?) then (yes)
+            :Collect ground AI unit positions\ninto requests IntSeq;
+        else (no)
+            :Skip non-ground / non-AI units;
+        endif
+    endif
+
+    :futures.clear();
+
+    if (executor == null?) then (yes)
+        :Lazy-init: create FixedThreadPool\n(size = processes.count)\nwith daemon threads;
+    else (no)
+    endif
+
+    :Submit enabled processes to thread pool;
+
+    fork
+        :PhysicsProcess.shouldProcess()\n→ always true;
+        :executor.submit(PhysicsProcess::process)\n→ add Future to futures;
+    fork again
+        if (AvoidanceProcess.active?) then (yes)
+            :AvoidanceProcess.shouldProcess()\n→ true;
+            :executor.submit(AvoidanceProcess::process)\n→ add Future to futures;
+        else (no)
+            :AvoidanceProcess skipped;
+        endif
+    end fork
+
+    |Physics Thread|
+    :PhysicsProcess.process();
+    :Set PhysicsBody positions\nfrom snapshotted x/y;
+    :PhysicsWorld.update();
+    :Clear all 4 QuadTrees\n(ground, legs, flying, underwater);
+    :Insert all PhysicsBodies\ninto layer QuadTrees\n(skip if body.layer < 0);
+    :Detect collisions per layer;
+    if (body.local == true?) then (yes)
+        :Resolve collisions:\nmass-weighted push between bodies;
+    else (no)
+        :Skip resolution\n(non-local / remote unit);
+    endif
+    :Physics async work complete;
+
+    |Avoidance Thread|
+    :AvoidanceProcess.process();
+    if (modified flag set from prior frame?) then (yes)
+        :Arrays.fill(buffer, 0)\n— reset write buffer;
+    else (no)
+        :Skip buffer reset;
+    endif
+    :Swap double-buffer\n(write to inactive buffer);
+    :Stamp avoidance radii of\nground units into write buffer;
+    :Set modified flag;
+    :Avoidance async work complete;
+
+    |Main Thread (AsyncCore)|
+    :Main thread continues:\nLogic tick, AI updates,\nrendering preparation;
+
+    :AsyncCore.end();
+
+    if (state.isPlaying()?) then (yes)
+        :complete() — block until all futures done\nfuture.get() for each Future;
+
+        :Apply phase — for each AsyncProcess.end();
+
+        :PhysicsProcess.end();
+        :For each PhysicRef:\nentity.move(body.x − ref.x, body.y − ref.y)\n→ apply collision delta to world position;
+
+        :AvoidanceProcess.end()\n(no-op — double-buffer already committed);
+    else (no)
+        :Skip end-phase (not playing);
+    endif
+
+else (no)
+    :Skip all async work\n(game not in play state);
+endif
+
+:Frame Complete;
+
+stop
+
+|Lifecycle Events|
+note
+  **WorldLoadEvent → AsyncCore:**
+  complete() → p.init() for all processes
+  (PhysicsProcess.init(): create PhysicsWorld
+   with world quad bounds)
+
+  **ResetEvent → AsyncCore:**
+  complete() → p.reset() for all processes
+  (PhysicsProcess.reset(): clear refs, null physics
+   AvoidanceProcess: reset active flag)
+end note
+
+@enduml

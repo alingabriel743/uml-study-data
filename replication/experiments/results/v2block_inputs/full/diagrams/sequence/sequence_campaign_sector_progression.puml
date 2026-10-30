@@ -1,0 +1,182 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #495057
+    LifeLineBackgroundColor #F8F9FA
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ParticipantFontColor #212529
+    ActorBackgroundColor #E9ECEF
+    ActorBorderColor #495057
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+}
+
+title Campaign Sector Progression
+
+actor Player as player
+participant "Logic" as logic
+participant "Call\n(Remote RPC)" as call
+participant "GameState\n(state.rules)" as gamestate
+participant "Events\n(EventBus)" as events
+participant "Control" as control
+participant "TechTree" as techtree
+participant "Sector" as sector
+participant "Planet" as planet
+participant "PlanetGenerator" as generator
+participant "World" as world
+participant "Saves" as saves
+
+== Win Condition Check ==
+
+loop every game tick
+    logic -> gamestate : check waves, enemies, wave >= winWave\n[or attackMode && !waveTeam.isAlive()]
+end
+
+logic -> call : sectorCapture(sector)\n@Remote @Loc.server
+activate call
+
+== Sector Capture (Server-Authoritative) ==
+
+call -> gamestate : rules.waves = false
+call -> sector : initial = !info.wasCaptured
+call -> sector : info.wasCaptured = true
+
+call -> events : fire(SectorCaptureEvent(sector, initial))
+activate events
+
+call -> gamestate : rules.attackMode = false\nrules.disableWorldProcessors = true
+call -> saves : saveSector(sector)\n[if !headless && !net.client()]
+deactivate call
+
+== SectorCaptureEvent: Logic Handler ==
+
+events -> logic : onSectorCaptureEvent
+activate logic
+logic -> gamestate : waveTeam.data().destroyToDerelict()\n[enemy units → derelict]
+logic -> generator : onSectorCaptured(sector)\n[if !net.client() && generator != null]
+activate generator
+generator --> logic : (post-capture world update)
+deactivate generator
+logic -> planet : stats().sectorsCaptured++
+deactivate logic
+
+== SectorCaptureEvent: Control Handler ==
+
+events -> control : onSectorCaptureEvent
+activate control
+deactivate events
+
+control -> control : app.post(checkAutoUnlocks)
+
+alt preset.isLastSector && initialCapture
+    control -> player : ui.campaignComplete.show(sector.planet)\n[after 120f delay]
+end
+
+== Auto-Unlock Cascade ==
+
+control -> techtree : iterate TechTree.all
+activate techtree
+
+loop for each TechNode
+    techtree -> techtree : if !unlocked\n&& (parent==null || parent.content.unlocked())\n&& requirements.length==0\n&& all objectives complete
+    techtree -> events : node.content.unlock()\n→ fire UnlockEvent(content)
+    activate events
+    events -> control : onUnlockEvent
+    note right of control : if content instanceof SectorPreset\n→ show toast for newly available tech
+    control -> control : checkAutoUnlocks()\n[cascade further unlocks]
+    deactivate events
+end
+
+deactivate techtree
+
+== Adjacent Sector Availability ==
+
+note over sector : Sector.unlocked() = hasBase() OR preset.alwaysUnlocked\nSector.hasBase() = save!=null && info.hasCore\nSector.near() = adjacent PlanetGrid tiles
+
+deactivate control
+
+== Player Launches New Sector ==
+
+player -> control : playSector(sector)
+activate control
+control -> control : playSector(origin, sector, new WorldReloader())
+
+control -> saves : getCurrent().save()\nresetSave() [if in-game]
+
+alt sector.preset != null
+    control -> sector : preset.quietUnlock()
+end
+
+control -> player : ui.planet.hide()
+control -> planet : setLastSector(sector)
+
+alt sector.save != null && !clearSectors (existing save)
+    control -> saves : slot.load(world.makeSectorContext(sector))
+    control -> gamestate : rules.sector = sector\nrules.cloudColor = planet.landCloudColor
+
+    alt no cores in loaded save
+        control -> control : playNewSector(origin, sector, reloader)
+    else cores present
+        control -> gamestate : state.set(State.playing)
+        control -> control : reloader.end()
+    end
+else new sector (no save)
+    control -> control : playNewSector(origin, sector, reloader)
+end
+
+== playNewSector: Map Generation ==
+
+control -> world : loadSector(sector, params)
+activate world
+
+world -> world : setSectorRules(sector)
+
+alt sector.preset != null
+    world -> generator : preset.generator.generate(tiles, params)
+    activate generator
+    generator --> world : generated tiles
+    deactivate generator
+    world -> gamestate : preset.rules.get(state.rules)
+else no preset
+    world -> generator : planet.generator.generate(tiles, sector, params)
+    activate generator
+    generator --> world : generated tiles
+    deactivate generator
+    world -> generator : planet.generator.postGenerate(tiles)\n[post-generate bases]
+end
+
+world -> gamestate : rules.sector = sector
+world -> planet : applyRules(state.rules)\n[ruleSetter + campaignRules.apply()]
+world -> sector : saveInfo()
+deactivate world
+
+== Sector Ready ==
+
+control -> logic : logic.play()
+control -> saves : saveSector(sector)
+control -> events : fire(SectorLaunchEvent(sector))
+control -> events : fire(Trigger.newGame)
+control -> control : reloader.end()
+control -> gamestate : state.set(State.playing)
+deactivate control
+
+player -> player : new sector map loaded\nand gameplay begins
+
+@enduml

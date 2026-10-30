@@ -1,0 +1,243 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #495057
+}
+
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #DEE2E6
+    TitleFontColor #212529
+}
+
+title Mindustry — Main Game Loop & Wave Spawning Activity
+
+|#E8F4F8| Logic (Core Game Loop) |
+start
+:Load World\n(WorldLoadEvent);
+:Apply Campaign Rules\n(difficulty, enemy settings);
+:Set State to Playing\n(Logic.play());
+:Initialize Wave Timer\n(initialWaveSpacing × difficultyMultiplier);
+:Add Starting Items\nto Core Inventories;
+:Heal All Cores;
+:Fire PlayEvent;
+
+repeat
+
+  :Update Frame\n(Logic.update());
+
+  if (Game is paused?) then (yes)
+    :Skip entity updates;
+  else (no)
+    :Increment state.tick\nand state.updateId;
+    :Update Team Stats;
+
+    if (Fog of War enabled?) then (yes)
+      :fogControl.update();
+    else (no)
+    endif
+
+    if (Campaign mode?) then (yes)
+      :Update Sector Info;
+      :Update Universe;
+    else (no)
+    endif
+
+    :Time.update();
+    :logicVars.update();
+
+    |#FFF3E0| Team AI Manager |
+
+    if (Server / not client?) then (yes)
+      :updateWeather();
+
+      fork
+        :Update BuilderAI\nfor each team\n(data.buildAi.update());
+      fork again
+        :Update RtsAI\nfor each team\n(data.rtsAi.update());
+      fork again
+        :Spawn PrebuildAI units\nfor each core;
+      end fork
+    else (no)
+    endif
+
+    |#E8F4F8| Logic (Core Game Loop) |
+
+    :Update Objectives\n(state.rules.objectives.update());
+
+    if (Waves enabled AND wave timer active?) then (yes)
+      if (Waiting for enemies to clear?) then (yes)
+        :Hold wave timer\n(isWaitingWave = true);
+      else (no)
+        :Decrement wavetime\n(wavetime -= Time.delta);
+      endif
+
+      if (wavetime <= 0 AND not client?) then (yes)
+
+        |#E8F5E9| WaveSpawner |
+
+        :WaveSpawner.spawnEnemies();
+        :Set spawning = true;
+        :Execute shockwave\nat each ground spawn;
+
+        fork
+          :Iterate Ground Spawn Groups;
+          :Calculate spawned count\n(with difficulty multiplier);
+          repeat
+            :eachGroundSpawn(group.spawn, ...);
+            :spawnUnit(group, x, y);
+            :Apply spawn effects\n(unmoving 30f, invincible 60f);
+            :Fire UnitSpawnEvent;
+          repeat while (more units to spawn?) is (yes)
+        fork again
+          :Iterate Flying Spawn Groups;
+          repeat
+            :eachFlyerSpawn(group.spawn, ...);
+            :spawnUnit(group, x, y);
+            :Apply spawn effects;
+            :Fire UnitSpawnEvent;
+          repeat while (more flyers to spawn?) is (yes)
+        end fork
+
+        :state.wave++;
+        :Reset wavetime\n(waveSpacing × multiplier);
+        :Fire WaveEvent;
+        :Time.run(121f) → set spawning = false;
+
+        |#E8F4F8| Logic (Core Game Loop) |
+
+      else (no)
+      endif
+    else (no)
+    endif
+
+    :Update Weather Attributes\n(envAttrs from rules + active weathers);
+
+    |#FCE4EC| Unit AI (per unit) |
+
+    :Groups.update()\n(all entities update);
+
+    fork
+      :GroundAI.updateMovement();
+      :Find closest enemy core;
+      if (Core in weapon range?) then (yes)
+        :Set target = enemy core;
+        :Face target;
+      else (no)
+        if (Drop zone restriction?) then (yes)
+          :Hold position\nnear spawner;
+        else (no)
+          :pathfind(fieldCore)\ntoward enemy core;
+        endif
+      endif
+      :Detect and resolve\nstuck units;
+    fork again
+      :BuilderAI.updateMovement();
+      if (Following another builder?) then (yes)
+        :Validate following unit;
+        if (Still valid and building?) then (yes)
+          :Copy follower's build plan;
+          :Move toward build site;
+        else (no)
+          :Clear following;
+        endif
+      else (no)
+        if (Has active build plan?) then (yes)
+          :Validate build plan;
+          if (Plan is valid?) then (yes)
+            :moveTo(plan.tile, buildRange);
+            :Execute building;
+          else (no)
+            :Discard invalid plan\n(plans.removeFirst());
+          endif
+        else (no)
+          :Scan nearby units\n(Units.nearby);
+          if (Active builder found in range?) then (yes)
+            :Set following = builder;
+          else (no)
+            if (Team has rebuild plans?) then (yes)
+              :Pick next block plan;
+              if (Valid placement?) then (yes)
+                :addBuild(new BuildPlan(...));
+                :Rotate queue (removeFirst → addLast);
+              else (no)
+                :Skip, try next plan;
+              endif
+            else (no)
+              :Check for enemies\nnear retreat zone;
+              if (Enemy in flee range?) then (yes)
+                :Flee toward closest core;
+              else (no)
+                :Idle;
+              endif
+            endif
+          endif
+        endif
+      endif
+    end fork
+
+    |#E8F4F8| Logic (Core Game Loop) |
+
+    :Fire afterGameUpdate;
+  endif
+
+  :checkGameState();
+
+  if (Campaign mode?) then (yes)
+    if (All player cores destroyed?) then (yes)
+      :Fire GameOverEvent\n(wave team wins);
+    else (no)
+      if (Win wave reached AND no enemies?) then (yes)
+        if (Attack-after-waves preset?) then (yes)
+          :Activate Attack Mode;
+          :Disable Waves;
+        else (no)
+          :Call.sectorCapture();
+          :Fire SectorCaptureEvent;
+          :Disable Waves & Attack Mode;
+          :Save sector;
+        endif
+      else (no)
+      endif
+    endif
+  else (no)
+    if (All player cores destroyed?) then (yes)
+      :Fire GameOverEvent;
+    else (no)
+      if (Attack mode: only one team alive?) then (yes)
+        :Fire GameOverEvent\n(last team standing wins);
+      else (no)
+      endif
+    endif
+  endif
+
+repeat while (Game Over?) is (no)
+-> yes;
+
+:Display Game Over / Victory screen\n(Time.run 3s → ui.restart.show(winner));
+:Save game stats\n(wavesLasted, buildingsBuilt, etc.);
+
+stop
+
+@enduml

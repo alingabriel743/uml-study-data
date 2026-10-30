@@ -1,0 +1,164 @@
+@startuml
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 11
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #212529
+    EndColor #212529
+    BarColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+
+title Mod Loading and Content Parsing
+
+|Bootstrap|
+start
+:Application boots;
+
+|ContentLoader|
+:createBaseContent()\n(vanilla Items, Blocks, Units,\nLiquids, Planets, TechTree);
+:createModContent()\n→ Mods.loadContent();
+
+|Mods|
+note right: **JAR Mod Pre-Loading**
+:Read mod.json / mod.hjson\n→ ModMeta (name, version, mainClass);
+if (mainFile exists AND\nplatform/version checks pass?) then (yes)
+  :platform.loadJar(sourceFile, mainLoader)\n[URLClassLoader or Android dex loader];
+  :mainLoader.addChild(loader)\n[ModClassLoader aggregates children];
+  :Class.forName(mainClass, true, loader)\n→ instantiate Mod via reflection;
+  if (main extends Plugin?) then (yes)
+    :meta.hidden = true;
+  endif
+  if (overwrite + existing mod loaded?) then (yes)
+    :ClassLoaderCloser.close(other.loader)\n[URLClassLoader.close() or\nAndroid dex cache workaround];
+  endif
+else (no)
+  :mainMod = null\n(no Java class for this mod);
+endif
+:return new LoadedMod\n(file, root, mainMod, loader, meta);
+
+|ContentLoader|
+note right: **Phase 1: Java / Class Mod Content**
+repeat
+  if (mod.main != null\nAND !mod.meta.hidden?) then (yes)
+    :setCurrentMod(mod);
+    |Mods|
+    :mod.main.loadContent()\n[user-implemented Mod subclass];
+    |ContentLoader|
+  endif
+repeat while (more orderedMods?) is (yes)
+->no;
+:setCurrentMod(null);
+
+|Mods|
+note right: **Phase 2: JSON Content Discovery**
+repeat
+  if (mod.root.child('content')\nfolder exists?) then (yes)
+    repeat
+      :Derive folder name:\ntype.name().toLowerCase() + 's'\n(e.g. "blocks", "items", "units");
+      :folder.findAll\n(ext == "json" OR "hjson");
+      if (filename in\nmod.meta.contentOrder?) then (yes)
+        :Add to orderedContent map\n(deterministic priority ordering);
+      else (no)
+        :Add to unorderedContent list\n(sorted alphabetically);
+      endif
+    repeat while (more ContentTypes?) is (yes)
+    ->no;
+    :Build LoadRun list:\norder-specified runs first,\nthen alphabetically-sorted runs;
+  else (no)
+    :Skip — no content folder;
+  endif
+repeat while (more LoadedMods?) is (yes)
+->no;
+
+|ContentParser|
+note right: **Phase 3: Parse Each Content File (LoadRuns)**
+:checkInit()\n→ if contentTypes map empty,\nbuild Class→ContentType registry;
+repeat
+  :Sanitize raw JSON text\n(replace bare '#' characters);
+  :Jval.read(json).toString(Jformat.plain)\n→ parsed JsonValue;
+  if (TypeParser found\nfor ContentType?) then (yes)
+    :TypeParser.parse(mod.name, name, jsonValue);
+    :readBundle()\n→ inject 'name' / 'description'\ninto I18N bundle, strip from JSON;
+    :locate()\n→ look up existing content by name;
+    if (content already exists\n(vanilla name match)?) then (yes)
+      :Target = existing vanilla content\n(JSON merges onto it; no type change);
+    else (no)
+      :resolve(type, DefaultClass)\n→ ClassMap short-name lookup\nor Class.forName();
+      :make(resolvedClass, modName + '-' + name)\n[reflective newInstance];
+      :c.minfo.sourceFile = file\nc.minfo.mod = mod;
+    endif
+    :read(Runnable)\n→ DEFER: enqueue field-parsing\nlambda into reads list;
+    :add content to toBeParsed set;
+  else (no)
+    :throw SerializationException\n(no TypeParser for ContentType);
+  endif
+  if (parse error thrown?) then (yes)
+    :markError(content, mod, file, e)\n→ log error, set minfo.error,\nadd to mod.erroredContent;
+  endif
+repeat while (more LoadRuns?) is (yes)
+->no;
+
+note right: **Phase 4: Deferred Field Reads (finishParsing)**
+:finishParsing();
+repeat
+  :run.run()\n→ set currentMod / currentContent\n→ call readFields(object, jsonMap);
+  repeat
+    :Lookup FieldMetadata\nfor field via parser.getFields(type);
+    if (unknown JSON field?) then (yes)
+      if (ignoreUnknownFields == true?) then (yes)
+        :warn and skip field;
+      else (no)
+        :throw SerializationException;
+      endif
+    else (no)
+      if ("add" merge field\n(Seq / ObjectSet / ObjectMap)?) then (yes)
+        :Merge incoming values\ninto existing collection;
+      else (no)
+        :parser.readValue\n(fieldType, elementType, child, keyType);
+        if (classParsers map has\nentry for field type?) then (yes)
+          :internalRead()\n→ custom parser\n(Effect, BulletType, Sound, Color…);
+          if (Sound or Music field?) then (yes)
+            |FileTree|
+            :loadSound(name) or loadMusic(name)\n→ cache lookup + async load\nvia Core.assets (.ogg / .mp3);
+            |ContentParser|
+          endif
+        else (no)
+          :ContentLoader.getByName(type, name)\n→ resolve Content cross-reference;
+          if (content not found?) then (yes)
+            :Fallback: Json.readValue();
+          endif
+        endif
+        :field.set(object, resolvedValue);
+      endif
+      if (field == "research" AND\ncontent is UnlockableContent?) then (yes)
+        :Queue postread lambda\nfor TechTree node creation;
+      endif
+    endif
+  repeat while (more JSON fields in object?) is (yes)
+  ->no;
+  :checkNullFields(content)\n→ verify all non-@Nullable\nfields are assigned;
+  :toBeParsed.remove(content);
+repeat while (more deferred reads?) is (yes)
+->no;
+
+:postreads.each(run)\n→ TechTree node wiring\n(UnlockableContent research links);
+:reads.clear()\npostreads.clear()\ntoBeParsed.clear();
+
+|ContentLoader|
+:handleContent() / handleMappableContent()\n→ register into contentMap\nand contentNameMap;
+:Events.fire(ModContentLoadEvent)\n→ signal all mod content loaded;
+
+stop
+@enduml

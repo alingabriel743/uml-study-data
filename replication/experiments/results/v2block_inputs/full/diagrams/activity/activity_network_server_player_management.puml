@@ -1,0 +1,335 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #212529
+    EndColor #212529
+}
+skinparam partition {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontSize 13
+    TitleFontStyle bold
+}
+skinparam note {
+    BackgroundColor #D1ECF1
+    BorderColor #0C5460
+}
+
+title Network Server and Player Management
+
+' ===================================================
+' PHASE 1: PLAYER CONNECTION ESTABLISHMENT
+' ===================================================
+|ArcNetProvider|
+start
+:Client TCP connects;
+if (DoS blacklisted?\nOR player limit exceeded?) then (yes)
+  :connection.close(DcReason.closed);
+  kill
+else (no)
+endif
+:Wrap in ArcConnection;
+:Fire Connect packet → NetServer;
+
+|NetServer|
+:Handle Connect.class\nEvents.fire(ConnectionEvent);
+if (IP banned?\nOR subnet banned?) then (yes)
+  :con.kick(KickReason.banned);
+  kill
+else (no)
+endif
+:Receive ConnectPacket;
+if (con.kicked?) then (yes)
+  :return (drop packet);
+  kill
+elseif (hasBegunConnecting already?) then (yes)
+  :con.kick(KickReason.idInUse);
+  kill
+else (no)
+endif
+
+|Administration|
+:admins.getInfo(uuid)\ncreate or retrieve PlayerInfo;
+
+|NetServer|
+:con.hasBegunConnecting = true;
+if (uuid == null\nOR usid == null?) then (yes)
+  :con.kick(KickReason.idInUse);
+  kill
+elseif (ID banned OR name banned?) then (yes)
+  :con.kick(KickReason.banned);
+  kill
+elseif (within kick cooldown\n[getKickTime(uuid, ip)]?) then (yes)
+  :con.kick(KickReason.recentKick);
+  kill
+elseif (player limit > 0\nAND at capacity AND not admin?) then (yes)
+  :con.kick(KickReason.playerLimit);
+  kill
+elseif (mod incompatibility\n[extraMods / missingMods]?) then (yes)
+  :con.kick(incompatibleModsText);
+  kill
+elseif (whitelist enabled\nAND not whitelisted?) then (yes)
+  :con.kick(KickReason.whitelist);
+  kill
+elseif (versionType mismatch\nOR custom client disallowed?) then (yes)
+  :con.kick(typeMismatch\nOR customClient);
+  kill
+elseif (strict mode AND\nduplicate name OR UUID?) then (yes)
+  :con.kick(nameInUse\nOR idInUse);
+  kill
+elseif (name empty after fixName()?) then (yes)
+  :con.kick(KickReason.nameEmpty);
+  kill
+else (all checks passed)
+endif
+
+|Administration|
+:admins.updatePlayerJoined(uuid, ip, name)\nupdate: lastName, lastIP, timesJoined, ips, names;
+
+|NetServer|
+if (version mismatch?) then (yes)
+  :con.kick(serverOutdated\nOR clientOutdated);
+  kill
+else (no)
+endif
+:Player.create()\nset admin, con, usid, uuid, name, locale, color;
+:player.team = assignTeam(player)\n[PvP: team with min players; else defaultTeam];
+:sendWorldData(player)\nNetworkIO.writeWorld → compress → con.sendStream(WorldStream);
+:Events.fire(PlayerConnect(player));
+
+note right
+  Phase 1 complete.
+  Waiting for client
+  world-load confirmation.
+end note
+
+' ===================================================
+' PHASE 2: CONNECT CONFIRM
+' ===================================================
+:Receive connectConfirm from client;
+if (con.kicked?) then (yes)
+  :return;
+  kill
+else (no)
+endif
+:player.add()\nEvents.fire(PlayerConnectionConfirmed);
+:con.hasConnected = true;
+if (showConnectMessages?) then (yes)
+  :Call.sendMessage("[player] has connected");
+else (no)
+endif
+if (motd != "off"?) then (yes)
+  :player.sendMessage(motd);
+else (no)
+endif
+:Events.fire(PlayerJoin(player));
+:player.deathTimer = deathDelay\nplayer.update();
+
+note right
+  Player fully joined.
+  Event-driven handlers
+  now active concurrently.
+end note
+
+' ===================================================
+' ACTIVE SESSION: CONCURRENT EVENT HANDLERS
+' ===================================================
+fork
+  ' --- CHAT MESSAGE HANDLER ---
+  |NetServer|
+  :[ CHAT MESSAGE HANDLER ];
+  :Player sends chat message;
+  if (player too young < 500ms\nOR !hasConnected OR !isAdded?) then (yes)
+    :drop message silently;
+  else (no)
+    if (chatRate.allow(2000, chatSpamLimit) fails?) then (yes)
+      :con.kick(KickReason.kick);
+      |Administration|
+      :admins.blacklistDos(address)\ndosBlacklist.add(address);
+    else (no)
+      |NetServer|
+      if (message.length() > maxTextLength?) then (yes)
+        :throw ValidateException;
+      else (no)
+        :Events.fire(PlayerChatEvent(player, message));
+        if (message starts with '/'?) then (yes)
+          :log command;
+          :clientCommands.handleMessage(message, player);
+          if (response.type == valid?) then (yes)
+            :command executed successfully;
+          else (no)
+            :invalidHandler.handle()\n[Levenshtein distance suggestion];
+            :player.sendMessage(errorText);
+          endif
+        else (no)
+          |Administration|
+          :admins.filterMessage(player, message)\nrun ChatFilter chain;
+          if (anti-spam: messageRateLimit violated?) then (yes)
+            :messageInfractions++;
+            if (messageInfractions >= messageSpamKick?) then (yes)
+              :con.kick(chat spam);
+            else (no)
+              :player.sendMessage(spam warning);
+            endif
+          elseif (duplicate message within 10s?) then (yes)
+            :suppress message (return null);
+          else (filters pass)
+            |NetServer|
+            :Call.sendMessage(\nchatFormatter.format(player, message));
+          endif
+        endif
+      endif
+    endif
+  endif
+
+fork again
+  ' --- ACTION FILTER HANDLER ---
+  |Administration|
+  :[ ACTION FILTER HANDLER ];
+  :admins.allowAction(player, actionType, tile, setter);
+  if (player == null\n[server-side action]?) then (yes)
+    :return true (always allow);
+  else (no)
+    :obtain pooled PlayerAction\npopulate fields;
+    :iterate actionFilters;
+    if (ActionFilter #1:\ninteract rate limit exceeded?) then (yes)
+      if (occurrences > interactRateKick?) then (yes)
+        :player.kick(interaction rate exceeded);
+      else (no)
+        :player.sendMessage(rate limit warning);
+      endif
+      :return false;
+      |NetServer|
+      :Call.removeQueueBlock(player.con)\ncon.rejectedRequests.add(req);
+    else (all filters pass)
+      :return true (allow action);
+    endif
+  endif
+
+fork again
+  ' --- DOS PROTECTION HANDLER ---
+  |ArcNetProvider|
+  :[ DOS PROTECTION HANDLER ];
+  :received(connection, packet);
+  if (packetSpamLimit > 0\nAND packetRate.allow(3000) fails?) then (yes)
+    :connection.close();
+    |Administration|
+    :admins.blacklistDos(ip)\ndosBlacklist.add(address);
+    note right
+      Future TCP connect from
+      same IP: isDosBlacklisted()
+      → close immediately
+    end note
+  else (no)
+    :dispatch packet normally;
+  endif
+
+fork again
+  ' --- ADMIN ACTIONS HANDLER ---
+  |NetServer|
+  :[ ADMIN ACTIONS HANDLER ];
+  :adminRequest(player, other, action, params)\n[@Remote, called = Loc.server];
+  if (!player.admin\nAND !player.isLocal()?) then (yes)
+    :warn: ACCESS DENIED;
+    kill
+  else (no)
+    if (other == null OR\n(other.admin AND !player.isLocal())?) then (yes)
+      :warn: cannot act on target;
+      kill
+    else (no)
+      :Events.fire(AdminRequestEvent(player, other, action));
+      if (action == wave?) then (yes)
+        :logic.skipWave();
+      elseif (action == ban?) then (yes)
+        |Administration|
+        :admins.banPlayerID(uuid)\nadmins.banPlayerIP(address);
+        |NetServer|
+        :other.kick(KickReason.banned);
+      elseif (action == kick?) then (yes)
+        :other.kick(KickReason.kick);
+      elseif (action == trace?) then (yes)
+        |Administration|
+        :admins.getInfo(uuid)\nbuild TraceInfo;
+        |NetServer|
+        :Call.traceInfo(player.con, other, info);
+      else (switchTeam)
+        :other.team(params as Team);
+      endif
+    endif
+  endif
+
+fork again
+  ' --- VOTEKICK HANDLER ---
+  |NetServer|
+  :[ VOTEKICK HANDLER ];
+  if (!enableVotekick\nOR players < 3\nOR player.isLocal?) then (yes)
+    :reject: votekick not available;
+  else (no)
+    if (vote already in progress\n[currentlyKicking != null]?) then (yes)
+      :reject: vote in progress;
+    else (no)
+      :find target player by name or #id;
+      if (target is admin\nOR local OR different team?) then (yes)
+        :reject: invalid target;
+      else (no)
+        if (player cooldown active\n[cooldowns.get(uuid)]?) then (yes)
+          :reject: cooldown active;
+        else (no)
+          :new VoteSession(target)\nsession.vote(player, +1)\ncurrentlyKicking = session;
+          :start voteDuration countdown timer;
+          if (admin cancels\n[/vote c]?) then (yes)
+            :cancel VoteSession; dismiss;
+          else (no)
+            if (votes sufficient\nafter voteDuration?) then (yes)
+              :target.kick(KickReason.vote);
+            else (no)
+              :dismiss vote session\n(insufficient votes);
+            endif
+          endif
+        endif
+      endif
+    endif
+  endif
+
+end fork
+
+' ===================================================
+' PHASE 3: PLAYER DISCONNECT
+' ===================================================
+|NetServer|
+:[ DISCONNECT HANDLER ];
+:onDisconnect(player, reason);
+if (player.con == null?) then (yes)
+  :player.remove();
+  kill
+else (no)
+  if (!con.hasDisconnected\nAND con.hasConnected?) then (yes)
+    :Events.fire(PlayerLeave(player));
+    :Call.sendMessage("[player] has disconnected");
+    :Call.playerDisconnect(id);
+  else (no)
+  endif
+  if (player.unit != null\nAND spawnedByCore AND !dead?) then (yes)
+    :Call.unitDespawn(unit);
+  else (no)
+  endif
+  :player.remove();
+  :con.hasDisconnected = true;
+endif
+
+stop
+
+@enduml

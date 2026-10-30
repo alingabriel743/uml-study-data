@@ -1,0 +1,137 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequence {
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    ActorBackgroundColor #E9ECEF
+    ActorBorderColor #495057
+}
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #F9A825
+}
+
+title Lyra — Text-to-World Diffusion Inference Pipeline
+
+actor User
+
+participant "DiffusionText2World\nGenerationPipeline" as Pipeline
+participant "DiffusionT2WModel" as T2WModel
+participant "GeneralConditioner" as Conditioner
+participant "AbstractEmbModel\n(Text Encoder)" as TextEncoder
+participant "GeneralDIT\n(Diffusion Transformer)" as DIT
+participant "VideoPositionEmb" as PosEmb
+participant "BasePretrainedImageVAE\n(Tokenizer / VAE)" as VAE
+
+== Initialization ==
+
+User -> Pipeline : __init__(inference_type, checkpoint_dir,\n  checkpoint_name, enable_prompt_upsampler)
+activate Pipeline
+
+Pipeline -> Pipeline : _load_model()
+activate Pipeline
+Pipeline -> T2WModel : __init__(config)
+activate T2WModel
+T2WModel -> T2WModel : build_model() : ModuleDict
+T2WModel -> T2WModel : set_up_tokenizer(tokenizer_dir)
+T2WModel --> Pipeline : model ready
+deactivate T2WModel
+deactivate Pipeline
+
+Pipeline -> Pipeline : _load_text_encoder_model()
+activate Pipeline
+Pipeline -> TextEncoder : __init__()
+activate TextEncoder
+TextEncoder --> Pipeline : encoder ready
+deactivate TextEncoder
+deactivate Pipeline
+
+deactivate Pipeline
+
+== Prompt Encoding ==
+
+User -> Pipeline : generate(prompt, negative_prompt, ...)
+activate Pipeline
+
+Pipeline -> Conditioner : get_condition_uncondition(data_batch)
+activate Conditioner
+Conditioner -> TextEncoder : random_dropout_input(in_tensor, dropout_rate)
+activate TextEncoder
+TextEncoder --> Conditioner : conditioned_embedding
+deactivate TextEncoder
+Conditioner -> Conditioner : _forward(batch, override_dropout_rate)
+Conditioner --> Pipeline : condition, uncondition
+deactivate Conditioner
+
+== Diffusion Sampling ==
+
+Pipeline -> T2WModel : generate_samples_from_batch(data_batch,\n  guidance, seed, num_steps)
+activate T2WModel
+
+T2WModel -> T2WModel : _get_conditions(data_batch,\n  is_negative_prompt)
+activate T2WModel
+T2WModel --> T2WModel : VideoExtendCondition
+deactivate T2WModel
+
+loop num_steps denoising iterations
+    T2WModel -> T2WModel : denoise(xt, sigma, condition)
+    activate T2WModel
+
+    T2WModel -> DIT : forward(x, timesteps, crossattn_emb,\n  crossattn_mask, fps, image_size,\n  padding_mask, scalar_feature)
+    activate DIT
+
+    DIT -> DIT : forward_before_blocks(x, timesteps,\n  crossattn_emb, ...)
+    activate DIT
+    DIT -> DIT : prepare_embedded_sequence(x_B_C_T_H_W,\n  fps, padding_mask)
+    DIT --> DIT : embedded_sequence
+    deactivate DIT
+
+    DIT -> PosEmb : generate_embeddings(B_T_H_W_C, fps)
+    activate PosEmb
+    PosEmb --> DIT : position_embeddings
+    deactivate PosEmb
+
+    DIT -> PosEmb : enable_context_parallel(cp_group)
+    activate PosEmb
+    PosEmb --> DIT : parallel context set
+    deactivate PosEmb
+
+    DIT -> DIT : forward_blocks_regular(x, affline_emb_B_D,\n  crossattn_emb, crossattn_mask,\n  rope_emb_L_1_1_D, adaln_lora_B_3D, ...)
+    activate DIT
+    DIT --> DIT : block_output
+    deactivate DIT
+
+    DIT -> DIT : decoder_head(x_B_T_H_W_D, emb_B_D,\n  crossattn_emb, origin_shape)
+    activate DIT
+    DIT --> DIT : decoded_tensor
+    deactivate DIT
+
+    DIT --> T2WModel : denoised_tensor
+    deactivate DIT
+
+    T2WModel --> T2WModel : DenoisePrediction
+    deactivate T2WModel
+end
+
+T2WModel --> Pipeline : generated_latent : Tensor
+deactivate T2WModel
+
+== Latent Decoding ==
+
+Pipeline -> VAE : decode(latent)
+activate VAE
+VAE -> VAE : register_mean_std(vae_dir)
+VAE --> Pipeline : video_frames : np.ndarray
+deactivate VAE
+
+Pipeline --> User : generated video output
+deactivate Pipeline
+
+@enduml

@@ -1,0 +1,212 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #495057
+    LifeLineBackgroundColor #F8F9FA
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ParticipantFontColor #212529
+    ActorBorderColor #495057
+    ActorBackgroundColor #F8F9FA
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+}
+
+title VCS Repository Loading Flow
+
+participant "VcsRepository" as repo
+participant "GitHubDriver\n(VcsDriver)" as driver
+participant "HttpDownloader" as http
+participant "VersionCache" as vcache
+participant "VersionParser" as vparser
+participant "ArrayLoader" as loader
+participant "ArrayRepository" as arrayrepo
+
+== Driver Initialisation ==
+
+[-> repo: initialize()
+activate repo
+
+repo -> repo: getDriver()
+activate repo
+note right of repo
+  Selects driver by type key
+  (e.g. "github") or by
+  static supports($io, $config, $url)
+end note
+repo -> driver: new($repoConfig, $io, $config,\n$httpDownloader, $processExecutor)
+activate driver
+repo -> driver: initialize()
+driver -> http: GET /repos/{owner}/{repo}\n(GitHub API — fetch repoData)
+activate http
+http --> driver: repoData (default branch, SHA)
+deactivate http
+driver --> repo: (driver ready, rootIdentifier set)
+deactivate driver
+deactivate repo
+
+== Root Composer File Check ==
+
+repo -> driver: hasComposerFile(rootIdentifier)
+activate driver
+driver -> driver: getComposerInformation(rootIdentifier)
+activate driver
+note right of driver
+  1. Check infoCache[id]
+  2. If 40-char SHA: cache->read(id)
+  3. getBaseComposerInformation(id)
+end note
+driver -> driver: getBaseComposerInformation(rootIdentifier)
+activate driver
+driver -> http: GET /repos/{owner}/{repo}/contents\n/composer.json?ref={rootIdentifier}
+activate http
+http --> driver: raw file content
+deactivate http
+driver -> driver: JsonFile::parseJson(content)
+driver --> driver: composerData[]
+deactivate driver
+driver --> driver: composerInfo (cached in infoCache)
+deactivate driver
+driver --> repo: composerInfo (non-null = file exists)
+deactivate driver
+
+== Tags Processing Loop ==
+
+repo -> driver: getTags()
+activate driver
+driver -> http: GET /repos/{owner}/{repo}/tags\n(paginated)
+activate http
+http --> driver: tags page(s)
+deactivate http
+driver --> repo: map<tagName, identifier>
+deactivate driver
+
+loop for each tag
+    repo -> repo: getCachedPackageVersion(tag, identifier)
+    activate repo
+    repo -> vcache: getVersionPackage(version, identifier)
+    activate vcache
+    vcache --> repo: package (hit) or null (miss)
+    deactivate vcache
+    deactivate repo
+
+    alt cache miss
+        repo -> repo: validateTag(tag)
+        activate repo
+        repo -> vparser: normalize(tag)
+        activate vparser
+        vparser --> repo: normalizedVersion or false
+        deactivate vparser
+        deactivate repo
+
+        opt valid tag
+            repo -> driver: getComposerInformation(identifier)
+            activate driver
+            driver --> repo: composerData[]
+            deactivate driver
+
+            repo -> repo: preProcess(driver, data, identifier)
+            activate repo
+            repo -> driver: getDist(identifier)
+            activate driver
+            driver --> repo: distInfo
+            deactivate driver
+            repo -> driver: getSource(identifier)
+            activate driver
+            driver --> repo: sourceInfo
+            deactivate driver
+            deactivate repo
+
+            repo -> loader: load(processedData)
+            activate loader
+            loader --> repo: CompletePackage
+            deactivate loader
+
+            repo -> arrayrepo: addPackage(package)
+            activate arrayrepo
+            arrayrepo --> repo: stored
+            deactivate arrayrepo
+        end
+    end
+end
+
+== Branches Processing Loop ==
+
+repo -> driver: getBranches()
+activate driver
+driver -> http: GET /repos/{owner}/{repo}/branches\n(paginated; root branch prepended)
+activate http
+http --> driver: branches data
+deactivate http
+driver --> repo: map<branchName, identifier>
+deactivate driver
+
+loop for each branch
+    repo -> repo: getCachedPackageVersion(branch, identifier)
+    activate repo
+    repo -> vcache: getVersionPackage(version, identifier)
+    activate vcache
+    vcache --> repo: package (hit) or null (miss)
+    deactivate vcache
+    deactivate repo
+
+    alt cache miss
+        repo -> repo: validateBranch(branch)
+        activate repo
+        repo -> vparser: normalizeBranch(branch)
+        activate vparser
+        vparser --> repo: normalizedVersion (dev-* prefix)
+        deactivate vparser
+        deactivate repo
+
+        opt valid branch
+            repo -> driver: getComposerInformation(identifier)
+            activate driver
+            driver --> repo: composerData[]
+            deactivate driver
+
+            repo -> repo: preProcess(driver, data, identifier)
+            activate repo
+            deactivate repo
+
+            repo -> loader: load(processedData)
+            activate loader
+            loader --> repo: CompletePackage
+            deactivate loader
+
+            repo -> arrayrepo: addPackage(package)
+            activate arrayrepo
+            arrayrepo --> repo: stored
+            deactivate arrayrepo
+        end
+    end
+end
+
+== Cleanup ==
+
+repo -> driver: cleanup()
+activate driver
+note right of driver: No-op in VcsDriver base
+driver --> repo: (done)
+deactivate driver
+
+[<-- repo: packages loaded into ArrayRepository
+deactivate repo
+
+@enduml

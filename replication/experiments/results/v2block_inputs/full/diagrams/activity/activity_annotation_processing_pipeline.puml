@@ -1,0 +1,261 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam note {
+    BackgroundColor #E8F4F8
+    BorderColor #5B9BD5
+}
+
+title Annotation Processing Pipeline
+
+|Java Compiler / BaseProcessor|
+start
+:Java Compiler discovers & invokes Annotation Processors;
+:BaseProcessor.init(ProcessingEnvironment)\nassign typeu, elementu, filer, messager\ninit Trees; set Log.level;
+:BaseProcessor.process(Set<TypeElement>, RoundEnvironment);
+if (round > rounds?) then (yes)
+    :return false — skip this round;
+    stop
+else (no)
+endif
+if (rootDirectory == null?) then (yes)
+    :resolve rootDirectory via\nfiler.getResource(CLASS_OUTPUT);
+else (no)
+endif
+:delegate to concrete process(RoundEnvironment);
+
+fork
+
+    |EntityProcess (rounds=3)|
+    :TypeIOResolver.resolve(this)\ncollect @BaseComponent, @Component types;
+    note right
+      **Round 1 / 3 — Component Interfaces**
+    end note
+    :For each component:
+    store varInitializers (field init expressions)
+    and methodBlocks (body text);
+    note right
+      Skip ABSTRACT or NATIVE methods
+      when storing methodBlocks
+    end note
+    :Index componentNames; collect imports;
+    if (component.genInterface() == true?) then (yes)
+        :Generate TypeSpec.Interface\nwith abstract methods + getters/setters;
+        :write(interfaceBuilder)\n→ mindustry.gen.<Component>c;
+    else (no)
+    endif
+    note right
+      **Round 2 / 3 — Entity Classes**
+    end note
+    :collect @EntityDef, @GroupDef, @EntityInterface;
+    :Resolve per-definition component dependencies;
+    :Generate concrete entity TypeSpec\nwith merged fields + methods;
+    :write(entityClassBuilder)\n→ mindustry.gen.<EntityName>;
+    note right
+      **Round 3 / 3 — Group Classes**
+    end note
+    :Generate group definition classes;
+    :write(groupBuilder)\n→ mindustry.gen.<GroupName>;
+
+fork again
+
+    |RemoteProcess / CallGenerator (rounds=1)|
+    :TypeIOResolver.resolve(this)\ncollect @Remote annotated methods;
+    if (method not public+static\nOR targets == Loc.none?) then (error)
+        :err() — report compile error;
+        stop
+    else (valid)
+    endif
+    :Sort methods by toString();
+    :For each @Remote method:
+    build MethodEntry(callLocation,
+    qualifiedName, packetClassName,
+    targets, variants, methodID, priority);
+    note right
+      Append index suffix on packet
+      name collision
+    end note
+    :CallGenerator.generate(serializer, methods);
+    :For each MethodEntry:
+    build packet TypeSpec extends Packet
+    makeWriter(packet, ent, serializer)
+    makeReader(packet, ent, serializer);
+    if (ent.where.isClient?) then (yes)
+        :writeHandleMethod(ent, false)\n→ client-side handler;
+    else (no)
+    endif
+    if (ent.where.isServer?) then (yes)
+        :writeHandleMethod(ent, true)\n→ server-side handler;
+    else (no)
+    endif
+    if (!(isClient && isServer)?) then (yes)
+        :add allow() override;
+    else (no)
+    endif
+    if (priority != PacketPriority.normal?) then (yes)
+        :add getPriority() override;
+    else (no)
+    endif
+    :build registerPackets() method;
+    :write(callBuilder)\n→ mindustry.gen.Call;
+
+fork again
+
+    |LoadRegionProcessor (rounds=1)|
+    :Collect fields annotated with @Load;
+    if (field not public?) then (error)
+        :err() — field must be public;
+        stop
+    else (valid)
+    endif
+    :Group Svars by enclosing Stype;
+    :Sort types; sort fields per type;
+    :For each type:
+    beginControlFlow('if content instanceof Type');
+    :For each field: count array dims;
+    if (dims == 0?) then (yes — scalar)
+        :addStatement:
+        atlas.find(parse(value), fallback);
+    else (no — array)
+        if (dims != lengths.length?) then (mismatch)
+            :err() — dimension mismatch;
+            stop
+        else (ok)
+        endif
+        :array init + nested for loops
+        (INDEX0..INDEXn)
+        atlas.find() per element;
+    endif
+    :endControlFlow;
+    :write(regionClass)\n→ mindustry.gen.ContentRegions;
+
+fork again
+
+    |LogicStatementProcessor (rounds=1)|
+    :Collect types annotated with @RegisterStatement;
+    :Build LogicIO TypeSpec\nadd allStatements field (Seq<Prov<LStatement>>);
+    :For each statement type:
+    generate write() if/else-if branch
+    serialize name + fields
+    (enum fields use .name());
+    note right
+      Skip TRANSIENT or STATIC fields
+    end note
+    :For each statement type:
+    generate read() if/else-if branch
+    new T(); assign fields;
+    call result.afterRead(); return result;
+    if (field type == java.lang.String?) then (yes)
+        :direct assignment;
+    else (no)
+        :assign via valueOf();
+    endif
+    :endControlFlow;
+    :write(logicIOBuilder)\n→ mindustry.gen.LogicIO;
+
+fork again
+
+    |AssetsProcess (rounds=1)|
+    :processSounds('Sounds', assets/sounds,\narc.audio.Sound, true);
+    :write → mindustry.gen.Sounds;
+    :processSounds('Musics', assets/music,\narc.audio.Music, false);
+    :write → mindustry.gen.Musics;
+    :processUI(@StyleDefaults elements):
+    read icons.properties
+    + fontgen/config.json
+    + sprites/ui;
+    :Generate Tex:
+    TextureRegion fields + load();
+    :write(tex) → mindustry.gen.Tex;
+    :Generate Icon:
+    TextureRegionDrawable fields
+    + load() + icons map;
+    :write(icon) → mindustry.gen.Icon;
+    :Generate Iconc:
+    char constants + codes/codeToName maps;
+    :write(iconc) → mindustry.gen.Iconc;
+
+fork again
+
+    |StructProcess (rounds=1)|
+    :Collect types annotated with @Struct;
+    if (!name.endsWith('Struct')?) then (error)
+        :err() and continue to next type;
+        stop
+    else (valid)
+    endif
+    if (fields.size == 0?) then (error)
+        :err() and continue to next type;
+        stop
+    else (valid)
+    endif
+    :Sum bit widths of all declared fields;
+    if (total bits <= 8?) then (byte)
+        :backing type = byte;
+    elseif (total bits <= 16?) then (short)
+        :backing type = short;
+    elseif (total bits <= 32?) then (int)
+        :backing type = int;
+    else (long)
+        :backing type = long;
+    endif
+    :Generate get(fields) packed constructor;
+    :For each field:
+    if (isBool?) then (yes)
+        :boolean getter/setter\nwith single-bit mask;
+    else (no)
+        :numeric getter (bit-shift + mask)\nnumeric setter (bit-mask write);
+    endif
+    :write(structClassBuilder)\n→ mindustry.gen.<StructName>;
+
+end fork
+
+|Java Compiler / BaseProcessor|
+:All processors complete —
+generated sources written to
+mindustry.gen via javax.tools.Filer;
+stop
+
+|ScriptMainGenerator (standalone Gradle task)|
+note
+  Runs as standalone main() via Gradle,
+  NOT as a javax annotation processor.
+  Uses Guava ClassPath for runtime reflection.
+end note
+start
+:ScriptMainGenerator.main(String[]);
+:getClasses(packages)\nvia Guava ClassPath reflection;
+:Filter classes:
+remove synthetic / anonymous /
+private / blacklisted;
+:Add explicit whitelist classes;
+:Sort all classes by name;
+:Generate global.js:
+read base.js
+append importPackage per unique package
+append EventType inner class constants;
+:write → core/assets/scripts/global.js;
+:Build ClassMap.java:
+filter classes matching target packages
+append classes.put(simpleName, CanonicalName.class);
+:write → core/src/mindustry/mod/ClassMap.java;
+stop
+
+@enduml

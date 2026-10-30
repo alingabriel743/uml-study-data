@@ -1,0 +1,232 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #2D6A4F
+    EndColor #9B2226
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleBorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #E7F3FF
+    BorderColor #4A90D9
+}
+
+title Building Update and Production Cycle
+
+|BuildingComp|
+start
+:BuildingComp.update() called each frame\n<i>(final/replace — cannot be overridden)</i>;
+
+:Decrement timeScaleDuration;
+if (timeScaleDuration expired\nor !block.canOverdrive?) then (yes)
+    :timeScale = 1f;
+else (no)
+    :Keep boosted timeScale;
+endif
+
+if (!headless && ambientSound set\n&& shouldAmbientSound()?) then (yes)
+    :Play ambient sound;
+endif
+
+:Call updateConsumption();
+
+|#FFF8F0|UpdateConsumption|
+if (!block.hasConsumers\nor cheating()?) then (yes)
+    :potentialEfficiency = enabled && productionValid() ? 1 : 0;
+    :efficiency = shouldConsume() ? potential : 0;
+    :updateEfficiencyMultiplier();
+    note right: Short-circuit:\nno consumer logic needed
+    -[hidden]->
+    |BuildingComp|
+    if (enabled || !block.noUpdateDisabled?) then (yes)
+        :Call updateTile();
+    else (no)
+        :Skip tile update;
+    endif
+    stop
+endif
+
+if (!enabled?) then (yes)
+    :potentialEfficiency = efficiency\n= optionalEfficiency = 0;
+    :shouldConsumePower = false;
+    |BuildingComp|
+    stop
+endif
+
+:update = shouldConsume() && productionValid();
+
+:First pass — iterate block.nonOptionalConsumers;
+:minEfficiency = min(cons.efficiency(self)) across all;
+if (any non-power consumer result <= 0?) then (yes)
+    :shouldConsumePower = false;
+endif
+
+:Optional pass — iterate block.optionalConsumers;
+:optionalEfficiency = min(cons.efficiency(self));
+
+:efficiency = minEfficiency;
+:potentialEfficiency = efficiency;
+
+if (!update?) then (yes)
+    :efficiency = 0;
+    :optionalEfficiency = 0;
+endif
+
+:updateEfficiencyMultiplier();
+note right: efficiency *= efficiencyScale()\noptionalEfficiency *= efficiencyScale()
+
+if (update && efficiency > 0?) then (yes)
+    :Iterate block.updateConsumers;
+    :cons.update(self) for each;
+endif
+
+|BuildingComp|
+if (enabled || !block.noUpdateDisabled?) then (yes)
+    :Call updateTile();
+else (no)
+    :Skip tile update;
+    stop
+endif
+
+fork
+    |#F0FFF0|GenericCrafter / AttributeCrafter|
+    note
+        delta() = Time.delta × timeScale
+        edelta() = efficiency × delta()
+        getProgressIncrease(base) = 1/base × edelta()
+    end note
+
+    if (efficiency > 0?) then (yes)
+        if (AttributeCrafter?) then (yes)
+            :attrsum = sumAttribute(attribute, tile.x, tile.y)\n<i>(recalculated on onProximityUpdate)</i>;
+            :efficiencyMultiplier =\nbaseEfficiency + min(maxBoost, boostScale×attrsum)\n+ attribute.env();
+            :progress += getProgressIncrease(craftTime)\n× efficiencyMultiplier();
+        else (GenericCrafter)
+            :progress += getProgressIncrease(craftTime);
+        endif
+        if (outputLiquids != null?) then (yes)
+            :liquids.add(output.liquid,\noutput.amount × edelta());
+        endif
+    endif
+
+    if (progress >= 1f?) then (yes)
+        :consume() — trigger all block.consumers;
+        note right: cons.trigger(self) for each consumer\n(deducts input items/liquids/power)
+        if (outputLiquids?) then (yes)
+            :Add liquid amounts to liquids module;
+        endif
+        if (outputItems?) then (yes)
+            :for each output: offload(item);
+            note right: produced(item,1)\n+ dump to proximity (round-robin cdump)
+        endif
+        :craftEffect.at(x, y);
+        :warmup → 1f via Mathf.approachDelta;
+        :progress = 0f  <i>(reset)</i>;
+    else (no)
+        :warmup approaches 0\nif efficiency == 0;
+    endif
+
+    if (timer(timerDump, dumpTime/timeScale)\n&& outputItems?) then (yes)
+        :dump(output.item) for each outputItem;
+        note right: Iterates proximity via\nround-robin cdump pointer
+    endif
+    if (outputLiquids?) then (yes)
+        :dumpLiquid(liquid, 2f, dir)\nfor each output liquid;
+    endif
+
+fork again
+    |#F0F0FF|BeamDrill|
+    if (lasers[0] == null?) then (yes)
+        :updateLasers()\n<i>set laser start positions per row</i>;
+    endif
+
+    :warmup = Mathf.approachDelta(\nwarmup, efficiency>0 ? 1 : 0, 1/60f);
+
+    :updateFacing() — scan range tiles in rotation direction;
+    :Count facingAmount (hardness <= tier);
+    :Track lastItem (ore type);
+
+    :multiplier = Mathf.lerp(1f,\noptionalBoostIntensity, optionalEfficiency);
+    :drillTime = block.drillTime\n/ drillMultipliers.get(lastItem, 1f);
+    :boostWarmup = Mathf.lerpDelta(\nboostWarmup, optionalEfficiency, 0.1f);
+    :lastDrillSpeed =\n(facingAmount × multiplier × timeScale)\n/ drillTime × efficiency;
+
+    :time += edelta() × multiplier;
+
+    if (time >= drillTime?) then (yes)
+        :for each facing tile:;
+        if (items.total < itemCapacity\n&& tile.wallDrop() != null?) then (yes)
+            :items.add(drop, 1);
+            :produced(drop);
+        endif
+        :time %= drillTime;
+    endif
+
+    if (timer(timerDump, dumpTime/timeScale)?) then (yes)
+        :dump();
+    endif
+
+fork again
+    |#FFF0F0|ConstructBuild|
+    if (current == Blocks.air?) then (yes)
+        :remove() — auto-remove empty construct block;
+        stop
+    endif
+
+    :constructColor = Mathf.lerpDelta(\nconstructColor, activeDeconstruct ? 1f : 0f, 0.2f);
+    :activeDeconstruct = false\n<i>(reset each tick)</i>;
+
+    note
+        construct() and deconstruct() are called
+        by Unit builders each frame externally
+    end note
+
+    fork
+        :**construct(amount) called by builder unit**;
+        :wasConstructing = true; activeDeconstruct = false;
+        :maxProgress = core==null || infiniteResources\n? amount : checkRequired(core.items, amount, false);
+        :Update accumulator[i] per requirement;
+        :maxProgress = checkRequired(core.items,\nmaxProgress, true)  <i>deduct from core</i>;
+        :progress = Mathf.clamp(progress + maxProgress);
+        if (progress >= 1f || infiniteResources?) then (yes)
+            :Check itemsLeft[i] > 0:\nattempt to take remaining from core;
+            if (canFinish: all itemsLeft == 0?) then (yes)
+                if (!net.client()?) then (yes)
+                    :constructed(tile, current,\nbuilder, rotation, team, config);
+                    :Call.constructFinish() — remote;
+                    note right: Places block\nFires BlockBuildEndEvent\ntile.build.placed()
+                endif
+            endif
+        endif
+    fork again
+        :**deconstruct(amount) called by builder unit**;
+        :wasConstructing = false; activeDeconstruct = true;
+        :clampedAmount = min(amount, progress);
+        :Update accumulator[i]; refund items to core if unlocked;
+        :progress = Mathf.clamp(progress - amount);
+        if (progress <= current.deconstructThreshold\nor infiniteResources?) then (yes)
+            :Refund leftover items to core;
+            :Call.deconstructFinish(tile, current, builder);
+            note right: Removes tile\nFires BlockBuildEndEvent
+        endif
+    end fork
+
+end fork
+
+stop
+
+@enduml

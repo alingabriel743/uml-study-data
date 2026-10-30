@@ -1,0 +1,149 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #212529
+    EndColor #212529
+    BarColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+
+title Evolver — Core Pipeline & Agent Lifecycle
+
+|#E3F2FD| System Startup |
+start
+:Load configuration;
+:Initialize EvoMapProxy;
+:Start ProxyHttpServer\n(bind port, register routes);
+:Start WebUiServer\n(serve client UI);
+
+|#FFF3E0| Lifecycle & Auth |
+:LifecycleManager.hello()\n(build headers, env fingerprint);
+if (Authentication successful?) then (yes)
+    :Store node secret & state;
+    :LifecycleManager.startHeartbeatLoop();
+else (no)
+    :LifecycleManager.reAuthenticate();
+    :Emit manual reset needed;
+    stop
+endif
+
+|#E8F5E9| Sync Engine |
+fork
+    :SyncEngine.start();
+    :Schedule outbound sync\n(_scheduleOutbound);
+    repeat
+        :OutboundSync.flush()\n(write outbound batch);
+        :Store updateStatusBatch;
+    repeat while (Running?) is (yes)
+fork again
+    :Schedule inbound sync\n(_scheduleInbound);
+    repeat
+        :InboundSync.pull()\n(pull messages from hub);
+        if (Auth error?) then (yes)
+            :_handleAuthError();
+            :Pause & retry;
+        else (no)
+            :InboundSync.ackDelivered();
+            :Store writeInboundBatch;
+        endif
+    repeat while (Running?) is (yes)
+end fork
+
+|#F3E5F5| Evolve Pipeline |
+:Receive trigger / heartbeat tick;
+fork
+    :collect.js — gather signals\nfrom sessions & events;
+    :signals.js — detectSignals()\n(_extractRegex, _mergeSignals);
+    :enrich.js — augment with\nmemory & transcript context;
+    :select.js — rank & select\nbest candidates;
+    :dispatch.js — route selected\ncandidates to hub;
+fork again
+    :hub.js — publish updates\nto hub channel;
+end fork
+
+|#FBE9E7| ATP / Hub Interaction |
+:orderService(opts)\n(consumerAgent);
+if (Order valid?) then (yes)
+    :defaultOrderHandler(order)\n(resolve ATP services);
+    if (New listing?) then (yes)
+        :publishService(svc)\n(POST to hub);
+    else (update)
+        :updateService(listingId, updates)\n(PATCH to hub);
+    endif
+    :_postJson / _hubPost\n(sign with HMAC, send);
+else (no)
+    :Log error and skip;
+endif
+
+|#E0F7FA| GEP / Skill Management |
+fork
+    :taskReceiver — estimateCapabilityMatch()\n(score task vs memory events);
+    if (Task accepted?) then (yes)
+        :synthesizeGene(parsed, execution)\n(skill2gep.js);
+        :assembleCapsule(gene, execution)\n(attach metadata & scores);
+        :publishBundleChannel(gene, capsule)\n(A2A protocol);
+        fork
+            :publishSkillToHub(gene, opts)\n(skillPublisher.js);
+            :updateSkillOnHub(nodeId, skillId, content)\n(PATCH skill content);
+        fork again
+            :_publishBundle(gene, capsule)\n(atpExecute.js — HMAC sign);
+        end fork
+    else (no)
+        :Discard task;
+    endif
+fork again
+    :SkillUpdater.pollAndApply()\n(poll mailbox for skill updates);
+    if (Skill update message?) then (yes)
+        :SkillUpdater.processSkillUpdate(message)\n(write skill.md to disk);
+        :store.ack(messageIds);
+    else (no)
+        :Idle wait;
+    endif
+end fork
+
+|#FFF8E1| Session Management |
+if (Session request received?) then (yes)
+    :SessionHandler.createSession()\n(invite node IDs, set max);
+    fork
+        :SessionHandler.joinSession()\n(validate roles, notify);
+        :SessionHandler.sendMessage()\n(broadcast to participants);
+    fork again
+        :SessionHandler.delegateSubtask()\n(assign subtask, validate role);
+        :SessionHandler.submitResult()\n(record summary, close subtask);
+    end fork
+else (no)
+    :DmHandler.send()\n(direct message routing);
+    :DmHandler.poll() / list()\n(retrieve pending DMs);
+    :DmHandler.ack(messageIds)\n(acknowledge delivery);
+endif
+
+|#E8F5E9| Sync Engine |
+:LifecycleManager.heartbeat()\n(send events map, countPending);
+if (Session complete / shutdown?) then (yes)
+    :SyncEngine — stop timers;
+    :EvoMapProxy.stop()\n(stop heartbeat loop);
+    :ProxyHttpServer.stop();
+    :WebUiServer.stop();
+    stop
+else (no)
+    :TaskMonitor.recordComplete()\nor recordFailed();
+    :Continue pipeline loop;
+    -> repeat;
+endif
+
+@enduml

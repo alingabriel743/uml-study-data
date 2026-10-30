@@ -1,0 +1,166 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontStyle bold
+}
+skinparam note {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+    FontColor #212529
+}
+
+title Guardrail Processing Flow
+
+' ════════════════════════════════════════════
+' INITIALIZATION PHASE
+' ════════════════════════════════════════════
+
+|Pipeline|
+start
+
+:BaseWorldGenerationPipeline.__init__\n(disable_guardrail, offload_guardrail_models, has_text_input);
+
+if (disable_guardrail == True?) then (yes)
+  #FF6B6B:Bypass entire guardrail system;
+  note right
+    No models loaded.
+    No checks at runtime.
+  end note
+  stop
+else (no)
+endif
+
+if (offload_guardrail_models == True?) then (yes)
+  :Defer all model loading to runtime;
+  note right
+    Models are loaded just-in-time
+    before each check, then deleted
+    after to free GPU memory.
+  end note
+else (no)
+  if (has_text_input == True?) then (yes)
+    |Text Guardrail|
+    :_load_text_guardrail()\nGuardrailRunner(\n  checkers = [Blocklist, LlamaGuard3]);
+    |Pipeline|
+  endif
+  |Video Guardrail|
+  :_load_video_guardrail()\nGuardrailRunner(\n  checkers = [VideoContentSafetyFilter],\n  postprocessors = [RetinaFaceFilter]);
+  |Pipeline|
+endif
+
+' ════════════════════════════════════════════
+' PROMPT GUARDRAIL FLOW
+' ════════════════════════════════════════════
+
+:_run_guardrail_on_prompt_with_offload(prompt: str);
+
+if (offload_guardrail_models?) then (yes)
+  |Text Guardrail|
+  :_load_text_guardrail() — lazy load;
+  |Pipeline|
+endif
+
+:_run_guardrail_on_prompt(prompt);
+
+|Text Guardrail|
+:guardrail_presets.run_text_guardrail\n(prompt, self.text_guardrail);
+
+:GuardrailRunner.run_safety_check(prompt);
+
+:Blocklist.check(prompt)\n→ (is_safe: bool, message: str);
+
+:LlamaGuard3.check(prompt)\n→ (is_safe: bool, message: str);
+
+|Pipeline|
+if (Prompt blocked?) then (yes — unsafe)
+  #FF6B6B:log.critical("GUARDRAIL BLOCKED: {message}");
+  if (offload_guardrail_models?) then (yes)
+    |Memory Management|
+    :_offload_guardrail_models()\ndel text_guardrail\ngc.collect()\ntorch.cuda.empty_cache();
+    |Pipeline|
+  endif
+  :return False;
+  note right
+    Caller (generate) checks return value.
+    False → skip video generation entirely.
+  end note
+else (no — safe)
+  if (offload_guardrail_models?) then (yes)
+    |Memory Management|
+    :_offload_guardrail_models();
+    |Pipeline|
+  endif
+  :return True → proceed to generation;
+endif
+
+' ════════════════════════════════════════════
+' VIDEO GUARDRAIL FLOW
+' ════════════════════════════════════════════
+
+:_run_guardrail_on_video_with_offload(video: np.ndarray);
+
+if (offload_guardrail_models?) then (yes)
+  |Video Guardrail|
+  :_load_video_guardrail() — lazy load;
+  |Pipeline|
+endif
+
+:_run_guardrail_on_video(video);
+
+|Video Guardrail|
+:guardrail_presets.run_video_guardrail\n(video, self.video_guardrail);
+
+:GuardrailRunner.run_safety_check(video);
+
+:VideoContentSafetyFilter.check(video)\n→ (is_safe: bool, message: str);
+
+|Pipeline|
+if (Video blocked?) then (yes — unsafe)
+  #FF6B6B:log.critical("GUARDRAIL BLOCKED: {message}");
+  if (offload_guardrail_models?) then (yes)
+    |Memory Management|
+    :_offload_guardrail_models()\ndel video_guardrail\ngc.collect()\ntorch.cuda.empty_cache();
+    |Pipeline|
+  endif
+  :return None;
+  note right
+    Caller checks return value.
+    None → discard video output entirely.
+  end note
+else (no — safe)
+  |Video Guardrail|
+  :GuardrailRunner.postprocess(video);
+  #D4EDDA:RetinaFaceFilter.process(video)\nDetect faces → apply blur to each face;
+  note right
+    Face blurring runs ONLY when
+    video passes the safety check.
+    Returns face-blurred frames.
+  end note
+  :return processed_frames (np.ndarray);
+  |Pipeline|
+  if (offload_guardrail_models?) then (yes)
+    |Memory Management|
+    :_offload_guardrail_models();
+    |Pipeline|
+  endif
+  :return safe, face-blurred video (np.ndarray);
+endif
+
+stop
+
+@enduml

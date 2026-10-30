@@ -1,0 +1,154 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activityBackgroundColor #F8F9FA
+skinparam activityBorderColor #495057
+skinparam activityArrowColor #495057
+skinparam activityFontColor #212529
+skinparam activityDiamondBackgroundColor #E9ECEF
+skinparam activityDiamondBorderColor #6C757D
+skinparam swimlaneBorderColor #6C757D
+skinparam swimlaneBackgroundColor #E9ECEF
+
+title Evolver — Agent Evolution Cycle Workflow
+
+|Main Process|
+start
+:Parse Config & Environment Flags\n(parseBoolEnv, parseMs, flag, list);
+
+:acquireLock();
+if (Lock acquired?) then (yes)
+else (no — another instance running)
+  :spawnReplacementProcess();
+  stop
+endif
+
+:readJsonSafe(statePath);
+
+if (isPendingSolidify(state)?) then (yes)
+  :rejectPendingRun(statePath);
+  note right
+    Rename state file,
+    log warning and
+    reset pending run
+  end note
+endif
+
+|EvoMapProxy|
+:new EvoMapProxy(config);
+:start() — register HTTP routes;
+:Start ProxyHttpServer;
+note right
+  HTTP API exposed locally
+  for hub communication
+end note
+
+|LifecycleManager|
+:lifecycle.hello();
+note right
+  Build env fingerprint,
+  send Hello to hub,
+  obtain auth token
+end note
+
+if (Authentication OK?) then (yes)
+else (no / AuthError)
+  :reAuthenticate();
+  if (Re-auth succeeded?) then (yes)
+  else (no)
+    :_emitManualResetNeeded();
+    |Main Process|
+    :shutdown();
+    :releaseLock();
+    stop
+  endif
+endif
+
+:startHeartbeatLoop(intervalMs);
+note right
+  Periodic heartbeat keeps
+  hub session alive
+end note
+
+|SyncEngine|
+:Start SyncEngine;
+fork
+  :_scheduleInbound(delayMs);
+fork again
+  :_scheduleOutbound(delayMs);
+end fork
+
+|Main Process|
+repeat
+
+  |SyncEngine|
+  :_scheduleInbound tick;
+  :InboundSync.pull();
+  if (Messages received from hub?) then (yes)
+    :store.writeInboundBatch();
+    :ackDelivered();
+  endif
+
+  :_scheduleOutbound tick;
+  :countPending();
+  if (Pending outbound messages > 0?) then (yes)
+    :OutboundSync.flush();
+    :store.updateStatusBatch();
+  endif
+
+  |SkillUpdater|
+  :pollAndApply();
+  if (Skill update message available?) then (yes)
+    :processSkillUpdate(message);
+    :Write updated skill.md to disk;
+    :store.ack(messageId);
+  endif
+
+  |TaskMonitor|
+  :recordClaim(taskId);
+  if (Task completed successfully?) then (yes)
+    :recordComplete(taskId, startedAt);
+  else (failed)
+    :recordFailed(taskId);
+  endif
+  :subscribe / unsubscribe clients\nvia send(setState);
+
+  |Main Process|
+  :writeCycleProgressAtomic(progressPath, fields);
+  :getLastSignals(statePath);
+
+  if (Distillation threshold reached?) then (yes)
+    :prepareDistillation();
+    :autoDistill();
+    if (Failure-based distillation due?) then (yes)
+      :autoDistillFromFailures();
+    endif
+    :completeDistillation(responseText);
+    note right
+      Writes refined skill
+      back into GEP skill store
+    end note
+  endif
+
+  if (CycleTimeoutError thrown?) then (yes)
+    :Log cycle timeout warning\n(phase, cycleNum);
+  endif
+
+  :sleepMs(totalSleepMs);
+
+repeat while (Evolution loop active?) is (yes)
+->no;
+
+|Main Process|
+:shutdown();
+note right
+  stopEventStream(),
+  close open handles
+end note
+:releaseLock();
+stop
+
+@enduml

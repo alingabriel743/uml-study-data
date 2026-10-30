@@ -1,0 +1,136 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipantBorderColor #495057
+skinparam sequenceParticipantBackgroundColor #F8F9FA
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceGroupBorderColor #6C757D
+skinparam sequenceGroupBackgroundColor #E9ECEF
+
+title Lyra — Autoregressive Video Generation Sequence
+
+actor User as user
+participant "ARVideo2World\nGenerationPipeline" as pipeline
+participant "ImageTextTokenizer" as tokenizer
+participant "AutoRegressiveModel" as armodel
+participant "VisionTransformer" as vit
+participant "MultimodalProjector" as projector
+participant "Transformer" as transformer
+participant "TransformerBlock" as tblock
+participant "Attention" as attention
+participant "RotaryPosition\nEmbedding" as rope
+participant "MLP" as mlp
+participant "LatentDiffusion\nDecoderModel" as diffusion
+participant "VideoDiffusion\nDecoderConditioner" as conditioner
+participant "DiffusionDecoder\nGeneralDIT" as dit
+
+user -> pipeline : generate(inp_prompt, inp_vid,\nnum_input_frames, seed, sampling_config)
+activate pipeline
+
+pipeline -> pipeline : _load_model()
+note right: Loads AR model checkpoint\nand tokenizer from disk
+
+pipeline -> tokenizer : encode(text=inp_prompt, images=inp_vid)
+activate tokenizer
+tokenizer --> pipeline : input_ids, prompt_embedding, prompt_mask
+deactivate tokenizer
+
+alt offload_network = False
+    pipeline -> pipeline : _run_model(prompt_embedding, prompt_mask,\ninp_vid, num_input_frames, seed, sampling_config)
+else offload_network = True
+    pipeline -> pipeline : _run_model_with_offload(prompt_embedding,\nprompt_mask, inp_vid, num_input_frames, seed, sampling_config)
+end
+
+activate pipeline
+
+pipeline -> armodel : embed_vision_language_features(input_ids, images)
+activate armodel
+
+armodel -> vit : forward(x: Tensor)
+activate vit
+vit --> armodel : visual_features: Tensor
+deactivate vit
+
+armodel -> projector : forward(x: visual_features)
+activate projector
+projector --> armodel : projected_features: Tensor
+deactivate projector
+
+armodel --> pipeline : token_embeddings: Tensor
+deactivate armodel
+
+loop autoregressive generation steps
+    pipeline -> transformer : forward(tokens, input_pos,\ntoken_embeddings, context, context_mask)
+    activate transformer
+
+    transformer -> rope : forward(seq_len)
+    activate rope
+    rope --> transformer : rotary_embeddings: Tensor
+    deactivate rope
+
+    loop for each TransformerBlock layer
+        transformer -> tblock : forward(x, rope, input_pos,\nmask, context, context_mask)
+        activate tblock
+
+        tblock -> attention : forward(x, rope, input_pos,\nmask, context)
+        activate attention
+        attention --> tblock : attn_output: Tensor
+        deactivate attention
+
+        tblock -> mlp : forward(x: Tensor)
+        activate mlp
+        mlp --> tblock : mlp_output: Tensor
+        deactivate mlp
+
+        tblock --> transformer : block_output: Tensor
+        deactivate tblock
+    end
+
+    transformer --> pipeline : logits: Tensor
+    deactivate transformer
+
+    pipeline -> pipeline : sample next token\nfrom logits
+end
+
+pipeline --> pipeline : prompt_tokens: List[Tensor]
+deactivate pipeline
+
+pipeline -> pipeline : generate_video_from_tokens(prompt_tokens,\nlatent_shape, video_start_boundary,\nmax_gen_len, sampling_config, seed)
+activate pipeline
+
+pipeline -> diffusion : generate_samples_from_batch(data_batch,\nguidance, seed, state_shape, n_sample)
+activate diffusion
+
+diffusion -> diffusion : _add_latent_conditions_to_data_batch(\ndata_batch, apply_corruptor, corrupt_sigma)
+
+diffusion -> conditioner : forward(batch, override_dropout_rate)
+activate conditioner
+conditioner --> diffusion : VideoLatentDiffusionDecoderCondition
+deactivate conditioner
+
+diffusion -> dit : prepare_embedded_sequence(x_B_C_T_H_W,\nfps, padding_mask, latent_condition,\nlatent_condition_sigma)
+activate dit
+dit --> diffusion : embedded_sequence: Tuple[Tensor, Tensor]
+deactivate dit
+
+diffusion --> pipeline : decoded_video: Tensor
+deactivate diffusion
+
+pipeline --> user : np.ndarray (generated video frames)
+deactivate pipeline
+
+@enduml

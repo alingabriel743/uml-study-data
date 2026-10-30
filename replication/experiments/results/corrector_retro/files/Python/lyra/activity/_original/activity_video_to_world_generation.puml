@@ -1,0 +1,144 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #495057
+    EndColor #212529
+}
+skinparam swimlane {
+    BorderColor #ADB5BD
+    TitleBackgroundColor #DEE2E6
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title Video-to-World Diffusion Generation\n<size:11>(DiffusionVideo2WorldGenerationPipeline — Cosmos-Predict1-7B-Video2World)</size>
+
+|Pipeline Orchestrator|
+start
+:Receive **generate**(prompt, image_or_video_path, negative_prompt);
+
+if (enable_prompt_upsampler?) then (yes)
+    |VLM Prompt Upsampler\n(Pixtral-12B)|
+    if (offload_prompt_upsampler?) then (yes)
+        :Load VLM model\n**create_vlm_prompt_upsampler()**;
+    else (no)
+    endif
+    :Build multimodal dialog\n**prepare_dialog**(image_or_video_path) → dialog;
+    :Run VLM inference\n**run_chat_completion_vlm**(dialog)\n→ upsampled_prompt;
+    if (offload_prompt_upsampler?) then (yes)
+        :Unload VLM model\n(del + gc.collect());
+    else (no)
+    endif
+    |Pipeline Orchestrator|
+    :Continue with **upsampled_prompt**;
+else (no)
+    :Continue with **original prompt** as-is;
+endif
+
+if (disable_guardrail?) then (no — run check)
+    |Guardrail Model|
+    :Evaluate prompt safety\n**_run_guardrail_on_prompt_with_offload**(prompt);
+    if (prompt is_safe?) then (no — unsafe)
+        #FFADAD:**Return None**\n[PROMPT GUARDRAIL BLOCKED];
+        stop
+    else (yes — safe)
+    endif
+    |Pipeline Orchestrator|
+else (yes — skip)
+    :Skip prompt guardrail;
+endif
+
+:Build prompts list:\n[prompt] or [prompt, negative_prompt];
+
+|T5 Text Encoder|
+if (offload_text_encoder?) then (yes)
+    :Load T5 encoder model;
+else (no)
+endif
+:Encode text prompts\n**_run_text_embedding_on_prompt_with_offload**(prompts)\n→ prompt_embeddings [ ];
+if (offload_text_encoder?) then (yes)
+    :Offload T5 encoder model;
+else (no)
+endif
+
+|Pipeline Orchestrator|
+:Extract embeddings:\n• prompt_embedding = embeddings[0]\n• negative_prompt_embedding = embeddings[1] (if present);
+
+:Invoke **_run_model_with_offload**(\n  prompt_embedding,\n  image_or_video_path,\n  negative_prompt_embedding);
+
+fork
+    |Tokenizer (CV8x8x8)|
+    if (offload_tokenizer?) then (yes)
+        :Load Tokenizer\n**_load_tokenizer()**;
+    else (no)
+    endif
+    :Encode condition frames\n**_run_tokenizer_encoding**(image_or_video_path);
+    :Compute latent representation\n**get_condition_latent**(model, path,\n  num_input_frames ∈ {1,9}, state_shape)\n→ **condition_latent** (Tensor);
+fork again
+    |Pipeline Orchestrator|
+    note right
+      Tokenizer encodes input
+      video/image frames first;
+      DiT network loads after.
+    end note
+end fork
+
+|DiffusionV2WModel (DiT)|
+if (offload_network?) then (yes)
+    :Load DiT network\n**_load_network()** via load_model_by_config();
+else (no)
+endif
+:Prepare video batch\n**get_video_batch**(model, embedding,\n  height, width, fps, num_video_frames)\n→ data_batch, state_shape;
+:Run diffusion sampling\n**generate_world_from_video**(model, state_shape,\n  data_batch, guidance_scale, num_steps,\n  seed, condition_latent, num_input_frames)\n→ **video_latent** (Tensor);
+if (offload_network?) then (yes)
+    :Offload DiT network\n**_offload_network()**;
+else (no)
+endif
+
+|Tokenizer (CV8x8x8)|
+:Decode latent to frames\n**_run_tokenizer_decoding**(video_latent);
+:Call **model.decode**(sample)\n→ raw frame tensors;
+:Post-process frames:\nclamp to [0, 2] → ÷2 → uint8\n→ ndarray **[T, H, W, C]**;
+if (offload_tokenizer?) then (yes)
+    :Offload Tokenizer\n**_offload_tokenizer()**;
+else (no)
+endif
+
+|Pipeline Orchestrator|
+if (disable_guardrail?) then (no — run check)
+    |Guardrail Model|
+    :Evaluate video safety\n**_run_guardrail_on_video_with_offload**(video_frames);
+    if (video is_safe?) then (no — unsafe)
+        #FFADAD:**Return None**\n[VIDEO GUARDRAIL BLOCKED];
+        stop
+    else (yes — safe)
+    endif
+    |Pipeline Orchestrator|
+else (yes — skip)
+    :Skip video guardrail;
+endif
+
+#C3E6CB:**Return** (video_frames_ndarray **[T,H,W,C]**, final_prompt);
+stop
+
+@enduml

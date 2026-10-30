@@ -1,0 +1,174 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #DEE2E6
+    ArrowColor #495057
+    ArrowFontColor #212529
+    ActorBorderColor #495057
+    ActorBackgroundColor #E9ECEF
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    DividerBackgroundColor #E9ECEF
+    DividerBorderColor #6C757D
+    GroupBorderColor #6C757D
+    GroupHeaderFontColor #495057
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Multiplayer Server Join Flow
+
+actor "User / UI" as user
+participant "Net" as net
+participant "ArcNetProvider" as arcnet
+participant "NetClient\n(client-side)" as nclient
+participant "NetServer\n(server-side)" as nserver
+participant "ArcConnection" as arcconn
+participant "NetworkIO" as netio
+
+box "Client Process" #E8F4FD
+    participant net
+    participant arcnet
+    participant nclient
+end box
+
+box "Server Process" #FDE8E8
+    participant nserver
+    participant arcconn
+    participant netio
+end box
+
+== TCP/UDP Connection Initiation ==
+
+user -> net : connect(ip, port, success)
+activate net
+net -> net : fire ClientServerConnectEvent\nactive=true, server=false
+net -> arcnet : connectClient(ip, port, success)
+activate arcnet
+arcnet -> arcnet : spawn daemon thread
+arcnet -> arcnet : arc.net.Client.connect(5000ms, ip, port)
+note right of arcnet : Low-level TCP + UDP handshake
+arcnet -> arcnet : NetListener.connected()\ncreate Connect{addressTCP}
+arcnet -> net : post handleClientReceived(Connect)\n[main thread dispatch]
+deactivate arcnet
+
+== Client Handshake Packet ==
+
+net -> nclient : [Connect handler]
+deactivate net
+activate nclient
+nclient -> nclient : reset()\nconnecting=true\nclientLoaded=false\nclear Groups
+nclient --> user : show loading UI (loadfrag)
+
+nclient -> nclient : build ConnectPacket {\n  version (Version.build),\n  versionType, name, locale,\n  usid, uuid (base64+CRC32),\n  mobile, color, mods[]\n}
+nclient -> net : send(ConnectPacket, reliable=true)
+activate net
+net -> arcnet : sendClient(ConnectPacket)
+activate arcnet
+arcnet -> arcnet : PacketSerializer: LZ4-compress if >36 bytes
+arcnet -> arcnet : arc.net.Client.sendTCP(ConnectPacket)
+deactivate arcnet
+deactivate net
+deactivate nclient
+
+== Server Receives & Validates ==
+
+arcnet -> arcnet : NetListener.received()\ncheck packetSpamLimit
+note right of arcnet : DOS detection: close +\nblacklistDos if exceeded
+arcnet -> net : post handleServerReceived(ArcConnection,\nConnectPacket)
+activate net
+net -> nserver : [ConnectPacket handler]
+deactivate net
+activate nserver
+nserver -> nserver : fire ConnectPacketEvent
+
+alt Validation Fails
+    nserver -> arcconn : kick(KickReason.banned)\n[IP / subnet ban]
+    nserver -> arcconn : kick(KickReason.idInUse)\n[duplicate connect attempt]
+    nserver -> arcconn : kick(KickReason.playerLimit)\n[server full]
+    nserver -> arcconn : kick(KickReason.clientOutdated\n| serverOutdated | typeMismatch)\n[version / type mismatch]
+    nserver -> arcconn : kick(KickReason.whitelist)\n[not on whitelist]
+    nserver -> arcconn : kick(mod mismatch message)\n[extra / missing mods]
+else Validation Passes
+    nserver -> nserver : Player.create()\nset admin, con, usid, uuid,\nmobile, name, locale, color\nassignTeam(player)
+end
+
+== World Data Transfer ==
+
+nserver -> netio : writeWorld(player, DeflaterOutputStream)
+activate netio
+netio --> nserver : compressed world bytes
+deactivate netio
+nserver -> nserver : wrap in WorldStream\n{ByteArrayInputStream(compressed)}
+nserver -> arcconn : sendStream(WorldStream)
+activate arcconn
+arcconn -> arcconn : add InputStreamSender listener
+arcconn -> arcnet : sendTCP(StreamBegin {\n  id, total, type=WorldStream\n})
+deactivate nserver
+
+arcnet -> net : handleClientReceived(StreamBegin)
+activate net
+net -> nclient : [StreamBegin handler]
+deactivate net
+activate nclient
+nclient -> nclient : create StreamBuilder\nstore as currentStream
+
+loop each 1024-byte chunk
+    arcconn -> arcnet : sendTCP(StreamChunk{id, data[1024]})
+    arcnet -> net : handleClientReceived(StreamChunk)
+    activate net
+    net -> nclient : [StreamChunk handler]
+    deactivate net
+    nclient -> nclient : builder.add(data)
+    nclient --> user : loadfrag.setProgress(progress)
+    nclient -> nclient : resetTimeout()
+end
+deactivate arcconn
+
+== World Load & Player Spawn ==
+
+nclient -> nclient : builder.isDone() → build()\nassemble complete WorldStream
+nclient -> netio : loadWorld(InflaterInputStream\n(data.stream))
+activate netio
+netio --> nclient : world decompressed and loaded
+deactivate netio
+
+nclient -> nclient : finishConnecting()\nstate.set(State.playing)\nconnecting=false
+nclient -> net : setClientLoaded(true)
+activate net
+net -> net : drain packetQueue\n(medium-priority packets buffered\nduring world load)
+deactivate net
+nclient -> nserver : Call.connectConfirm()\n[@Remote high-priority TCP,\n Loc.client → server]
+nclient --> user : hide loadfrag UI
+deactivate nclient
+
+activate nserver
+nserver -> nserver : [connectConfirm handler]\nplayer.add()\nfire PlayerConnectionConfirmed\ncon.hasConnected = true
+nserver -> nserver : broadcast join message\nfire PlayerJoin
+nserver -> nserver : respawn player\n(deathTimer = deathDelay\ntriggers player.update())
+deactivate nserver
+
+note over user, netio
+  Player is now live in the world.
+  Subsequent game-state sync uses medium-priority
+  entity snapshot packets drained from packetQueue.
+end note
+
+@enduml

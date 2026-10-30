@@ -1,0 +1,306 @@
+@startuml class_run_internal_streaming_session
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #F9A825
+    FontColor #212529
+}
+skinparam stereotype {
+    CBackgroundColor #D0E8FF
+    CBorderColor #3A7BD5
+}
+
+title Run Internal – Streaming & Session Persistence
+
+' ─────────────────────────────────────────────
+' CORE DOMAIN CLASSES
+' ─────────────────────────────────────────────
+
+package "result" {
+    class RunResultStreaming <<dataclass>> {
+        +input_guardrail_results: list[InputGuardrailResult]
+        +interruptions: list[ToolApprovalItem]
+        +is_complete: bool
+        -{field} _input_guardrail_queue: asyncio.Queue
+        -{field} _input_guardrails_task: asyncio.Task | None
+        -{field} _triggered_input_guardrail_result: InputGuardrailResult | None
+        --
+        +stream_events(): AsyncIterator[StreamEvent]
+        +cancel(mode: "immediate"|"after_turn"): None
+        +to_state(): RunState
+        -{method} _drain_input_guardrail_queue(): None
+    }
+}
+
+package "run_steps" {
+    class SingleStepResult <<dataclass>> {
+        +original_input: str | list[TResponseInputItem]
+        +model_response: ModelResponse
+        +pre_step_items: list[RunItem]
+        +new_step_items: list[RunItem]
+        +next_step: NextStepHandoff | NextStepFinalOutput | NextStepRunAgain | NextStepInterruption
+        +session_step_items: list[RunItem] | None
+        +tool_input_guardrail_results: list[ToolInputGuardrailResult]
+        +tool_output_guardrail_results: list[ToolOutputGuardrailResult]
+        +output_guardrail_results: list[OutputGuardrailResult]
+        +processed_response: ProcessedResponse | None
+        --
+        +generated_items: list[RunItem]
+    }
+}
+
+package "run_state" {
+    class RunState <<Generic[TContext, TAgent]>> {
+        -{field} _original_input
+        -{field} _generated_items: list[RunItem]
+        -{field} _session_items: list[RunItem]
+        -{field} _current_step
+        -{field} _current_turn_persisted_item_count: int
+        -{field} _reasoning_item_id_policy: ReasoningItemIdPolicy | None
+    }
+}
+
+package "memory" {
+    interface Session <<Protocol>> {
+        +session_id: str
+        --
+        +get_items(limit): list[TResponseInputItem]
+        +add_items(items): None
+        +pop_item(): TResponseInputItem | None
+        +run_compaction(args: OpenAIResponsesCompactionArgs): None
+    }
+}
+
+' ─────────────────────────────────────────────
+' RUN INTERNAL MODULES
+' ─────────────────────────────────────────────
+
+package "run_internal" {
+
+    package "oai_conversation" {
+        class OpenAIServerConversationTracker <<dataclass>> {
+            +conversation_id: str | None
+            +previous_response_id: str | None
+            +auto_previous_response_id: bool
+            +sent_items: set[int]
+            +server_items: set[int]
+            +server_item_ids: set[str]
+            +server_tool_call_ids: set[str]
+            +server_output_fingerprints: set[str]
+            +sent_item_fingerprints: set[str]
+            +restored_anonymous_tool_search_fingerprints: set[str]
+            +sent_initial_input: bool
+            +remaining_initial_input: list[TResponseInputItem] | None
+            +primed_from_state: bool
+            +reasoning_item_id_policy: ReasoningItemIdPolicy | None
+            +prepared_item_sources: dict[int, TResponseInputItem]
+            +prepared_item_sources_by_fingerprint: dict[str, list[TResponseInputItem]]
+            --
+            +hydrate_from_state(original_input, generated_items, model_responses, session_items): None
+            +track_server_items(model_response: ModelResponse | None): None
+            +mark_input_as_sent(items: Sequence[TResponseInputItem]): None
+            +rewind_input(items: Sequence[TResponseInputItem]): None
+            +prepare_input(original_input, generated_items): list[TResponseInputItem]
+            -{method} _register_prepared_item_source(prepared_item, source_item): None
+            -{method} _resolve_prepared_item_source(item): TResponseInputItem
+            -{method} _consume_prepared_item_source(item): TResponseInputItem
+        }
+    }
+
+    package "streaming" {
+        class StreamingFunctions <<module>> {
+            +stream_step_items_to_queue(new_step_items: list[RunItem], queue: asyncio.Queue): None
+            +stream_step_result_to_queue(step_result: SingleStepResult, queue: asyncio.Queue): None
+        }
+    }
+
+    package "session_persistence" {
+        class SessionPersistenceFunctions <<module>> {
+            +prepare_input_with_session(input, session, callback, settings, ...): tuple
+            +persist_session_items_for_guardrail_trip(session, tracker, items, input, state, store): list | None
+            +session_items_for_turn(turn_result: SingleStepResult): list[RunItem]
+            +resumed_turn_items(turn_result: SingleStepResult): tuple[list[RunItem], list[RunItem]]
+            +update_run_state_after_resume(run_state, *, turn_result, generated_items, session_items): None
+            +save_result_to_session(session, original_input, new_items, run_state, ...): int
+            +save_resumed_turn_items(*, session, items, persisted_count, response_id, ...): int
+            +rewind_session_items(session, items, server_tracker): None
+            +wait_for_session_cleanup(session, serialized_targets, *, max_attempts, ...): None
+        }
+    }
+
+    package "run_grouping" {
+        class RunGroupingFunctions <<module>> {
+            +resolve_run_grouping(*, conversation_id, session, group_id): RunGrouping
+            +resolve_run_grouping_id(*, conversation_id, session, group_id): str
+            +get_session_id_if_available(session): str | None
+        }
+
+        class RunGroupingKind <<enumeration>> {
+            conversation
+            session
+            group
+            run
+        }
+    }
+
+    package "guardrails" {
+        class GuardrailFunctions <<module>> {
+            +run_single_input_guardrail(agent, guardrail, input, context): InputGuardrailResult
+            +run_single_output_guardrail(guardrail, agent, agent_output, context): OutputGuardrailResult
+            +run_input_guardrails_with_queue(agent, guardrails, input, context, streamed_result, parent_span): None
+            +run_input_guardrails(agent, guardrails, input, context): list[InputGuardrailResult]
+            +run_output_guardrails(guardrails, agent, agent_output, context): list[OutputGuardrailResult]
+            +input_guardrail_tripwire_triggered_for_stream(streamed_result): bool
+        }
+    }
+}
+
+' ─────────────────────────────────────────────
+' STREAMING EVENT TYPES
+' ─────────────────────────────────────────────
+
+package "stream_events" {
+    class RunItemStreamEvent {
+        +type: str = "run_item_stream_event"
+        +item: RunItem
+        +name: str
+    }
+    class RawResponsesStreamEvent {
+        +type: str = "raw_response_event"
+        +data: ResponseStreamEvent
+    }
+    class AgentUpdatedStreamEvent {
+        +type: str = "agent_updated_stream_event"
+        +new_agent: Agent
+    }
+}
+
+package "items" {
+    abstract class RunItem {
+        +type: str
+        +raw_item
+    }
+    class MessageOutputItem { +type = "message_output_item" }
+    class HandoffCallItem { +type = "handoff_call_item" }
+    class HandoffOutputItem { +type = "handoff_output_item" }
+    class ToolCallItem { +type = "tool_call_item" }
+    class ToolCallOutputItem { +type = "tool_call_output_item" }
+    class ToolSearchCallItem { +type = "tool_search_call_item" }
+    class ToolSearchOutputItem { +type = "tool_search_output_item" }
+    class ReasoningItem { +type = "reasoning_item" }
+    class MCPApprovalRequestItem { +type = "mcp_approval_request_item" }
+    class MCPApprovalResponseItem { +type = "mcp_approval_response_item" }
+    class MCPListToolsItem { +type = "mcp_list_tools_item" }
+    class ToolApprovalItem { +type = "tool_approval_item" }
+
+    MessageOutputItem --|> RunItem
+    HandoffCallItem --|> RunItem
+    HandoffOutputItem --|> RunItem
+    ToolCallItem --|> RunItem
+    ToolCallOutputItem --|> RunItem
+    ToolSearchCallItem --|> RunItem
+    ToolSearchOutputItem --|> RunItem
+    ReasoningItem --|> RunItem
+    MCPApprovalRequestItem --|> RunItem
+    MCPApprovalResponseItem --|> RunItem
+    MCPListToolsItem --|> RunItem
+    ToolApprovalItem --|> RunItem
+}
+
+' ─────────────────────────────────────────────
+' RELATIONSHIPS
+' ─────────────────────────────────────────────
+
+' Streaming
+StreamingFunctions ..> SingleStepResult : reads new_step_items
+StreamingFunctions ..> RunItemStreamEvent : emits per RunItem
+StreamingFunctions ..> RunItem : iterates subtypes
+
+' Session Persistence
+SessionPersistenceFunctions ..> Session : get_items / add_items / pop_item
+SessionPersistenceFunctions ..> RunState : reads & updates _current_turn_persisted_item_count
+SessionPersistenceFunctions ..> SingleStepResult : reads session_step_items / new_step_items
+SessionPersistenceFunctions ..> OpenAIServerConversationTracker : checks server_item_ids on rewind
+
+' OAI Conversation Tracker
+OpenAIServerConversationTracker ..> RunState : hydrate_from_state (seeded on resume)
+OpenAIServerConversationTracker ..> Session : (rewind uses session.pop_item via persistence layer)
+
+' Guardrails
+GuardrailFunctions ..> RunResultStreaming : writes _input_guardrail_queue\n& _triggered_input_guardrail_result
+GuardrailFunctions ..> SingleStepResult : reads output_guardrail_results
+
+' Run Grouping
+RunGroupingFunctions ..> Session : reads session_id
+RunGroupingFunctions ..> RunGroupingKind : returns as tuple member
+
+' Stream events wrap items
+RunItemStreamEvent o-- RunItem : wraps
+
+' RunResultStreaming holds interruptions
+RunResultStreaming o-- ToolApprovalItem : interruptions (NOT streamed)
+
+' ─────────────────────────────────────────────
+' NOTES
+' ─────────────────────────────────────────────
+
+note bottom of OpenAIServerConversationTracker
+  Three-layer dedup strategy:
+  1. Object identity  → sent_items / server_items
+  2. Stable server IDs → server_item_ids / server_tool_call_ids
+  3. Content fingerprints → sent_item_fingerprints
+  hydrate_from_state() seeds all three from RunState on resume.
+  OpenAIConversationsSession uses ID-agnostic fingerprinting.
+end note
+
+note bottom of ToolApprovalItem
+  Intentionally NOT streamed.
+  Surfaces via RunResultStreaming.interruptions.
+  Resume via result.to_state() + state.approve().
+end note
+
+note right of RunGroupingFunctions
+  Priority hierarchy:
+  conversation_id > session.session_id
+  > group_id > uuid4().hex (per-run)
+end note
+
+note right of SessionPersistenceFunctions
+  Guardrail trip → persist input items only (no model output)
+  Rewind → pop_item() until all appended items removed;
+           verify via wait_for_session_cleanup()
+  Compaction → deferred when local tool outputs are present;
+               forced on next clean response
+  Dedup → already_persisted count in RunState prevents
+          re-persisting on streaming retry
+end note
+
+note right of GuardrailFunctions
+  Streaming: run_input_guardrails_with_queue uses
+  asyncio.create_task per guardrail + asyncio.as_completed.
+  First tripwire cancels remaining tasks, sets
+  _triggered_input_guardrail_result, attaches SpanError.
+  Non-streaming: raises InputGuardrailTripwireTriggered.
+  Output: raises OutputGuardrailTripwireTriggered.
+end note
+
+note bottom of HandoffOutputItem
+  "handoff_occured" event name is\nintentionally misspelled\nfor backward compatibility.
+end note
+
+@enduml

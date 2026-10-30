@@ -1,0 +1,281 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam interface {
+    BackgroundColor #EAF4FB
+    BorderColor #2980B9
+}
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #F0C040
+}
+
+title Trace Propagation
+
+' ─────────────────────────────────────────
+' External / Standard interfaces
+' ─────────────────────────────────────────
+package "PHP Standard Library" <<external>> {
+    interface IteratorAggregate {
+        +getIterator(): Traversable
+    }
+}
+
+package "OpenTelemetry\\API\\Trace" <<external>> {
+    interface SpanContextInterface as "SpanContextInterface\n(OTel)" {
+        +getTraceId(): string
+        +getSpanId(): string
+        +isSampled(): bool
+        +isValid(): bool
+        +isRemote(): bool
+        +getTraceFlags(): int
+        +getTraceState(): ?TraceStateInterface
+    }
+}
+
+' ─────────────────────────────────────────
+' DDTrace\\Contracts
+' ─────────────────────────────────────────
+package "DDTrace\\Contracts" {
+
+    interface SpanContext as "SpanContext\n<<interface>>" {
+        +getTraceId(): string
+        +getSpanId(): string
+        +getParentId(): string|null
+        +getBaggageItem($key): string|null
+        +withBaggageItem($key, $value): SpanContext
+        +getAllBaggageItems(): array
+        +getPropagatedPrioritySampling(): int
+        +setPropagatedPrioritySampling($v): void
+        +isHostRoot(): bool
+        +isDistributedTracingActivationContext(): bool
+    }
+    note right of SpanContext
+      Immutable.
+      withBaggageItem() returns
+      a **new** instance.
+      Baggage items propagate
+      in-band with the trace.
+    end note
+
+    interface Tracer as "Tracer\n<<interface>>" {
+        +inject(SpanContext $ctx, $format, &$carrier): void
+        +extract($format, $carrier): SpanContext|null
+    }
+}
+
+' ─────────────────────────────────────────
+' DDTrace\\Data
+' ─────────────────────────────────────────
+package "DDTrace\\Data" {
+
+    abstract class SpanContext as "SpanContext\n<<abstract>>" {
+        #$traceId: string
+        #$spanId: string
+        #$parentId: string|null
+        #$isDistributedTracingActivationContext: bool
+        #$propagatedPrioritySampling: int
+        #$origin: string|null
+        #$parentContext: SpanContextInterface
+        #$baggageItems: array
+    }
+    note right of SpanContext
+      IDs are 63-bit unsigned
+      integers stored as
+      decimal strings.
+    end note
+}
+
+' ─────────────────────────────────────────
+' DDTrace\\Log
+' ─────────────────────────────────────────
+package "DDTrace\\Log" {
+    class LoggingTrait <<trait>> {
+        #logDebug($message, $context): void
+        #logWarning($message, $context): void
+        #logError($message, $context): void
+        #isLogDebugActive(): bool
+    }
+}
+
+' ─────────────────────────────────────────
+' DDTrace  (root namespace)
+' ─────────────────────────────────────────
+package "DDTrace" {
+
+    interface Propagator as "Propagator\n<<interface>>" {
+        .. HTTP Header Constants ..
+        DEFAULT_BAGGAGE_HEADER_PREFIX = 'ot-baggage-'
+        DEFAULT_TRACE_ID_HEADER = 'x-datadog-trace-id'
+        DEFAULT_PARENT_ID_HEADER = 'x-datadog-parent-id'
+        DEFAULT_SAMPLING_PRIORITY_HEADER = 'x-datadog-sampling-priority'
+        DEFAULT_ORIGIN_HEADER = 'x-datadog-origin'
+        .. Methods ..
+        +inject(SpanContext $ctx, &$carrier): void
+        +extract($carrier): SpanContextInterface
+    }
+    note right of Propagator
+      Defines the Datadog-specific
+      HTTP header names used for
+      distributed trace propagation.
+    end note
+
+    class Format <<utility>> {
+        {static} BINARY = 'binary'
+        {static} TEXT_MAP = 'text_map'
+        {static} HTTP_HEADERS = 'http_headers'
+    }
+    note bottom of Format
+      TEXT_MAP: array|ArrayObject,
+        unrestricted charset.
+      HTTP_HEADERS: array|ArrayObject,
+        RFC 7230-compliant keys/values.
+    end note
+
+    class SpanContext as "SpanContext\n<<final>>" {
+        +__construct($traceId, $spanId, $parentId,\n  array $baggageItems, $isDistributed)
+        +{static} createAsChild(SpanContext $parent): self
+        +{static} createAsRoot(array $baggageItems): self
+        +getTraceId(): string
+        +getSpanId(): string
+        +getParentId(): string|null
+        +getIterator(): Traversable
+        +getPropagatedPrioritySampling(): int
+        +setPropagatedPrioritySampling($v): void
+        +getBaggageItem($key): string|null
+        +withBaggageItem($key, $value): SpanContext
+        +getAllBaggageItems(): array
+        +isEqual(SpanContext $ctx): bool
+        +isDistributedTracingActivationContext(): bool
+        +isHostRoot(): bool
+    }
+    note right of SpanContext
+      isDistributedTracingActivationContext=true
+      marks a **remotely-extracted** context
+      (cross-service boundary).
+      createAsChild() links extracted
+      remote context to a local span.
+    end note
+
+    class Tracer as "Tracer\n<<final>>" {
+        -$propagators: Propagator[]
+        +inject(SpanContext $ctx, $format, &$carrier): void
+        +extract($format, $carrier): SpanContext|null
+        +reset(): void
+    }
+    note right of Tracer
+      Routes inject/extract to the
+      registered Propagator keyed by
+      format string (e.g. Format::HTTP_HEADERS).
+      GlobalTracer::set()/get() manage
+      the singleton instance.
+    end note
+
+    class Time <<utility>> {
+        +{static} now(): int
+        +{static} fromMicrotime($microtime): int
+        +{static} isValid($time): bool
+    }
+    note bottom of Time
+      PHP has no nanotime/uint64.
+      Uses microtime() internally;
+      converts to nanoseconds for
+      Datadog Agent reporting.
+    end note
+}
+
+' ─────────────────────────────────────────
+' DDTrace\\Propagators
+' ─────────────────────────────────────────
+package "DDTrace\\Propagators" {
+
+    class TextMap as "TextMap\n<<final>>" {
+        +__construct(Tracer $tracer)
+        +inject(SpanContext $ctx, &$carrier): void
+        +extract($carrier): SpanContextInterface
+    }
+    note right of TextMap
+      Handles both TEXT_MAP and
+      HTTP_HEADERS formats via the
+      same carrier (string→string map).
+      Writes/reads Datadog headers and
+      ot-baggage-* baggage entries.
+    end note
+}
+
+' ─────────────────────────────────────────
+' DDTrace\\OpenTelemetry\\API\\Trace
+' ─────────────────────────────────────────
+package "DDTrace\\OpenTelemetry\\API\\Trace" {
+
+    class SpanContext as "SpanContext\n<<final>> (OTel bridge)" {
+        +getTraceId(): string
+        +getTraceIdBinary(): string
+        +getSpanId(): string
+        +getSpanIdBinary(): string
+        +getTraceState(): ?TraceStateInterface
+        +isSampled(): bool
+        +isValid(): bool
+        +isRemote(): bool
+        +getTraceFlags(): int
+        +{static} createFromRemoteParent(...): SpanContextInterface
+        +{static} create(...): SpanContextInterface
+        +{static} getInvalid(): SpanContextInterface
+        +{static} createFromLocalSpan(SpanData, ...): SpanContextInterface
+    }
+    note right of SpanContext
+      OTel bridge: adapts DDTrace
+      spans into the OpenTelemetry
+      SpanContext API surface.
+    end note
+}
+
+' ─────────────────────────────────────────
+' Relationships
+' ─────────────────────────────────────────
+
+' SpanContext contract hierarchy
+"DDTrace\\Contracts".SpanContext --|> IteratorAggregate : extends
+
+"DDTrace\\Data".SpanContext ..|> "DDTrace\\Contracts".SpanContext : implements
+
+"DDTrace".SpanContext --|> "DDTrace\\Data".SpanContext : extends
+
+"DDTrace\\OpenTelemetry\\API\\Trace".SpanContext ..|> "OpenTelemetry\\API\\Trace".SpanContextInterface : implements
+
+' Propagator hierarchy
+"DDTrace\\Propagators".TextMap ..|> "DDTrace".Propagator : implements
+
+' Tracer hierarchy
+"DDTrace".Tracer ..|> "DDTrace\\Contracts".Tracer : implements
+
+' Tracer aggregates Propagators (keyed by format)
+"DDTrace".Tracer o-- "DDTrace".Propagator : propagators[format]
+
+' TextMap uses Tracer (constructor injection)
+"DDTrace\\Propagators".TextMap ..> "DDTrace\\Contracts".Tracer : <<uses>>
+
+' TextMap works with SpanContext
+"DDTrace\\Propagators".TextMap ..> "DDTrace\\Contracts".SpanContext : inject/extract
+
+' Tracer routes by format
+"DDTrace".Tracer ..> "DDTrace".Format : routes by format
+
+' TextMap uses LoggingTrait
+"DDTrace\\Propagators".TextMap ..> "DDTrace\\Log".LoggingTrait : <<uses trait>>
+
+@enduml

@@ -1,0 +1,193 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #495057
+    LifeLineBackgroundColor #F8F9FA
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    ActorBackgroundColor #FEFEFE
+    ActorBorderColor #495057
+}
+skinparam noteBackgroundColor #FFF9C4
+skinparam noteBorderColor #F0C800
+
+title Composer Install Command Flow
+
+actor User
+participant "ConsoleApplication" as App
+participant "InstallCommand" as Cmd
+participant "BaseCommand" as Base
+participant "Composer" as Composer
+participant "EventDispatcher" as Events
+participant "Installer" as Installer
+participant "RepositoryManager" as RepoMgr
+participant "Locker" as Locker
+participant "Solver" as Solver
+participant "InstallationManager" as InstMgr
+participant "AutoloadGenerator" as Autoload
+participant "Auditor" as Auditor
+
+== Bootstrap Phase ==
+
+User -> App: composer install [args]
+activate App
+
+App -> Base: initialize(input, output)
+activate Base
+
+Base -> App: getComposer(true, disablePlugins, disableScripts)
+activate Composer
+App --> Base: Composer instance
+deactivate Composer
+
+Base -> Events: dispatch(PRE_COMMAND_RUN, PreCommandRunEvent)
+activate Events
+Events --> Base: (plugins notified)
+deactivate Events
+
+deactivate Base
+
+== Command Execution Phase ==
+
+App -> Cmd: execute(input, output)
+activate Cmd
+
+Cmd -> Base: getIO()
+Base --> Cmd: ConsoleIO
+
+Cmd -> Base: requireComposer()
+Base --> Cmd: Composer instance
+
+Cmd -> Events: dispatch(COMMAND, CommandEvent('install'))
+activate Events
+Events --> Cmd: (plugins notified)
+deactivate Events
+
+== Installer Setup Phase ==
+
+Cmd -> Installer: create(io, composer) [static factory]
+note right of Installer
+  Extracts from Composer aggregate:
+  Config, RootPackage, DownloadManager,
+  RepositoryManager, Locker,
+  InstallationManager, EventDispatcher,
+  AutoloadGenerator
+end note
+activate Installer
+
+Cmd -> Installer: setDryRun() / setDevMode()\nsetPreferSource() / setPreferDist()\nsetOptimizeAutoloader()\nsetPolicyConfig() / setAuditConfig() ...
+
+== Install Orchestration (Installer::run) ==
+
+Cmd -> Installer: run()
+
+Installer -> Events: dispatchScript(PRE_INSTALL_CMD, devMode)
+activate Events
+Events --> Installer: (scripts executed)
+deactivate Events
+
+Installer -> RepoMgr: getLocalRepository()
+activate RepoMgr
+RepoMgr --> Installer: InstalledRepository (localRepo)
+deactivate RepoMgr
+
+alt No lock file present
+    Installer -> Installer: set update = true
+    note right: Falls back to doUpdate() mode
+end
+
+== doInstall Internals ==
+
+Installer -> Installer: doInstall(localRepo)
+
+Installer -> Locker: getLockedRepository(devMode)
+activate Locker
+Locker --> Installer: lockedRepository
+deactivate Locker
+
+Installer -> Installer: createPlatformRepo(false)
+note right: Builds platform constraints\n(PHP version, extensions)
+
+Installer -> Installer: createPolicy(false)
+Installer -> Installer: createRepositorySet(false, platformRepo, [], lockedRepository)
+Installer -> Installer: createRequest(rootPackage, platformRepo, lockedRepository)
+
+Installer -> Solver: new Solver(policy, pool, io)
+activate Solver
+
+Installer -> Solver: solve(request, platformRequirementFilter)
+Solver --> Installer: lockTransaction
+deactivate Solver
+
+Installer -> Installer: new LocalRepoTransaction(lockedRepository, localRepo)
+note right: Computes diff: what to\ninstall / update / uninstall
+
+Installer -> Events: dispatchInstallerEvent(PRE_OPERATIONS_EXEC, devMode,\n  executeOperations, localRepoTransaction)
+activate Events
+Events --> Installer: (plugins may modify operations)
+deactivate Events
+
+loop for each operation (InstallOperation / UpdateOperation / UninstallOperation)
+    Installer -> InstMgr: execute(localRepo, [operation], devMode, runScripts, downloadOnly)
+    activate InstMgr
+    InstMgr --> Installer: operation complete
+    deactivate InstMgr
+end
+
+== Post-Install Steps ==
+
+Installer -> InstMgr: notifyInstalls(io)
+activate InstMgr
+InstMgr --> Installer: (packagist notified)
+deactivate InstMgr
+
+Installer -> Autoload: dump(config, localRepo, package,\n  installationManager, 'composer',\n  optimizeAutoloader, null, locker)
+activate Autoload
+Autoload --> Installer: autoloader written
+deactivate Autoload
+
+Installer -> InstMgr: ensureBinariesPresence(package) [each pkg]
+activate InstMgr
+InstMgr --> Installer: binaries linked
+deactivate InstMgr
+
+Installer -> Events: dispatchScript(POST_INSTALL_CMD, devMode)
+activate Events
+Events --> Installer: (post-install scripts run)
+deactivate Events
+
+opt auditConfig.audit = true
+    Installer -> Auditor: audit(io, repoSet, policyConfig,\n  packages, auditFormat, true, filterListProviderSet)
+    activate Auditor
+    Auditor --> Installer: audit result (advisories)
+    deactivate Auditor
+end
+
+Installer --> Cmd: exit code\n(0=success, 1=generic, 2=solver,\n3=no-lock-partial, 4=lock-invalid,\n5=audit-fail, 6=PSR-violation)
+deactivate Installer
+
+Cmd --> App: exit code
+deactivate Cmd
+
+App --> User: process exits with code
+deactivate App
+
+@enduml

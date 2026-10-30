@@ -1,0 +1,164 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequence {
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    ActorBorderColor #212529
+    NoteBackgroundColor #E9ECEF
+    NoteBorderColor #6C757D
+}
+
+title Resource Distribution Pipeline\n<size:11>Items flow from production blocks through conveyors, routers and bridges to storage</size>
+
+participant "ProductionBlock\n(Building)" as prod
+participant "ConveyorBuild" as conv
+participant "RouterBuild" as router
+participant "BufferedItemBridgeBuild" as bridge
+participant "DirectionalItemBuffer" as dbuffer
+participant "StorageBlock\n(Building)" as storage
+participant "ItemModule" as items
+
+== Item Production & Offload ==
+
+activate prod
+prod -> prod : produced(item)\n[mark item produced]
+prod -> prod : offload(item)
+note right of prod
+  Building iterates proximity[]
+  with cdump round-robin index
+end note
+prod -> prod : dump(item)
+
+prod -> conv : acceptItem(this, item)
+activate conv
+note right of conv
+  Checks:
+  • len < capacity (max 3)
+  • from behind: minitem >= 0.4f
+  • from side: minitem > 0.7f
+end note
+conv --> prod : true
+
+prod -> conv : handleItem(this, item)
+note right of conv
+  Inserts into parallel arrays:
+  ids[], xs[], ys[] (ys=0 from behind,
+  ys=0.5 from side entry)
+  Calls noSleep() to wake tick loop
+end note
+deactivate prod
+
+== Conveyor Belt Transport (Tick Loop) ==
+
+loop each game tick — updateTile()
+  conv -> conv : ys[i] += speed * edelta()
+  note right of conv
+    Item advances along belt.
+    nextMax = 1 - spacing gap
+    (coordinated with aligned nextc)
+  end note
+
+  alt ys[i] >= 1.0f — item reaches belt end
+    conv -> conv : pass(ids[i])
+
+    alt next != null && same team
+      conv -> router : acceptItem(this, item)
+      router --> conv : true
+      conv -> router : handleItem(this, item)
+      note right of conv
+        Remove item from arrays:
+        items.remove(ids[i], len-i)
+      end note
+    else next rejects or null
+      conv -> conv : clogHeat++\n[item stays, belt blocked]
+    end
+  end
+end
+
+deactivate conv
+
+== Router Distribution (Round-Robin) ==
+
+activate router
+router -> router : updateTile()\nlastItem = items.first()
+router -> router : time += 1/speed * delta()
+
+alt time >= 1 — ready to route
+  router -> router : getTileTarget(lastItem, lastInput, false)\n[dry-run: find valid target]
+  note right of router
+    Iterates proximity with cdump
+    round-robin; skips source;
+    checks acceptItem on each candidate
+  end note
+
+  router -> bridge : getTileTarget(lastItem, lastInput, true)\n[mark chosen target]
+  bridge --> router : target confirmed
+
+  router -> bridge : handleItem(this, lastItem)
+  activate bridge
+  router -> router : items.remove(lastItem, 1)
+end
+deactivate router
+
+== Buffered Bridge Transport ==
+
+bridge -> bridge : updateTransport()\n[timer: timerAccept, 4/timeScale]
+
+alt buffer.accepts() && items.total() > 0
+  bridge -> dbuffer : accept(buffer, items.take())
+  activate dbuffer
+  note right of dbuffer
+    Encodes item as long:
+    (item.id + Time.time)
+    buffers[direction][indexes[direction]++]
+  end note
+  dbuffer --> bridge : buffered
+  deactivate dbuffer
+end
+
+bridge -> dbuffer : poll(buffer, speed/timeScale)
+activate dbuffer
+note right of dbuffer
+  Returns item if:
+  Time.time >= storedTime + speed
+  OR Time.time < storedTime (wrap-around)
+  Returns null if not yet ready
+end note
+dbuffer --> bridge : item / null
+deactivate dbuffer
+
+alt item != null
+  bridge -> storage : acceptItem(this, item)
+  activate storage
+  storage --> bridge : true
+
+  bridge -> storage : handleItem(this, item)
+  bridge -> dbuffer : remove(buffer)
+  activate dbuffer
+  note right of dbuffer
+    arraycopy shift left
+    indexes[buffer]--
+  end note
+  deactivate dbuffer
+end
+
+deactivate bridge
+
+== Item Stored ==
+
+storage -> items : add(item, 1)
+activate items
+items -> items : items[item.id] += amount
+items -> items : total += amount
+items -> items : handleFlow(item, amount)\n[update WindowedMean flow stats]
+deactivate items
+deactivate storage
+
+@enduml

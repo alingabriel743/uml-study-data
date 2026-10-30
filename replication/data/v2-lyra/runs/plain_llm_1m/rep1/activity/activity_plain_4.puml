@@ -1,0 +1,97 @@
+@startuml lyra2_ar_spatial_inference
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+}
+
+title Lyra-2 Autoregressive Spatial World Generation\n(Lyra2InferencePipeline + run_lyra2_sample)
+
+|User / CLI|
+start
+:Provide:\n  — input image or video\n  — camera trajectory spec\n  — text prompt(s)\n  — AR chunk parameters;
+
+|Depth & Pose Estimation|
+:Load MoGe / DA3 depth model;
+:Predict monocular depth\nfor first frame;
+:Estimate intrinsics\n(focal length from depth model);
+:Set initial world-to-camera matrix (w2c);
+
+|Camera Trajectory Builder|
+:Build full camera trajectory\n(create_spiral / create_horizontal /\n create_orbit trajectory);
+:Split into AR chunks\n(chunk_size frames each);
+
+|Text Encoder|
+:Encode text prompt(s)\nwith UMT5EncoderModel;
+:Produce T5 embeddings + neg embeddings;
+
+|Lyra2InferencePipeline|
+:Initialize pipeline:\n— Prime VAE encoder cache\n  with history frames\n— Initialize Sparse3DCache\n  (depth + pose + frame data)\n— Load history latents buffer;
+
+fork
+    :Prepare CLIP image embeddings\n(Wan2pt1CLIPEmbLyra2)\nfor first frame reference;
+fork again
+    :Prepare initial depth buffer\n(B×1×H×W tensor);
+end fork
+
+repeat : For each AR chunk
+
+    |Camera Controls|
+    :Receive next cam_w2c_chunk\n+ intrinsics_chunk;
+    :Compute Plücker ray embeddings\nfor new camera positions\n(ray_condition function);
+    :Select temporal history indices\nfrom latent buffer;
+    :Sample spatial history frames\nfrom Sparse3DCache\n(forward warp to new viewpoint);
+    
+    |Lyra2Model (Diffusion)|
+    :Encode conditioning frames\nwith WanVAE (chunk-wise);
+    :Augment condition latents\nwith noise (augment_sigma);
+    
+    fork
+        :Apply camera Plücker\nto model blocks\n(Lyra2AttentionBlock cam_dim);
+    fork again
+        :Apply spatial buffer features\n(buffer_B_C_T_H_W input);
+    end fork
+    
+    :Run Lyra2WanModel forward:\n  — patch embedding (patchify_lyra2)\n  — 32 transformer blocks\n  — cross-attn (text + CLIP)\n  — rope 3D position embeddings\n  — head decode;
+    :ODE solver step\n(RectifiedFlow + UniPC scheduler);
+    :Decode new frames with WanVAE;
+    
+    |Depth & Cache Update|
+    :Run DA3 depth estimation\non newly generated frames;
+    if (VIPE enabled?) then (yes)
+        :Run VIPEWrapper\nfor pose alignment;
+        :Align predicted poses\nto model coordinate system;
+    endif
+    :Update Sparse3DCache:\n  — add new depth + pose entries\n  — store RGB values;
+    :Append decoded frames\nto history buffer;
+    :Update history latents;
+    
+    if (Snapshot requested?) then (yes)
+        :Save pipeline snapshot\nfor potential revert;
+    endif
+
+repeat while (More AR chunks?) is (yes)
+-> (no);
+
+|Output Assembly|
+:Collect all generated video frames\n(concatenate chunks);
+:Save video (.mp4) output;
+if (DA3 GS export enabled?) then (yes)
+    :Build 3D Gaussian reconstruction\nvia VIPE + DA3;
+    :Export .ply Gaussian file;
+endif
+
+|User / CLI|
+:Return final video array\n+ camera trajectory\n+ depth maps;
+stop
+
+@enduml

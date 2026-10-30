@@ -1,0 +1,165 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+}
+skinparam swimlaneBorderColor #6C757D
+skinparam swimlaneTitleBackgroundColor #E9ECEF
+skinparam swimlaneTitleFontColor #212529
+skinparam noteBorderColor #ADB5BD
+skinparam noteBackgroundColor #F1F3F5
+
+title Package Download Lifecycle
+
+|#E3F2FD|Caller (InstallationManager)|
+start
+:Trigger package install / update;
+
+|#E8F4FD|DownloadManager|
+
+'─────────────────────────────────────────
+' PHASE 1 — PREPARE
+'─────────────────────────────────────────
+:prepare(type, package, targetDir, prevPackage?);
+:normalizeTargetDir — strip trailing slashes;
+:getDownloaderForPackage(package);
+
+if (metapackage?) then (yes)
+  :resolve(null) — prepare no-op;
+else (no)
+  |#E8F5E9|DownloaderInterface|
+  :downloader->prepare(type, package, targetDir, prevPackage);
+  |#E8F4FD|DownloadManager|
+endif
+
+'─────────────────────────────────────────
+' PHASE 2 — DOWNLOAD (core lifecycle)
+'─────────────────────────────────────────
+:download(package, targetDir, prevPackage?);
+:normalizeTargetDir(targetDir);
+
+|#FFF3E0|Filesystem|
+:ensureDirectoryExists(dirname(targetDir));
+
+|#E8F4FD|DownloadManager|
+:getAvailableSources(package, prevPackage);
+note right
+  Builds an ordered candidate list:
+  • package->getSourceType() → append 'source'
+  • package->getDistType()   → append 'dist'
+end note
+
+if (No source types available?) then (yes)
+  #FFB3B3:throw InvalidArgumentException\n(package has neither dist nor source);
+  kill
+else (no)
+endif
+
+'─── Source ordering ───────────────────
+if (prevPackage AND prevSource still valid\n(not stable-dist → dev upgrade)?) then (yes)
+  :Put prevSource first\n(preserve install source on update);
+else (no)
+  :resolvePackageInstallPreference(package);
+  note right
+    1. Match package name against
+       packagePreferences glob patterns.
+    2. On match: 'dist' if pref='dist'
+       or (pref='auto' AND !isDev).
+    3. No match: isDev → 'source',
+       stable → 'dist'.
+  end note
+  if (preferSource flag OR isDev package?) then (yes)
+    :Order sources: [source, dist];
+  else (preferDist / stable / auto)
+    :Order sources: [dist, source];
+  endif
+endif
+
+'─── Download attempt loop ─────────────
+repeat
+  :Pop next source from ordered list;
+  :package->setInstallationSource(source);
+  :getDownloaderForPackage(package);
+
+  if (installationSource == 'dist'?) then (dist)
+    :getDownloader(package->getDistType());
+  else (source)
+    :getDownloader(package->getSourceType());
+  endif
+
+  if (downloader type mismatch\ninstallation source?) then (yes)
+    #FFB3B3:throw LogicException;
+    kill
+  else (no)
+  endif
+
+  |#E8F5E9|DownloaderInterface|
+  :downloader->download(package, targetDir, prevPackage)\n→ PromiseInterface;
+
+  |#E8F4FD|DownloadManager|
+  if (Download outcome?) then (success)
+    :Resolve PromiseInterface;
+    break
+  elseif (IrrecoverableDownloadException?) then (fatal)
+    #FFB3B3:Re-throw immediately — retry bypass;
+    kill
+  else (RuntimeException)
+    if (No remaining sources OR\nsourceFallback == false?) then (yes)
+      if (sourceFallback explicitly false?) then (yes)
+        :io->writeError "Fallback disabled";
+      endif
+      #FFB3B3:Re-throw RuntimeException;
+      kill
+    else (no — fallback allowed)
+      :io->writeError warning\n"Trying next source...";
+    endif
+  endif
+repeat while (more sources in list?) is (yes)
+-> no more sources;
+#FFB3B3:throw — all sources exhausted;
+kill
+
+'─────────────────────────────────────────
+' PHASE 3 — INSTALL / UPDATE
+'─────────────────────────────────────────
+:install(package, targetDir);
+:normalizeTargetDir(targetDir);
+:getDownloaderForPackage(package);
+
+if (metapackage?) then (yes)
+  :resolve(null) — install no-op;
+else (no)
+  |#E8F5E9|DownloaderInterface|
+  :downloader->install(package, targetDir)\n→ PromiseInterface;
+  |#E8F4FD|DownloadManager|
+endif
+
+'─────────────────────────────────────────
+' PHASE 4 — CLEANUP
+'─────────────────────────────────────────
+:cleanup(type, package, targetDir, prevPackage?);
+:normalizeTargetDir(targetDir);
+:getDownloaderForPackage(package);
+
+if (metapackage?) then (yes)
+  :resolve(null) — cleanup no-op;
+else (no)
+  |#E8F5E9|DownloaderInterface|
+  :downloader->cleanup(type, package,\ntargetDir, prevPackage);
+  |#E8F4FD|DownloadManager|
+endif
+
+|#E3F2FD|Caller (InstallationManager)|
+:Package successfully installed / updated;
+stop
+
+@enduml

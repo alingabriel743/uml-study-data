@@ -1,0 +1,191 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequence {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    LifeLineBorderColor #6C757D
+    ActorBackgroundColor #E9ECEF
+    ActorBorderColor #6C757D
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+}
+
+title Entity Network Sync and Interpolation
+
+box "Compile Time" #E8F4FD
+    participant "EntityProcess" as EP
+    participant "EntityIO" as EIO
+    participant "RevisionSystem" as REV
+end box
+
+box "Runtime — Server" #FFF3CD
+    participant "Server" as SRV
+    participant "GeneratedEntity\n(server side)" as GSRV
+end box
+
+participant "Network" as NET
+
+box "Runtime — Client" #D4EDDA
+    participant "GeneratedEntity\n(client side)" as GCLI
+    participant "Client Renderer" as CLR
+end box
+
+== Compile-Time Code Generation ==
+
+EP -> EP: process(round=2)\n@EntityDef annotations found
+activate EP
+
+EP -> EP: allComponents(type)\nresolve full component dependency tree via getDependencies()
+
+EP -> EIO: new EntityIO(name, builder,\nallFieldSpecs, serializer, revisionsDir)
+activate EIO
+
+EIO -> REV: load JSON revision files\nfrom revisions/<EntityName>/*.json
+activate REV
+REV --> EIO: sorted Seq<Revision>
+deactivate REV
+
+EIO -> REV: if field layout changed\n→ append new Revision
+EIO --> EP: EntityIO instance ready
+deactivate EIO
+
+loop for each @EntityDef component
+    EP -> EP: detect @SyncField fields
+    EP -> EP: add field_TARGET_ (TRANSIENT PRIVATE)\ncompanion field to builder
+    EP -> EP: add field_LAST_ (TRANSIENT PRIVATE)\ncompanion field to builder
+
+    EP -> EIO: writeSync(mbuilder, isWrite=true, allFields)
+    activate EIO
+    note right of EIO
+        Generated **write** body (server side):
+        for each SyncField (skips @NoSync):
+          write.f(this.x)
+          write.f(this.y)
+          write.b(this.health)  ...
+    end note
+    EIO --> EP: writeSync [write path] emitted
+    deactivate EIO
+
+    EP -> EIO: writeSync(mbuilder, isWrite=false, allFields)
+    activate EIO
+    note right of EIO
+        Generated **read** body (client side):
+        if(lastUpdated != 0)
+          updateSpacing = Time.timeSinceMillis(lastUpdated)
+        lastUpdated = Time.millis()
+        islocal = isLocal()
+        for each SyncField:
+          x_LAST_ = this.x
+          this.x_TARGET_ = read.f()
+        afterSync()
+    end note
+    EIO --> EP: writeSync [read path] emitted
+    deactivate EIO
+
+    EP -> EIO: writeInterpolate(mbuilder, syncedFields)
+    activate EIO
+    note right of EIO
+        Generated **interpolate** body (per frame):
+        if(lastUpdated != 0 && updateSpacing != 0)
+          alpha = min(timeSinceMillis(lastUpdated)
+                      / updateSpacing, 2f)
+          x = Mathf.lerp(x_LAST_, x_TARGET_, alpha)
+          rotation = Mathf.slerp(rot_LAST_,
+                                 rot_TARGET_, alpha)
+        else if(lastUpdated != 0)
+          x = x_TARGET_   // snap on first update
+    end note
+    EIO --> EP: interpolate method emitted
+    deactivate EIO
+end
+
+EP -> EP: process(round=3)\nwrite generated entity classes to source files
+deactivate EP
+
+== Runtime — Server Tick ==
+
+SRV -> GSRV: writeSync(write)
+activate GSRV
+note right of GSRV
+    [generated method]
+    Iterates @SyncField fields;
+    skips fields annotated @NoSync
+end note
+GSRV -> GSRV: write.f(this.x)
+GSRV -> GSRV: write.f(this.y)
+GSRV -> GSRV: write.b(this.health)
+GSRV --> SRV: entity snapshot written to buffer
+deactivate GSRV
+
+SRV -> NET: send entity snapshot packet
+activate NET
+
+== Runtime — Client Receives Snapshot ==
+
+NET -> GCLI: deliver entity snapshot packet
+deactivate NET
+activate GCLI
+
+GCLI -> GCLI: readSync(read) [generated method]
+note right of GCLI
+    Record timing:
+    updateSpacing = Time.timeSinceMillis(lastUpdated)
+    lastUpdated   = Time.millis()
+    islocal       = isLocal()
+end note
+
+loop for each @SyncField
+    alt @SyncLocal && islocal (local player — no server override)
+        GCLI -> GCLI: x_LAST_ = this.x\nx_TARGET_ = this.x\n(no positional jump on de-possession)
+    else normal SyncField
+        GCLI -> GCLI: x_LAST_ = this.x\n(save interpolation start point)
+        GCLI -> GCLI: this.x_TARGET_ = read.f()\n(store server-authoritative value)
+    end
+end
+
+GCLI -> GCLI: afterSync()\n(notify entity sync complete)
+deactivate GCLI
+
+== Runtime — Client Render Frame (called every frame) ==
+
+CLR -> GCLI: interpolate()
+activate GCLI
+
+alt lastUpdated != 0 && updateSpacing != 0 (normal interpolation)
+    GCLI -> GCLI: timeSinceUpdate = Time.timeSinceMillis(lastUpdated)
+    GCLI -> GCLI: alpha = Math.min(timeSinceUpdate / updateSpacing, 2f)
+    GCLI -> GCLI: x = Mathf.lerp(x_LAST_, x_TARGET_, alpha)\ny = Mathf.lerp(y_LAST_, y_TARGET_, alpha)
+    GCLI -> GCLI: rotation = Mathf.slerp(rot_LAST_, rot_TARGET_, alpha)
+    GCLI --> CLR: smooth interpolated position & rotation
+else lastUpdated != 0 (first update received — snap immediately)
+    GCLI -> GCLI: x = x_TARGET_\ny = y_TARGET_\nrotation = rot_TARGET_
+    GCLI --> CLR: snapped to initial server position
+else no update received yet
+    GCLI --> CLR: no change (entity not yet synced)
+end
+deactivate GCLI
+
+note over GCLI
+    **Triple-field pattern** generated per @SyncField:
+    ─────────────────────────────────────────────
+    x            — interpolated render value (used by renderer)
+    x_TARGET_    — latest server-authoritative value (TRANSIENT PRIVATE)
+    x_LAST_      — value before last server update, lerp start (TRANSIENT PRIVATE)
+end note
+
+note over EIO, REV
+    **Revision system** (persistence only — not network sync):
+    JSON files in revisions/<EntityName>/<version>.json
+    Enables backward-compatible save/load; network sync always
+    uses the latest schema (newest Revision).
+end note
+
+@enduml

@@ -1,0 +1,285 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF9C4
+    DiamondBorderColor #F9A825
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontStyle bold
+}
+skinparam note {
+    BackgroundColor #EDE7F6
+    BorderColor #7E57C2
+    FontColor #212529
+}
+
+title Worker Creation and Execution
+
+|#D6EAF8|Client (WorkersHandler)|
+|#D5F5E3|WorkerService (Backend)|
+|#FAD7A0|Cloudflare Deploy|
+
+' =========================================================
+' PHASE 1: CONSTRUCTION
+' =========================================================
+|Client (WorkersHandler)|
+start
+note right
+  **Phase 1: Construction**
+end note
+:new WorkersHandler(authToken);
+:Store authToken as this.authToken;
+
+' =========================================================
+' PHASE 2: CREATE WORKER
+' =========================================================
+note right
+  **Phase 2: Create Worker**
+end note
+:create(workerName, filePath, appName);
+
+if (Web env & no authToken?) then (yes)
+  :puter.ui.authenticateWithPuter();
+  if (Auth fails?) then (yes)
+    #FFB3B3:Throw "Authentication failed.";
+    detach
+  endif
+endif
+
+if (appName is string?) then (yes)
+  :Lookup app UID via puter.apps.list();
+else (no — object/undefined)
+  :Call puter.whoami / puter.getUser();
+  if (user token & sandbox enabled?) then (yes)
+    :Try puter.apps.get('sandbox-{workerName}');
+    if (Sandbox app not found?) then (yes)
+      :Create sandbox app via puter.apps.create();
+    endif
+    if (Owner mismatch?) then (yes)
+      #FFB3B3:Throw "Sandbox context not owned by you";
+      detach
+    endif
+    :appId = sandboxApp.uid;
+  endif
+endif
+
+:Normalize workerName to lowercase;
+:Read currentWorkers from puter.kv.get('user-workers');
+:Resolve absolute filePath via getAbsolutePathForApp();
+:Invoke make_driver_method()\n→ worker-service::create(authToken, filePath, workerName, appId);
+
+|WorkerService (Backend)|
+note right
+  **Backend: Create**
+end note
+:Normalize workerName to lowercase;
+:Acquire es:subdomain, svc_auth, svc_su;
+:Query subdomains starting with 'workers.puter.*';
+
+if (Subdomain count >= 100?) then (yes)
+  #FFB3B3:Throw APIError: subdomain_limit_reached;
+  detach
+endif
+if (workerName in reserved words?) then (yes)
+  #FFB3B3:Throw APIError: subdomain_reserved;
+  detach
+endif
+if (workerName matches /^[a-zA-Z0-9_-]+$/?) then (no)
+  #FFB3B3:Return undefined (invalid name);
+  detach
+endif
+
+if (appId provided?) then (yes)
+  :get_app({uid: appId});
+  :Validate actor owns app;
+  :svc_auth.get_user_app_token(appId);
+  :Sudo as app-token actor;
+  :Upsert subdomain entity (SKIP_ES_VALIDATION);
+else (no)
+  :Upsert subdomain entity directly;
+endif
+
+:Resolve filePath via FSNodeParam.consolidate();
+:Fetch userData via getUserInfo(authorization, api_base_url);
+:Read file content via readPuterFile(actor, filePath) [max 10 MB];
+:Prepend puter.js preamble to file content;
+
+|Cloudflare Deploy|
+:createWorker(userData, authToken,\ncalculatedName, preamble+fileData, PREAMBLE_LENGTH);
+:Return {success, url, errors};
+
+|WorkerService (Backend)|
+:Return cfData to driver caller;
+
+|Client (WorkersHandler)|
+if (driverResult.success === false?) then (yes)
+  #FFB3B3:Throw Error(driverResult.errors);
+  detach
+endif
+:Update currentWorkers[workerName]\n= {filePath, url, deployTime, createTime};
+:Persist via puter.kv.set('user-workers', currentWorkers);
+#C8E6C9:Return driverResult to caller;
+
+' =========================================================
+' PHASE 3: EXECUTE WORKER
+' =========================================================
+note right
+  **Phase 3: Execute Worker (exec)**
+end note
+:exec(...args);
+if (No authToken?) then (yes)
+  :puter.ui.authenticateWithPuter();
+endif
+:Build Request object from args;
+if (No 'puter-auth' header\nAND no 'x-puter-no-auth' header?) then (yes)
+  :Set puter-auth = puter.authToken;
+endif
+:Remove x-puter-no-auth header;
+:Forward authenticated request via fetch(req);
+#C8E6C9:Return fetch Response to caller;
+
+' =========================================================
+' PHASE 4: LIST WORKERS
+' =========================================================
+note right
+  **Phase 4: List Workers**
+end note
+:list();
+if (No authToken?) then (yes)
+  :puter.ui.authenticateWithPuter();
+endif
+:Invoke make_driver_method([])\n→ worker-service::getFilePaths();
+
+|WorkerService (Backend)|
+:Query all worker subdomains for user;
+:Return [{name, url, file_path, file_uid, created_at}];
+
+|Client (WorkersHandler)|
+#C8E6C9:Return worker list array to caller;
+
+' =========================================================
+' PHASE 5: GET SINGLE WORKER
+' =========================================================
+note right
+  **Phase 5: Get Worker**
+end note
+:get(workerName);
+if (No authToken?) then (yes)
+  :puter.ui.authenticateWithPuter();
+endif
+:Normalize workerName to lowercase;
+:Invoke make_driver_method(['workerName'])\n→ worker-service::getFilePaths(workerName);
+#C8E6C9:Return first matching result (driverCall[0]);
+
+' =========================================================
+' PHASE 6: DELETE WORKER
+' =========================================================
+note right
+  **Phase 6: Delete Worker**
+end note
+:delete(workerName);
+if (No authToken?) then (yes)
+  :puter.ui.authenticateWithPuter();
+endif
+:Normalize workerName to lowercase;
+:Invoke make_driver_method(['authorization','workerName'])\n→ worker-service::destroy(authToken, workerName);
+
+|WorkerService (Backend)|
+note right
+  **Backend: Destroy**
+end note
+:Normalize workerName to lowercase;
+:Get userData via getUserInfo(authorization);
+:Select subdomain entity 'workers.puter.{workerName}';
+if (Owner uuid !== userData.uuid?) then (yes)
+  #FFB3B3:Throw "This is not your worker!";
+  detach
+endif
+
+|Cloudflare Deploy|
+:deleteWorker(userData, authToken, workerName);
+:Return cfData;
+
+|WorkerService (Backend)|
+:Delete subdomain entity from es:subdomain;
+:Return cfData;
+
+|Client (WorkersHandler)|
+if (driverResult.result falsy?) then (yes)
+  #FFB3B3:Throw Error(driverResult.errors);
+  detach
+endif
+:Read currentWorkers from puter.kv.get('user-workers');
+:delete currentWorkers[workerName];
+:Persist via puter.kv.set('user-workers', currentWorkers);
+#C8E6C9:Return true;
+
+' =========================================================
+' PHASE 7: AUTO-REDEPLOY (EVENT-DRIVEN)
+' =========================================================
+fork
+  note right
+    **Phase 7: Auto-Redeploy\n(Event-Driven — runs independently)**
+  end note
+
+  |WorkerService (Backend)|
+  :Listen on event 'fs.write.file';
+  if (meta.from_outside?) then (yes)
+    :Skip (external write ignored);
+    detach
+  endif
+  if (node.uid missing?) then (yes)
+    :Skip (no file UID);
+    detach
+  endif
+  :Select subdomains where root_dir = written node;
+  if (No matching subdomains?) then (yes)
+    :Skip (not a worker file);
+    detach
+  endif
+  :For each subdomain matching 'workers.puter.*';
+  :Read updated file via readPuterFile(actor, node.path);
+  if (appOwner exists?) then (yes)
+    :authToken = svc_auth.get_user_app_token(appID);
+  else (no)
+    :authToken = svc_auth.create_session_token(owner).token;
+  endif
+  :Prepend puter.js preamble to file content;
+
+  |Cloudflare Deploy|
+  :createWorker(owner.user, authToken,\nworkerName, preamble+fileData, PREAMBLE_LENGTH);
+  :Return {success, url, errors};
+
+  |WorkerService (Backend)|
+  if (Deployment succeeded?) then (yes)
+    #C8E6C9:svc_notification.notify user\n"Successfully deployed {url}";
+  else (no)
+    #FFB3B3:svc_notification.notify user\n"Failed to deploy {workerName}";
+  endif
+fork again
+  |Client (WorkersHandler)|
+  :Worker lifecycle complete;
+end fork
+
+stop
+
+@enduml

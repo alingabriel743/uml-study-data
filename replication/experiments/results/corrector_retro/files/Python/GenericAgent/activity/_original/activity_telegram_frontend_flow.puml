@@ -1,0 +1,175 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #212529
+    EndColor #212529
+    BarColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontColor #495057
+    TitleFontSize 13
+}
+skinparam note {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+title Telegram Frontend Message Handling
+
+|#E8F4FD| Telegram User |
+|#EAF7EA| handle_msg / Bot Handler |
+|#FFF8E1| _stream Coroutine |
+|#F3E8FF| GeneraticAgent (Daemon Thread) |
+
+|Telegram User|
+start
+:Send TEXT message to Telegram Bot;
+
+|handle_msg / Bot Handler|
+:Extract uid = update.effective_user.id;
+
+if (ALLOWED set non-empty\nAND uid not in ALLOWED?) then (yes — blocked)
+    :reply_text('no');
+    stop
+else (no — authorized)
+endif
+
+:reply_text('thinking...')
+[send placeholder message → msg];
+
+:Build prompt string
+(prepend [FILE:filepath] instruction);
+
+:dq = agent.put_task(prompt, source='telegram')
+[enqueue task → returns async queue];
+
+|_stream Coroutine|
+fork
+    :asyncio.create_task(_stream(dq, msg));
+    note right: Spawned as independent\nasync task; handler returns
+
+    |handle_msg / Bot Handler|
+    :ctx.user_data['stream_task'] = task;
+    :Handler returns;
+
+fork again
+    |_stream Coroutine|
+    :Begin _stream(dq, msg) coroutine;
+
+    |GeneraticAgent (Daemon Thread)|
+    :Process task\nstream output\nchunks into queue dq;
+
+    |_stream Coroutine|
+    repeat
+
+        :await asyncio.sleep(3)
+        [3-second poll interval];
+
+        :Drain queue dq
+        (loop dq.get_nowait() until empty);
+
+        if (No new item\nin queue?) then (yes — queue empty)
+            :Skip — continue loop;
+        else (no — item received)
+            :raw = item['done'] if done\nelse item['next'];
+            :done = ('done' in item);
+
+            :show = _clean(raw)
+            [strip <thinking>, <summary>,
+            <tool_use>, <file_content> tags;
+            collapse 3+ newlines → 2];
+
+            if (len(show) > 4000\nchars?) then (yes — overflow)
+                :msg = await msg.reply_text('(continued...)')
+                [start new message];
+                :show = show[-3900:]
+                [keep last 3900 chars];
+                :Reset last_text;
+            else (no — fits)
+            endif
+
+            if (Task\nnot done?) then (yes — still streaming)
+                :display = show + ' ⏳';
+            else (no — done)
+                :display = show;
+            endif
+
+            if (display != last_text?) then (yes — changed)
+                :await msg.edit_text(_to_html(display),\nparse_mode='HTML')
+                [fallback: plain text on error];
+                :last_text = display;
+            else (no — unchanged)
+                :Skip edit;
+            endif
+        endif
+
+    repeat while (done == False?) is (not done — keep polling)
+    ->done;
+
+    :=== File Delivery Phase ===;
+    :files = re.findall(r'\[FILE:([^\]]+)\]',\nshow[-1000:])
+    [extract file paths from last 1000 chars];
+
+    :Strip [FILE:...] markers from show;
+
+    if (Files\nfound?) then (yes)
+        :FOR EACH fpath in files;
+
+        if (Path is relative?) then (yes)
+            :Resolve against _TEMP_DIR\n(/project/temp/);
+        else (no — absolute path)
+        endif
+
+        if (File\nexists?) then (yes)
+            if (Extension in\n.png/.jpg/.jpeg/.gif/.webp?) then (yes — image)
+                :await msg.reply_photo(open(fpath, 'rb'));
+            else (no — other file type)
+                :await msg.reply_document(open(fpath, 'rb'));
+            endif
+        else (no — skip)
+            :Skip missing file;
+        endif
+
+        :Next file;
+    else (no files)
+    endif
+
+    if (show.strip()\nnon-empty?) then (yes)
+        :await msg.edit_text(_to_html(show),\nparse_mode='HTML')
+        [final clean edit; fallback: plain];
+    else (no)
+        :Skip final edit;
+    endif
+
+    :break — stream complete;
+
+end fork
+
+|Telegram User|
+:Receive streamed live updates\n(message edited every ~3 sec);
+:Receive file attachments\n(photos / documents);
+stop
+
+@enduml

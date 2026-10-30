@@ -1,0 +1,212 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipantBackgroundColor #F8F9FA
+skinparam sequenceParticipantBorderColor #495057
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceBoxBackgroundColor #E9ECEF
+skinparam noteBorderColor #6C757D
+skinparam noteBackgroundColor #FFF9C4
+
+title Evolver Proxy — Startup & Message Sync Flow
+
+actor "External Hub" as hub #LightBlue
+actor "HTTP Client" as client #LightGreen
+
+participant "EvoMapProxy" as proxy #F8F9FA
+participant "LifecycleManager" as lifecycle #F8F9FA
+participant "ProxyHttpServer" as httpServer #F8F9FA
+participant "WebUiServer" as webui #F8F9FA
+participant "SyncEngine" as syncEngine #F8F9FA
+participant "InboundSync" as inbound #F8F9FA
+participant "OutboundSync" as outbound #F8F9FA
+participant "MailboxStore" as mailbox #F8F9FA
+participant "TaskMonitor" as taskMonitor #F8F9FA
+participant "SessionHandler" as session #F8F9FA
+
+== Proxy Startup ==
+
+proxy -> lifecycle: hello()
+activate proxy
+activate lifecycle
+lifecycle -> lifecycle: _getEnvFingerprint()
+lifecycle -> lifecycle: _buildHeaders()
+lifecycle -> hub: POST /hello (auth + fingerprint)
+activate hub
+hub --> lifecycle: 200 OK (nodeSecret, config)
+deactivate hub
+lifecycle --> proxy: authHeaders
+deactivate lifecycle
+
+proxy -> taskMonitor: new TaskMonitor()
+activate taskMonitor
+taskMonitor --> proxy: monitor instance
+deactivate taskMonitor
+
+proxy -> httpServer: new ProxyHttpServer(buildRoutes(...))
+activate httpServer
+httpServer --> proxy: server instance
+deactivate httpServer
+
+proxy -> webui: start()
+activate webui
+webui --> proxy: WebUI listening
+deactivate webui
+
+proxy -> httpServer: start()
+activate httpServer
+httpServer --> proxy: HTTP server listening
+deactivate httpServer
+
+proxy -> lifecycle: startHeartbeatLoop(intervalMs)
+activate lifecycle
+loop every intervalMs
+    lifecycle -> lifecycle: heartbeat()
+    lifecycle -> lifecycle: countPending()
+    lifecycle -> hub: POST /heartbeat (status + pending count)
+    activate hub
+    hub --> lifecycle: 200 OK
+    deactivate hub
+end
+deactivate lifecycle
+
+== Sync Engine Startup ==
+
+proxy -> syncEngine: start()
+activate syncEngine
+syncEngine -> syncEngine: _scheduleOutbound(delayMs)
+syncEngine -> syncEngine: _scheduleInbound(delayMs)
+syncEngine --> proxy: sync running
+deactivate syncEngine
+deactivate proxy
+
+== Inbound Sync Cycle ==
+
+syncEngine -> inbound: pull()
+activate syncEngine
+activate inbound
+inbound -> inbound: getHeaders()
+inbound -> hub: GET /mailbox/inbound
+activate hub
+hub --> inbound: message batch (JSON)
+deactivate hub
+
+alt Auth Error
+    inbound -> syncEngine: onAuthError("inbound")
+    activate syncEngine
+    syncEngine -> lifecycle: reAuthenticate()
+    activate lifecycle
+    lifecycle -> lifecycle: hello()
+    lifecycle --> syncEngine: new authHeaders
+    deactivate lifecycle
+    deactivate syncEngine
+else Success
+    inbound -> mailbox: writeInboundBatch(messages)
+    activate mailbox
+    mailbox -> mailbox: _rebuildIndex()
+    mailbox -> mailbox: _persistState()
+    mailbox --> inbound: written
+    deactivate mailbox
+    inbound -> hub: POST /mailbox/ack (deliveredIds)
+    activate hub
+    hub --> inbound: 200 OK
+    deactivate hub
+end
+
+inbound --> syncEngine: done
+deactivate inbound
+deactivate syncEngine
+
+== Outbound Sync Cycle ==
+
+syncEngine -> mailbox: countPending()
+activate syncEngine
+activate mailbox
+mailbox --> syncEngine: pendingCount
+deactivate mailbox
+
+opt pendingCount > 0
+    syncEngine -> outbound: flush()
+    activate outbound
+    outbound -> mailbox: writeInboundBatch(pendingMessages)
+    activate mailbox
+    mailbox --> outbound: messages
+    deactivate mailbox
+    outbound -> hub: POST /mailbox/outbound (batch)
+    activate hub
+    hub --> outbound: 200 OK (ackIds)
+    deactivate hub
+    outbound -> mailbox: updateStatusBatch(ackIds)
+    activate mailbox
+    mailbox --> outbound: updated
+    deactivate mailbox
+    outbound --> syncEngine: flushed
+    deactivate outbound
+end
+deactivate syncEngine
+
+== HTTP Request Handling ==
+
+client -> httpServer: HTTP Request (method, path, body)
+activate httpServer
+httpServer -> httpServer: _matchRoute(method, pathname)
+httpServer -> httpServer: _handleRequest(req, res)
+
+alt Session Delegation
+    httpServer -> session: delegateSubtask(role, payload)
+    activate session
+    session -> mailbox: store.send(message)
+    activate mailbox
+    mailbox -> mailbox: _rebuildIndex()
+    mailbox --> session: sent
+    deactivate mailbox
+    syncEngine -> syncEngine: notifyNewOutbound()
+    session --> httpServer: delegationResult
+    deactivate session
+else Task Status Query
+    httpServer -> taskMonitor: recordClaim(taskId)
+    activate taskMonitor
+    taskMonitor -> taskMonitor: getMetrics()
+    taskMonitor --> httpServer: metricsSnapshot
+    deactivate taskMonitor
+end
+
+httpServer --> client: JSON Response
+deactivate httpServer
+
+== Skill Update Flow ==
+
+note over mailbox: Skill update message received\nvia inbound sync
+
+proxy -> proxy: pollAndApply() [SkillUpdater]
+activate proxy
+proxy -> mailbox: store.poll()
+activate mailbox
+mailbox --> proxy: skillUpdateMessages
+deactivate mailbox
+loop for each skill update message
+    proxy -> proxy: processSkillUpdate(message)
+    proxy -> proxy: fs.writeFileSync(skill.md, content)
+end
+proxy -> mailbox: store.ack(messageIds)
+activate mailbox
+mailbox --> proxy: acked
+deactivate mailbox
+deactivate proxy
+
+@enduml

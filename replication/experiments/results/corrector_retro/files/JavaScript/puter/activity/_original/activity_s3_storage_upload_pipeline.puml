@@ -1,0 +1,271 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #DEE2E6
+    TitleFontColor #212529
+}
+skinparam partition {
+    BackgroundColor #EDF2F7
+    BorderColor #6C757D
+}
+
+title S3 Storage Upload Pipeline\n<size:11><i>S3StorageController — Initialization, Upload & Copy Operations</i></size>
+
+|#E8F4FD|S3StorageController|
+|#EAF7EA|AWS S3|
+
+' ─────────────────────────────────────────────
+'  INITIALIZATION
+' ─────────────────────────────────────────────
+|S3StorageController|
+start
+:[[init()]]
+Set **clients_** = {};
+:Load **global_config**;
+:Create **EWMA** tracker
+//initial = 4000 ms, alpha = 0.1//;
+note right
+  Tracks exponentially-weighted
+  average part-upload time to
+  tune chunk_stream pacing
+end note
+
+' ─────────────────────────────────────────────
+'  UPLOAD — entry point
+' ─────────────────────────────────────────────
+:[[upload()]]
+Receive request
+//uid, file { buffer? | stream, size }//
+//storage_meta { bucket, bucket_region }//
+//storage_api { progress_tracker }//;
+:Extract **progress_tracker**,
+**bucket**, **bucket_region**;
+:Get regional S3 client
+**#get_client**(bucket_region);
+
+if (file.**buffer** present?) then (yes\nBuffer path)
+
+    ' ── Buffer upload ──────────────────────────
+    :simple_retry(
+    **PutObjectCommand**
+    { Bucket, Key:uid, Body:buffer }
+    retries=3, delay=200 ms);
+    |AWS S3|
+    :Execute PutObject request;
+    |S3StorageController|
+    if (retry succeeded?) then (yes)
+        :progress_tracker.**set_total**(file.size);
+        :progress_tracker.**set**(file.size);
+    else (no — retries\nexhausted)
+        #FFB3B3:throw **s3_error**;
+        stop
+    endif
+
+else (no\nStream path)
+
+    ' ── Stream → multipart upload ──────────────
+    :simple_retry(
+    **#upload_stream**({ bucket_region, bucket,
+    key:uid, stream, on_progress })
+    retries=3, delay=200 ms);
+    note right
+      on_progress callback updates
+      progress_tracker.set_total(size)
+      and progress_tracker.set(uploaded)
+    end note
+
+    ' ── #upload_stream internals ───────────────
+    :Get regional S3 client
+    **#get_client**(bucket_region);
+    |AWS S3|
+    :Send **CreateMultipartUploadCommand**
+    { Bucket, Key }
+    → receive **UploadId**;
+    |S3StorageController|
+    :Set **part_size** = 5 MiB;
+    :Create **chunk_iterator** =
+    chunk_stream(stream, part_size,
+    global_average_S3_part_time);
+
+    ' ── Part upload loop ───────────────────────
+    while (next chunk available?) is (yes)
+        if (concurrent parts\nin flight >= 4?) then (yes)
+            :Create **TeePromise** //tp//;
+            :await //tp//
+            **⟳ backpressure gate**;
+            note right
+              Limits concurrent S3
+              UploadPart requests to 4
+            end note
+        else (no)
+        endif
+        :Increment **part_number**;
+        :Increment **count_parts_being_uploaded**;
+        :simple_retry(
+        **UploadPartCommand**
+        { Bucket, Key, PartNumber,
+          UploadId, Body:part }
+        retries=3, delay=50 ms);
+        |AWS S3|
+        :Execute UploadPart;
+        |S3StorageController|
+        if (error or !success?) then (yes)
+            #FFB3B3:throw **err**
+            → triggers CATCH block;
+        else (no)
+        endif
+        :Record **elapsed** time;
+        :Update EWMA:
+        **global_average_S3_part_time**
+        .put(elapsed / part_size);
+        :uploaded_bytes += part.length;
+        :call **on_progress**({ uploaded: uploaded_bytes });
+        :Decrement **count_parts_being_uploaded**;
+        if (TeePromise pending?) then (yes)
+            :Resolve TeePromise
+            **unblock** backpressure gate;
+        else (no)
+        endif
+        :call **check_queue**() — drain part_queue;
+    endwhile (no more chunks)
+
+    ' ── Empty-file edge case ───────────────────
+    if (chunk count == 0\n(empty file)?) then (yes)
+        :simple_retry(
+        **UploadPartCommand**
+        { PartNumber:1, Body:Buffer.alloc(0) }
+        retries=3, delay=50 ms);
+        :call **on_progress**; push result;
+    else (no)
+    endif
+
+    ' ── Drain remaining queue ──────────────────
+    if (part_queue non-empty?) then (yes)
+        :await **queue_empty_promise**
+        (TeePromise resolved when\nqueue fully drains);
+    else (no)
+    endif
+
+    :await **Promise.all**(upload_promises)
+    → upload_results[];
+
+    |AWS S3|
+    :Send **CompleteMultipartUploadCommand**
+    { Bucket, Key, UploadId,
+      Parts:[{ PartNumber, ETag }] };
+    |S3StorageController|
+
+    ' ── Error / abort path ─────────────────────
+    note left
+      **CATCH — any error:**
+      Send AbortMultipartUploadCommand
+      { Bucket, Key, UploadId }
+      then re-throw error
+    end note
+
+    if (retry succeeded?) then (yes)
+    else (no — retries\nexhausted)
+        #FFB3B3:throw **s3_error**;
+        stop
+    endif
+
+endif
+
+' ─────────────────────────────────────────────
+'  COPY — entry point
+' ─────────────────────────────────────────────
+:[[copy()]]
+Receive request
+//src_node, dst_storage { key, bucket, bucket_region }//
+//storage_api { progress_tracker }//;
+:Extract **progress_tracker**;
+:src_storage = await src_node.**get**('s3:location')
+→ { key, bucket };
+:size = await src_node.**get**('size');
+
+if (size < 4 GB − 100 bytes\n(~3.99 GiB)?) then (yes\nSimple copy)
+
+    ' ── #copy_simple ───────────────────────────
+    :Get regional S3 client
+    **#get_client**(dst_bucket_region);
+    |AWS S3|
+    :Send **CopyObjectCommand**
+    { Bucket:dst_bucket, Key:dst_key,
+      CopySource:'src_bucket/src_key' };
+    |S3StorageController|
+    :progress_tracker.**set_total**(size);
+    :progress_tracker.**set**(size);
+    :Return copy result;
+
+else (no\nMultipart copy ≥ 4 GB)
+
+    ' ── #copy_multipart ────────────────────────
+    :Get regional S3 client
+    **#get_client**(dst_bucket_region);
+    |AWS S3|
+    :Send **CreateMultipartUploadCommand**
+    { Bucket:dst_bucket, Key:dst_key }
+    → receive **UploadId**;
+    |S3StorageController|
+    :Set **part_size** = 4 GiB;
+
+    while (byte_start < size?) is (yes)
+        :Compute **byte_end** =
+        min(byte_start + part_size, size) − 1;
+        :simple_retry(
+        **UploadPartCopyCommand**
+        { Bucket, Key, PartNumber, UploadId,
+          CopySource, CopySourceRange:
+          'bytes=start-end' }
+        retries=3, delay=50 ms);
+        |AWS S3|
+        :Execute UploadPartCopy;
+        |S3StorageController|
+        if (error or !success?) then (yes)
+            #FFB3B3:throw **err**;
+            stop
+        else (no)
+        endif
+        :Push result;
+        :call **on_progress**
+        ({ uploaded: byte_end + 1 });
+        :byte_start += part_size;
+    endwhile (all parts sent)
+
+    |AWS S3|
+    :Send **CompleteMultipartUploadCommand**
+    { Bucket, Key, UploadId,
+      Parts:[{ PartNumber, ETag: CopyPartResult.ETag }] };
+    |S3StorageController|
+    :Return multipart copy result;
+
+endif
+
+:Operation complete;
+stop
+
+@enduml

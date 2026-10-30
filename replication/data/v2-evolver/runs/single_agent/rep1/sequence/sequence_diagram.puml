@@ -1,0 +1,218 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceGroupBorderColor #495057
+skinparam sequenceGroupFontColor #212529
+skinparam sequenceGroupBackgroundColor #E9ECEF80
+skinparam noteBorderColor #6C757D
+skinparam noteBackgroundColor #FFF8DC
+
+title v2-Evolver: ATP Order-to-Delivery Sequence
+
+actor       "Buyer / Script"      as Buyer
+participant "ConsumerAgent"       as Consumer
+participant "MerchantAgent"       as Merchant
+participant "ATPTaskPickup"       as Pickup
+participant "HubClient"           as Hub
+participant "A2A Hub Server"      as Server
+participant "TaskMonitor"         as Monitor
+participant "LLMReview"           as Review
+
+== Initialization ==
+
+Buyer -> Consumer : orderService({ capabilities, budget, routingMode })
+activate Consumer
+
+Consumer -> Consumer : ensureInitialized()
+note right: one-time registration guard
+
+Consumer -> Hub : sendHelloToHub()
+activate Hub
+Hub -> Server : POST /a2a/hello  { node_id, capabilities }
+activate Server
+Server --> Hub : { ok: true, node_id }
+deactivate Server
+Hub --> Consumer : { ok: true }
+deactivate Hub
+
+Consumer -> Consumer : _initialized = true
+
+== Service Registration (Merchant Side) ==
+
+Merchant -> Hub : sendHelloToHub()
+activate Hub
+Hub -> Server : POST /a2a/hello  { node_id }
+activate Server
+Server --> Hub : { ok: true }
+deactivate Server
+Hub --> Merchant : { ok: true }
+deactivate Hub
+
+loop for each service
+    Merchant -> Hub : publishService(svc)
+    activate Hub
+    Hub -> Server : POST /a2a/services
+    activate Server
+    Server --> Hub : { ok: true }
+    deactivate Server
+    Hub --> Merchant : { ok: true, title }
+    deactivate Hub
+end
+
+Merchant -> Merchant : startHeartbeat()
+note right: periodic keep-alive to Hub
+
+== Order Placement ==
+
+Consumer -> Hub : placeOrder({ capabilities, budget, routingMode, verifyMode, question })
+activate Hub
+Hub -> Server : POST /atp/order
+activate Server
+Server -> Server : route to best merchant\n(fastest | cheapest | auction | swarm)
+Server --> Hub : { ok: true, order_id, merchant: { node_id } }
+deactivate Server
+Hub --> Consumer : { ok: true, data: { order_id, merchant } }
+deactivate Hub
+
+Consumer --> Buyer : { ok: true, order_id }
+
+== Task Pickup — Merchant Polling Loop ==
+
+loop every pollMs (default 30 s)
+    Pickup -> Hub : GET /a2a/task/my
+    activate Hub
+    Hub -> Server : fetch tasks with atp_order_id, no result_asset_id
+    activate Server
+    Server --> Hub : [ { id, atp_order_id, status: "claimed", question } ]
+    deactivate Server
+    Hub --> Pickup : tasks[]
+    deactivate Hub
+
+    alt new eligible task found
+        Pickup -> Pickup : _readLedger() — dedup check
+        Pickup -> Pickup : renderSessionsSpawnCall(task)
+        Pickup -> Merchant : sessions_spawn prompt\n(sub-session to answer question)
+    else already spawned or no tasks
+        Pickup --> Pickup : skip
+    end
+end
+
+== Order Processing ==
+
+Merchant -> Monitor : recordClaim(taskId)
+activate Monitor
+Monitor -> Monitor : ++tasks_claimed\nsave stats to store
+deactivate Monitor
+
+Merchant -> Merchant : onOrder(order) — user-supplied handler
+activate Merchant
+note right: user business logic runs here;\nproduces proofPayload
+
+Merchant -> Hub : submitDelivery(order_id, proofPayload)
+activate Hub
+Hub -> Server : POST /atp/delivery  { order_id, proof }
+activate Server
+Server --> Hub : { ok: true }
+deactivate Server
+Hub --> Merchant : { ok: true }
+deactivate Hub
+deactivate Merchant
+
+Merchant -> Monitor : recordComplete(taskId, startedAt)
+activate Monitor
+Monitor -> Monitor : ++tasks_completed\nupdate avg_completion_ms
+deactivate Monitor
+
+== Optional LLM Review of Code Change ==
+
+opt EVOLVER_LLM_REVIEW=true
+    Merchant -> Review : runLlmReview({ diff, gene, signals, mutation })
+    activate Review
+    Review -> Review : buildReviewPrompt()
+    Review -> Review : execFileSync node -e reviewScript
+    Review --> Merchant : { approved, confidence, concerns, summary }
+    deactivate Review
+
+    alt approved == false
+        Merchant -> Merchant : block delivery / flag for human review
+    end
+end
+
+== Delivery Verification (Consumer Side) ==
+
+Buyer -> Consumer : confirmDelivery(orderId)  OR  requestAiJudge(orderId)
+activate Consumer
+
+alt verifyMode == "bilateral"
+    Consumer -> Hub : verifyDelivery(orderId, "confirm")
+    activate Hub
+    Hub -> Server : POST /atp/verify  { mode: "confirm" }
+    activate Server
+    Server --> Hub : { ok: true, status: "verified" }
+    deactivate Server
+    Hub --> Consumer : { ok: true }
+    deactivate Hub
+else verifyMode == "ai_judge"
+    Consumer -> Hub : verifyDelivery(orderId, "ai_judge")
+    activate Hub
+    Hub -> Server : POST /atp/verify  { mode: "ai_judge" }
+    activate Server
+    Server --> Hub : { ok: true, status: "ai_reviewed" }
+    deactivate Server
+    Hub --> Consumer : { ok: true }
+    deactivate Hub
+end
+
+== Settlement ==
+
+Consumer -> Hub : settleOrder(orderId)
+activate Hub
+Hub -> Server : POST /atp/settle
+activate Server
+Server --> Hub : { ok: true, credits_transferred }
+deactivate Server
+Hub --> Consumer : { ok: true }
+deactivate Hub
+
+Consumer --> Buyer : { ok: true, settled }
+deactivate Consumer
+
+== Error / Dispute Path ==
+
+opt delivery rejected or timeout
+    Buyer -> Consumer : dispute(orderId, reason)
+    activate Consumer
+    Consumer -> Hub : disputeOrder(orderId, reason)
+    activate Hub
+    Hub -> Server : POST /atp/dispute
+    activate Server
+    Server --> Hub : { ok: true, dispute_id }
+    deactivate Server
+    Hub --> Consumer : { ok: true, dispute_id }
+    deactivate Hub
+    Consumer --> Buyer : { ok: true, dispute_id }
+    deactivate Consumer
+end
+
+@enduml

@@ -1,0 +1,143 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activityBackgroundColor #F8F9FA
+skinparam activityBorderColor #495057
+skinparam arrowColor #495057
+skinparam activityFontColor #212529
+skinparam swimlaneBackgroundColor #E9ECEF
+skinparam swimlaneBorderColor #6C757D
+
+title Logic Block Execution Pipeline
+
+|GameEngine|
+start
+
+:GlobalVars.update()\n@time, @tick, @wave,\n@mapw, @maph, @server, @client;
+note right: Called once per game tick globally
+
+:LogicBuild.updateTile();
+
+if (executor.initialized()?\n(instructions.length > 0)) then (no)
+  :Idle — return;
+  kill
+else (yes)
+endif
+
+:accumulator += Time.delta;
+
+if (accumulator >= 1?) then (no)
+  :Sub-tick — skip and return;
+  kill
+else (yes)
+endif
+
+:accumulator -= 1\nexecutor.yield = false;
+
+|LExecutor|
+
+while (i < ipt AND yield == false?) is (continue)
+
+  :runOnce();
+
+  if (counter out of [0, instructions.length)?) then (yes)
+    :Reset counter = 0\n(wrap-around restart);
+  endif
+
+  :instr = instructions[(int) counter++];
+  :instr.run(exec)\n[polymorphic dispatch];
+
+  |Instruction Dispatch|
+
+  if (Pure Computation\nSetI / OpI / SelectI / GetLinkI?) then (yes)
+    :Mutate output LVar(s)\nNo yield, execution continues;
+
+  elseif (Control Flow\nJumpI / EndI?) then (yes)
+    if (JumpI: op.test(value, compare)?) then (yes)
+      :counter = target address\n(branch taken);
+    else (EndI or branch not taken)
+      :counter = instructions.length\n(force wrap on next runOnce);
+    endif
+
+  elseif (Yield Instruction\nWaitI / StopI?) then (yes)
+    if (WaitI: curTime < value.num()?) then (yes)
+      :counter--\nyield = true\ncurTime += delta / 60;
+    else (WaitI resolved)
+      :curTime = 0\n(resume next tick);
+    endif
+    note right
+      StopI: counter--, yield=true
+      Infinite pause until externally reset
+    end note
+
+  elseif (I/O Instruction\nSenseI / ReadI / WriteI?) then (yes)
+    :SenseI: target.sense(LAccess) → output LVar\nReadI / WriteI: LReadable / LWritable\n(memory cell delegate);
+
+  elseif (Buffer Output\nPrintI / PrintCharI / FormatI / DrawI?) then (yes)
+    :Append to textBuffer (max 400 chars)\nor encode into graphicsBuffer (max 256 entries);
+    if (PrintFlushI?) then (yes)
+      :MessageBuild.message.setLength(0)\nAppend textBuffer → clear textBuffer;
+    elseif (DrawFlushI?) then (yes)
+      :LogicDisplayBuild.flushCommands(graphicsBuffer)\nClear graphicsBuffer;
+    endif
+
+  elseif (Building Control\nControlI?) then (yes)
+    :Validate target is a linked building\nbuilding.control(LAccess, p1..p4)\n[Controllable interface];
+
+  elseif (Unit Bind\nUnitBindI?) then (yes)
+    :Lookup unit by type in exec.team cache\nexec.unit.setconst(unit);
+
+  elseif (Unit Control\nUnitControlI?) then (yes)
+    |LogicAI|
+    if (unit.isValid() AND\nunit.team == exec.team AND\nisLogicControllable()?) then (yes)
+      if (controller already LogicAI?) then (no)
+        :new LogicAI()\nunit.controller(la)\nclear mineTile / building;
+      endif
+      :la.controller = exec.building()\nai.controlTimer = 600 ticks (10 s);
+      if (transfer op AND\n!timeoutDone(unit, 90f)?) then (yes)
+        :Return — transfer rate-limited\n(transferDelay = 1.5 s);
+      else (allowed)
+        :Dispatch LUnitControl command:\nmove / approach / pathfind / stop\ntarget / mine / payDrop / payTake;
+      endif
+    else (no)
+      :Return null — unit not controllable\n(wrong team, invalid, or rules denied);
+    endif
+    |Instruction Dispatch|
+
+  elseif (Variable Sync\nSyncI?) then (yes)
+    |Network Sync|
+    if (!variable.constant AND\ntimeSinceMillis(syncTime) > 50 ms AND\nexec.build != null?) then (yes)
+      :variable.syncTime = Time.millis();
+      :Call.syncVariable(exec.build, variable.id, value)\nServer broadcasts updated value to clients;
+      :Clients: syncVariable(@Remote)\nexecutor.optionalVar(variable)\nUpdate LVar value remotely;
+    else (no)
+      :Skip — rate-limited or no build\n(max 20 syncs / sec per variable);
+    endif
+    |Instruction Dispatch|
+
+  elseif (SetRateI?) then (yes)
+    :ipt = clamp(value, 1, maxInstructionsPerTick)\nDynamic rate adjustment at runtime;
+  endif
+
+  |LExecutor|
+
+endwhile (yield set or ipt exhausted)
+
+|LogicAI|
+note
+  LogicAI updateMovement (called by unit AI system each tick):
+  targetTimer -= delta; if <= 0 → radars.clear(), reset to 40
+  GUARD: controlTimer > 0 AND controller.isValid()
+    YES: controlTimer -= delta; dispatch move/approach/pathfind/stop
+    NO:  unit.resetController() → revert to default AI
+end note
+
+|GameEngine|
+:Tick execution complete;
+stop
+
+@enduml

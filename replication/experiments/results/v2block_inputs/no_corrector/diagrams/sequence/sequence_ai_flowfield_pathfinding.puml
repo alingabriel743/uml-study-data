@@ -1,0 +1,252 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequence {
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #DEE2E6
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    GroupBackgroundColor #FFF3CD
+    GroupBorderColor #FFC107
+    GroupHeaderFontColor #856404
+    NoteBackgroundColor #D1ECF1
+    NoteBorderColor #0C5460
+}
+skinparam ActorBackgroundColor #F8F9FA
+skinparam ActorBorderColor #495057
+
+title AI Flowfield Pathfinding\n(Unit Pathfinding via Flowfields: Request Submission, Cluster Computation, Path Resolution)
+
+box "Main Thread" #E8F5E9
+    actor "Unit (AI)" as Unit
+    participant "ControlPathfinder" as CP
+    participant "Pathfinder" as PF
+end box
+
+box "Background Thread A — Legacy BFS" #FFF8E1
+    participant "Pathfinder\n[Thread]" as PFThread
+    participant "Flowfield /\nEnemyCoreField" as FF
+    participant "PathCost" as PCost
+end box
+
+box "Background Thread B — Hierarchical A*" #E3F2FD
+    participant "ControlPathfinder\n[Thread]" as CPThread
+    participant "PathRequest" as PR
+    participant "PathfindQueue" as PQ
+    participant "Cluster" as Clust
+    participant "FieldCache" as FC
+end box
+
+== Legacy Flowfield Pathfinding (Pathfinder) ==
+
+note over Unit, PF
+  Unit reads a pre-computed shared flowfield to find the next tile
+end note
+
+Unit -> PF : getField(team, costGround, fieldCore)
+activate PF
+PF --> Unit : Flowfield (EnemyCoreField instance)
+deactivate PF
+
+Unit -> FF : getNextTile(currentTile)
+activate FF
+FF --> Unit : nextTile (cheapest neighbor per weights[])
+deactivate FF
+
+|||
+
+== Legacy BFS Update Cycle (~16 ms) ==
+
+loop Every ~16 ms
+    PFThread -> FF : needsRefresh()
+    activate FF
+    FF --> PFThread : true / false (based on refreshRate vs lastUpdateTime)
+    deactivate FF
+
+    alt Field needs refresh
+        PFThread -> PF : updateTargets(flowfield)
+        activate PF
+        PF -> FF : getPositions(IntSeq out)
+        activate FF
+        note right of FF
+          EnemyCoreField fills targets with
+          enemy core tiles + random strategic
+          building positions
+        end note
+        FF --> PF : target tile positions
+        deactivate FF
+        deactivate PF
+
+        PFThread -> PF : preloadPath(flowfield)
+        activate PF
+        note right of PF : Seeds BFS frontier with target tiles
+        PF --> PFThread : frontier seeded
+        deactivate PF
+
+        PFThread -> PF : updateFrontier(flowfield, nsToRun=8ms)
+        activate PF
+        loop BFS expansion (up to 8 ms budget)
+            PF -> PCost : getCost(team, tile)
+            activate PCost
+            PCost --> PF : int cost (-1 = impassable)
+            deactivate PCost
+            note right of PF
+              Updates weights[] for each tile;
+              swaps to completeWeights[] when BFS done
+              (hasComplete = true, volatile)
+            end note
+        end
+        PF --> PFThread : frontier updated
+        deactivate PF
+    end
+end
+
+|||
+
+note over Unit, PF
+  Tile-change events invalidate affected flowfields
+end note
+
+Unit -> PF : updateTile(tile)
+activate PF
+PF -> FF : mark dirty (needsRefresh = true)
+deactivate PF
+
+|||
+
+== Hierarchical A* Pathfinding (ControlPathfinder) ==
+
+note over Unit, CP
+  Unit requests a movement position toward a destination
+end note
+
+Unit -> CP : getPathPosition(unit, destination: Vec2,\n  out: Vec2, noResultFound[])
+activate CP
+
+CP -> CP : unitRequests.get(unit) → PathRequest?
+
+alt No existing PathRequest
+    CP -> PR : new PathRequest(unit, team, costId, destTilePos)
+    activate PR
+    CP -> CP : unitRequests.put(unit, request)
+end
+
+CP -> FC : fields.get(mapKey) → FieldCache?
+activate FC
+
+alt FieldCache missing or invalidated
+    CP -> FC : new FieldCache(cost, costId, team, goalPos)
+end
+
+CP -> CP : getCost(cache, x, y, requeue=true)
+
+alt Cluster not yet computed
+    CP -> FC : addFlowCluster(cx, cy, addingFrontier=true)
+    note right of FC : Queues cluster for BFS field expansion
+end
+
+FC --> CP : float cost from field
+deactivate FC
+
+CP --> Unit : output Vec2 (movement direction)
+deactivate CP
+
+|||
+
+== Path Request Processing (Background Thread) ==
+
+loop ControlPathfinder background run()
+    CPThread -> CPThread : processClusterUpdates()
+
+    opt Cluster invalidated
+        CPThread -> Clust : updateCluster(team, pathCost, cx, cy)
+        activate Clust
+        Clust -> Clust : updateInnerEdges(team, cost, cx, cy)
+        note right of Clust
+          innerAstar per portal pair
+          to recompute intra-cluster edges
+        end note
+        Clust --> CPThread : portals + portalConnections rebuilt
+        deactivate Clust
+        CPThread -> FC : clusterChanged(team, pathCost, cx, cy)
+        activate FC
+        FC -> FC : mark dependent FieldCaches invalidated
+        deactivate FC
+    end
+
+    CPThread -> CPThread : processPathRequests()
+
+    opt PathRequest needs initialization
+        CPThread -> CP : initializePathRequest(request, team,\n  costId, unitX, unitY, goalX, goalY)
+        activate CP
+
+        CP -> CP : findClosestNode(team, pathCost, unitX, unitY)\n  → startNodeIndex
+        CP -> CP : findClosestNode(team, pathCost, goalX, goalY)\n  → endNodeIndex
+
+        CP -> CP : clusterAstar(request, pathCost,\n  startNode, endNode)
+        activate CP #LightBlue
+
+        loop Cluster-graph A* (PathfindQueue)
+            CP -> PQ : add(nodeIndex, heuristic)
+            activate PQ
+            PQ --> CP : —
+            deactivate PQ
+            CP -> PQ : poll() → min-cost node
+            activate PQ
+            PQ --> CP : current node
+            deactivate PQ
+
+            CP -> CP : checkEdges(request, team, pathCost,\n  current, goal, cx, cy, connections)
+
+            opt Cross-cluster boundary
+                CP -> CP : innerAstar(team, cost, minX, minY,\n  maxX, maxY, startPos, goalPos)
+                activate CP #LightGreen
+                loop Tile-level A* within cluster
+                    CP -> PCost : getCost(team, packTile) → int
+                    activate PCost
+                    PCost --> CP : tile cost
+                    deactivate PCost
+                end
+                CP -> PR : append tiles to resultPath (IntSeq)
+                deactivate CP
+            end
+        end
+        deactivate CP
+
+        PR --> CP : resultPath populated
+        deactivate CP
+        deactivate CP
+    end
+
+    CPThread -> CPThread : updateFields(cache, nsToRun)
+    activate CPThread #LightBlue
+    loop BFS from goalPos through clusters
+        CPThread -> FC : compute tile costs for cluster frontier
+        activate FC
+        FC -> FC : write into cache.fields[clusterIndex][]
+        FC --> CPThread : cluster costs updated
+        deactivate FC
+    end
+    deactivate CPThread
+end
+
+|||
+
+note over Unit, CPThread
+  Tile-change events rebuild affected clusters and invalidate cached fields
+end note
+
+Unit -> CP : updateTile(tile)
+activate CP
+CP -> CP : queueClusterUpdate(cx, cy)
+CP -> CP : clustersToUpdate.add(clusterIndex)
+deactivate CP
+
+@enduml

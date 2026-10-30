@@ -1,0 +1,181 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #212529
+    EndColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam note {
+    BackgroundColor #FFF8E1
+    BorderColor #B8860B
+}
+
+title A2A Promote Pipeline\n<size:11>//node scripts/a2a_promote.js --type <capsule|gene|event> --id <id> --validated//</size>
+
+|CLI / Orchestrator|
+start
+
+:Parse CLI arguments\n<size:10>extract: id, typeRaw, --validated flag, limit (default 500)</size>;
+
+if (id and typeRaw present?) then (no)
+    #FFD7D7:Throw usage Error\n"Usage: …";
+    end
+else (yes)
+endif
+
+if (--validated flag set?) then (no)
+    #FFD7D7:Throw Error\n"Refusing to promote\nwithout --validated";
+    end
+else (yes)
+endif
+
+:Normalise type string\n<size:10>capsule → Capsule | gene → Gene | event → EvolutionEvent</size>;
+
+if (type string valid?) then (no)
+    #FFD7D7:Throw Error\n"Unknown type";
+    end
+else (yes)
+endif
+
+|AssetStore|
+
+:readRecentExternalCandidates(limit)\n<size:10>Load external candidate list</size>;
+
+|CLI / Orchestrator|
+
+if (Candidate with matching\ntype + id found?) then (no)
+    #FFD7D7:Throw Error\n"Candidate not found\nin external zone";
+    end
+else (yes)
+endif
+
+|Safety Layer|
+
+if (type === Gene?) then (yes)
+    :Validate each validation command\n<size:10>solidifyMod.isValidationCommandAllowed(cmd)</size>\n<size:10>Allowlist: node / npm / npx, no shell operators</size>;
+    if (All commands allowed?) then (no)
+        #FFD7D7:Throw safety Error\n"validation command rejected\nby safety check";
+        end
+    else (yes)
+    endif
+else (no — Capsule or EvolutionEvent)
+endif
+
+|CLI / Orchestrator|
+
+:Deep-clone candidate → promoted object;
+
+:Enrich promoted object\n<size:10>• promoted.a2a.status = 'promoted'</size>\n<size:10>• promoted.a2a.promoted_at = ISO timestamp</size>\n<size:10>• promoted.schema_version = SCHEMA_VERSION (if missing)</size>;
+
+|Safety Layer|
+
+:Compute deterministic asset ID\n<size:10>contentHash.computeAssetId(promoted)</size>;
+
+|CLI / Orchestrator|
+
+:Read env A2A_EMIT_DECISIONS flag;
+
+if (type === EvolutionEvent?) then (yes)
+
+    |AssetStore|
+    :appendEventJsonl(promoted)\n<size:10>Write event to JSONL store</size>;
+
+    |A2A Protocol|
+    if (A2A_EMIT_DECISIONS?) then (yes)
+        :buildDecision(\n  decision: 'accept',\n  reason: 'event promoted\n  for provenance tracking'\n)\n→ getTransport().send(dm);
+    else (no)
+    endif
+
+    |CLI / Orchestrator|
+    #D4EDDA:stdout: "promoted_event=<id>";
+    end
+
+else (no)
+endif
+
+if (type === Capsule?) then (yes)
+
+    |AssetStore|
+    :appendCapsule(promoted)\n<size:10>Append capsule to capsule store</size>;
+
+    |A2A Protocol|
+    if (A2A_EMIT_DECISIONS?) then (yes)
+        :buildDecision(\n  decision: 'accept',\n  reason: 'capsule promoted\n  after validation'\n)\n→ getTransport().send(dm);
+    else (no)
+    endif
+
+    |CLI / Orchestrator|
+    #D4EDDA:stdout: "promoted_capsule=<id>";
+    end
+
+else (no — type === Gene)
+endif
+
+note right
+  Gene promotion path includes
+  conflict detection against
+  existing local genes
+end note
+
+|AssetStore|
+
+:loadGenes()\n<size:10>Retrieve current local gene store</size>;
+
+|CLI / Orchestrator|
+
+if (Local Gene with\nsame id exists?) then (yes)
+
+    |A2A Protocol|
+    if (A2A_EMIT_DECISIONS?) then (yes)
+        :buildDecision(\n  decision: 'reject',\n  reason: 'local gene with\n  same ID already exists'\n)\n→ getTransport().send(dm);
+    else (no)
+    endif
+
+    |CLI / Orchestrator|
+    #FFE8A1:stdout: "conflict_keep_local_gene=<id>";
+    end
+
+else (no)
+
+    |AssetStore|
+    :upsertGene(promoted)\n<size:10>Insert or update gene in local store</size>;
+
+    |A2A Protocol|
+    if (A2A_EMIT_DECISIONS?) then (yes)
+        :buildDecision(\n  decision: 'accept',\n  reason: 'gene promoted\n  after safety audit'\n)\n→ getTransport().send(dm);
+    else (no)
+    endif
+
+    |CLI / Orchestrator|
+    #D4EDDA:stdout: "promoted_gene=<id>";
+    end
+
+endif
+
+@enduml

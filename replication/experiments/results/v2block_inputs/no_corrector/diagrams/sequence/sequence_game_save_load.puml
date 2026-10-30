@@ -1,0 +1,209 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequenceArrowThickness 1.5
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    LifeLineBorderColor #495057
+    LifeLineBackgroundColor #E9ECEF
+    GroupBorderColor #6C757D
+    ArrowColor #495057
+    DividerBackgroundColor #E9ECEF
+    DividerBorderColor #6C757D
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title Game Save and Load
+
+actor "UI / GameLogic" as caller
+participant "Saves" as saves
+participant "SaveSlot" as slot
+participant "SaveIO" as sio
+participant "SaveVersion\n(Save11)" as sver
+participant "SectorInfo" as sector
+participant "WorldTiles" as tiles
+participant "EntityIO\n(codegen)" as entityio
+participant "GameLogic /\nRenderer" as logic
+participant "Server /\nNetworkIO" as server
+participant "Client /\nNetworkIO" as client
+
+' ─────────────────────────────────────────────
+== Saving Game State ==
+' ─────────────────────────────────────────────
+
+caller -> saves : saveSector(sector)
+activate saves
+
+saves -> slot : save()\n[create slot if null; set autosave=true]
+activate slot
+
+slot -> sio : save(file)\n[back up existing → file-backup.msav]
+activate sio
+
+sio -> sio : open DeflaterOutputStream;\nwrite magic header 'MSAV' + version int
+note right of sio : fires SaveWriteEvent
+
+sio -> sver : ver.write(DataOutputStream, extraTags)
+activate sver
+
+    sver -> sector : SectorInfo.prepare(sector);\nsector.saveInfo()
+    activate sector
+    sector --> sver : SectorInfo serialized
+    deactivate sector
+
+    note over sver
+      Regions written sequentially:
+      meta → content → patches → map → entities → markers → custom
+    end note
+
+    sver -> sver : writeRegion('meta') → writeMeta()\n[rules JSON, map name, wave, tick,\nwavetime, stats, mods, controlGroups]
+
+    sver -> sver : writeRegion('content') → writeContentHeader()\n[content ID mapping table]
+
+    sver -> sver : writeRegion('patches') → writeContentPatches()
+
+    sver -> tiles : writeRegion('map') → writeMap(stream)
+    activate tiles
+    tiles --> sver : world grid (Tiles) serialized
+    deactivate tiles
+
+    sver -> entityio : writeRegion('entities') → writeEntities(stream)\n[iterate entity Groups]
+    activate entityio
+    entityio -> entityio : for each entity:\nentity.write(Writes)\n[generated per-field I/O]
+    entityio --> sver : all entities serialized
+    deactivate entityio
+
+    sver -> sver : writeRegion('markers') → writeMarkers(stream)
+
+    sver -> sver : writeRegion('custom') → writeCustomChunks(stream, false)
+
+sver --> sio : write complete
+deactivate sver
+
+sio -> slot : getMeta(file)\n[re-read compressed metadata]
+activate slot #CCDDEE
+slot --> slot : cache SaveMeta\n{timestamp, build, wave, timePlayed, rules, mods}
+deactivate slot
+
+deactivate sio
+
+slot -> logic : minimap.getPixmap()\nasync savePreview() → PNG
+
+deactivate slot
+deactivate saves
+
+' ─────────────────────────────────────────────
+== Loading Game State ==
+' ─────────────────────────────────────────────
+
+caller -> slot : load(WorldContext context)
+activate slot
+
+slot -> sio : load(file, context)\n[open InflaterInputStream on .msav file]
+activate sio
+
+alt file unreadable / corrupt
+    sio -> sio : retry with file-backup.msav
+end
+
+sio -> logic : logic.reset()\n[clears all world state]
+activate logic
+logic --> sio : world cleared
+deactivate logic
+
+sio -> sio : read magic 'MSAV';\nread version int → resolve SaveVersion
+
+sio -> sver : ver.read(DataInputStream,\nCounterInputStream, context)
+activate sver
+
+    sver -> sector : readRegion('meta') → readMeta()\n[restore rules, map, wave, tick,\nwavetime, stats, SectorInfo]
+    activate sector
+    sector --> sver : SectorInfo restored
+    deactivate sector
+
+    sver -> sver : readRegion('content') → readContentHeader()\n[restore content ID mapping]
+
+    sver -> sver : readRegion('patches') [v11+]\n→ readContentPatches()
+
+    sver -> tiles : readRegion('map') → readMap(stream, context)
+    activate tiles
+    tiles --> sver : world grid (Tiles) restored
+    deactivate tiles
+
+    sver -> entityio : readRegion('entities') → readEntities(stream)\n[per entity Group, per revision]
+    activate entityio
+    entityio -> entityio : entity.read(Reads)\n[field matched by name+type;\nmissing → default, extra → skip]
+    entityio --> sver : entities restored
+    deactivate entityio
+
+    sver -> sver : readRegion('markers') → readMarkers(stream)
+
+    sver -> sver : readRegion('custom') → readCustomChunks(stream)
+
+sver --> sio : read complete
+deactivate sver
+
+note right of sio : fires SaveLoadEvent(context.isMap())
+
+deactivate sio
+
+slot -> slot : current = this;\ntotalPlaytime = meta.timePlayed
+slot -> logic : minimap.savePreview() async
+
+deactivate slot
+
+' ─────────────────────────────────────────────
+== Network World Sync (Server → Client) ==
+' ─────────────────────────────────────────────
+
+server -> server : writeWorld(player, OutputStream)\n[write rules JSON, mapLocales, map tags,\nwave, wavetime, tick, RNG seeds,\nplayer.id + player.write(Writes)]
+
+server -> sver : writeContentHeader(stream)\nwriteContentPatches(stream)
+activate sver
+sver --> server
+deactivate sver
+
+server -> tiles : writeMap(stream)
+activate tiles
+tiles --> server : map written
+deactivate tiles
+
+server -> sver : writeTeamBlocks()\nwriteMarkers()\nwriteCustomChunks()
+activate sver
+sver --> server : network world stream ready
+deactivate sver
+
+client -> client : Time.clear();\nread rules, mapLocales, wave,\nwavetime, tick, RNG seeds
+
+client -> sver : readContentHeader(stream)\nreadContentPatches(stream)
+activate sver
+sver --> client
+deactivate sver
+
+client -> tiles : readMap(world.context)
+activate tiles
+tiles --> client : map restored
+deactivate tiles
+
+client -> sver : readTeamBlocks()\nreadMarkers()\nreadCustomChunks()
+activate sver
+sver --> client
+deactivate sver
+
+client -> client : Groups.clear(); player.reset();\nplayer.read(Reads); player.add();\ncontent.setTemporaryMapper(null)
+
+note over server, client
+  NetworkIO reuses SaveVersion write/read methods for world sync,
+  but skips the meta and entities regions (units not transmitted).
+end note
+
+@enduml

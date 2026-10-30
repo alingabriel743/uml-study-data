@@ -1,0 +1,222 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+title Evolver Proxy - System Startup and Message Synchronization Flow
+
+actor User
+participant "EvoMapProxy" as proxy
+participant "LifecycleManager" as lifecycle
+participant "ProxyHttpServer" as httpServer
+participant "SyncEngine" as syncEngine
+participant "InboundSync" as inbound
+participant "OutboundSync" as outbound
+participant "MailboxStore" as store
+participant "TaskMonitor" as taskMonitor
+participant "WebUiServer" as webui
+
+== System Startup ==
+
+User -> proxy: start()
+activate proxy
+
+proxy -> lifecycle: hello()
+activate lifecycle
+lifecycle -> lifecycle: _buildHeaders()
+lifecycle -> lifecycle: _getEnvFingerprint()
+lifecycle --> proxy: authentication result
+deactivate lifecycle
+
+proxy -> taskMonitor: new TaskMonitor()
+activate taskMonitor
+taskMonitor --> proxy: monitor instance
+deactivate taskMonitor
+
+proxy -> httpServer: new ProxyHttpServer(routes)
+activate httpServer
+httpServer --> proxy: server instance
+deactivate httpServer
+
+proxy -> httpServer: start()
+activate httpServer
+httpServer -> httpServer: _handleRequest()
+httpServer --> proxy: server started
+deactivate httpServer
+
+proxy -> lifecycle: startHeartbeatLoop(intervalMs)
+activate lifecycle
+lifecycle -> lifecycle: tick()
+lifecycle -> lifecycle: heartbeat()
+lifecycle -> lifecycle: countPending()
+deactivate lifecycle
+
+proxy -> syncEngine: start()
+activate syncEngine
+syncEngine -> syncEngine: _scheduleInbound(delayMs)
+syncEngine -> syncEngine: _scheduleOutbound(delayMs)
+syncEngine --> proxy: sync started
+deactivate syncEngine
+
+proxy -> webui: start()
+activate webui
+webui -> webui: _handle(req, res)
+webui --> proxy: WebUI started
+deactivate webui
+
+proxy --> User: proxy started
+deactivate proxy
+
+== Message Synchronization - Inbound ==
+
+syncEngine -> inbound: pull()
+activate syncEngine
+activate inbound
+
+inbound -> inbound: getHeaders()
+inbound -> inbound: getState()
+
+alt successful pull
+    inbound -> store: writeInboundBatch(messages)
+    activate store
+    store -> store: _rebuildIndex()
+    store -> store: _persistState()
+    store --> inbound: messages stored
+    deactivate store
+
+    inbound -> inbound: stringify(result)
+    inbound --> syncEngine: pulled messages
+else authentication error
+    inbound -> inbound: AuthError
+    inbound --> syncEngine: auth error
+    syncEngine -> syncEngine: _handleAuthError(source)
+    syncEngine -> lifecycle: onAuthError()
+end
+
+deactivate inbound
+deactivate syncEngine
+
+== Message Synchronization - Outbound ==
+
+syncEngine -> syncEngine: notifyNewOutbound()
+activate syncEngine
+
+syncEngine -> store: countPending()
+activate store
+store --> syncEngine: pending count
+deactivate store
+
+syncEngine -> outbound: flush()
+activate outbound
+
+outbound -> store: updateStatusBatch(updates)
+activate store
+store --> outbound: status updated
+deactivate store
+
+outbound -> store: writeInboundBatch(inboundMessages)
+activate store
+store --> outbound: messages written
+deactivate store
+
+outbound --> syncEngine: flush complete
+deactivate outbound
+deactivate syncEngine
+
+== HTTP Request - Task Monitoring ==
+
+User -> httpServer: HTTP POST /tasks/claim
+activate httpServer
+
+httpServer -> httpServer: _matchRoute(method, pathname)
+httpServer -> httpServer: parseBody(req, opts)
+
+httpServer -> taskMonitor: recordClaim(taskId)
+activate taskMonitor
+taskMonitor -> taskMonitor: getMetrics()
+taskMonitor -> taskMonitor: stringify(metrics)
+taskMonitor --> httpServer: claim recorded
+deactivate taskMonitor
+
+httpServer --> User: response
+deactivate httpServer
+
+== Task Completion ==
+
+User -> httpServer: HTTP POST /tasks/complete
+activate httpServer
+
+httpServer -> taskMonitor: recordComplete(taskId, startedAt)
+activate taskMonitor
+taskMonitor -> taskMonitor: getMetrics()
+taskMonitor -> taskMonitor: reduce(metrics)
+taskMonitor --> httpServer: completion recorded
+deactivate taskMonitor
+
+httpServer --> User: response
+deactivate httpServer
+
+== Mailbox Operations ==
+
+User -> httpServer: HTTP GET /mailbox/list
+activate httpServer
+
+httpServer -> store: list(params)
+activate store
+store -> store: slice(messages)
+store --> httpServer: message list
+deactivate store
+
+httpServer --> User: message list response
+deactivate httpServer
+
+== System Lifecycle - Heartbeat ==
+
+loop every intervalMs
+    lifecycle -> lifecycle: heartbeat()
+    activate lifecycle
+    lifecycle -> lifecycle: hello()
+    lifecycle -> lifecycle: _buildHeaders()
+    lifecycle -> lifecycle: countPending()
+    lifecycle -> lifecycle: stringify(events)
+    deactivate lifecycle
+end
+
+== System Shutdown ==
+
+User -> proxy: stop()
+activate proxy
+
+proxy -> lifecycle: stopHeartbeatLoop()
+activate lifecycle
+lifecycle --> proxy: heartbeat stopped
+deactivate lifecycle
+
+proxy -> httpServer: stop()
+activate httpServer
+httpServer -> httpServer: close()
+httpServer --> proxy: server stopped
+deactivate httpServer
+
+proxy -> webui: stop()
+activate webui
+webui -> webui: close()
+webui --> proxy: WebUI stopped
+deactivate webui
+
+proxy --> User: proxy stopped
+deactivate proxy
+
+@enduml

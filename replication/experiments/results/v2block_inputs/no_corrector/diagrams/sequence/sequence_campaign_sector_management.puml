@@ -1,0 +1,213 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #DEE2E6
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    DividerBackgroundColor #E9ECEF
+    GroupBackgroundColor #F1F3F5
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #C8A400
+}
+
+title Campaign and Sector Management
+
+actor "Game Engine" as Engine
+
+box "Core Game Loop" #E9ECEF
+    participant "GameLoop" as GameLoop
+    participant "Universe" as Universe
+end box
+
+box "World Model" #EDF4FB
+    participant "Planet" as Planet
+    participant "Sector" as Sector
+    participant "SectorInfo" as SectorInfo
+end box
+
+box "Campaign System" #F0FBF0
+    participant "CampaignRules" as CampaignRules
+    participant "CampaignStats" as CampaignStats
+    participant "CoreBuild" as CoreBuild
+    participant "Events" as Events
+end box
+
+== Per-Frame Update ==
+
+Engine -> GameLoop: frame tick
+activate GameLoop
+
+GameLoop -> Universe: update()
+activate Universe
+
+Universe -> Universe: secondCounter += Time.delta\nturnCounter += Time.delta
+
+alt secondCounter >= 1 (every ~10s)
+    Universe -> Universe: save()
+    note right: persist seconds + turn\nto Core.settings
+end
+
+alt turnCounter >= turnDuration
+    Universe -> Universe: runTurn()
+    activate Universe #DDEEFF
+end
+
+== Turn Processing ==
+
+Universe -> Universe: turn++
+
+loop for each planet
+    Universe -> Planet: iterate content.planets()
+    activate Planet
+
+    loop for each sector in planet
+        Universe -> Sector: check legacyLaunchPads
+        activate Sector
+
+        alt legacyLaunchPads enabled
+            Universe -> Sector: clear lastImported
+            note right: pass 1 — reset import state
+            Universe -> Sector: compute export items\n(stat.mean * newSecondsPassed)
+            Universe -> Sector: addItems(items) to destination sector
+            note right: pass 2 — transfer resources\nto neighboring sectors
+        end
+
+        deactivate Sector
+
+        Universe -> SectorInfo: refreshImportRates(planet)\n[if importRateCache != null]
+        activate SectorInfo
+
+        == SectorInfo Turn Update ==
+
+        alt isAttacked()
+            SectorInfo -> SectorInfo: minutesCaptured = 0
+            note right: reset capture progress\nwhile under attack
+        else not attacked
+            SectorInfo -> SectorInfo: minutesCaptured += turnDuration / 3600
+        end
+
+        alt !isAttacked() && !isBeingPlayed()
+            SectorInfo -> SectorInfo: add production to items\n(capped at storageCapacity)
+            note right: passive resource accumulation\nwhile player is away
+        end
+
+        == Invasion Check ==
+
+        alt sectorInvasion && minutesCaptured > invasionGracePeriod && hasSpawns
+            SectorInfo -> SectorInfo: compute nearby enemy base count
+            SectorInfo -> SectorInfo: chance-based invasion roll\n(scales with enemy count)
+
+            alt invasion triggers during active play
+                SectorInfo -> SectorInfo: modify state.rules\n(winWave, waves, attackMode)
+                Universe -> CampaignRules: apply(planet, state.rules)
+                activate CampaignRules
+                CampaignRules -> CampaignRules: set fog, showSpawns,\nrandomWaveAI, pauseDisabled,\nobjectiveTimerMultiplier
+                CampaignRules -> CampaignRules: set waveTeam rtsAi,\nblockHealthMultiplier,\nunitHealthMultiplier\nbased on Difficulty
+                note right #FFEAEA: Difficulty presets:\n• casual: 0.5x health, 2x time\n• easy: lighter penalties\n• normal: baseline\n• hard: 1.25x/1.5x/0.8x\n• eradication: 1.5x/2x/0.6x
+                CampaignRules --> Universe: rules applied
+                deactivate CampaignRules
+            end
+        end
+
+        deactivate SectorInfo
+
+        Universe -> SectorInfo: updateStats(export)\nupdateStats(imports)\n[every refreshPeriod frames]
+        activate SectorInfo
+        SectorInfo -> SectorInfo: updateDelta(item, production, coreDeltas)
+        SectorInfo -> SectorInfo: cap production.mean <= rawProduction.mean\ncap export, cap imports
+        deactivate SectorInfo
+
+    end
+
+    deactivate Planet
+end
+
+Universe -> Events: fire(TurnEvent)
+activate Events
+Events --> Universe: dispatched
+deactivate Events
+
+Universe -> Universe: save()
+
+deactivate Universe #DDEEFF
+
+== Sector Capture ==
+
+note over Sector, Events: Triggered when player conquers a sector
+
+Sector -> Events: fire(SectorCaptureEvent)
+activate Events
+Events -> Planet: updateBaseCoverage()\n[if !net.client() && isCampaign()]
+activate Planet
+Planet -> Planet: recalculate base coverage\nacross sectors
+Planet --> Events: coverage updated
+deactivate Planet
+Events -> CampaignStats: sectorsCaptured++
+activate CampaignStats
+CampaignStats --> Events: stat recorded
+deactivate CampaignStats
+deactivate Events
+
+== Player Leaves Sector (Snapshot) ==
+
+note over SectorInfo, CoreBuild: Called on PlayerLeaveSector event
+
+SectorInfo -> CoreBuild: read items from entity.items module
+activate CoreBuild
+CoreBuild --> SectorInfo: current item storage
+deactivate CoreBuild
+
+SectorInfo -> SectorInfo: snapshot wave, winWave, waves,\nattack, hasCore, bestCoreType,\nstorageCapacity, hasSpawns,\nlightCoverage
+note right: freeze live game state\ninto SectorInfo fields
+
+SectorInfo -> Sector: saveInfo()
+activate Sector
+Sector --> SectorInfo: info persisted
+deactivate Sector
+
+SectorInfo -> Planet: generator.beforeSaveWrite(sector)\n[if generator != null]
+activate Planet
+Planet --> SectorInfo: pre-save hook done
+deactivate Planet
+
+== Player Enters Sector (Restore) ==
+
+note over SectorInfo, CoreBuild: Called on PlayerEnterSector event
+
+SectorInfo -> SectorInfo: write()
+activate SectorInfo #DDFFF0
+
+SectorInfo -> SectorInfo: set state.rules:\nwaves, waveSpacing,\nwinWave, attackMode
+
+SectorInfo -> CoreBuild: clear items
+activate CoreBuild
+SectorInfo -> CoreBuild: add snapshot items\n(clamped to storageCapacity)
+note right: restore resource state\nfrom last visit
+CoreBuild --> SectorInfo: items restored
+deactivate CoreBuild
+
+deactivate SectorInfo
+
+deactivate Universe
+deactivate GameLoop
+
+@enduml

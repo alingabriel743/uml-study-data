@@ -1,0 +1,193 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title Defense Block Behaviors
+
+|AutoDoor|
+start
+:Block placed / activated;
+repeat
+  :Wait checkInterval (20 ticks);
+  if (net.client()?) then (yes)
+    :Skip — server only logic;
+  else (no)
+    :Query team units within\n(size×tilesize + triggerMargin×2) rect;
+    :Filter: groundCheck = isGrounded()\n&& !unit.type.allowLegStep;
+    if (Team ground units present?) then (yes)
+      :shouldOpen = **true**;
+    else (no)
+      :shouldOpen = **false**;
+    endif
+    if (open != shouldOpen\n(state changed)?) then (yes)
+      :RPC Call.autoDoorToggle\n(tile, shouldOpen);
+      :setOpen(open):\nUpdate open flag;
+      :pathfinder.updateTile(tile);
+      :Play door effect + sound;
+      note right
+        checkSolid() = !open
+        (closed = solid wall)
+      end note
+    endif
+    :draw(): render openRegion\nor closed region;
+  endif
+repeat while (block active) is (active)
+-> destroyed;
+
+|BaseShield|
+:updateTile tick;
+:Lerp smoothRadius →\nradius × efficiency (speed 0.05);
+if (smoothRadius > 1\n(shield active)?) then (yes)
+  :Set paramBuild = this\n(static context for consumers);
+  fork
+    :Groups.bullet.intersect\n(bounding box around shield);
+    repeat
+      if (bullet.team != shield.team\n&& bullet.type.absorbable\n&& bullet.within(shield, radius)?) then (yes)
+        :bullet.absorb()\n(remove bullet, absorb energy);
+      else (no)
+        :Ignore bullet;
+      endif
+    repeat while (more bullets in box)
+  fork again
+    :Units.nearbyEnemies\n(team, x, y, radius + 10);
+    repeat
+      :Compute overlapDst =\n(unit.hitSize/2 + radius) − dst(unit);
+      if (overlapDst > hitSize × 1.5?) then (yes)
+        :<color:red>unit.kill()</color>\n(stuck deeply inside shield);
+      elseif (overlapDst > 0?) then (yes)
+        :unit.vel.setZero();
+        :unit.move(repelVector);
+        :Chance: spark effect;
+      else (no)
+        :No collision;
+      endif
+    repeat while (more nearby enemies)
+  end fork
+  if (not broken?) then (yes)
+    :drawShield(): draw polygon\nat shields layer, team color\nblended by hit intensity;
+  else (no)
+    :Shield broken — no draw;
+  endif
+else (no)
+  :Shield radius too small — inactive;
+endif
+
+|Turret AI Loop|
+:updateTile tick;
+:validateTarget(): clear target if\nUnits.invalidateTarget reports invalid;
+:Update BlockUnit proxy\n(tile, rotation, team);
+:Update shootWarmup\n(lerp → 1 if shooting/charging, else → 0);
+:Decay curRecoil and heat toward 0;
+if (activationTimer > 0\n(placement cooldown)?) then (yes)
+  :Decrement activationTimer;
+  :Return early — AI disabled;
+  detach
+else (no)
+endif
+if (heatRequirement > 0?) then (yes)
+  :calculateHeat(sideHeat[4])\n→ heatReq efficiency multiplier;
+endif
+if (logicControlTime > 0?) then (yes)
+  :Decrement logicControlTime;
+  note right: Expires after 120 ticks\n→ reverts to AI
+endif
+if (hasAmmo()?) then (no)
+  :Idle — no ammo available;
+  detach
+else (yes)
+endif
+:timerTarget fires → findTarget();
+if (trackingRange > range?) then (yes)
+  :findEnemy(trackingRange)\n(lock-on before fire range);
+else (no)
+  :findEnemy(range());
+endif
+if (no enemy found\n&& canHeal?) then (yes)
+  :Units.findAllyTile(..., damaged)\n→ target = ally building;
+endif
+if (validateTarget()?) then (yes)
+  if (Player controlled\n(unit.isPlayer())?) then (yes)
+    :targetPos = unit.aimX / aimY;
+    :canShoot = unit.isShooting();
+  elseif (Logic controlled\n(logicControlTime > 0)?) then (yes)
+    :targetPos from logic\nLAccess.shoot p1/p2 coords;
+    :canShoot = logicShooting;
+  else (no)
+    :AI: targetPosition(target)\nwith bullet intercept prediction;
+    :canShoot = within(target, range);
+  endif
+  :Compute targetRot = angleTo(targetPos);
+  if (shouldTurn()?) then (yes)
+    :turnToTarget(targetRot)\nvia rotateSpeed × delta × efficiency;
+  endif
+  if (angleDist(rotation, targetRot)\n< shootCone && canShoot?) then (yes)
+    |Turret Firing|
+    :updateShooting();
+  endif
+else (no)
+  :No valid target — idle;
+endif
+if (alwaysShooting?) then (yes)
+  |Turret Firing|
+  :updateShooting()\n(bypasses target check);
+endif
+
+|Turret Firing|
+if (reloadCounter >= reload\n&& !charging()\n&& shootWarmup >= minWarmup?) then (yes)
+  :shoot(peekAmmo());
+  :Compute bulletX/bulletY:\nrotation offset + shootX/shootY;
+  if (firstShotDelay > 0?) then (yes)
+    :Play chargeSound;
+    :Emit type.chargeEffect;
+    :Charging phase — delay shots;
+  endif
+  :pattern.shoot(barrelCounter, callback)\n→ iterate shot offsets/angles/delays;
+  if (shot delay > 0?) then (yes)
+    :queuedBullets++;
+    :Time.run(delay, () → bullet(...));
+  else (no)
+    :bullet(type, xOffset, yOffset,\nangle, mover) — fire immediately;
+  endif
+  if (consumeAmmoOnce?) then (yes)
+    :useAmmo() once per pattern;
+  else (no)
+    :useAmmo() per bullet fired;
+  endif
+  :reloadCounter %= reload;
+  :Emit shootEffect + sound;
+  :Apply screen shake;
+  :Emit ammoUseEffect;
+else (no)
+  :Increment reloadCounter;
+  :Continue reloading;
+endif
+
+stop
+@enduml

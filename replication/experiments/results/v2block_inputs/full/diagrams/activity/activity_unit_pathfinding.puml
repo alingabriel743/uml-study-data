@@ -1,0 +1,198 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activityBackgroundColor #F8F9FA
+skinparam activityBorderColor #495057
+skinparam activityArrowColor #495057
+skinparam activityFontColor #212529
+skinparam activityDiamondBackgroundColor #E9ECEF
+skinparam activityDiamondBorderColor #6C757D
+
+title Unit Pathfinding and Navigation\n(HPA* Flow Field System — Mindustry)
+
+|#DBEAFE| Main Thread |
+
+start
+:Unit calls **getPathPosition**(unit, destination, out);
+:Compute costId = unit.type.pathCostId\nGet tileX/tileY from unit world position;
+
+if (Raycast: direct line-of-sight clear?) then (yes)
+  :out.set(destination);
+  :Return **true** — direct move, no pathfinding needed;
+  stop
+else (blocked)
+endif
+
+:Lookup PathRequest in unitRequests map\n(keyed by unit handle);
+
+if (PathRequest exists AND\ndestination matches?) then (yes)
+  :Lookup FieldCache via\nFieldIndex(destPos, costId, team);
+  if (FieldCache found?) then (yes)
+    :Traverse flowfield — up to **30 steps**\nFollow d4 neighbor with lowest cost weight;
+    :Raycast each candidate tile\n(avoid wall clipping);
+    :request.lastTargetTile = best tile found;
+    :out.set(lastTargetTile.worldX, worldY);
+    :Return **true** — path position ready;
+    stop
+  else (null)
+    if (request.oldCache available?) then (yes)
+      :Use oldCache as fallback snapshot;
+      :Return **true** — fallback path;
+      stop
+    else (none)
+      :Return **false** — cache missing, requeue;
+      stop
+    endif
+  endif
+else (no matching request)
+  :Create new **PathRequest**\n(unit, team, costId, destPos);
+  :threadPathRequests.add(request);
+  :queue.post: recalculatePath(request);
+  :Return **false** — path queued, not yet ready;
+  stop
+endif
+
+|#FEF9C3| ControlPathfinder Thread |
+
+start
+:**recalculatePath**(request) dequeued from main thread;
+:initializePathRequest\n(team, costId, unitPos, goalPos)\nClear costs map, cameFrom map, frontier;
+
+fork
+  :**findClosestNode** for unit start tile\nGet/create Cluster at (cx = tileX/clusterSize, cy)\nRun **innerAstar** within cluster bounds to\neach portal in all 4 directions\nReturn NodeIndex with minimum cost;
+fork again
+  :**findClosestNode** for destination tile\nGet/create Cluster at (cx = goalX/clusterSize, cy)\nRun **innerAstar** within cluster bounds to\neach portal in all 4 directions\nReturn NodeIndex with minimum cost;
+end fork
+
+if (destNode == MAX_VALUE\n(destination unreachable)?) then (yes)
+  :request.notFound = true;
+  stop
+else (both nodes found)
+endif
+
+if (startNode == destNode (same cluster)?) then (yes)
+  :nodePath = single-element IntSeq;
+else (different clusters)
+  :Start **clusterAstar** over HPA* portal graph\nInit PathfindQueue frontier\nfrontier.add(startNode, priority = 0);
+  while (frontier not empty AND\ndestNode not yet reached?) is (yes)
+    :current = frontier.poll()\n(NodeIndex with min f-cost);
+    if (current == destNode?) then (yes)
+      :Backtrack cameFrom map\nReconstruct nodePath as IntSeq;
+    else (no)
+      :Decode cluster + dir + portal\nfrom NodeIndex 32-bit pack\n(22-bit cluster | 2-bit dir | 8-bit portal);
+      :Get/create Cluster for decoded position;
+      :Check portalConnections[dir][portal]\n(LongSeq of IntraEdge packed longs);
+      :newCost = costs[current] + IntraEdge.cost;
+      if (newCost < known cost for next node?) then (yes)
+        :Update costs[next], cameFrom[next];
+        :frontier.add(next,\nf = newCost + clusterNodeHeuristic);
+      endif
+      :Also check edges from adjacent cluster\n(reverse portal side);
+    endif
+  endwhile (frontier empty or path found)
+
+  if (path not found in cluster graph?) then (yes)
+    :request.notFound = true\nrequest.oldCache = null;
+    stop
+  endif
+endif
+
+:Lookup or create **FieldCache**\nfor (goalPos, costId, team) key;
+if (New FieldCache created?) then (yes)
+  :Seed BFS: cache.frontier.addFirst(goalPos)\naddingFrontier = false;
+endif
+
+repeat
+  :**addFlowCluster**(cache, clusterIndex)\nAllocate int[clusterSize x clusterSize]\nweight array for cluster;
+  :Also add adjacent cluster in node direction;
+repeat while (more NodeIndex entries in nodePath?) is (yes)
+:addFlowCluster for unit's current cluster\n(ensures coverage around the unit);
+
+:**updateFields**(cache, maxBudget = 12ms)\nBFS / Dijkstra flood-fill from goal outward;
+
+while (frontier not empty AND\ntime budget remaining?) is (yes)
+  :tile = frontier.removeLast();
+  if (tile passable (cost != impassable)?) then (yes)
+    :For each d4 neighbor:;
+    :otherCost = PathCost lambda(team, cost, tile, neighbor);
+    if (weights[neighbor] > weights[tile] + otherCost?) then (yes)
+      :frontier.addFirst(neighbor);
+      :weights[neighbor] = weights[tile] + otherCost;
+      :searches[neighbor] = current search ID;
+    endif
+  endif
+  :Every 200 iterations:\nCheck elapsed time vs 12ms budget;
+endwhile (frontier empty or time exceeded)
+
+if (frontier completely empty?) then (yes)
+  :arraycopy weights[] -> completeWeights[];
+  :hasComplete = **true**\nFieldCache ready for main thread reads;
+else (time budget exceeded)
+  :Partial update complete\nResume on next 33ms thread cycle;
+endif
+:Thread.sleep(33ms);
+stop
+
+|#DCFCE7| Pathfinder Thread — Enemy AI BFS |
+
+start
+:**Pathfinder.run**() — background loop\nMIN_PRIORITY, 16ms sleep interval;
+
+while (not interrupted?) is (yes)
+  if (game state is playing?) then (yes)
+    :queue.run()\nProcess deferred main-thread tasks;
+    :Iterate each Flowfield in threadList;
+    if (field.dirty AND frontier.size == 0?) then (yes)
+      :**updateTargets**(field)\nRebuild target tile positions\nfrom world state;
+      :field.dirty = false;
+    endif
+    :**updateFrontier**(field, maxUpdate = 8ms)\nBFS flood-fill from target tiles\nPropagate tile movement cost weights;
+    note right
+      Flood-fill: BFS/Dijkstra from targets
+      weights[neighbor] = weights[tile] + tileCost
+      Stops when frontier empty or 8ms elapsed
+      On completion: weights[] -> completeWeights[]
+      hasComplete = true
+    end note
+  endif
+  :Thread.sleep(16ms);
+endwhile (interrupted)
+stop
+
+|#FFE4E6| Main Thread — Tile Change Events |
+
+start
+:TileChangeEvent fires (tile placed/destroyed);
+
+fork
+  :**Pathfinder.updateTile**(tile)\npackTile() for tile + all linked tiles\nneedsRefresh = true;
+fork again
+  :**ControlPathfinder.updateTile**(tile)\nupdateSingleTile(t);
+  if (Tile is on cluster boundary edge?) then (yes)
+    :queue.post:\nclustersToUpdate.add(affected cluster)\nclustersToUpdate.add(neighbor clusters)\nRebuilds portal edge ranges;
+  else (interior tile)
+    :queue.post:\nclustersToInnerUpdate.add(cluster)\nRecomputes intra-cluster A* edges;
+  endif
+end fork
+
+:afterGameUpdate event triggers:;
+:If needsRefresh: updateTargetPositions()\nQueue dirty = true on all threadList Flowfields;
+
+note right
+  ControlPathfinder thread picks up cluster changes:
+  clustersToUpdate -> updateCluster() + clusterChanged()
+  clustersToInnerUpdate -> updateInnerEdges() + clusterChanged()
+
+  Periodically (every 1000ms): process invalidRequests
+  If FieldCache frontier is empty -> remove field,
+  recalculatePath() for all dependent PathRequests
+
+  WorldLoadEvent: full reset — stop thread, packTile()
+  all world tiles, preload EnemyCoreField, restart thread
+end note
+stop
+
+@enduml

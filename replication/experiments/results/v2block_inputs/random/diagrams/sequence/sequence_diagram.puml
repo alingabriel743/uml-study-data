@@ -1,0 +1,218 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #F8F9FA
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #495057
+    DividerFontColor #212529
+    GroupBorderColor #495057
+    GroupFontColor #212529
+    GroupBackgroundColor #E9ECEF
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+    NoteFontColor #212529
+}
+
+title Mindustry – Steam Workshop, Network Serialization & Game World Interactions
+
+actor "Player / UI" as user
+
+box "Steam Workshop  (mindustry.desktop.steam)" #DDEEFF
+    participant "SWorkshop\n<<SteamUGCCallback>>" as workshop
+    participant "SteamUGC" as ugc
+    database "detailHandlers\nMap<Query → Handler>" as detailHandlers
+    database "updatedHandlers\nMap<FileID → Runnable>" as updatedHandlers
+end box
+
+box "Network Layer  (mindustry.net)" #EDE7F6
+    participant "ArcNetProvider" as netProvider
+    participant "PacketSerializer\n<<NetSerializer>>" as serializer
+end box
+
+box "Game World  (mindustry.world)" #E8F5E9
+    participant "StackConveyorBuild\nextends Building" as conveyor
+    participant "Building" as building
+    participant "LiquidModule\nextends BlockModule" as liquid
+end box
+
+' ─────────────────────────────────────────────────────────
+== Workshop: Publish New Content ==
+' ─────────────────────────────────────────────────────────
+
+user -> workshop : publish(p: Publishable)
+activate workshop
+
+workshop -> workshop : showPublish(published: Cons<SteamPublishedFileID>)
+note right: Opens dialog; on confirm\ncalls back with new file ID
+
+workshop -> ugc : createItem(appId, FileType.Community)
+activate ugc
+note right of ugc : Async Steam API call
+
+ugc --> workshop : onCreateItem(publishedFileID, needsToAcceptWLA=false, OK)
+deactivate ugc
+
+alt result == OK
+    workshop -> workshop : update(p, publishedFileID, changelog, updateDescription=true)
+    activate workshop
+
+    workshop -> ugc : beginItemUpdate(appId, publishedFileID)
+    activate ugc
+    ugc --> workshop : updateHandle: SteamUGCUpdateHandle
+    deactivate ugc
+
+    workshop -> workshop : updateItem(publishedFileID, tagger, updated: Runnable)
+    activate workshop
+
+    workshop -> ugc : submitItemUpdate(updateHandle, changelog)
+    activate ugc
+
+    ugc --> workshop : onSubmitItemUpdate(publishedFileID, needsToAcceptWLA=false, OK)
+    deactivate ugc
+
+    workshop -> updatedHandlers : get(publishedFileID).run()
+    activate updatedHandlers
+    updatedHandlers --> workshop : post-update callback executed
+    deactivate updatedHandlers
+
+    deactivate workshop
+    deactivate workshop
+else result == ERROR
+    workshop --> user : show error dialog
+end
+
+deactivate workshop
+
+' ─────────────────────────────────────────────────────────
+== Workshop: Query UGC Content ==
+' ─────────────────────────────────────────────────────────
+
+user -> workshop : query(query: SteamUGCQuery,\nhandler: Cons2<Seq<Details>, SteamResult>)
+activate workshop
+
+workshop -> detailHandlers : put(query, handler)
+workshop -> ugc : sendQueryUGCRequest(query)
+activate ugc
+note right of ugc : Steam backend processes\nUGC search request
+
+ugc --> workshop : onUGCQueryCompleted(query, numResults,\ntotalMatchingResults, isCachedData, result)
+deactivate ugc
+
+loop for i in 0..numResults
+    workshop -> ugc : getQueryUGCResult(query, i)
+    ugc --> workshop : SteamUGCDetails
+end
+
+workshop -> detailHandlers : get(query) → handler
+activate detailHandlers
+detailHandlers --> workshop : handler
+deactivate detailHandlers
+
+workshop -> workshop : handler.get(details, result)
+workshop -> ugc : releaseQueryUGCRequest(query)
+
+deactivate workshop
+
+' ─────────────────────────────────────────────────────────
+== Network: Packet Serialization ==
+' ─────────────────────────────────────────────────────────
+
+netProvider -> serializer : write(byteBuffer: ByteBuffer, packet: Object)
+activate serializer
+
+serializer -> serializer : writes = writes.get()\n[ThreadLocal<Writes>]
+serializer -> serializer : compress packet bytes\ninto decompressBuffer
+serializer -> serializer : record upload stats\n(uploadAccum, lastUpload)
+serializer --> netProvider : byteBuffer filled with framed data
+deactivate serializer
+
+netProvider -> serializer : read(byteBuffer: ByteBuffer)
+activate serializer
+
+serializer -> serializer : reads = reads.get()\n[ThreadLocal<Reads>]
+serializer -> serializer : decompress into decompressBuffer
+serializer -> serializer : record download stats\n(downloadAccum, lastDownload)
+serializer --> netProvider : deserialized Packet
+deactivate serializer
+
+' ─────────────────────────────────────────────────────────
+== Game World: Conveyor Item Routing & Liquid Flow ==
+' ─────────────────────────────────────────────────────────
+
+building -> conveyor : acceptItem(source: Building, item: Item)
+activate conveyor
+
+alt state == LOADED and cooldown <= 0
+    conveyor -> conveyor : handleItem(source, item)
+    activate conveyor
+    note right : Updates state, sets\nlastItem, resets cooldown
+    deactivate conveyor
+
+    conveyor -> conveyor : onProximityUpdate()\n[recalculate link & blendprox]
+
+    conveyor -> liquid : updateFlow()
+    activate liquid
+    liquid -> liquid : check flowTimer interval
+    liquid -> liquid : update WindowedMean[] flow\nfor tracked liquids
+    liquid --> conveyor : flow rates updated
+    deactivate liquid
+
+    conveyor -> conveyor : updateTile()
+    conveyor --> building : true (item accepted)
+else state == MOVING or cooldown > 0
+    conveyor --> building : false (not ready)
+else item type mismatch
+    conveyor --> building : false (rejected)
+end
+
+deactivate conveyor
+
+' ─────────────────────────────────────────────────────────
+== Workshop: Subscribe / Unsubscribe Item ==
+' ─────────────────────────────────────────────────────────
+
+user -> workshop : (subscribe via Steam overlay)
+activate workshop
+
+ugc -> workshop : onSubscribeItem(publishedFileID, result: OK)
+activate workshop
+
+workshop -> workshop : notify itemHandlers callbacks
+activate workshop
+workshop -> workshop : handler.get(publishedFileID)
+deactivate workshop
+
+deactivate workshop
+deactivate workshop
+
+opt user unsubscribes
+    ugc -> workshop : onUnsubscribeItem(publishedFileID, result: OK)
+    activate workshop
+    workshop -> workshop : remove from local workshop cache\n(workshopFiles map)
+    deactivate workshop
+end
+
+@enduml

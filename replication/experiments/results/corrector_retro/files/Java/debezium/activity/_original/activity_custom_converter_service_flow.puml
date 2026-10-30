@@ -1,0 +1,157 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #198754
+    EndColor #DC3545
+    BarColor #0D6EFD
+}
+
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontSize 13
+    TitleFontStyle bold
+}
+
+title Custom Converter Service Flow
+
+|**BaseSourceTask**\n(Connector Startup)|
+start
+:Connector startup begins;
+:Call registerServiceProviders(serviceRegistry);
+:serviceRegistry.registerServiceProvider(\n  new CustomConverterServiceProvider());
+note right
+  Registered alongside
+  PostProcessorRegistry,
+  Snapshotter, etc.
+end note
+
+|**ServiceRegistry**\n(DefaultServiceRegistry)|
+:ServiceProvider stored in registry\n(service creation is **lazy**);
+
+|**Application / Schema Builder**|
+:Consumer requests\nserviceRegistry.getService(\n  CustomConverterRegistry.class);
+
+|**ServiceRegistry**\n(DefaultServiceRegistry)|
+:Locate CustomConverterServiceProvider\nfor requested service class;
+:Invoke CustomConverterServiceProvider\n.createService(configuration, serviceRegistry);
+
+|**CustomConverterServiceProvider**|
+:Read config key CUSTOM_CONVERTERS\n→ Strings.listOf(\n     configuration.getString("converters"))\n→ List<String> converterNames;
+
+if (converterNames list is empty?) then (yes)
+    :customConverters = empty list;
+else (no)
+    fork
+        :createConverter(configuration, name₁);
+        :configuration.getInstance(\n  name₁ + ".type",\n  CustomConverter.class)\n→ Instantiate via reflection;
+        :converter₁.configure(\n  configuration.subset(name₁, true)\n  .asProperties())\n→ Pass name-prefixed props;
+        :return configured CustomConverter₁;
+    fork again
+        :createConverter(configuration, nameₙ);
+        :configuration.getInstance(\n  nameₙ + ".type",\n  CustomConverter.class)\n→ Instantiate via reflection;
+        :converterₙ.configure(\n  configuration.subset(nameₙ, true)\n  .asProperties())\n→ Pass name-prefixed props;
+        :return configured CustomConverterₙ;
+    end fork
+    :Collect all into\ncustomConverters list;
+endif
+
+:converterFactories =\n  ServiceLoader.load(CustomConverterFactory.class)\n→ Load SPI factories from classpath;
+
+if (CustomConverterFactory found on classpath?) then (yes)
+    :converterFactories.findFirst()\n  .map(CustomConverterFactory::get)\n→ Call factory.get() on **first** factory only\n  (@Incubating API);
+    :Produce additional CustomConverter\nfrom SPI factory;
+    :additionalConverters = [factoryConverter];
+else (no)
+    :additionalConverters = empty list;
+endif
+
+:customConverters.addAll(additionalConverters)\n→ Merge config-based +\n  SPI-factory-based converters;
+:return new CustomConverterRegistry(\n  Collections.unmodifiableList(customConverters));
+note right
+  Registry holds immutable
+  list of all converters.
+  @ThreadSafe
+end note
+
+|**ServiceRegistry**\n(DefaultServiceRegistry)|
+:Store CustomConverterRegistry\nas available service;
+
+|**Application / Schema Builder**|
+:CustomConverterRegistry\nservice is available\n→ **Initialization complete**;
+
+' ─── Runtime: Column Type Resolution ─────────────────────────────────
+
+|||
+note across
+  **─── Runtime Phase: Column Type Resolution & Value Conversion ───**
+end note
+|||
+
+:Schema building triggers column resolution\nfor table + column;
+
+|**CustomConverterRegistry**\n(@ThreadSafe)|
+:Call registerConverterFor(\n  tableId, column, defaultValue)\n[synchronized method];
+
+:Build anonymous RelationalColumn\nfrom Column + TableId metadata;
+
+repeat
+    :customConverter.converterFor(\n  relationalColumn, registrationCallback)\n→ Ask converter if it handles this column;
+
+    if (Converter matches this column?) then (yes)
+        :ConverterRegistration.register(\n  fieldSchema, converterFn)\n→ Store definition in AtomicReference;
+        :Put ConverterDefinition in\nconversionFunctionMap\n[fullColumnName → definition];
+        :return Optional<SchemaBuilder>\nwith matched schema;
+        stop
+    else (no)
+        :Try next converter;
+    endif
+repeat while (More converters to try?) is (yes)
+
+:No converter matched this column\n→ conversionFunctionMap.remove(fullColumnName)\n  (handles schema alter / stale entries);
+:return Optional.empty()\n→ Use default type mapping;
+
+' ─── Runtime: Value Conversion ───────────────────────────────────────
+
+|||
+note across
+  **─── Runtime Phase: Value Conversion at Record Production Time ───**
+end note
+|||
+
+:Record production requests\nvalue converter for column;
+
+|**CustomConverterRegistry**\n(@ThreadSafe)|
+:Call getValueConverter(tableId, column)\n→ Build fullColumnName key;
+
+if (conversionFunctionMap\ncontains fullColumnName?) then (yes)
+    :Retrieve ConverterDefinition;
+    :return Optional<ValueConverter>\nwrapping converterDef.converter.convert(x);
+else (no)
+    :return Optional.empty()\n→ Default value handling applies;
+endif
+
+stop
+
+@enduml

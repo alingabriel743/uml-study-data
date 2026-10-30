@@ -1,0 +1,267 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #495057
+    EndColor #495057
+    BarColor #6C757D
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontSize 13
+    TitleFontStyle bold
+}
+
+title Combat and Damage System
+
+|Turret / Unit (Shooter)|
+start
+:Weapon fire triggered;
+:ShootPattern.shoot(totalShots, BulletHandler, barrelIncrementer);
+
+|Bullet System (BulletType / ShootPattern)|
+repeat
+  :handler.shoot(x_offset, y_offset, rotation_offset, delay);
+  :BulletType.createNet() / BulletType.create() — instantiate Bullet;
+  :BulletType.init(Bullet)\n• killShooter if flagged\n• set instantDisappear\n• spawn spawnBullets;
+repeat while (more shots?) is (yes)
+->no;
+
+note right
+  ShootAlternate, ShootBarrel,
+  ShootHelix, ShootMulti,
+  ShootSine, ShootSpread, ShootSummon
+end note
+
+:Bullet enters world (EntityGroup);
+
+|Bullet System (BulletType / ShootPattern)|
+repeat
+  :BulletType.update(Bullet) — per tick;
+
+  fork
+    :updateTrail(b)\nupdate trail quad positions;
+  fork again
+    if (homingPower > 0 && time >= homingDelay?) then (yes)
+      :updateHoming(b)\nfind nearest enemy, rotate toward it;
+    endif
+  fork again
+    :updateWeaving(b)\napply sine-wave lateral movement;
+  fork again
+    :updateTrailEffects(b)\nemit trail particles;
+  fork again
+    if (intervalBullet set && timer fires?) then (yes)
+      :spawn intervalBullet children;
+    endif
+  end fork
+
+repeat while (bullet lifetime active && !b.hit?) is (yes)
+->lifetime exhausted or b.hit = true;
+
+|Collision System (EntityCollisions / Damage)|
+if (laser / line bullet?) then (yes)
+  :Damage.collideLine(hitter, team, x, y, angle, length, pierceCap);
+  :findLength() → findPierceLength() or findLaserLength();
+  :Raycast tiles (World.raycastEachWorld)\n+ Units.nearbyEnemies() — gather hits;
+  :Sort hits by distance from bullet origin;
+  repeat
+    :unit.collision(hitter,x,y) + hitter.collision(unit,x,y)\nOR tile.collision(hitter);
+  repeat while (more hits && within pierceCap?) is (yes)
+  ->pierceCap reached or no more hits;
+else (no — projectile)
+  :EntityCollisions.collide(EntityGroup)\nbuild sweep rect, quad-tree getCollisions();
+  :For each overlapping candidate: checkCollide(a, b)\nverify a.collides(b) && b.collides(a);
+  if (AABB sweep intersection?) then (yes)
+    :a.collision(b, x, y) + b.collision(a, x, y);
+  endif
+endif
+
+|Bullet System (BulletType / ShootPattern)|
+if (hit a Unit?) then (yes)
+  :BulletType.hitEntity(Bullet, entity, health);
+  :Compute effective damage\n(cap by maxDamageFraction; account for shield);
+
+  if (lifesteal > 0?) then (yes)
+    :Heal bullet owner proportional to damage dealt;
+  endif
+
+  if (pierceArmor?) then (yes)
+    :entity.damagePierce(damage);
+  elseif (armorMultiplier != 1?) then (yes)
+    :entity.damageArmorMult(damage, armorMultiplier);
+  else (no)
+    :entity.damage(damage);
+  endif
+
+  :Apply knockback impulse\n(impact=true → bullet direction, else radial);
+  :unit.apply(status, statusDuration);
+  :Events.fire(UnitDamageEvent);
+
+  if (unit just died?) then (yes)
+    :Events.fire(UnitBulletDestroyEvent);
+  endif
+
+  :handlePierce(b, initialHealth, x, y)\n→ subtract pierceDamageFactor×health from b.damage\n→ if damage<=0: mark hit + remove;
+
+else (hit a Building)
+  :BulletType.hitTile(Bullet, build, x, y, initialHealth, direct);
+
+  if (makeFire && enemy team?) then (yes)
+    :Fires.create(build.tile);
+  endif
+
+  if (heals() && same team?) then (yes)
+    :healEffect.at(), build.heal(healPercent×maxHealth + healAmount)\nhealSound.at();
+  elseif (enemy && direct?) then (yes)
+    :hit(b, x, y) [side effects only]\nlifesteal from build.health;
+  endif
+
+  :handlePierce(b, initialHealth, x, y);
+endif
+
+:BulletType.hit(Bullet b, x, y, createFrags)\n— common hit side effects;
+:hitEffect.at(x, y, rotation, hitColor)\nhitSound.at(x, y, pitch, volume)\nEffect.shake(hitShake, hitShake, b);
+
+fork
+  if (createFrags && fragOnHit?) then (yes)
+    :createFrags(b, x, y)\nspawn fragBullet children;
+  endif
+fork again
+  :createPuddles(b, x, y)\ndeposit liquid puddles on tiles;
+fork again
+  if (incendiary?) then (yes)
+    :createIncend(b, x, y)\nDamage.createIncend() → spawn fire tiles;
+  endif
+fork again
+  if (despawnUnit set?) then (yes)
+    :createUnits(b, x, y)\nspawn despawnUnit units at hit;
+  endif
+fork again
+  if (suppressionRange > 0?) then (yes)
+    :Damage.applySuppression()\nsuppress nearby enemy building healing;
+  endif
+fork again
+  if (lightning > 0?) then (yes)
+    :Lightning.create() — spawn lightning strands;
+  endif
+end fork
+
+|Collision System (EntityCollisions / Damage)|
+if (splashDamageRadius > 0?) then (yes)
+  :BulletType.createSplashDamage(b, x, y);
+  :Damage.damage(team, x, y, splashDamageRadius, splashDamage\n  collidesAir, collidesGround, scaledSplashDamage, armorMultiplier);
+  :Units.nearbyEnemies(): for each unit in rect\ncheck team / target / within radius;
+  :calculateDamage(dist, radius)\nfalloff = lerp(1 - dist/radius, 1, 0.4);
+  :unit.damage() or unit.damageArmorMult()\n+ velocity displacement\nEvents.fire(UnitDamageEvent / UnitBulletDestroyEvent if killed);
+  :tileDamage(team, tx, ty, radius, damage×buildingDamageMultiplier)\n→ raycast rays at each angle\n→ build damage map with falloff+absorption\n→ build.damage(source, team, value);
+
+  if (status effect != none?) then (yes)
+    :Damage.status()\napply StatusEffect to units in splash radius;
+  endif
+
+  if (heals()?) then (yes)
+    :Heal nearby damaged friendly buildings;
+  endif
+
+  if (makeFire?) then (yes)
+    :Fires.create() on enemy buildings in radius;
+  endif
+endif
+
+|Effects System (StatusEffect / Fx)|
+if (status effect applied to unit?) then (yes)
+  :unit.apply(StatusEffect, duration) — store StatusEntry;
+  :StatusEffect.applied(unit, time, extend)\nshow applyEffect visual;
+
+  repeat
+    :StatusEffect.update(Unit, StatusEntry) — per tick;
+
+    if (damage > 0?) then (yes)
+      :unit.damageContinuousPierce(damage)\narmor-piercing DoT;
+    elseif (damage < 0?) then (yes)
+      :unit.heal(-damage × Time.delta)\nregeneration;
+    endif
+
+    if (intervalDamageTime > 0 && threshold reached?) then (yes)
+      :unit.damagePierce() or unit.damage(intervalDamage);
+    endif
+
+    if (effect != Fx.none?) then (yes)
+      :Spawn visual particle at random offset on unit;
+    endif
+
+    :StatusEffect.applyTransition(unit, newEffect, entry, time);
+    if (transition registered for new effect?) then (yes)
+      if (affinities contain new effect?) then (yes)
+        :Affinity reaction:\ndeal transitionDamage, transform entry;
+      elseif (opposites contain new effect?) then (yes)
+        :Reduce current effect time by 50%\npossibly replace with new effect;
+      else (custom handler)
+        :TransitionHandler.handle(unit, entry, time);
+      endif
+    endif
+
+  repeat while (duration remaining && !permanent?) is (yes)
+  ->duration expired;
+
+  :Remove StatusEntry from unit;
+endif
+
+|Bullet System (BulletType / ShootPattern)|
+:Bullet end of life (lifetime exhausted or b.hit=true);
+
+if (despawnHit?) then (yes)
+  :hit(b, b.x, b.y, false)\ntrigger all hit side effects without frags;
+else (no)
+  if (despawnUnit set?) then (yes)
+    :createUnits(b, b.x, b.y);
+  endif
+endif
+
+:despawnEffect.at(b.x, b.y, rotation, hitColor)\ndespawnSound.at(b, pitch)\nEffect.shake(despawnShake);
+
+:BulletType.removed(b) — any removal;
+
+if (trailLength > 0?) then (yes)
+  :Fx.trailFade — fade out trail;
+endif
+
+if (frags==0 && fragOnDespawn?) then (yes)
+  :createFrags(b, b.x, b.y)\nspawn fragment bullets;
+endif
+
+|Collision System (EntityCollisions / Damage)|
+note
+  **Damage.dynamicExplosion** (unit death / explosive bullet)
+  dynamicExplosion(x, y, flammability, explosiveness, power, radius, damage)
+  • power > 700 → Lightning.create() strands
+  • fire && flammability > 0 → spawn fireball bullets
+  • explosiveness > 2 → loop explosion waves with ExplosionShield absorption
+  • explosiveness > 15 → Fx.shockwave.at(x, y)
+  • explosiveness > 30 → Fx.bigShockwave.at(x, y)
+  • Effect.shake() + explosionFx.at()
+end note
+
+stop
+
+@enduml

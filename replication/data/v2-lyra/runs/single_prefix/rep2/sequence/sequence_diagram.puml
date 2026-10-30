@@ -1,0 +1,136 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxLineColor #6C757D
+    BoxBackgroundColor #E9ECEF
+}
+
+title Lyra — Autoregressive Video World Generation Pipeline
+
+actor Client
+
+participant "ARVideo2World\nGenerationPipeline" as Pipeline
+participant "AutoRegressiveModel" as ARModel
+participant "VisionTransformer" as ViT
+participant "MultimodalProjector" as MMProj
+participant "Transformer" as Trans
+participant "TransformerBlock" as TBlock
+participant "Attention" as Attn
+participant "MLP" as MLP
+participant "LatentDiffusionDecoderModel" as DiffDecoder
+participant "VideoDiffusion\nDecoderConditioner" as Conditioner
+participant "DiffusionDecoder\nGeneralDIT" as DIT
+participant "CausalDiscrete\nVideoTokenizer" as VideoTok
+
+== Initialization ==
+
+Client -> Pipeline : generate(inp_prompt, inp_vid, num_input_frames, seed, sampling_config)
+activate Pipeline
+
+Pipeline -> Pipeline : _load_model()
+note right: loads AR model + tokenizer\nfrom checkpoint_dir
+
+== Vision-Language Embedding ==
+
+Pipeline -> ARModel : embed_vision_language_features(input_ids, images)
+activate ARModel
+
+ARModel -> ViT : forward(inp_vid: Tensor)
+activate ViT
+ViT --> ARModel : visual_features: Tensor
+deactivate ViT
+
+ARModel -> MMProj : forward(visual_features)
+activate MMProj
+MMProj --> ARModel : projected_features: Tensor
+deactivate MMProj
+
+ARModel --> Pipeline : token_embeddings: Tensor
+deactivate ARModel
+
+== Autoregressive Token Generation ==
+
+Pipeline -> Pipeline : _run_model(prompt_embedding, prompt_mask,\n inp_vid, num_input_frames, seed, sampling_config)
+activate Pipeline #DDE8FF
+
+loop for each generation step
+    Pipeline -> Trans : forward(tokens, input_pos,\n token_embeddings, context, context_mask)
+    activate Trans
+
+    Trans -> Trans : _prepare_layer_kwargs(input_pos, mask, context, context_mask)
+
+    loop for each TransformerBlock layer
+        Trans -> TBlock : forward(x, rope, input_pos, mask, context, context_mask)
+        activate TBlock
+
+        TBlock -> Attn : forward(x, rope, input_pos, mask, context)
+        activate Attn
+        note right: QKV projection,\nRoPE encoding,\nscaled dot-product attention
+        Attn --> TBlock : attended: Tensor
+        deactivate Attn
+
+        TBlock -> MLP : forward(x)
+        activate MLP
+        MLP --> TBlock : hidden: Tensor
+        deactivate MLP
+
+        TBlock --> Trans : x: Tensor
+        deactivate TBlock
+    end
+
+    Trans --> Pipeline : logits: Tensor
+    deactivate Trans
+
+    Pipeline -> Pipeline : sample next token\n(apply logit_clipping_range, sampling_config)
+end
+
+deactivate Pipeline #DDE8FF
+
+Pipeline -> Pipeline : generate_video_from_tokens(\n  prompt_tokens, latent_shape,\n  video_start_boundary, max_gen_len,\n  sampling_config, seed)
+
+== Diffusion Decoding ==
+
+Pipeline -> DiffDecoder : generate_samples_from_batch(\n  data_batch, guidance, seed,\n  state_shape, num_steps)
+activate DiffDecoder
+
+DiffDecoder -> DiffDecoder : _add_latent_conditions_to_data_batch(\n  data_batch, apply_corruptor)
+
+DiffDecoder -> DiffDecoder : _get_conditions(\n  data_batch, is_negative_prompt)
+
+DiffDecoder -> Conditioner : forward(batch, override_dropout_rate)
+activate Conditioner
+Conditioner --> DiffDecoder : VideoLatentDiffusionDecoderCondition
+deactivate Conditioner
+
+DiffDecoder -> DIT : prepare_embedded_sequence(\n  x_B_C_T_H_W, fps, padding_mask,\n  latent_condition, latent_condition_sigma)
+activate DIT
+DIT --> DiffDecoder : embedded_sequence: Tuple[Tensor, Tensor]
+deactivate DIT
+
+DiffDecoder --> Pipeline : generated_latents: Tensor
+deactivate DiffDecoder
+
+== Video Decoding ==
+
+Pipeline -> VideoTok : decode(quant)
+activate VideoTok
+note right: FSQ tokenizer decodes\nlatent codes → pixel frames
+VideoTok --> Pipeline : video_frames: Tensor
+deactivate VideoTok
+
+Pipeline --> Client : video: np.ndarray
+deactivate Pipeline
+
+@enduml

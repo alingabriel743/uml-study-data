@@ -1,0 +1,191 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipant underline
+skinparam sequenceBoxBackgroundColor #E9ECEF
+skinparam sequenceBoxBorderColor #6C757D
+skinparam activationBarColor #ADB5BD
+skinparam noteBorderColor #6C757D
+skinparam noteBackgroundColor #F8F9FA
+
+title Game Load and World Restoration
+
+actor "Player" as player
+participant "LoadDialog" as loadDialog
+participant "SaveSlot" as saveSlot
+participant "SaveIO" as saveIO
+participant "SaveVersion\n(SaveFileReader)" as saveVersion
+participant "WorldContext\n(World.Context)" as worldCtx
+participant "World" as world
+participant "GameState\n(state)" as gameState
+participant "Groups\n(EntityGroup)" as groups
+participant "Logic" as logic
+
+== Initiate Load ==
+
+player -> loadDialog : click Load button
+activate loadDialog
+
+loadDialog -> saveSlot : runLoadSave(slot)
+activate saveSlot
+
+loadDialog -> loadDialog : net.reset()
+
+saveSlot -> saveSlot : cautiousLoad(() -> slot.load())
+saveSlot -> saveIO : SaveIO.load(file, context)
+activate saveIO
+
+alt SaveException thrown
+    saveIO -> saveIO : fallback to *.msav-backup.* file
+end
+
+saveIO -> saveIO : new InflaterInputStream(file.read(bufferSize))
+saveIO -> saveIO : load(InputStream, context)
+
+saveIO -> logic : logic.reset()
+activate logic
+logic --> saveIO : (prior state cleared)
+deactivate logic
+
+== Parse Header & Resolve Version ==
+
+saveIO -> saveIO : readHeader(stream)\n— validates 'MSAV' magic bytes
+saveIO -> saveIO : stream.readInt() → version number
+saveIO -> saveIO : versions.get(version) → SaveVersion ver
+
+saveIO -> saveVersion : ver.read(stream, counter, context)
+activate saveVersion
+
+== Region: meta — Restore GameState ==
+
+saveVersion -> saveVersion : readRegion('meta', ...) → readMeta(stream, context)
+activate saveVersion
+saveVersion -> gameState : state.wave, state.wavetime,\nstate.tick, state.stats restored
+activate gameState
+saveVersion -> gameState : state.rules restored from StringMap
+saveVersion -> gameState : state.map = maps.byName(mapname)
+deactivate gameState
+deactivate saveVersion
+
+== Region: content — Content Header ==
+
+saveVersion -> saveVersion : readRegion('content', ...)\n→ readContentHeader()
+
+opt version >= 11
+    saveVersion -> saveVersion : readRegion('patches', ...)\n→ readContentPatches()
+    note right : fires ContentPatchLoadEvent(patches)
+end
+
+== Region: map — World Restoration ==
+
+saveVersion -> saveVersion : readRegion('map', ...) → readMap(stream, context)
+activate saveVersion
+
+saveVersion -> worldCtx : context.begin()
+activate worldCtx
+worldCtx -> world : World.beginMapLoad()\n— sets generating=true
+activate world
+world --> worldCtx : fires WorldLoadBeginEvent
+deactivate world
+deactivate worldCtx
+
+saveVersion -> worldCtx : context.resize(width, height)\n→ World.resize(width, height)
+
+loop for each tile
+    saveVersion -> worldCtx : context.create(x, y, floorID, overlayID, wallID)
+    activate worldCtx
+    worldCtx -> world : new Tile(x, y, ...) stored in tiles[]
+    deactivate worldCtx
+end
+
+loop for each block tile
+    saveVersion -> saveVersion : tile.setBlock(block)
+end
+
+loop for each building with entity data
+    saveVersion -> saveVersion : tile.build.readAll(in, revision)
+    saveVersion -> worldCtx : context.onReadBuilding()
+end
+
+note over saveVersion, worldCtx : finally block — always executes
+
+saveVersion -> worldCtx : context.end()
+activate worldCtx
+worldCtx -> world : World.endMapLoad()
+activate world
+world --> world : fires WorldLoadEndEvent
+world --> world : updateProximity() per tile
+world --> world : addDarkness()
+world --> groups : Groups.resize()
+world --> world : fires WorldLoadEvent
+deactivate world
+deactivate worldCtx
+
+deactivate saveVersion
+
+== Region: entities — Restore Entities ==
+
+saveVersion -> saveVersion : readRegion('entities', ...)\n→ readEntities()
+activate saveVersion
+
+saveVersion -> saveVersion : readEntityMapping(stream)\n→ custom Prov[] id map
+saveVersion -> saveVersion : readTeamBlocks(stream)\n→ BlockPlan queues per Team
+
+saveVersion -> saveVersion : readWorldEntities(stream, mapping)
+loop for each deserialized entity
+    saveVersion -> groups : entity.add()
+    activate groups
+    deactivate groups
+end
+saveVersion -> groups : Groups.all.each(Entityc::afterReadAll)
+
+deactivate saveVersion
+
+== Region: markers & custom ==
+
+saveVersion -> saveVersion : readRegion('markers', ...) [v8+]\n→ readMarkers()
+saveVersion -> saveVersion : readRegion('custom', ...)\n→ readCustomChunks()
+
+note over saveVersion : finally block
+saveVersion -> saveVersion : content.setTemporaryMapper(null)
+deactivate saveVersion
+
+== Finalize ==
+
+saveIO -> saveIO : Events.fire(SaveLoadEvent(isMap))
+
+note over saveIO : finally block — always executes
+saveIO -> world : world.setGenerating(false)
+saveIO -> saveIO : content.setTemporaryMapper(null)
+deactivate saveIO
+
+saveSlot -> saveSlot : meta = SaveIO.getMeta(file)
+saveSlot -> saveSlot : current = this\ntotalPlaytime = meta.timePlayed
+saveSlot -> saveSlot : savePreview()\n— writes minimap pixmap to file
+
+saveSlot --> loadDialog : load complete
+deactivate saveSlot
+
+loadDialog -> gameState : state.rules.editor = false\nstate.rules.sector = null
+activate gameState
+loadDialog -> gameState : state.set(State.playing)
+deactivate gameState
+
+deactivate loadDialog
+
+@enduml

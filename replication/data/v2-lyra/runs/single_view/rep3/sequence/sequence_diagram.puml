@@ -1,0 +1,205 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #E9ECEF
+    DividerBorderColor #6C757D
+    GroupBorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF3CD
+    BorderColor #FFC107
+}
+
+title Lyra — Text-to-World Video Generation: Inference Pipeline
+
+actor "User / Script" as user
+
+participant "DiffusionText2World\nGenerationPipeline" as pipeline
+participant "DiffusionT2WModel\n/ DiffusionV2WModel" as diffmodel
+participant "GeneralConditioner" as conditioner
+participant "AbstractEmbModel" as embmodel
+participant "GeneralDIT\n(DiT Network)" as dit
+participant "VideoPositionEmb" as posemb
+participant "BasePretrainedImageVAE\n(Tokenizer)" as vae
+
+== Pipeline Initialisation ==
+
+user -> pipeline : __init__(inference_type, checkpoint_dir,\n  checkpoint_name, enable_prompt_upsampler)
+activate pipeline
+
+pipeline -> pipeline : _load_text_encoder_model()
+activate pipeline
+pipeline --> pipeline : text encoder ready
+deactivate pipeline
+
+pipeline -> pipeline : _load_model(checkpoint_name)
+activate pipeline
+pipeline -> diffmodel : instantiate(config)
+activate diffmodel
+diffmodel -> diffmodel : build_model()
+diffmodel --> pipeline : model module dict
+deactivate diffmodel
+pipeline --> pipeline : model loaded
+deactivate pipeline
+
+pipeline -> vae : set_up_tokenizer(tokenizer_dir)
+activate vae
+vae -> vae : register_mean_std(mean_std_fp)
+vae --> pipeline : tokenizer ready
+deactivate vae
+
+deactivate pipeline
+
+== Text-to-World Inference ==
+
+user -> pipeline : generate(prompt, negative_prompt,\n  num_steps, guidance, seed)
+activate pipeline
+
+pipeline -> pipeline : _run_model_with_offload(prompt_embedding,\n  negative_prompt_embedding)
+activate pipeline
+
+pipeline -> pipeline : _run_model(embedding, negative_prompt_embedding)
+activate pipeline
+
+pipeline -> diffmodel : generate_samples_from_batch(\n  data_batch, guidance, seed,\n  num_steps, is_negative_prompt)
+activate diffmodel
+
+== Conditioning ==
+
+diffmodel -> conditioner : get_condition_uncondition(data_batch)
+activate conditioner
+
+conditioner -> conditioner : _forward(batch,\n  override_dropout_rate)
+activate conditioner
+
+conditioner -> embmodel : random_dropout_input(in_tensor,\n  dropout_rate, key)
+activate embmodel
+embmodel --> conditioner : conditioned tensor
+deactivate embmodel
+
+conditioner --> conditioner : embeddings dict
+deactivate conditioner
+
+conditioner --> diffmodel : condition, uncondition
+deactivate conditioner
+
+opt negative prompt provided
+    diffmodel -> conditioner : get_condition_with_negative_prompt(data_batch)
+    activate conditioner
+    conditioner --> diffmodel : condition, negative_condition
+    deactivate conditioner
+end
+
+== Classifier-Free Guidance Sampling Loop ==
+
+loop num_steps denoising iterations
+
+    diffmodel -> diffmodel : generate_cfg_samples(\n  batch_size, condition,\n  uncondition, guidance)
+    activate diffmodel
+
+    diffmodel -> dit : forward(x, timesteps, crossattn_emb,\n  crossattn_mask, fps, image_size,\n  padding_mask)
+    activate dit
+
+    dit -> dit : forward_before_blocks(x, timesteps,\n  crossattn_emb, fps, padding_mask)
+    activate dit
+
+    dit -> posemb : generate_embeddings(B_T_H_W_C, fps)
+    activate posemb
+    posemb -> posemb : enable_context_parallel(cp_group)
+    posemb --> dit : position embeddings
+    deactivate posemb
+
+    dit -> dit : prepare_embedded_sequence(\n  x_B_C_T_H_W, fps, padding_mask)
+    activate dit
+    dit --> dit : embedded sequence
+    deactivate dit
+
+    dit --> dit : pre-block features
+    deactivate dit
+
+    alt regular forward pass
+        dit -> dit : forward_blocks_regular(\n  x, affline_emb_B_D,\n  crossattn_emb, rope_emb_L_1_1_D)
+    else memory-saving forward pass
+        dit -> dit : forward_blocks_memory_save(\n  x, affline_emb_B_D,\n  crossattn_emb, feature_indices)
+    end
+
+    dit -> dit : decoder_head(x_B_T_H_W_D, emb_B_D,\n  crossattn_emb, origin_shape)
+    activate dit
+    dit --> dit : denoised output
+    deactivate dit
+
+    dit --> diffmodel : denoised tensor
+    deactivate dit
+
+    diffmodel --> diffmodel : updated x (denoised step)
+    deactivate diffmodel
+
+end
+
+diffmodel --> pipeline : generated latent tensor
+deactivate diffmodel
+
+== VAE Decoding ==
+
+pipeline -> vae : decode(latent_tensor)
+activate vae
+vae -> vae : reset_dtype()
+vae --> pipeline : decoded video frames (np.ndarray)
+deactivate vae
+
+pipeline --> pipeline : video output
+deactivate pipeline
+pipeline --> pipeline : video output
+deactivate pipeline
+
+pipeline --> user : generated video (frames / file path)
+deactivate pipeline
+
+== Training Step (abbreviated) ==
+
+note over user, vae
+  Training path: Model.training_step triggers\n  DiffusionModel.compute_loss_with_epsilon_and_sigma,\n  followed by Callback hooks at each phase boundary.
+end note
+
+user -> diffmodel : training_step(data_batch, iteration)
+activate diffmodel
+
+diffmodel -> diffmodel : compute_loss_with_epsilon_and_sigma(\n  data_batch, x0, condition,\n  epsilon, sigma)
+activate diffmodel
+diffmodel --> diffmodel : loss tensor
+deactivate diffmodel
+
+diffmodel -> conditioner : _forward(batch)
+activate conditioner
+conditioner --> diffmodel : embeddings
+deactivate conditioner
+
+diffmodel --> user : output_batch, loss
+deactivate diffmodel
+
+@enduml

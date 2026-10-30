@@ -1,0 +1,246 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequence {
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    ActorBackgroundColor #F8F9FA
+    ActorBorderColor #495057
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title A* Search for Unit Navigation\n(Mindustry — Astar.java + ControlPathfinder HPA*)
+
+' ── Participants ─────────────────────────────────────────────
+box "Game / Main Thread" #E3F2FD
+    actor       "UnitAI"          as unit
+    participant "ControlPathfinder\n(main-thread API)" as cp
+end box
+
+box "Background Pathfind Thread" #FFF3E0
+    participant "ControlPathfinder\n(run loop)"    as cpRun
+    participant "innerAstar\n(intra-cluster A*)"   as innerA
+    participant "clusterAstar\n(portal-graph A*)"  as clusterA
+    participant "FieldCache\n(flow field)"         as fieldCache
+end box
+
+participant "PathRequest"                          as pathReq
+participant "PathfindQueue\n(priority frontier)"   as frontier
+participant "PathCost\n(tile traversal cost)"      as pathCost
+participant "TileHeuristic\n/ DistanceHeuristic"   as heuristic
+participant "TaskQueue\n(cross-thread)"            as taskQ
+
+' ════════════════════════════════════════════════════════════
+== Main Thread — Navigation Request ==
+' ════════════════════════════════════════════════════════════
+
+unit -> cp : getPathPosition(unit, destination, out, noResultFound)
+activate cp
+
+cp -> cp : raycast(team, pathCost, tileX, tileY, destX, destY)
+note right of cp
+  Bresenham line-of-sight check.
+  Near destination (<2.5 tiles)
+  uses rect-intersection variant.
+  Result cached per unit position.
+end note
+
+alt Raycast succeeds — destination directly reachable
+    cp --> unit : out.set(destination)\nreturn true
+else No existing PathRequest for this unit
+    cp -> pathReq ** : new PathRequest(unit, team, costId, destPos)
+    cp -> taskQ : queue.post(\n  () -> recalculatePath(request)\n)
+    cp --> unit : return false\n[pathfinding running async]
+end
+
+deactivate cp
+
+' ════════════════════════════════════════════════════════════
+== Background Thread — Path Computation ==
+' ════════════════════════════════════════════════════════════
+
+cpRun -> taskQ : queue.run()
+activate cpRun
+taskQ --> cpRun : execute recalculatePath(request)
+
+cpRun -> cpRun : recalculatePath(request)
+cpRun -> cpRun : initializePathRequest(\n  request, team, costId,\n  unitX, unitY, goalX, goalY\n)
+note right of cpRun
+  Allocates A* state inside PathRequest:
+  costs (IntFloatMap),
+  cameFrom (IntIntMap),
+  frontier (PathfindQueue)
+end note
+
+' ── Step 1: locate start & end cluster nodes via innerAstar ──
+group Step 1 — Intra-Cluster A* to find portal costs
+    cpRun -> innerA : innerAstar(team, cost,\n  minX, minY, maxX, maxY,\n  startPos, goalPos,\n  goalX1, goalY1, goalX2, goalY2)
+    activate innerA
+
+    innerA -> frontier : add(startTile, 0.0)
+    activate frontier
+
+    loop while frontier not empty
+        frontier --> innerA : poll() → currentTile
+        innerA -> pathCost : getCost(currentTile) → traversal cost
+        innerA -> innerA : expand Geometry.d4 neighbors
+
+        alt neighbor within cluster bounds and not impassable
+            innerA -> heuristic : dh.cost(next.x, next.y,\n  goalPos.x, goalPos.y) → h(n)
+            note right of heuristic
+              Manhattan: |dx| + |dy|
+              Priority = g(n) + h(n)
+            end note
+            innerA -> frontier : add(neighbor, newCost + h(n))
+        end
+    end
+
+    deactivate frontier
+    innerA --> cpRun : return connectionCost (float)\nor -1 if unreachable
+    deactivate innerA
+end
+
+' ── Step 2: abstract portal-graph A* ──
+group Step 2 — Portal-Graph A* (clusterAstar)
+    cpRun -> clusterA : clusterAstar(\n  request, pathCost,\n  startNodeIndex, endNodeIndex\n)
+    activate clusterA
+
+    clusterA -> pathReq : read request.frontier (PathfindQueue)
+    clusterA -> pathReq : read request.costs (IntFloatMap)
+    clusterA -> pathReq : read request.cameFrom (IntIntMap)
+
+    loop expand abstract NodeIndex nodes
+        clusterA -> clusterA : checkEdges()\n[inner + outer portal connections]
+        clusterA -> clusterA : clusterNodeHeuristic(node, goal)\n→ h(portalNode)
+        note right of clusterA
+          Operates on NodeIndex (portal graph),
+          not raw tiles. Each edge cost was
+          pre-computed by innerAstar.
+        end note
+        clusterA -> pathReq : update costs / cameFrom maps
+    end
+
+    clusterA -> pathReq : request.resultPath (IntSeq)\n← sequence of portal NodeIndices
+    note right of pathReq
+      costs / cameFrom / frontier
+      nulled after completion
+      to free memory
+    end note
+    deactivate clusterA
+end
+
+' ── Step 3: build flow field ──
+group Step 3 — Build Flow Field (Dijkstra BFS from goal)
+    cpRun -> fieldCache ** : new FieldCache(\n  pathCost, costId, team, goalPos\n)
+    activate fieldCache
+
+    loop for each portal node in resultPath
+        cpRun -> fieldCache : addFlowCluster(\n  cache, clusterX, clusterY,\n  addingFrontier\n)
+    end
+
+    cpRun -> fieldCache : updateFields(cache, maxUpdate=12ms)
+    fieldCache -> fieldCache : BFS outward from goalPos\nthrough registered flow clusters
+    fieldCache -> fieldCache : fill weights[clusterIndex]\n→ weight array[clusterSize * clusterSize]
+    deactivate fieldCache
+end
+
+deactivate cpRun
+
+' ════════════════════════════════════════════════════════════
+== Main Thread — Next Frame: Follow Flow Field ==
+' ════════════════════════════════════════════════════════════
+
+unit -> cp : getPathPosition(...) [subsequent call]
+activate cp
+
+cp -> fieldCache : fields.get(fieldKey)
+activate fieldCache
+fieldCache --> cp : FieldCache (pre-computed flow weights)
+deactivate fieldCache
+
+cp -> cp : getCost(targetCache, tileOn.x, tileOn.y, requeue)
+
+loop up to 30 iterations — follow minimum-cost neighbor
+    cp -> cp : sample neighbor weights\n→ pick lowest-cost adjacent tile
+end
+
+cp --> unit : out.set(targetTile.worldx(), worldy())\nreturn true
+deactivate cp
+
+' ════════════════════════════════════════════════════════════
+== Standalone Short-Range A* (Astar.java) ==
+' ════════════════════════════════════════════════════════════
+
+note across
+  Astar.java — independent static utility for short-range pathfinding.
+  Used for direct unit movement and building placement checks.
+  No dependency on ControlPathfinder. Shares static state — NOT thread-safe.
+end note
+
+participant "Caller"        as caller
+participant "Astar (static)" as astar
+
+caller -> astar : pathfind(from, to,\n  TileHeuristic th,\n  Boolf<Tile> passable)
+activate astar
+
+astar -> astar : delegate to pathfind(\n  startX, startY, endX, endY,\n  th, manhattan, passable\n)
+note right of astar
+  Overloads chain to core
+  7-argument method.
+  manhattan = (x1,y1,x2,y2) ->
+    |x1-x2| + |y1-y2|
+end note
+
+astar -> astar : initialize costs[], rotations[][]\nclear PQueue
+
+loop while PQueue not empty
+    astar <- frontier : poll() → currentTile
+    activate frontier
+
+    alt currentTile == endTile (goal reached)
+        astar -> astar : trace back via rotations[][]\nfrom end to start
+        astar -> astar : reverse path (Seq.reverse())
+        astar --> caller : return Seq<Tile> path
+        note right of astar
+          Shared static Seq<Tile> out.
+          Not thread-safe — caller
+          must consume before next call.
+        end note
+    else expand Geometry.d4 neighbors
+        astar -> caller : passable.get(child)\n→ traversability check
+        note right of caller
+          Caller provides passable lambda.
+          e.g., tile -> !tile.solid()
+        end note
+
+        alt neighbor is passable
+            astar -> heuristic : th.cost(currentTile, child)\n→ edge cost g contribution
+            astar -> heuristic : dh.cost(child.x, child.y,\n  end.x, end.y) → h(n)
+            note right of heuristic
+              Priority = edgeCost + h(n)
+              Default dh = manhattan
+              TileHeuristic default:
+                cost(from, tile) { return cost(tile); }
+            end note
+
+            alt newCost < costs[child]
+                astar -> astar : costs[child] = newCost\nrotations[child][...] = direction
+                astar -> frontier : add(child, newCost + h(n))
+            end
+        end
+    end
+    deactivate frontier
+end
+
+astar --> caller : return null [no path found]
+deactivate astar
+
+@enduml

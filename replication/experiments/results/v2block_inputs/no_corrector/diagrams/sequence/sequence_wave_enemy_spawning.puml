@@ -1,0 +1,186 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+}
+
+title Wave and Enemy Spawning
+
+participant "Logic" as logic
+participant "WaveSpawner" as spawner
+participant "SpawnGroup" as group
+participant "UnitType" as unitType
+participant "Unit" as unit
+participant "AIController" as ai
+participant "Pathfinder" as pathfinder
+participant "Events" as events
+
+== Wave Timer Tick ==
+
+loop each game update
+    logic -> logic : update()
+    activate logic
+    note right of logic
+      checks: rules.waves &&
+      rules.waveTimer && !gameOver
+    end note
+
+    alt not isWaitingWave()
+        logic -> logic : state.wavetime -= Time.delta
+    else isWaitingWave() (rules.waitEnemies && enemies > 0)
+        note over logic : wavetime decrement paused\nuntil all enemies cleared
+    end
+
+    alt state.wavetime <= 0
+        logic -> logic : runWave()
+        activate logic
+
+        logic -> spawner : spawnEnemies()
+        activate spawner
+
+        logic -> logic : state.wave++\nstate.wavetime = rules.waveSpacing\n  * difficultyMultiplier
+        logic -> events : fire(new WaveEvent())
+        deactivate logic
+    end
+    deactivate logic
+end
+
+== Enemy Group Spawning ==
+
+activate spawner
+spawner -> spawner : spawning = true
+spawner -> spawner : eachGroundSpawn(-1, doShockwave)\n[visual shockwave at all spawn tiles]
+
+loop for each SpawnGroup in state.rules.spawns
+    spawner -> group : getSpawned(state.wave - 1)
+    activate group
+
+    alt wave < begin || wave > end || (wave-begin) % spacing != 0
+        group --> spawner : 0  (skip this group)
+    else within wave band and on spacing interval
+        group --> spawner : min(unitAmount + (wave-begin)/spacing/unitScaling, max)
+    end
+    deactivate group
+
+    note over spawner
+      [campaign] scale count by
+      difficulty.enemySpawnMultiplier
+    end note
+
+    alt group.type.flying (flying unit)
+        loop spawned count times
+            spawner -> spawner : eachFlyerSpawn(group.spawn, ...)\n→ spawnUnit(group, x, y)
+        end
+    else ground unit
+        loop spawned count times
+            spawner -> spawner : eachGroundSpawn(group.spawn, ...)\n→ spawnUnit(group, x+rnd, y+rnd)
+        end
+    end
+end
+
+== Unit Creation ==
+
+spawner -> group : createUnit(team, x, y, rotation, wave, spawnEffect)
+activate group
+
+group -> unitType : spawn(team, x, y, rotation, cons)
+activate unitType
+
+unitType -> unitType : create(team)
+activate unitType
+unitType -> unitType : constructor.get()\n[allocate unit entity]
+unitType -> unit ** : setType(this) ; team = team
+activate unit
+unitType -> unit : assign AIController\n(GroundAI or FlyingAI)
+unitType -> unit : heal()  [full HP]
+deactivate unitType
+
+unitType -> unit : set(x, y) ; rotation = rotation
+unitType -> unit : add()  [add to world Groups]
+
+unitType -> spawner : cons.get(unit)\n[call spawnEffect callback]
+activate spawner
+deactivate unitType
+
+== Spawn Status Effects ==
+
+spawner -> unit : apply(StatusEffects.unmoving, 30f)
+spawner -> unit : apply(StatusEffects.invincible, 60f)
+spawner -> unit : unloaded()
+spawner -> events : fire(new UnitSpawnEvent(unit))
+spawner -> spawner : Call.spawnEffect(x, y, rotation, type)\n[sync visual FX to all clients]
+deactivate spawner
+
+== Post-Creation Unit Configuration ==
+
+group -> unit : shield = getShield(wave)\n[shields + shieldScaling*(wave-begin)]
+
+opt effect != null (e.g. boss / overdrive)
+    group -> unit : apply(effect, 999999f)
+end
+
+opt items != null
+    group -> unit : addItem(items.item, items.amount)
+end
+
+opt payloads != null
+    loop each payload type
+        group -> unitType : create(unit.team)  [payload unit]
+        group -> unit : pay.pickup(payload)
+    end
+end
+
+deactivate group
+deactivate unit
+
+note over spawner
+  After 121f ticks:
+  Time.run(121f, () -> spawning = false)
+end note
+
+deactivate spawner
+
+== Pathfinding Assignment (post-invincibility) ==
+
+note over ai, pathfinder
+  Each AI update tick, once invincibility expires
+end note
+
+ai -> ai : pathfind(pathTarget)
+activate ai
+note right of ai
+  costType = unit.type.flowfieldPathType
+  (costGround / costNaval / costLegs /
+   costHover / costNone for flying)
+end note
+
+ai -> pathfinder : getField(team, costType, pathTarget)
+activate pathfinder
+pathfinder --> ai : cached Flowfield\n(EnemyCoreField by default)
+deactivate pathfinder
+
+ai -> ai : nextTile = field.getNextTile(currentTile)
+ai -> unit : movePref(vec toward nextTile)
+deactivate ai
+
+@enduml

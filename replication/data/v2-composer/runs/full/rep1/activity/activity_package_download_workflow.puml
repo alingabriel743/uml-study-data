@@ -1,0 +1,228 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #212529
+    EndColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+
+title Package Download Workflow\n(DownloadManager Lifecycle: prepare → download → install → cleanup)
+
+|Installer / DownloadManager|
+start
+
+:Installer triggers **prepare**(type, package, targetDir);
+:normalizeTargetDir(targetDir);
+:getDownloaderForPackage(package);
+
+if (package.getType() == "metapackage"?) then (yes)
+    :resolve(null) — skip all operations;
+    stop
+else (no)
+endif
+
+if (operation type?) then (install)
+    |VcsDownloader|
+    :filesystem.emptyDirectory(path)\n[wipe target before fresh install];
+else if (update)
+    |VcsDownloader|
+    :cleanChanges(prevPackage, path)\n[stash local modifications];
+else (uninstall)
+    |VcsDownloader|
+    :cleanChanges(package, path, stash=false)\n[discard local modifications];
+endif
+
+|FileDownloader|
+note right: FileDownloader.prepare()\nis a no-op — resolves null immediately
+
+|Installer / DownloadManager|
+:DownloadManager.**download**(package, targetDir, prevPackage);
+:normalizeTargetDir(targetDir);
+:filesystem.ensureDirectoryExists(dirname(targetDir));
+:getAvailableSources(package, prevPackage)\n→ build ordered [source | dist] list;
+
+if (preferSource=true OR isDev()?) then (yes — source first)
+    :sources = [source, dist];
+else if (preferDist=true OR isDev()=false?) then (yes — dist first)
+    :sources = [dist, source];
+else (prevPackage has known source)
+    :preserve previous installation source order;
+endif
+
+:Shift next source from list\npackage.setInstallationSource(source);
+:getDownloaderForPackage(package)\n→ FileDownloader (dist) or VcsDownloader (source);
+
+if (downloader type?) then (FileDownloader)
+
+    |FileDownloader|
+    :processUrl(package, url)\n→ validate / update dist reference;
+
+    if (EventDispatcher present?) then (yes)
+        :dispatch PRE_FILE_DOWNLOAD event;
+    else (no)
+    endif
+
+    if (cache hit AND sha1 checksum valid?) then (yes)
+        :cache.copyTo(cacheKey, tmpFileName)\n→ serve from local cache;
+    else (no — cache miss)
+        :httpDownloader.addCopy(processedUrl, tmpFileName)\n[async HTTP download];
+
+        if (HTTP download succeeded?) then (yes — accept())
+            :cache.copyFrom(cacheKey, tmpFileName)\n→ populate cache with downloaded file;
+        else (no — reject())
+            :filesystem.unlink(tmpFileName) +\nclearLastCacheWrite();
+
+            if (IrrecoverableDownloadException OR MaxFileSizeExceeded?) then (yes)
+                :rethrow exception immediately\n[no retry];
+            else (no)
+                if (retries > 0?) then (yes)
+                    :usleep(500 ms);
+                    :retry download (same URL);
+                else if (more URLs available?) then (yes)
+                    :usleep(100 ms);
+                    :try next mirror URL;
+                else (no retries, no URLs)
+                    :throw DownloadException;
+                    |Installer / DownloadManager|
+                    stop
+                endif
+            endif
+        endif
+    endif
+
+    :verify file exists on disk\n+ validate sha1 checksum;
+
+    if (EventDispatcher present?) then (yes)
+        :dispatch POST_FILE_DOWNLOAD event;
+    else (no)
+    endif
+
+else (VcsDownloader)
+
+    |VcsDownloader|
+    :prepareUrls(package.getSourceUrls())\n→ mirror-expanded URL list;
+
+    repeat
+        :doDownload(package, path, url, prevPackage)\n[abstract — e.g. GitDownloader fetches refs];
+        if (doDownload failed?) then (yes)
+            :try next URL in list;
+        else (no)
+        endif
+    repeat while (more URLs AND download failed?) is (yes)
+    ->no more failures;
+
+    if (no URLs succeeded?) then (yes)
+        :rethrow last exception;
+        |Installer / DownloadManager|
+        stop
+    else (no)
+    endif
+
+endif
+
+|Installer / DownloadManager|
+if (RuntimeException AND NOT IrrecoverableDownloadException?) then (yes)
+    if (sourceFallback=true AND more sources in list?) then (yes)
+        :fallback: retry with alternate source (source↔dist swap);
+        :Shift next source from list\npackage.setInstallationSource(source);
+        note right: loops back to downloader selection
+    else (no fallback or no more sources)
+        :rethrow exception;
+        stop
+    endif
+else (download succeeded)
+endif
+
+:DownloadManager.**install**(package, targetDir);
+:getDownloaderForPackage(package);
+
+if (downloader type?) then (FileDownloader)
+
+    |FileDownloader|
+    :filesystem.emptyDirectory(path)\n[unless nested vendor dir];
+    :filesystem.ensureDirectoryExists(path);
+    :filesystem.rename(tmpFile → path/basename)\n→ extract / place dist archive;
+    :chmod binaries to executable;
+
+else (VcsDownloader)
+
+    |VcsDownloader|
+    :prepareUrls(package.getSourceUrls());
+
+    repeat
+        :doInstall(package, path, url)\n[abstract — e.g. git clone / checkout];
+        if (doInstall failed?) then (yes)
+            :try next URL in list;
+        else (no)
+        endif
+    repeat while (more URLs AND install failed?) is (yes)
+    ->no more failures;
+
+    if (no URLs succeeded?) then (yes)
+        :rethrow last exception;
+        |Installer / DownloadManager|
+        stop
+    else (no)
+    endif
+
+endif
+
+|Installer / DownloadManager|
+fork
+    :** SUCCESS path**;
+fork again
+    :** FAILURE path**\n[partial artifacts remain];
+end fork
+
+note right
+  cleanup() is ALWAYS called
+  on both success and failure
+end note
+
+:DownloadManager.**cleanup**(type, package, targetDir);
+:getDownloaderForPackage(package);
+
+if (downloader type?) then (FileDownloader)
+    |FileDownloader|
+    :unlink tmp file\n+ remove empty directories;
+else (VcsDownloader)
+    |VcsDownloader|
+    if (operation type == update?) then (yes)
+        :reapplyChanges(path)\n→ restore stashed local modifications;
+    else (no)
+        :no post-cleanup action required;
+    endif
+endif
+
+|Installer / DownloadManager|
+:return PromiseInterface (resolved);
+
+stop
+
+@enduml

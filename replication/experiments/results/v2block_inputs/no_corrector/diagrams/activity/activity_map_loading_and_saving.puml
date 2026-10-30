@@ -1,0 +1,218 @@
+@startuml
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam swimlane {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+    TitleBackgroundColor #CED4DA
+    TitleFontColor #212529
+}
+skinparam note {
+    BackgroundColor #FFF3CD
+    BorderColor #6C757D
+    FontColor #212529
+}
+skinparam arrow {
+    Color #495057
+    FontColor #495057
+}
+
+title Map Loading and Saving
+
+|Maps|
+start
+
+== Load All Maps ==
+
+:Maps.load() — Application Startup;
+fork
+  :Load default .msav files\n(defaultMapNames);
+fork again
+  :Load custom maps\n(customMapDirectory/*.msav);
+fork again
+  :Load workshop maps\n(platform.getWorkshopContent(Map.class)\nset map.workshop=true + steamid tag);
+fork again
+  :Load mod maps\n(mods.listFiles('maps')\nset map.mod);
+fork end
+note right: Each source calls loadMap(file, custom)\n→ MapIO.createMap(file, custom)
+
+== Create Map from File ==
+
+|MapIO|
+:MapIO.createMap(file, custom);
+:Open InflaterInputStream(file.read(bufferSize))\n→ CounterInputStream → DataInputStream\n(DEFLATE decompression);
+
+|SaveFileReader|
+:SaveIO.readHeader(stream) — validate magic bytes;
+:stream.readInt() → version integer;
+:getSaveWriter(version) → SaveVersion ver;
+if (version known?) then (yes)
+else (no — null)
+  #FFC0C0:Throw IOException\n"Unknown save version";
+  stop
+endif
+:ver.readRegion('meta', stream, counter, consumer)\n→ ver.readStringMap(in) → tags StringMap;
+note right
+  readStringMap:
+  readShort(count) → loop:
+    readUTF key + readUTF value
+end note
+
+|MapIO|
+:Return new Map(file,\n  tags.getInt('width'), tags.getInt('height'),\n  tags, custom, version, build);
+
+|Maps|
+:maps.add(map) → maps.sort();
+
+== Load Map Previews ==
+
+:Maps.loadPreviews();
+while (more maps to process?) is (yes)
+  if (previewFile().exists()?) then (yes)
+    :Core.assets.load(\n  AssetDescriptor<Texture>(path,\n  MapPreviewParameter(map)));
+    note right
+      MapPreviewLoader (extends TextureLoader):
+      getDependencies → 'contentcreate'
+        (ensures content loaded before textures)
+      loadAsync → super.loadAsync on sibling file
+        on error: maps.queueNewPreview(param.map)
+      loadSync → super.loadSync
+        fallback 1: new Texture(file)
+        fallback 2: new Texture('sprites/error.png')
+    end note
+    :on loaded: map.texture = Texture;
+    :readCache(map)\n← spawns + team IDs from .dat file;
+    if (readCache succeeded?) then (yes)
+    else (error)
+      :queueNewPreview(map)\n→ previewList.add(map);
+    endif
+  else (no preview file)
+    :queueNewPreview(map)\n→ previewList.add(map);
+  endif
+endwhile (all maps processed)
+
+:createAllPreviews()\n→ createNewPreview(map, errorHandler)\n  for each map in previewList;
+
+== Generate Preview from File ==
+
+|MapIO|
+:MapIO.generatePreview(Map map);
+:Reset map.spawns=0 and map.teams;
+:Open InflaterInputStream → DataInputStream;
+:readHeader + readInt version + getSaveWriter(version);
+:Create floors Pixmap(width, height)\n+ walls Pixmap(width, height);
+:readRegion('content') → readContentHeader;
+if (ver.version >= 11?) then (yes)
+  :readRegion('content') → skipContentPatches;
+endif
+:readRegion('preview_map')\n→ ver.readMap(in, WorldContext);
+note right
+  WorldContext callbacks:
+  · create(x, y, floorID, overlayID, wallID):
+      paint floor/overlay pixel
+      count spawns; store floorIds/overlays
+  · onReadBuilding():
+      paint team color pixels
+      track CoreBlock teams
+  · onReadTileData():
+      apply minimapColor for
+      non-synthetic blocks and floors
+end note
+:floors.draw(walls, true) — composite walls onto floors;
+:Dispose walls Pixmap;
+:content.setTemporaryMapper(null);
+:Return floors Pixmap;
+
+|Maps|
+:map.texture = new Texture(pix);
+:Submit to mainExecutor (async):\n  map.previewFile().writePng(pix)\n  + writeCache(map) + pix.dispose();
+note right: Fire-and-forget async PNG write;\non exception: failed.get(e) + Log.err
+
+== Save Custom Map ==
+
+|Maps|
+:Maps.saveMap(baseTags);
+:Copy baseTags → new StringMap; extract 'name';
+if (map with same\ndisplay name exists?) then (yes)
+  :Dispose existing texture;\nRemove from maps;\nReuse existing file path;
+else (no match)
+  :findFile(name):\n  sanitize filename\n  find non-colliding path\n  in customMapDirectory;
+endif
+:Construct new Map(file,\n  world.width(), world.height(),\n  tags, custom=true);
+:fogControl.resetFog();
+
+|MapIO|
+:MapIO.writeMap(file, map)\n→ SaveIO.write(file, map.tags);
+
+|SaveFileReader|
+:writeChunk(output, runner):\n  reset byteOutput\n  run runner → capture bytes\n  writeInt(length) + write bytes;
+note right
+  IO Chunk Management (SaveFileReader):
+  · writeRegion(name, stream, cons):
+      calls writeChunk; wraps IOException
+      with region name
+  · readRegion(name, stream, counter, cons):
+      calls readChunk; validates
+      counter.count - 4 == length;
+      throws on mismatch
+  · skipChunk: readChunk + skipBytes(length)
+  · Nested chunks: chunkNested flag
+      uses byteOutput2/writes2 for inner chunk
+  · writeStringMap / readStringMap:
+      writeShort(count) + writeUTF pairs
+  · 60+ legacy block name mappings
+      for forward compatibility
+end note
+
+|Maps|
+if (not headless?) then (yes)
+  :Scan world tiles for\nCoreBlock teams + spawn overlays;
+  :Unload existing preview asset\nfrom Core.assets if loaded;
+
+  |MapIO|
+  :MapIO.generatePreview(Tiles tiles);
+  :Create Pixmap(tiles.width, tiles.height);
+  :For each tile:\n  determine color from\n  block.minimapColor\n  or floor.minimapColor\n  or colorFor(tile);
+  :pixmap.set(x, height-1-y, color);
+  :Return Pixmap;
+
+  |Maps|
+  :writeCache(map):\n  write byte(0) version\n  writeInt(spawns)\n  writeByte(teams.size)\n  write each team ID → .dat file;
+  :map.texture = new Texture(pix);
+  :Async: map.previewFile().writePng(pix)\n+ pix.dispose();
+endif
+:maps.add(map) → maps.sort();
+
+== Import Map ==
+
+|Maps|
+:Maps.importMap(file);
+:findFile(file.name()) → dest path;
+:file.copyTo(dest);
+:loadMap(dest, custom=true)\n→ MapIO.createMap(file, custom);
+:createNewPreview(map, errorHandler);
+if (preview generation\nerror?) then (yes)
+  #FFC0C0:maps.remove(map)\nmap.file.delete()\nThrow IOException;
+  stop
+endif
+:maps.add(imported map);
+
+== Remove Map ==
+
+:Maps.removeMap(map);
+if (map.texture != null?) then (yes)
+  :map.texture.dispose();
+endif
+:maps.remove(map);
+:map.file.delete();
+
+stop
+@enduml

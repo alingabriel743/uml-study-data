@@ -1,0 +1,237 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ArrowColor #495057
+    LifeLineBorderColor #ADB5BD
+    LifeLineBackgroundColor #E9ECEF
+    ActorBorderColor #495057
+    ActorBackgroundColor #F8F9FA
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #F1F3F5
+    DividerBackgroundColor #DEE2E6
+}
+
+title Composer Install — Package Resolution and Installation Flow
+
+actor "User" as user
+participant "BaseCommand" as cmd
+participant "Installer" as inst
+participant "ConsoleIO" as io
+participant "EventDispatcher" as evd
+participant "RepositorySet" as repoSet
+participant "ComposerRepository" as compRepo
+participant "Solver" as solver
+participant "InstallationManager" as imgr
+participant "FileDownloader" as fdl
+participant "PluginManager" as pm
+participant "Filesystem" as fs
+
+== Initialization ==
+
+user -> cmd: execute(input, output)
+activate cmd
+
+cmd -> cmd: getComposer(required, disablePlugins, disableScripts)
+activate cmd
+cmd -> cmd: createComposerInstance(input, io, config)
+cmd --> cmd: Composer
+deactivate cmd
+
+cmd -> pm: loadInstalledPlugins()
+activate pm
+pm -> pm: loadRepository(repo, isGlobalRepo, rootPackage)
+pm -> pm: isPluginAllowed(package, isGlobalPlugin)
+pm -> pm: addPlugin(plugin, isGlobalPlugin, sourcePackage)
+pm --> cmd
+deactivate pm
+
+cmd -> inst: create(io, composer)
+activate inst
+note right of inst
+  Receives DownloadManager,
+  RepositoryManager, Locker,
+  InstallationManager, EventDispatcher
+end note
+inst --> cmd: Installer
+deactivate inst
+
+== Run Install ==
+
+cmd -> inst: run()
+activate inst
+
+inst -> io: writeError("Installing dependencies from lock file")
+
+alt runScripts enabled
+    inst -> evd: dispatchScript(PRE_INSTALL_CMD, devMode)
+    activate evd
+    evd --> inst
+    deactivate evd
+end
+
+== Dependency Verification ==
+
+inst -> inst: doInstall(localRepo)
+activate inst
+
+inst -> io: writeError("Verifying lock file contents...")
+
+inst -> inst: createRepositorySet(forUpdate=false, platformRepo, aliases, lockedRepo)
+activate inst
+inst --> inst: RepositorySet
+deactivate inst
+
+inst -> repoSet: addRepository(lockedRepository)
+activate repoSet
+repoSet --> inst
+deactivate repoSet
+
+inst -> inst: createRequest(rootPackage, platformRepo, lockedRepo)
+
+inst -> repoSet: createPool(request, io, eventDispatcher)
+activate repoSet
+
+repoSet -> compRepo: loadPackages(packageNameMap, stabilities, flags, alreadyLoaded)
+activate compRepo
+compRepo -> compRepo: loadAsyncPackages(packageNames, stabilities, flags)
+compRepo -> compRepo: fetchFile(filename, cacheKey, sha256)
+compRepo --> repoSet: packages
+deactivate compRepo
+
+repoSet --> inst: Pool
+deactivate repoSet
+
+inst -> solver: solve(request, platformRequirementFilter)
+activate solver
+note right of solver
+  Analyzes rules to resolve
+  all dependencies and checks
+  lock file compatibility
+end note
+solver --> inst: LockTransaction
+deactivate solver
+
+== Package Operations Execution ==
+
+inst -> evd: dispatchInstallerEvent(PRE_OPERATIONS_EXEC, devMode, operations)
+activate evd
+evd --> inst
+deactivate evd
+
+inst -> io: writeError("Package operations: N installs, N updates, N removals")
+
+inst -> imgr: execute(localRepo, operations, devMode, runScripts, downloadOnly)
+activate imgr
+
+loop for each batch of operations
+
+    imgr -> imgr: downloadAndExecuteBatch(repo, operations, cleanupPromises)
+    activate imgr
+
+    == Download Phase ==
+
+    loop for each install/update operation
+        imgr -> fdl: download(package, path, prevPackage)
+        activate fdl
+
+        fdl -> fs: ensureDirectoryExists(path)
+        activate fs
+        fs --> fdl
+        deactivate fs
+
+        alt package in cache
+            fdl -> io: writeError("Loading from cache")
+        else download required
+            fdl -> io: writeError("Downloading package")
+            fdl -> evd: dispatch(PRE_FILE_DOWNLOAD, event)
+            activate evd
+            evd --> fdl
+            deactivate evd
+            fdl -> fdl: httpDownloader.addCopy(url, fileName)
+        end
+
+        fdl --> imgr: Promise
+        deactivate fdl
+    end
+
+    imgr -> imgr: waitOnPromises(downloadPromises)
+
+    == Install Phase ==
+
+    imgr -> imgr: executeBatch(repo, operations, cleanupPromises, devMode, runScripts)
+    activate imgr
+
+    loop for each operation
+        imgr -> evd: dispatchPackageEvent(PRE_PACKAGE_INSTALL, devMode, operation)
+        activate evd
+        evd --> imgr
+        deactivate evd
+
+        imgr -> fdl: prepare(opType, package, initialPackage)
+        activate fdl
+        fdl --> imgr: Promise
+        deactivate fdl
+
+        imgr -> imgr: install(repo, operation)
+        activate imgr
+        imgr --> imgr: Promise
+        deactivate imgr
+
+        imgr -> fdl: cleanup(opType, package, initialPackage)
+        activate fdl
+        fdl --> imgr: Promise
+        deactivate fdl
+
+        imgr -> evd: dispatchPackageEvent(POST_PACKAGE_INSTALL, devMode, operation)
+        activate evd
+        evd --> imgr
+        deactivate evd
+    end
+
+    deactivate imgr
+    deactivate imgr
+end
+
+imgr -> imgr: repo.write(devMode)
+imgr --> inst
+deactivate imgr
+
+deactivate inst
+
+== Autoload Generation ==
+
+inst -> io: writeError("Generating autoload files")
+inst -> inst: autoloadGenerator.dump(config, localRepo, package, installationManager)
+
+== Post-Install ==
+
+alt runScripts enabled
+    inst -> evd: dispatchScript(POST_INSTALL_CMD, devMode)
+    activate evd
+    evd --> inst
+    deactivate evd
+end
+
+inst --> cmd: exitCode
+deactivate inst
+
+cmd --> user: output
+deactivate cmd
+
+@enduml

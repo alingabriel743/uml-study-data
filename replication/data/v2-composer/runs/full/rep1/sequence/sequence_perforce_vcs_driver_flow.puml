@@ -1,0 +1,253 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #E9ECEF
+}
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #F9A825
+    FontColor #212529
+}
+
+title Perforce VCS Driver Flow
+
+participant "VcsRepository" as repo
+participant "PerforceDriver" as driver
+participant "Perforce" as p4util
+participant "ConsoleIO" as io
+participant "ProcessExecutor" as proc
+participant "Filesystem" as fs
+
+== Driver Instantiation & Initialization ==
+
+repo -> driver : new PerforceDriver(repoConfig, io, config,\nhttpDownloader, process)
+activate driver
+
+repo -> driver : initialize()
+driver -> p4util : Perforce::create(repoConfig, url, repoDir, process, io)
+activate p4util
+p4util --> driver : $perforce
+deactivate p4util
+
+== Authentication (p4Login) ==
+
+driver -> p4util : p4Login()
+activate p4util
+
+p4util -> p4util : queryP4User()\n[check $p4User / getP4variable("P4USER")]
+
+opt P4USER not found in environment
+    p4util -> io : ask("Enter P4 User:")
+    activate io
+    io --> p4util : $username
+    deactivate io
+end
+
+p4util -> p4util : isLoggedIn()\n[generateP4Command(["login","-s"], false)]
+p4util -> proc : execute(["p4","-u",user,"-p",port,"login","-s"])
+activate proc
+proc --> p4util : exit code
+deactivate proc
+
+opt not logged in
+    p4util -> io : askAndHideAnswer("Enter password for p4 user...")
+    activate io
+    io --> p4util : $password
+    deactivate io
+    p4util -> proc : execute(["p4","-u",user,"-p",port,"login","-a"], $password)
+    activate proc
+    proc --> p4util : success
+    deactivate proc
+end
+
+p4util --> driver : logged in
+deactivate p4util
+
+== Stream & Client Setup ==
+
+driver -> p4util : checkStream()\n[generateP4Command(["depots"], false)]
+activate p4util
+p4util -> proc : execute(["p4","-u",user,"-p",port,"depots"])
+activate proc
+proc --> p4util : depot list
+deactivate proc
+p4util -> p4util : set p4DepotType\n(stream vs. classic)
+p4util --> driver : depotType resolved
+deactivate p4util
+
+driver -> p4util : writeP4ClientSpec()\n[getP4ClientSpec() → fopen(spec,"w")]
+activate p4util
+p4util -> fs : ensureDirectoryExists(cacheVcsDir/depot/)
+activate fs
+fs --> p4util : ok
+deactivate fs
+p4util -> p4util : writeClientSpecToFile()\n[writes temp .p4.spec file]
+p4util --> driver : specFile written
+deactivate p4util
+
+driver -> p4util : connectClient()\n[generateP4Command(["client","-i"])]
+activate p4util
+p4util -> proc : new Process(cmd, null, null, specContents)\n→ process->run()
+activate proc
+proc --> p4util : client created
+deactivate proc
+p4util --> driver : client connected
+deactivate p4util
+
+deactivate driver
+
+== Root Identifier & Composer File Check ==
+
+repo -> driver : getRootIdentifier()
+activate driver
+driver --> repo : $branch (depot default branch)
+deactivate driver
+
+repo -> driver : hasComposerFile(rootIdentifier)
+activate driver
+driver -> p4util : getComposerInformation("//" + depot + "/" + identifier)
+activate p4util
+p4util -> p4util : getFilePath("composer.json", identifier)\n[generateP4Command(["files", path], false)]
+p4util -> proc : execute(["p4","-u",user,"-p",port,"files",path+"@label"])
+activate proc
+proc --> p4util : file path result
+deactivate proc
+p4util -> proc : execute(["p4","-u",user,"-c",client,"-p",port,"print",path])
+activate proc
+proc --> p4util : composer.json content
+deactivate proc
+p4util --> driver : composerData
+deactivate p4util
+driver --> repo : true / composerData
+deactivate driver
+
+== Tag Discovery ==
+
+repo -> driver : getTags()
+activate driver
+driver -> p4util : getTags()
+activate p4util
+p4util -> proc : execute(["p4","-u",user,"-c",client,"-p",port,"labels"])
+activate proc
+proc --> p4util : Label lines
+deactivate proc
+p4util -> p4util : parse label lines\n→ map tag → stream@label
+p4util --> driver : tags map
+deactivate p4util
+driver --> repo : tags map
+deactivate driver
+
+loop for each tag
+    repo -> driver : getComposerInformation(tagIdentifier)
+    activate driver
+    driver -> p4util : getComposerInformation(path)
+    activate p4util
+    p4util -> proc : execute p4 print <path>@<label>
+    activate proc
+    proc --> p4util : composer.json content
+    deactivate proc
+    p4util --> driver : package metadata
+    deactivate p4util
+    driver --> repo : packageData
+    deactivate driver
+end
+
+== Branch Discovery ==
+
+repo -> driver : getBranches()
+activate driver
+driver -> p4util : getBranches()
+activate p4util
+
+alt stream depot
+    p4util -> proc : execute(["p4","streams","//<depot>/..."])
+    activate proc
+    proc --> p4util : stream list
+    deactivate proc
+    loop for each stream
+        p4util -> proc : execute(["p4","changes","<stream>/..."])
+        activate proc
+        proc --> p4util : last change number
+        deactivate proc
+    end
+    p4util -> p4util : build map branch → stream@changeNum
+else classic depot
+    p4util -> proc : execute(["p4","changes","//<depot>/..."])
+    activate proc
+    proc --> p4util : changes
+    deactivate proc
+end
+
+p4util --> driver : branches map
+deactivate p4util
+driver --> repo : branches map
+deactivate driver
+
+loop for each branch
+    repo -> driver : getComposerInformation(branchIdentifier)
+    activate driver
+    driver -> p4util : getComposerInformation(path)
+    activate p4util
+    p4util -> proc : execute p4 print <path>@<change>
+    activate proc
+    proc --> p4util : composer.json content
+    deactivate proc
+    p4util --> driver : package metadata
+    deactivate p4util
+    driver --> repo : packageData
+    deactivate driver
+end
+
+== Package Pre-processing ==
+
+repo -> driver : preProcess(driver, data, identifier)\n→ getDist(identifier)
+activate driver
+driver --> repo : null (Perforce has no dist)
+deactivate driver
+
+repo -> driver : preProcess(driver, data, identifier)\n→ getSource(identifier)
+activate driver
+driver --> repo : {type:"perforce", url, reference, p4user}
+deactivate driver
+
+== Cleanup ==
+
+repo -> driver : cleanup()
+activate driver
+driver -> p4util : cleanupClientSpec()
+activate p4util
+p4util -> p4util : generateP4Command(["client","-d",client], false)
+p4util -> proc : execute(["p4","-u",user,"-p",port,"client","-d",client])
+activate proc
+proc --> p4util : client deleted
+deactivate proc
+p4util -> fs : remove(clientSpecFile)
+activate fs
+fs --> p4util : spec file removed
+deactivate fs
+p4util --> driver : done
+deactivate p4util
+driver --> repo : cleaned up
+deactivate driver
+
+note over repo, fs
+  PerforceDriver acts as a thin adapter;
+  all p4 logic lives in the Perforce utility class.
+  ConsoleIO is only invoked when P4USER / P4PASSWD
+  environment variables are absent.
+end note
+
+@enduml

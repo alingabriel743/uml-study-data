@@ -1,0 +1,197 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+}
+skinparam partition {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #D1ECF1
+    BorderColor #0C5460
+}
+
+title Mod Loading and Content Registration
+
+|Mods|
+start
+
+' ── Phase 1: Mod Discovery ──
+:Scan modDirectory for .jar / .zip / directory files;
+note right
+  Looks for: mod.json, mod.hjson,
+  plugin.json, plugin.hjson
+end note
+
+:Add Steam Workshop mods via\nplatform.getWorkshopContent();
+
+:Parse ModMeta for each candidate\nvia json.fromJson(ModMeta.class, ...);
+
+if (meta == null or meta.name == null?) then (skip)
+  :Discard candidate;
+else (valid)
+  :Collect ModMeta into metas list;
+endif
+
+:resolveDependencies(metas)\n→ topological OrderedMap<String, ModState>;
+
+if (Dependency problem detected?) then (yes)
+  :Mark mod state:\ncircularDependencies /\nmissingDependencies /\nincompleteDependencies;
+else (no conflicts)
+
+  ' ── Phase 2: Single Mod Load ──
+  |LoadedMod|
+  :Resolve root — unwrap ZipFi,\nhandle single-directory zips;
+
+  :findMeta(zip) — scan for\nmod.json / plugin.json;
+
+  if (meta == null?) then (yes)
+    #FFCCCC:throw ModLoadException\n"No mod.json found";
+    stop
+  else (no)
+    :Compute mainClass from meta.main\nor convention: {name}.{Name}Mod;
+  endif
+
+  if (Name conflict with existing mod?) then (yes)
+    if (overwrite == true?) then (yes)
+      :Close old classloader\ndelete old files;
+    else (no)
+      #FFCCCC:throw ModLoadException\n(name conflict);
+      stop
+    endif
+  endif
+
+  if (JAR exists AND version compatible\nAND not blacklisted AND initialize?) then (yes)
+    :platform.loadJar(sourceFile, mainLoader)\n→ add child classloader;
+    :Class.forName(mainClass, true, loader)\n→ verify classloader guard;
+    :mainMod = mainClass.getDeclaredConstructor()\n.newInstance();
+  else (no)
+    :mainMod = null\n(JSON-only or script mod);
+  endif
+
+  if (mainMod instanceof Plugin?) then (yes)
+    :meta.hidden = true;
+  endif
+
+  :Return new LoadedMod\n(sourceFile, zip, mainMod, loader, meta);
+
+  |Mods|
+  :Add LoadedMod to mods list\ninvalidate lastOrderedMods cache;
+endif
+
+:updateDependencies(mod) for each mod\n→ resolve dependency object references;
+:Set mod.state = unsupported if !isSupported()\nor disabled if !shouldBeEnabled();
+:sortMods() — by state.ordinal() then name;
+:buildFiles() — populate virtual file tree\n+ load i18n bundle properties;
+
+' ── Phase 3: Script Loading ──
+|Scripts|
+if (skipModCode == true?) then (yes)
+  :Skip script loading entirely;
+else (no)
+  :For each enabled mod via eachEnabled();
+
+  if (mod.root/scripts/ directory exists?) then (yes)
+    :content.setCurrentMod(mod);
+
+    if (scripts == null?) then (yes)
+      :scripts = platform.createScripts();
+    endif
+
+    if (single .js file OR scripts/main.js exists?) then (yes)
+      :scripts.run(mod, mainFile);
+      if (Throwable thrown?) then (yes)
+        :Log "Error loading main script"\nasync via Core.app.post;
+      endif
+    else (no)
+      :Log "No main.js found" for mod;
+    endif
+
+    :content.setCurrentMod(null);
+  endif
+endif
+
+' ── Phase 4: Content Registration ──
+|ContentParser|
+
+note left: **Phase A** — Java mod content first
+:For each mod in orderedMods()\nwhere mod.main != null AND !meta.hidden;
+:content.setCurrentMod(mod);
+:mod.main.loadContent();
+:content.setCurrentMod(null);
+
+note left: **Phase B** — Build JSON content load list
+:For each mod in orderedMods():\nscan mod.root/content/<type>s/\nfor .json and .hjson files;
+:Apply contentOrder — ordered items first,\nremaining sorted alphabetically;
+:Accumulate LoadRun(type, file, mod) entries;
+
+note left: **Phase C** — Parse each content file
+:Track content.getLastAdded() before parse;
+:parser.parse(mod, nameWithoutExtension,\nfileContent, file, type) → Content;
+
+if (parse throws Throwable?) then (yes)
+  if (New content was added before error?) then (yes)
+    :parser.markError(lastAdded, mod, file, e);
+    :mod.erroredContent set;\nmod.state = contentErrors;
+  else (no)
+    :new ErrorContent();\nparser.markError(errorContent, mod, file, e);
+  endif
+else (no)
+  :Content object registered successfully;
+endif
+
+note left: **Phase D** — Finish parsing
+:parser.finishParsing()\n→ execute deferred reads[] Runnables\n→ execute postreads[] Runnables;
+:Fire ModContentLoadEvent;
+
+' ── Phase 5: Asset / Sprite Loading ──
+|MultiPacker / Assets|
+if (No enabled mods?) then (yes)
+  :Skip asset loading;
+else (no)
+  :Create MultiPacker;
+  :For each enabled mod:\nfind sprites/*.png and\nsprites-override/*.png;
+  fork
+    :Submit parallel tasks via mainExecutor:\nPixmap.read() → optional Pixmaps.bleed() → pack Runnable;
+  fork again
+    :mod.main.packSprites(packer)\n(Java mods only);
+  end fork
+  :Await all futures;\nexecute pack Runnables\n→ add pages to MultiPacker;
+
+  :Dispose old Core.atlas;
+  :Create dummy shadow atlas for\nregion lookup during icon generation;
+  :For each UnlockableContent where mod != null:\nu.load(); u.loadIcon(); u.createIcons(packer);
+  :packer.flush(filter, atlas)\n→ new TextureAtlas;\napply textureResize scales;
+  :Fire AtlasPackEvent;
+  :loadSync(): loadIcons()\n→ load icon.png or preview.png per mod;
+endif
+
+' ── Phase 6: Post-load Validation ──
+|Mods|
+:On ClientLoadEvent:\nCore.app.post(checkWarnings());
+
+if (scripts.hasErrored()?) then (yes)
+  :Show "@mod.scripts.disable"\nerror dialog;
+endif
+
+if (Any mod has contentErrors?) then (yes)
+  :Show dialog listing errored\ncontent files with details button;
+endif
+
+if (Mods have unmet dependencies?) then (yes)
+  :checkDependencies()\n→ offer dependency download dialog;
+endif
+
+stop
+
+@enduml

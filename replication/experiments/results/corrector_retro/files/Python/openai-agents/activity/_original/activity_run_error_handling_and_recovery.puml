@@ -1,0 +1,184 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam note {
+    BackgroundColor #E7F3FF
+    BorderColor #4A90D9
+}
+
+title Run Error Handling and Recovery
+
+|#E3F2FD|run_loop (Runner)|
+start
+:Increment current_turn counter;
+
+if (current_turn > max_turns?) then (yes)
+
+    :Attach SpanError('Max turns exceeded')\nto current tracing span;
+    :Instantiate MaxTurnsExceeded exception;
+
+|#FFFDE7|error_handlers.py|
+
+    note right
+      build_run_error_data(
+        input, new_items, raw_responses,
+        last_agent, reasoning_item_id_policy
+      )
+    end note
+    :Convert input → history list\n(ItemHelpers.input_to_new_input_list());
+    :Convert each RunItem → TResponseInputItem\n(run_item_to_input_item());
+    :Return RunErrorData\n(input, new_items, history,\noutput, raw_responses, last_agent);
+
+|run_loop (Runner)|
+
+    :Call resolve_run_error_handler_result\n(error_handlers, error,\ncontext_wrapper, run_data);
+
+|error_handlers.py|
+
+    if (error_handlers is None\nor empty?) then (yes)
+        :return None;
+    else (no)
+        if (max_turns handler\nregistered in error_handlers?) then (no)
+            :return None;
+        else (yes)
+            :Build RunErrorHandlerInput\n(error=MaxTurnsExceeded,\ncontext=RunContextWrapper,\nrun_data=RunErrorData);
+
+|#E8F5E9|User Handler (Callback)|
+
+            note right
+              Registered via:
+              Runner.run(error_handlers=
+                {'max_turns': fn})
+              Supports sync and async handlers.
+              Only MaxTurnsExceeded is recoverable.
+            end note
+            :Execute handler(handler_input);
+            :Return result\n(RunErrorHandlerResult | dict | Any | None);
+
+|error_handlers.py|
+
+            if (inspect.isawaitable(result)?) then (yes)
+                :await result;
+            endif
+
+            if (result is None?) then (yes)
+                :return None;
+            elseif (isinstance(result,\nRunErrorHandlerResult)?) then (yes)
+                :return result as-is;
+            elseif (result is dict\nwith 'final_output' key?) then (yes)
+                if (extra / invalid keys\npresent in dict?) then (yes)
+                    #FFCDD2:raise UserError\n'Invalid run error handler result.';
+                    stop
+                else (no)
+                    :return RunErrorHandlerResult(**result);
+                endif
+            else (raw value)
+                :Wrap: RunErrorHandlerResult\n(final_output=result);
+            endif
+        endif
+    endif
+
+|run_loop (Runner)|
+
+    if (handler_result is None?) then (yes)
+
+        note right
+          MaxTurnsExceeded IS an AgentsException.
+          The BaseException catch block enriches it
+          with RunErrorDetails before propagation.
+        end note
+        :Attach RunErrorDetails to exc.run_data\n(input, new_items, raw_responses,\nlast_agent, context_wrapper,\nguardrail_results);
+        #FFCDD2:re-raise MaxTurnsExceeded\n(no recovery — propagates to caller);
+        stop
+
+    else (recovery path)
+
+|error_handlers.py|
+
+        note right
+          validate_handler_final_output(
+            current_agent,
+            handler_result.final_output
+          )
+        end note
+        :Get output_schema via\nget_output_schema(agent);
+
+        if (output schema is None\nor plain text?) then (yes)
+            :Return final_output unchanged;
+        else (structured output)
+            :Serialize to JSON\n(type_adapter.dump_json());
+            :Validate via\noutput_schema.validate_json();
+            if (serialization or\nvalidation error?) then (yes)
+                #FFCDD2:raise UserError\n'Invalid final_output for\nstructured output.';
+                stop
+            else (valid)
+                :Return validated_output;
+            endif
+        endif
+
+|run_loop (Runner)|
+
+        :format_final_output_text\n(current_agent, validated_output) → str;
+        :create_message_output_item\n(current_agent, output_text)\n→ MessageOutputItem\n(role='assistant', status='completed',\nid=FAKE_RESPONSES_ID);
+
+        if (handler_result.include_in_history\n== True?) then (yes)
+            :Append synthesized MessageOutputItem\nto generated_items and session_items;
+            note right
+              include_in_history=False lets the
+              handler supply a final_output without
+              polluting the conversation context.
+            end note
+            :Persist to session\n(if session persistence enabled);
+        endif
+
+        :run_final_output_hooks\n(agent, hooks, context_wrapper, output);
+        :run_output_guardrails\n(..., validated_output, ...);
+        :Construct RunResult\n(input, new_items, raw_responses,\nfinal_output=validated_output, ...);
+        :Set result._current_turn = max_turns;
+        #C8E6C9:Return RunResult\n— recovery complete;
+        stop
+
+    endif
+
+else (no)
+
+    :Continue normal agent turn processing;
+    stop
+
+endif
+
+|run_loop (Runner)|
+
+note
+  **BaseException Catch Block** (wraps entire run loop)
+  Any exception escaping the loop that is an AgentsException subclass
+  is enriched with RunErrorDetails (input, new_items, raw_responses,
+  last_agent, context_wrapper, guardrail_results) before re-raise.
+  Non-AgentsException errors propagate without enrichment.
+  This is a data-attachment-only operation — no recovery is attempted.
+end note
+:Catch BaseException as exc\n(any error during run loop);
+if (isinstance(exc, AgentsException)?) then (yes)
+    :Attach RunErrorDetails to exc.run_data\n(input, new_items, raw_responses,\nlast_agent, context_wrapper,\nguardrail_results);
+endif
+#FFCDD2:re-raise exc;
+stop
+
+@enduml

@@ -1,0 +1,160 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+skinparam note {
+    BackgroundColor #E8F4FD
+    BorderColor #2196F3
+}
+
+title Package Archive Creation Flow
+
+|ArchiveManager|
+start
+:Receive archive($package, $format, $targetDir,\n$fileName = null, $ignoreFilters = false);
+
+if (format is empty?) then (yes)
+    #FFB3B3:throw InvalidArgumentException\n("Format must be specified");
+    stop
+else (no)
+endif
+
+:Iterate registered archivers\ncalling supports($format, $package->getSourceType());
+
+if (usable archiver found?) then (no)
+    #FFB3B3:throw RuntimeException\n("No archiver found to support %s format");
+    stop
+else (yes)
+endif
+
+if ($package instanceof RootPackageInterface?) then (yes)
+    :$sourcePath = realpath('.');
+    note right: Use current working directory\n— no download needed
+else (no)
+    |ArchiveManager|
+    :Create temp dir\n$sourcePath = sys_get_temp_dir()\n  + '/composer_archive' + random hex;
+    |Filesystem|
+    :ensureDirectoryExists($sourcePath);
+    |DownloadManager|
+    :download($package, $sourcePath)\n[async → SyncHelper::await()];
+    :install($package, $sourcePath)\n[async → SyncHelper::await()];
+    |ArchiveManager|
+    if (download/install throws exception?) then (yes)
+        |Filesystem|
+        :removeDirectory($sourcePath);
+        |ArchiveManager|
+        #FFB3B3:rethrow exception;
+        stop
+    else (no)
+    endif
+    if (composer.json exists in $sourcePath?) then (yes)
+        |JsonFile|
+        :Read composer.json\nfrom downloaded source;
+        |ArchiveManager|
+        if (archive.name set in composer.json?) then (yes)
+            :$package->setArchiveName(name);
+        else (no)
+        endif
+        if (archive.exclude set in composer.json?) then (yes)
+            :$package->setArchiveExcludes(excludes);
+        else (no)
+        endif
+    else (no)
+    endif
+endif
+
+|ArchiveManager|
+if ($fileName provided?) then (no)
+    :getPackageFilenameParts($package);
+    note right
+        Compute name parts:
+        • base = getArchiveName() or sanitize getName()
+        • distReference is 40-char hex?
+          → add dist_reference + dist_type
+        • else → add version + dist_reference
+        • sourceReference present?
+          → add source_reference = substr(sha1(), 0, 6)
+        • filter nulls, replace '/' with '-'
+    end note
+else (yes)
+    :$packageNameParts = ['base' => $fileName];
+endif
+
+:getPackageFilenameFromParts($packageNameParts)\n→ $packageName = implode('-', parts);
+
+:buildExcludePatterns($packageNameParts, getSupportedFormats());
+note right
+    getSupportedFormats():
+    • ZipArchiver → ['zip']
+    • PharArchiver → ['zip','tar','tar.gz','tar.bz2']
+    → array_unique
+
+    buildExcludePatterns():
+    • base = parts['base']
+    • count(parts) > 1 → base .= '-*'
+    • foreach format: patterns[] = '$base.$format'
+end note
+
+|Filesystem|
+:ensureDirectoryExists($targetDir);
+|ArchiveManager|
+:$target = realpath($targetDir)\n  + '/' + $packageName + '.' + $format;
+|Filesystem|
+:ensureDirectoryExists(dirname($target));
+
+|ArchiveManager|
+if (overwriteFiles=false\nAND file_exists($target)?) then (yes)
+    #D4EDDA:Return existing $target path\n(skip re-archiving);
+    stop
+else (no)
+endif
+
+:Create temp archive path\n$tempTarget = sys_get_temp_dir()\n  + '/composer_archive' + random hex + '.' + $format;
+
+|ArchiverInterface|
+:usableArchiver->archive(\n  $sourcePath,\n  $tempTarget,\n  $format,\n  merge($excludePatterns,\n    $package->getArchiveExcludes()),\n  $ignoreFilters\n);
+
+|Filesystem|
+:rename($tempTarget → $target);
+
+|ArchiveManager|
+if (NOT RootPackageInterface?) then (yes)
+    |Filesystem|
+    :removeDirectory($sourcePath)\n(clean up temp source dir);
+else (no)
+endif
+
+|Filesystem|
+:remove($tempTarget)\n(clean up temp archive file);
+
+|ArchiveManager|
+#D4EDDA:Return $target (final archive path);
+stop
+
+@enduml

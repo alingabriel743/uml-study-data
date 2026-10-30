@@ -1,0 +1,284 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleBackgroundColor #E9ECEF
+}
+skinparam note {
+    BackgroundColor #FFF9E6
+    BorderColor #C8A400
+    FontColor #5C4A00
+}
+skinparam arrow {
+    Color #495057
+}
+
+title WordPress REST Posts CRUD Flow\n<size:11>WP_REST_Posts_Controller — Two-Phase: Permission Gate → CRUD Handler</size>
+
+|REST Client|
+start
+:HTTP Request to /wp/v2/posts[/{id}];
+
+|#EAF4FF|WP_REST_Posts_Controller|
+:WP_REST_Server routes request\nto WP_REST_Posts_Controller;
+
+:check_is_post_type_allowed($post_type);
+if (Post type is REST-enabled?) then (no)
+    #FFCCCC:Return WP_Error\n(rest_invalid_post_type);
+    detach
+else (yes)
+endif
+
+switch (HTTP Method + Route?)
+
+case ( GET /posts — List Posts )
+
+    note right: **Phase 1: Permission Gate**
+    :get_items_permissions_check();
+    if (post_status param requires\nelevated privileges?) then (yes)
+        if (current_user_can('edit_posts')?) then (no)
+            #FFCCCC:Return WP_Error\n(rest_cannot_read);
+            detach
+        else (yes)
+        endif
+    else (no — public read allowed)
+    endif
+
+    note right: **Phase 2: Handler**
+    :get_items($request);
+    :Build query args from $request params;
+    :prepare_items_query($prepared_args, $request);
+    note right
+        Sanitizes: orderby, per_page,
+        offset, search, author, exclude,
+        include, sticky, tax_query, date_query
+    end note
+
+    |#EDFAED|WordPress Core|
+    :Execute new WP_Query($args);
+    :Retrieve matching posts;
+
+    |#EAF4FF|WP_REST_Posts_Controller|
+    :Loop through posts;
+    :check_read_permission($post) per post\n— skip post if false;
+    :prepare_item_for_response($post, $request)\nfor each readable post;
+    :prepare_response_for_collection();
+
+    |REST Client|
+    #D4EDDA:Return 200 WP_REST_Response\n(posts array + X-WP-Total pagination headers);
+
+case ( GET /posts/{id} — Read Post )
+
+    note right: **Phase 1: Permission Gate**
+    :get_item_permissions_check();
+
+    |#EDFAED|WordPress Core|
+    :get_post($id);
+
+    |#EAF4FF|WP_REST_Posts_Controller|
+    if (Post found & post_type matches?) then (no)
+        #FFCCCC:Return WP_Error 404\n(rest_invalid_post);
+        detach
+    else (yes)
+    endif
+
+    :check_read_permission($post);
+    if (post_status?) then (publish)
+        :Public read — no authentication required;
+    elseif (private) then
+        if (current_user_can\n('read_private_posts')?) then (no)
+            #FFCCCC:Return WP_Error\n(rest_cannot_read);
+            detach
+        else (yes)
+        endif
+    else (draft / pending)
+        if (current_user_can\n('edit_post', $id)?) then (no)
+            #FFCCCC:Return WP_Error\n(rest_cannot_read);
+            detach
+        else (yes)
+        endif
+    endif
+
+    if (Post is password-protected?) then (yes)
+        :can_access_password_content($post, $request);
+        :hash_equals(post_password_hash,\nsupplied_password);
+        if (Password matches?) then (no)
+            #FFCCCC:Return WP_Error\n(rest_cannot_read);
+            detach
+        else (yes)
+        endif
+    else (no)
+    endif
+
+    note right: **Phase 2: Handler**
+    :get_item($request);
+    :prepare_item_for_response($post, $request);
+
+    |REST Client|
+    #D4EDDA:Return 200 WP_REST_Response;
+
+case ( POST /posts — Create Post )
+
+    note right: **Phase 1: Permission Gate**
+    :create_item_permissions_check();
+    :check_is_post_type_allowed($post_type);
+    if (current_user_can(create_posts cap)?) then (no)
+        #FFCCCC:Return WP_Error\n(rest_cannot_create);
+        detach
+    else (yes)
+    endif
+    if (status param provided?) then (yes)
+        :handle_status_param()\nValidate publish / private status caps;
+        if (User lacks required status cap?) then (yes)
+            #FFCCCC:Return WP_Error\n(rest_post_invalid_status);
+            detach
+        else (no)
+        endif
+    endif
+
+    note right: **Phase 2: Handler**
+    :create_item($request);
+    :prepare_item_for_database($request);
+    note right
+        Map fields: title, content, excerpt,
+        post_status, slug, author, date
+    end note
+
+    |#EDFAED|WordPress Core|
+    :wp_insert_post($post_data, true);
+
+    |#EAF4FF|WP_REST_Posts_Controller|
+    if (WP_Error returned?) then (yes)
+        #FFCCCC:Return error response;
+        detach
+    else (no)
+    endif
+
+    :handle_terms($post_id, $request);
+    :check_assign_terms_permission($request);
+    :handle_featured_media($featured_media_id, $post_id);
+    note right: set_post_thumbnail() via WP Core
+    :handle_template($template, $post_id, $validate=true);
+    note right: check_template() + update_post_meta\n('_wp_page_template')
+    :meta->update_value()\nfor custom meta fields;
+    :prepare_item_for_response(get_post($post_id), $request);
+
+    |REST Client|
+    #D4EDDA:Return 201 WP_REST_Response\n(Location: /wp/v2/posts/{id} header);
+
+case ( PUT/PATCH /posts/{id} — Update Post )
+
+    note right: **Phase 1: Permission Gate**
+    :update_item_permissions_check();
+
+    |#EDFAED|WordPress Core|
+    :get_post($id);
+
+    |#EAF4FF|WP_REST_Posts_Controller|
+    if (Post found & correct post_type?) then (no)
+        #FFCCCC:Return WP_Error 404\n(rest_invalid_post);
+        detach
+    else (yes)
+    endif
+    if (current_user_can('edit_post', $id)?) then (no)
+        #FFCCCC:Return WP_Error\n(rest_cannot_edit);
+        detach
+    else (yes)
+    endif
+    if (Status field is changing?) then (yes)
+        :handle_status_param()\nCheck publish / private caps;
+        if (User lacks status cap?) then (yes)
+            #FFCCCC:Return WP_Error\n(rest_post_invalid_status);
+            detach
+        else (no)
+        endif
+    endif
+
+    note right: **Phase 2: Handler**
+    :update_item($request);
+    :prepare_item_for_database($request)\n— partial field mapping;
+
+    |#EDFAED|WordPress Core|
+    :wp_update_post($post_data);
+
+    |#EAF4FF|WP_REST_Posts_Controller|
+    :handle_terms / handle_featured_media\n/ handle_template (same as create);
+    :meta->update_value() for meta fields;
+    :prepare_item_for_response(get_post($post_id), $request);
+
+    |REST Client|
+    #D4EDDA:Return 200 WP_REST_Response;
+
+case ( DELETE /posts/{id} — Delete Post )
+
+    note right: **Phase 1: Permission Gate**
+    :delete_item_permissions_check();
+
+    |#EDFAED|WordPress Core|
+    :get_post($id);
+
+    |#EAF4FF|WP_REST_Posts_Controller|
+    if (Post found?) then (no)
+        #FFCCCC:Return WP_Error 404\n(rest_invalid_post);
+        detach
+    else (yes)
+    endif
+    if (current_user_can('delete_post', $id)?) then (no)
+        #FFCCCC:Return WP_Error\n(rest_cannot_delete);
+        detach
+    else (yes)
+    endif
+
+    note right: **Phase 2: Handler**
+    :delete_item($request);
+    :prepare_item_for_response($post, $request)\n— capture previous post state;
+
+    if (force=true in request?) then (yes — hard delete)
+        |#EDFAED|WordPress Core|
+        :wp_delete_post($id, force=true)\npermanent deletion;
+    else (no — soft delete)
+        |#EDFAED|WordPress Core|
+        :wp_trash_post($id)\nmove post to Trash;
+        |#EAF4FF|WP_REST_Posts_Controller|
+        if (wp_trash_post failed?) then (yes)
+            #FFCCCC:Return WP_Error\n(rest_cannot_trash);
+            detach
+        else (no)
+        endif
+    endif
+
+    |#EAF4FF|WP_REST_Posts_Controller|
+    :Confirm deletion / trash operation;
+
+    |REST Client|
+    #D4EDDA:Return 200 WP_REST_Response\n(previous post state as body);
+
+endswitch
+
+stop
+
+legend right
+    |= Symbol |= Meaning |
+    |<back:#D4EDDA>  </back>| Success response |
+    |<back:#FFCCCC>  </back>| Error / WP_Error response |
+    |<back:#FFF3CD>  </back>| Decision point |
+    | detach | Execution path ends (error) |
+    Each operation follows a strict two-phase pattern:
+    (1) *_permissions_check() — evaluated before routing
+    (2) main handler method — performs the DB operation
+endlegend
+
+@enduml

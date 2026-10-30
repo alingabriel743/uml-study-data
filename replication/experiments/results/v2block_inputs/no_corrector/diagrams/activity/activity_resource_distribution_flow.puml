@@ -1,0 +1,205 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #495057
+    StartColor #212529
+    EndColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam arrowColor #495057
+skinparam noteBorderColor #6C757D
+skinparam noteBackgroundColor #FFF9E6
+
+title Resource Distribution Flow
+
+|Conveyor / ArmoredConveyor|
+start
+
+:Game tick fires **updateTile()**;
+
+if (len == 0 AND timeScale == 1?) then (yes — idle)
+    :Reset clogHeat = 0;
+    :sleep() and return;
+    stop
+else (no — items present)
+endif
+
+:Calculate nextMax\n(aligned: 1 - max(itemSpace - nextc.minitem, 0)\nelse: 1.0);
+:moved = speed × edelta();
+
+:Iterate items **back → front** (len-1 downto 0);
+
+repeat
+    :Compute gap to next item;
+    :maxmove = clamp(gap, 0, moved);
+    :ys[i] += maxmove  — cap at nextMax;
+
+    if (ys[i] >= 1.0?\n(item at front edge)) then (yes)
+        :Call **pass(item)**;
+
+        if (next != null\nAND next.team == team\nAND next.acceptItem(this, item)?) then (accepted)
+            :next.handleItem(this, item);
+            :Remove item from array; len--;
+        else (rejected)
+            :Item stays at front edge\n(conveyor stalls);
+        endif
+
+    else (no — still moving)
+        :Update minitem = min(minitem, ys[i]);
+    endif
+
+repeat while (more items?) is (yes)
+-> no;
+
+if (minitem < itemSpace threshold?) then (yes — clogged)
+    :Increment clogHeat toward 1.0\n(stops animation + unit push > 0.5);
+else (no)
+    :clogHeat = 0;
+endif
+
+|Conveyor / ArmoredConveyor|
+note right
+  **acceptItem() guard checks:**
+  1. len >= capacity (3) → REJECT
+  2. getFacingEdge(src, tile) == null → REJECT
+  3. direction==0 (inline): minitem >= itemSpace → REJECT
+     direction odd (side): minitem > 0.7 → REJECT
+  4. ArmoredConveyor extra:
+     src.block not instanceof Conveyor
+     AND facing edge relativeTo ≠ rotation → REJECT
+  On pass: insert at ys=0 (inline) or ys=0.5 (side)
+end note
+
+stop
+
+|ItemBridge|
+start
+
+:Game tick fires **updateTile()**;
+
+:timer(timerCheckMoved, 30):\nsnapshot wasMoved; reset moved = false;
+:checkIncoming():\nremove stale entries from incoming list;
+
+if (linkValid(tile, world.tile(link))?) then (no — broken link)
+    :doDump() — scatter items\nto adjacent neighbors;
+    :warmup → 0;
+    stop
+else (yes — link OK)
+endif
+
+:Add self to other.incoming list;
+:warmup approaches efficiency;
+:Call **updateTransport(other.build)**;
+
+:transportCounter += edelta();
+
+repeat
+    :item = items.take();
+
+    if (item != null\nAND other.acceptItem(this, item)?) then (yes)
+        :other.handleItem(this, item);
+        :moved = true;
+    else (no — item rejected)
+        if (item != null?) then (yes)
+            :items.add(item, 1);\nitems.undoFlow(item)\n— put item back;
+        else (no item)
+        endif
+    endif
+
+    :transportCounter -= transportTime;
+
+repeat while (transportCounter >= transportTime?) is (yes)
+-> no;
+
+stop
+
+|BufferedItemBridge|
+start
+
+:Game tick fires\n**updateTransport()** (override);
+
+if (buffer.accepts()\nAND items.total() > 0?) then (yes)
+    :buffer.accept(items.take())\n— timestamp item into\ninternal buffer;
+else (no)
+endif
+
+:item = buffer.poll(speed / timeScale)\n— check if oldest item waited long enough;
+
+if (timer(timerAccept, 4/timeScale)\nAND item != null\nAND other.acceptItem(this, item)?) then (yes)
+    :moved = true;
+    :other.handleItem(this, item);
+    :buffer.remove();
+else (no)
+    :Item remains in buffer\n(max capacity 50, speed 40 ticks/item);
+endif
+
+stop
+
+|OverflowGate|
+start
+
+:Item arrives — **acceptItem / handleItem** called;
+
+:from = relativeToEdge(src.tile)\n— direction item came from;
+:to = nearby((from + 2) % 4)\n— forward neighbor;
+
+:canForward = (to != null\nAND to.team == team\nAND !(both instantTransfer)\nAND to.acceptItem(this, item));
+
+:inv = (invert XOR enabled)\n— effective inversion state;
+
+if (!canForward OR inv?) then (yes — try sides)
+    :a = nearby((from - 1) % 4)  — left;
+    :b = nearby((from + 1) % 4)  — right;
+    :ac = a accepts item;\nbc = b accepts item;
+
+    if (ac OR bc?) then (at least one side available)
+        if (ac AND bc?) then (both sides available)
+            :Alternate using rotation bit\nfor direction 'from';\nflip bit after routing;
+        else if (ac only?) then (left only)
+            :Route to left neighbor **a**;
+        else (right only)
+            :Route to right neighbor **b**;
+        endif
+    else (no side available)
+        if (inv AND canForward?) then (yes)
+            :Route forward to **to**;
+        else (no)
+            :Drop / reject item\n(no valid target);
+            stop
+        endif
+    endif
+
+else (no — forward available and not inverted)
+    :Route item forward to **to**;
+endif
+
+:**target.handleItem(this, item)**\n— deliver to chosen target;
+
+stop
+
+@enduml

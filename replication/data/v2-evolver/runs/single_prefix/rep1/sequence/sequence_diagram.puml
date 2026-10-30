@@ -1,0 +1,166 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequence {
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+}
+
+title EvoMapProxy — Startup & Sync Cycle
+
+actor "Node Process" as node
+participant "main()" as main
+participant "EvoMapProxy" as proxy
+participant "LifecycleManager" as lifecycle
+participant "ProxyHttpServer" as httpServer
+participant "TaskMonitor" as monitor
+participant "SyncEngine" as sync
+participant "InboundSync" as inbound
+participant "OutboundSync" as outbound
+participant "MailboxStore" as store
+participant "SkillUpdater" as skillUpdater
+
+== Startup ==
+
+node -> main: start process
+activate main
+
+main -> main: acquireLock()
+note right: prevent duplicate instances
+
+main -> main: readJsonSafe(statePath)
+note right: load persisted run state
+
+main -> proxy: new EvoMapProxy(config)
+activate proxy
+
+proxy -> lifecycle: new LifecycleManager(config)
+activate lifecycle
+
+proxy -> httpServer: new ProxyHttpServer(routes)
+activate httpServer
+
+proxy -> monitor: new TaskMonitor()
+activate monitor
+
+proxy -> proxy: start()
+
+== Lifecycle Hello / Authentication ==
+
+proxy -> lifecycle: hello()
+activate lifecycle #LightBlue
+lifecycle -> lifecycle: _buildHeaders()
+lifecycle -> lifecycle: _getEnvFingerprint()
+lifecycle --> proxy: helloResponse (token, nodeId)
+deactivate lifecycle
+
+proxy -> lifecycle: startHeartbeatLoop(intervalMs)
+activate lifecycle #LightBlue
+lifecycle -> lifecycle: heartbeat()
+note right: periodic heartbeat\nto hub
+
+loop every intervalMs
+    lifecycle -> lifecycle: heartbeat()
+    lifecycle -> lifecycle: countPending(events)
+    lifecycle --> proxy: heartbeatAck
+end
+deactivate lifecycle
+
+== HTTP Server Startup ==
+
+proxy -> httpServer: start()
+activate httpServer #LightBlue
+httpServer -> httpServer: crypto.randomBytes(token)
+httpServer --> proxy: listening on port
+deactivate httpServer
+
+== Sync Engine Startup ==
+
+proxy -> sync: new SyncEngine(store, inbound, outbound)
+activate sync
+
+proxy -> sync: start()
+activate sync #LightBlue
+sync -> sync: _scheduleOutbound(delayMs)
+sync -> sync: _scheduleInbound(delayMs)
+deactivate sync
+
+== Inbound Sync Cycle ==
+
+sync -> inbound: pull()
+activate inbound
+inbound -> inbound: getHeaders()
+inbound -> inbound: getState()
+note right: fetch messages\nfrom remote hub
+inbound -> store: writeInboundBatch(messages)
+activate store
+store -> store: _rebuildIndex()
+store -> store: _persistState()
+store --> inbound: ok
+deactivate store
+inbound --> sync: pulledMessages
+deactivate inbound
+
+inbound -> inbound: ackDelivered()
+note right: acknowledge delivered\nmessages to hub
+
+sync -> sync: _scheduleInbound(nextDelayMs)
+note right: reschedule for next poll
+
+== Skill Update (on inbound message) ==
+
+sync -> skillUpdater: pollAndApply()
+activate skillUpdater
+skillUpdater -> store: poll()
+activate store
+store --> skillUpdater: pendingMessages
+deactivate store
+skillUpdater -> skillUpdater: processSkillUpdate(message)
+note right: write updated skill\nmarkdown to disk
+skillUpdater -> store: ack(messageIds)
+deactivate skillUpdater
+
+== Outbound Sync Cycle ==
+
+sync -> outbound: flush()
+activate outbound
+outbound -> store: countPending()
+activate store
+store --> outbound: pendingCount
+deactivate store
+outbound -> outbound: store.updateStatusBatch(ids, "sending")
+outbound -> outbound: store.writeInboundBatch(responses)
+note right: send pending messages\nto hub, store responses
+outbound --> sync: flushResult
+deactivate outbound
+
+sync -> sync: _scheduleOutbound(nextDelayMs)
+
+== Shutdown ==
+
+node -> main: SIGTERM / signal
+main -> main: shutdown()
+activate main #LightPink
+main -> proxy: stop()
+proxy -> httpServer: stop()
+activate httpServer #LightPink
+httpServer -> httpServer: server.close()
+httpServer --> proxy: closed
+deactivate httpServer
+proxy -> lifecycle: stopHeartbeatLoop()
+proxy --> main: stopped
+deactivate proxy
+main -> main: releaseLock()
+deactivate main
+
+@enduml

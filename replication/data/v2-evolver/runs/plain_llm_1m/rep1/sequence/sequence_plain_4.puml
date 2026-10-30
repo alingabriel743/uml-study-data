@@ -1,0 +1,98 @@
+@startuml evolver_mailbox_routing
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequenceParticipant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    GroupBackgroundColor #E9ECEF
+    GroupBorderColor #6C757D
+}
+
+title Proxy Mailbox — Inbound & Outbound Message Routing
+
+participant "A2A Hub\n(heartbeat)" as Hub
+participant "LifecycleManager\n(heartbeat)" as LC
+participant "MailboxStore\n(mailbox/store.js)" as Store
+participant "ProxyHttpServer\n(server/http.js)" as Server
+participant "DmHandler /\nSessionHandler" as Ext
+participant "evolver\nconsumer" as Evo
+participant "OutboundSync\n(sync/outbound.js)" as OB
+
+== Inbound: Hub → Consumer ==
+Hub -> LC: pending_messages[]\n(in heartbeat response)
+activate LC
+LC -> Store: writeInboundBatch(messages)
+activate Store
+loop each message
+  Store -> Store: _appendMessage(msg)\n[assign UUIDv7, timestamp]
+  Store -> Store: _inbound.push(id)
+end
+Store --> LC: accepted_ids[]
+deactivate Store
+deactivate LC
+
+Evo -> Server: POST /mailbox/poll\n{type?, limit}
+activate Server
+Server -> Store: poll({limit, type})
+activate Store
+Store -> Store: walk _inbound queue\n(status: pending)
+Store --> Server: messages[]
+deactivate Store
+Server --> Evo: {messages[]}
+deactivate Server
+
+Evo -> Ext: process messages\n(DM, session invites, etc.)
+activate Ext
+Ext --> Evo: handled
+deactivate Ext
+
+Evo -> Server: POST /mailbox/ack\n{messageIds[]}
+activate Server
+Server -> Store: ack(messageIds)
+activate Store
+loop each id
+  Store -> Store: _appendUpdate(id,\n{status: "acked"})
+  Store -> Store: _evictFromIndex(id)
+end
+Store --> Server: ok
+deactivate Store
+Server --> Evo: {ok: true, acked: n}
+deactivate Server
+
+== Outbound: Consumer → Hub ==
+Evo -> Server: POST /mailbox/send\n{type, payload}
+activate Server
+Server -> Store: send({type, payload})
+activate Store
+Store -> Store: safeParse(payload)
+Store -> Store: _appendMessage(msg)\n[_outbound.push(id)]
+Store --> Server: {id}
+deactivate Store
+Server --> Evo: {id}
+deactivate Server
+
+OB -> Store: pollOutbound()
+activate Store
+Store -> Store: sort by priority/timestamp\n(pending outbound)
+Store --> OB: pendingMessages[]
+deactivate Store
+
+OB -> Hub: POST /a2a/mailbox/send\n{messages[]}
+activate Hub
+Hub --> OB: {accepted_ids[], rejected_ids[]}
+deactivate Hub
+
+OB -> Store: updateStatusBatch\n([{id, status: "sent"}])
+activate Store
+Store -> Store: _appendUpdate() per id
+Store -> Store: _evictFromIndex() [terminal]
+deactivate Store
+
+@enduml

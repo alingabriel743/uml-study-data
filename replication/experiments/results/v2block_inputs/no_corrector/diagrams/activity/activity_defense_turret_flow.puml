@@ -1,0 +1,192 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #495057
+    EndColor #212529
+    BarColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+skinparam note {
+    BackgroundColor #FFF3CD
+    BorderColor #FFC107
+}
+
+title Defense Turret Targeting and Firing
+
+|TurretBuild|
+start
+
+:updateTile() called each game tick;
+
+:validateTarget()\nif invalid → set target = null;
+
+:Update ammo fraction for player-controlled unit\nUpdate sound loop;
+
+note right
+  Warmup and thermal state
+  are updated every tick
+  regardless of firing.
+end note
+
+:Compute warmupTarget\n(isShooting() && canConsume()) || charging() ? 1 : 0;
+
+:Lerp shootWarmup toward warmupTarget × efficiency\nDecay curRecoil toward 0 (1/recoilTime per tick)\nDecay heat toward 0 (1/cooldownTime per tick);
+
+if (charging()?) then (yes)
+    :Advance charge counter;
+endif
+
+:Sync unit tile / rotation / team\nDecrement logicControlTime if logic-controlled\nCalculate heatReq if heatRequirement > 0;
+
+:updateReload() — increment reloadCounter\nupdateCooling() — apply liquid coolant bonus;
+
+if (activationTimer > 0?) then (yes)
+    :Decrement activationTimer;
+    note right: Placement cooldown —\nblock all targeting/firing
+    stop
+endif
+
+if (hasAmmo()?\nammo.size > 0 && peek().amount >= ammoPerShot && canConsume()) then (no)
+    :Skip all targeting and firing;
+    stop
+endif
+
+' ─── TARGET ACQUISITION ───
+if (timer(timerTarget, targetInterval) elapsed?) then (yes)
+    :findTarget();
+    :findEnemy(range)\n→ Units.bestTarget() / bestEnemy();
+    :Set target;
+    if (target == null && canHeal()?) then (yes)
+        :Find ally tile needing healing\nwithin range;
+        :Set target to healing target;
+    endif
+endif
+
+:validateTarget() — recheck;
+if (target still valid?) then (no)
+    :target = null;
+endif
+
+' ─── CONTROL MODE BRANCH ───
+if (isControlled by player?) then (yes)
+    :targetPos = unit.aimX / aimY\ncanShoot = unit.isShooting();
+else if (logicControlled?) then (yes)
+    :canShoot = logicShooting;
+else (AI)
+    |AIController|
+    :retarget()? timer.get(timerTarget,\ntarget==null ? 40 : 90);
+    if (retarget interval elapsed?) then (yes)
+        :findMainTarget(x, y, range,\ntargetAir, targetGround);
+        :Set unit.target;
+    endif
+    if (invalid(target)?) then (yes)
+        :target = null\nnoTargetTime++;
+    else (valid)
+        :noTargetTime = 0;
+        :Per weapon mount:\nfindTarget(mountX, mountY, wrange);
+        :checkTarget(mount.target) —\ninvalidate if out of range;
+        :Predict.intercept(unit, mount.target,\nweapon.bullet) → aimX / aimY;
+        :mount.shoot = mount.rotate = within(target, wrange)\n&& shouldShoot();
+        if (!shouldFire()?) then (yes)
+            :mount.shoot = false;
+        endif
+        if (no target && noTargetTime >= rotateBackTimer?) then (yes)
+            :Rotate weapon back to baseRotation;
+        endif
+    endif
+    |TurretBuild|
+    :targetPos = predicted intercept (aimX / aimY)\ncanShoot = within(target, range);
+endif
+
+' ─── ROTATION ───
+:shouldTurn()?\nmoveWhileCharging || !charging();
+if (shouldTurn()?) then (yes)
+    :turnToTarget(targetRot)\nAngles.moveToward(rotation, targetRot,\nrotateSpeed × delta × efficiency);
+endif
+
+' ─── SHOOT DECISION ───
+if (alwaysShooting?) then (yes)
+    :updateShooting() — fire unconditionally;
+else if (Angles.angleDist(rotation, targetRot) < shootCone\nAND canShoot?) then (yes)
+    :updateShooting();
+else (no)
+    :Do not fire this tick;
+    stop
+endif
+
+' ─── FIRE READINESS CHECK ───
+if (reloadCounter >= reload\nAND !charging()\nAND shootWarmup >= minWarmup?) then (no)
+    :Reload not ready — wait;
+    stop
+endif
+
+:shoot(peekAmmo()) — compute bulletX/Y\nfrom rotation + shootX/Y offsets;
+
+if (firstShotDelay > 0?) then (yes)
+    :Play chargeSound\nPlay chargeEffect;
+endif
+
+' ─── SHOOT PATTERN EXECUTION ───
+|ShootPattern|
+:Select ShootPattern:\ntype.shootPattern != null\n? type.shootPattern : turret.shoot;
+
+:ShootPattern.shoot(\nbarrelCounter, BulletHandler, barrelIncrementer);
+
+note right
+  Loops i in 0..shots:
+  handler.shoot(0, 0, 0,
+    firstShotDelay + shotDelay × i)
+end note
+
+|BulletHandler|
+fork
+    :Shot 1: schedule or fire immediately;
+fork again
+    :Shot 2 … N: schedule with delay offsets;
+end fork
+
+:bullet(type, xOffset, yOffset, angleOffset, mover):;
+
+:Decrement queuedBullets\nCompute final bulletX/Y + xRand spread\nshootAngle = rotation + angleOffset + inaccuracy;
+
+if (type.scaleLife?) then (yes)
+    :Scale bullet lifetime by\ndistance to target;
+endif
+
+:type.create(owner, team, bulletX, bulletY,\nshootAngle, ...) → spawn Bullet entity;
+
+:Apply shootEffect, smokeEffect\nshootSound, ammoUseEffect;
+
+if (shake > 0?) then (yes)
+    :Effect.shake();
+endif
+
+|TurretBuild|
+:Set curRecoil = 1\nSet heat = 1\nIncrement totalShots;
+
+' ─── AMMO CONSUMPTION ───
+if (consumeAmmoOnce = true?) then (yes — once per trigger pull)
+    :useAmmo() once\nammo.peek().amount -= ammoPerShot\nif amount <= 0 → pop entry\ntotalAmmo -= ammoPerShot;
+else (no — per bullet)
+    :useAmmo() called\nper bullet fired;
+endif
+
+:reloadCounter reset to 0\nNext tick cycle begins;
+
+stop
+
+@enduml

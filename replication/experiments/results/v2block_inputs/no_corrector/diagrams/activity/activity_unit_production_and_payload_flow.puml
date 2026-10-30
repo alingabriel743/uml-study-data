@@ -1,0 +1,221 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #DEE2E6
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title Unit Production and Payload Flow
+
+' =====================================================================
+' FLOW 1: Reconstructor Upgrade — UnitPayload transport chain
+' =====================================================================
+
+|ReconstructorBuild|
+start
+:UnitPayload arrives at ReconstructorBuild;
+:acceptPayload(source, payload) called;
+if (payload == null\nor wrong direction\nor not UnitPayload?) then (reject)
+  :Reject payload — no-op;
+  detach
+else (accept)
+endif
+if (team.activateUnitFactories()?) then (no)
+  :Status = INACTIVE\n— block disabled;
+  detach
+else (yes)
+endif
+:Look up upgrade(unit.type)\nin upgrades Seq<UnitType[]>;
+if (upgrade found?) then (no)
+  :Show "no upgrade" overlay;
+  |"PayloadBlock Infrastructure"|
+  :moveOutPayload()\n— eject payload downstream;
+  detach
+else (yes)
+endif
+if (upgrade.unlockedNowHost()\n|| team.isAI()?) then (no)
+  :Reject — upgrade locked;
+  detach
+else (yes)
+endif
+if (upgrade.isBanned()?) then (yes)
+  :Reject — upgrade banned;
+  detach
+else (no)
+endif
+:handlePayload():\nstore payload, payVector, payRotation;
+
+|"PayloadBlock Infrastructure"|
+:moveInPayload():\npayload approaches center\n(payVector.approach(ZERO));
+
+|ReconstructorBuild|
+repeat
+  :progress += edelta() × unitBuildSpeed\n(requires efficiency > 0);
+repeat while (progress < constructTime\n[default: 120 ticks / 2s]?) is (constructing)
+-> complete;
+:payload.unit =\nnewType.create(payload.unit.team());
+if (unit.isCommandable()?) then (yes)
+  :Set commandPosition + command;
+else (no)
+endif
+:createSound.at(this);\nEffect.shake; Fx.producesmoke;
+:consume()\n— deduct upgrade items from inventory;
+:Events.fire(UnitCreateEvent\n(payload.unit, this));
+:progress %= 1f;
+
+|"PayloadBlock Infrastructure"|
+:moveOutPayload()\n— payVector approaches front direction;
+if (front building\naccepts payload?) then (yes)
+  :movePayload(payload)\n— hand off to next building;
+  detach
+else (no)
+  :dumpPayload()\n→ payload.dump();
+endif
+
+|"UnitPayload / World"|
+if (Units.canCreate\n(team, type)?) then (cap exceeded)
+  :Show overlay — unit cap hit;\nreturn false;
+  detach
+else (ok)
+endif
+if (path blocked or\nground unit overlap?) then (blocked)
+  :Cannot deploy — retry next tick;
+  detach
+else (clear)
+endif
+:unit.add() — deploy unit to world;
+:unit.unloaded();
+:Events.fire(UnitUnloadEvent);
+
+|ReconstructorBuild|
+stop
+
+' =====================================================================
+' FLOW 2: DroneCenter — direct unit spawn (no payload chain)
+' =====================================================================
+
+|DroneCenterBuild|
+start
+:updateTile() called each game tick;
+:Resolve units Seq —\nremoveAll(dead or removed);
+:droneWarmup lerps toward\n(units.size < unitsSpawned ? efficiency : 0);
+if (units.size < unitsSpawned?) then (yes — need more drones)
+  :droneProgress +=\nedelta() / droneConstructTime\n[default: 180 ticks / 3s];
+  if (droneProgress >= 1.0?) then (spawned)
+    :droneType.create(team)\n— instantiate drone unit;
+    if (unit instanceof\nBuildingTetherc?) then (yes)
+      :bt.building(this)\n— tether drone to DroneCenterBuild;
+    else (no)
+    endif
+    :unit.set(x, y);\nunit.rotation = 90; unit.add();
+    :Fx.spawn.at(unit);\nunits.add(unit); droneProgress = 0;
+  else (still constructing)
+    :Draw construct animation;\ncontinue this tick;
+  endif
+else (no — squad full)
+  :Skip spawning\n— unitsSpawned quota met;
+endif
+:Resolve target:\nGroups.unit.getByID(readTarget)\nor Units.closest(team, x, y, range);
+
+|EffectDroneAI|
+:updateUnit() each tick per drone;
+if (BuildingTetherc.building()\nis DroneCenterBuild?) then (no)
+  :Skip — invalid or missing tether;
+  detach
+else (yes)
+endif
+:moveTo(target, droneRange offset);
+:unit.lookAt(target);
+if (within(target,\ndroneRange + target.hitSize)?) then (in range)
+  :target.apply(status, statusDuration)\n— apply buff/debuff status effect;
+else (out of range)
+  :Continue moving toward target;
+endif
+
+|DroneCenterBuild|
+stop
+
+' =====================================================================
+' FLOW 3: BuilderComp — unit build-plan queue management
+' =====================================================================
+
+|BuilderComp|
+start
+:Unit receives addBuild(BuildPlan plan);
+if (canBuild()?\n[buildSpeed > 0 &&\nbuildSpeedMultiplier > 0]) then (no)
+  :Reject — unit cannot build;
+  detach
+else (yes)
+endif
+:Remove any existing plan\nat same tile coordinates;
+:Set plan.progress from\nexisting ConstructBuild (if any);
+:plans.addLast(plan)\nor addFirst(plan) (priority);
+
+repeat
+  :updateBuildLogic() tick;
+  :validatePlans() —\nremove completed / invalid;
+  if (updateBuilding &&\ncanBuild()?) then (yes)
+    :buildCounter += Time.delta;
+    if (buildCounter >= 1?) then (yes)
+      :Rotate queue — pick closest\nin-range, non-stuck plan;
+      if (plan within buildRange?) then (yes)
+        if (tile has ConstructBuild?) then (no — not yet)
+          if (!breaking &&\nvalidPlaceIgnoreUnits?) then (yes)
+            :Call.beginPlace()\n→ create ConstructBuild on tile;
+          else (no)
+            if (breaking &&\nvalidBreak?) then (yes)
+              :Call.beginBreak()\n→ start deconstruction;
+            else (no)
+              :Remove invalid plan\nfrom queue;
+            endif
+          endif
+        else (yes — ConstructBuild exists)
+          :bs = (1 / buildCost) × buildSpeed\n× multiplier × rules.buildSpeed(team);
+          if (plan.breaking?) then (yes)
+            :entity.deconstruct\n(self(), core, bs);
+          else (no)
+            :entity.construct\n(self(), core, bs, config);
+          endif
+          :Update plan.progress;\nmark plan.stuck if unchanged;
+        endif
+      else (no — out of range)
+        :Skip — cannot reach tile\nthis tick;
+      endif
+    else (no)
+      :Wait for next tick;
+    endif
+  else (no)
+    :Skip this tick;
+  endif
+repeat while (plans queue not empty?) is (continue)
+-> queue empty;
+:All plans completed\n— blocks placed in world;
+
+|BuilderComp|
+stop
+
+@enduml

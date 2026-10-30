@@ -1,0 +1,266 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F9A825
+}
+
+title PostgreSQL Type Conversion Flow
+
+participant "PostgresTypeMetadataPerf\n(JMH Benchmark)" as Bench
+participant "AbstractReplicationMessage\nColumn" as ARC
+participant "TypeMetadataImpl" as TMI
+participant "PostgresType" as PT
+participant "TypeRegistry" as TR
+participant "PostgresConnection" as PC
+participant "PostgresValueConverter" as PVC
+participant "PostgresConnectorConfig" as PCC
+
+== TypeRegistry Initialization ==
+
+[-> TR: new TypeRegistry(postgresConnection)
+activate TR
+
+TR -> PC: execute(SQL_TYPES)\npg_catalog.pg_type JOIN pg_namespace\nLEFT JOIN enum_values
+activate PC
+PC --> TR: ResultSet (name, oid, jdbcId, category, modifiers, parentOid, elementOid, enumValues)
+deactivate PC
+
+loop for each row in ResultSet
+    TR -> TR: createTypeBuilderFromResultSet(rs)
+    activate TR
+    TR -> PT: new PostgresType.Builder(typeRegistry, name, oid, jdbcId, modifiers, typeInfo)
+    activate PT
+    alt CATEGORY_ENUM
+        TR -> PT: builder.enumValues(enumValues)
+    else CATEGORY_ARRAY
+        TR -> PT: builder.elementType(elementOid)
+    end
+    TR -> PT: builder.parentType(parentTypeOid)
+    PT --> TR: TypeBuilderWithSchema
+    deactivate PT
+    deactivate TR
+end
+
+note over TR
+  Two-pass strategy:
+  1st pass — simple types (no parent/element refs) → addType() immediately
+  2nd pass — delayed builders → resolve parent/element OIDs → addType()
+end note
+
+TR -> TR: addType(builder.build(), schemaName)
+activate TR
+TR -> PT: builder.build()
+activate PT
+PT -> TR: get(parentTypeOid)
+PT -> TR: get(elementTypeOid)
+TR --> PT: resolved PostgresType refs
+PT --> TR: new PostgresType(name, oid, jdbcId, modifiers, typeInfo,\nenumValues, parentType, elementType)
+deactivate PT
+TR -> TR: oidToType.put(oid, type)\nnameToType.put(qualifiedName, type)\ncache special OIDs (geometryOid,\nhstoreOid, ltreeOid, vectorOid…)
+deactivate TR
+
+deactivate TR
+
+== TypeRegistry Lookup ==
+
+[-> TR: get(int oid)
+activate TR
+alt oid found in oidToType
+    TR --> [: PostgresType
+else oid unknown
+    TR -> PC: execute(SQL_OID_LOOKUP, oid)
+    activate PC
+    PC --> TR: ResultSet → resolvedType
+    deactivate PC
+    TR --> [: PostgresType
+end
+deactivate TR
+
+== Lazy Type Metadata Resolution (AbstractReplicationMessageColumn) ==
+
+Bench -> ARC: setup(): createColumn(modifierIndex)\nnew AbstractReplicationMessageColumn\n(name, PostgresType.UNKNOWN, typeWithModifiers, optional)
+activate ARC
+
+Bench -> ARC: columnMetadata(Blackhole)\n→ column.getTypeMetadata()
+activate ARC
+
+alt typeMetadata == null  (first call — cold path)
+    ARC -> ARC: initMetadata()
+    ARC -> TMI: new TypeMetadataImpl(columnName, type,\ntypeWithModifiers, optional)
+    activate TMI
+
+    TMI -> TMI: modifierCache.computeIfAbsent(\ntypeWithModifiers, mod → parseModifiers(mod, columnName))
+    activate TMI
+    note right of TMI
+      Static LRUCacheMap<String, String[]>(128)
+      Regex: TYPE_PATTERN extracts 'mod' group
+      e.g. "numeric(12,3)" → ["12","3"]
+      e.g. "character varying(255)" → ["255"]
+    end note
+    TMI -> TMI: match TYPE_PATTERN regex\n→ split by TYPEMOD_PATTERN
+    TMI --> TMI: String[] modifiers
+    deactivate TMI
+
+    TMI -> PT: type.getDefaultLength()\n[TypeInfo.getPrecision / getDisplaySize]
+    activate PT
+    PT --> TMI: defaultLength
+    deactivate PT
+
+    TMI -> PT: type.getDefaultScale()\n[TypeInfo.getScale]
+    activate PT
+    PT --> TMI: defaultScale
+    deactivate PT
+
+    alt modifiers[0] present
+        TMI -> PT: type.length(parseInt(modifiers[0]))
+        TMI -> PT: type.scale(parseInt(modifiers[0]))\n[OID-specific switch]
+    end
+    alt modifiers[1] present
+        TMI -> TMI: scale = parseInt(modifiers[1])
+    end
+
+    TMI --> ARC: TypeMetadataImpl instance
+    deactivate TMI
+    ARC -> ARC: typeMetadata = newMetadata (cached)
+
+else typeMetadata != null  (hot path — LRUCache hit)
+    note over ARC: Return cached TypeMetadataImpl directly
+end
+
+ARC --> Bench: TypeMetadataImpl
+deactivate ARC
+deactivate ARC
+
+== Schema Building (PostgresValueConverter) ==
+
+[-> PVC: schemaBuilder(Column column)
+activate PVC
+
+PVC -> PVC: switch(column.nativeType() / oid)
+activate PVC
+
+alt BIT / VARBIT
+    PVC --> [: Bits.builder(n) or SchemaBuilder.bool()
+else NUMERIC
+    PVC -> PCC: getDecimalMode()
+    activate PCC
+    PCC --> PVC: DecimalMode (PRECISE / STRING / DOUBLE)
+    deactivate PCC
+    PVC --> [: numericSchema(column)\n→ Decimal.builder(scale) / STRING / FLOAT64
+else BYTEA
+    PVC -> PCC: getBinaryMode()
+    activate PCC
+    PCC --> PVC: BinaryMode
+    deactivate PCC
+    PVC --> [: binaryMode.getSchema()
+else TIMESTAMPTZ
+    PVC --> [: ZonedTimestamp.builder()
+else JSON / JSONB
+    PVC --> [: Json.builder()
+else UUID
+    PVC --> [: Uuid.builder()
+else POINT
+    PVC --> [: Point.builder()
+else unknown OID — dynamic lookup
+    PVC -> TR: geometryOid() / hstoreOid() / ltreeOid() / vectorOid()
+    activate TR
+    TR --> PVC: dynamic OID values
+    deactivate TR
+    alt oid == hstoreOid
+        PVC --> [: hstoreSchema()\n→ SchemaBuilder.map(STRING, optional STRING)\nor Json.builder() (JSON mode)
+    else oid == geometryOid / geographyOid
+        PVC --> [: Geometry.builder()
+    else oid == ltreeOid
+        PVC --> [: Ltree.builder()
+    else array type
+        PVC -> TR: get(oid) → arrayType.getElementType()
+        activate TR
+        TR --> PVC: elementPostgresType
+        deactivate TR
+        PVC -> PVC: schemaBuilder(elementColumn)
+        PVC --> [: SchemaBuilder.array(elementSchema)
+    end
+end
+
+deactivate PVC
+deactivate PVC
+
+== Value Conversion (PostgresValueConverter) ==
+
+[-> PVC: converter(Column column, Field fieldDefn)
+activate PVC
+
+PVC -> PVC: switch(oid) → returns ValueConverter lambda
+activate PVC
+
+alt NUMERIC
+    PVC --> [: data → convertDecimal(column, fieldDefn, data, decimalMode)\n[PRECISE→BigDecimal, STRING→string, DOUBLE→float64]
+else BYTEA
+    PVC --> [: data → convertBinary(column, fieldDefn, data, binaryMode)
+else hstoreOid
+    PVC -> PCC: getHStoreHandlingMode()
+    activate PCC
+    PCC --> PVC: HStoreHandlingMode (MAP / JSON)
+    deactivate PCC
+    alt MAP mode
+        PVC --> [: data → convertHstoreToMap()\n→ Map<String,String>
+    else JSON mode
+        PVC --> [: data → convertHstoreToJsonString()\n→ JSON string
+    end
+else array OID
+    PVC -> TR: get(oid) → arrayType.getElementType()
+    activate TR
+    TR --> PVC: elementPostgresType
+    deactivate TR
+    PVC -> PVC: createArrayConverter(column, fieldDefn)
+    activate PVC
+    PVC -> PVC: build elementColumn\nschemaBuilder(elementColumn)\nconverter(elementColumn, elementField)
+    PVC --> PVC: elementConverter
+    deactivate PVC
+
+    PVC --> [: data → convertArray(column, fieldDefn,\nelementType, elementConverter, data)
+    note right of PVC
+      List<> source: stream map resolveArrayValue
+        → elementConverter.convert each element
+      PgArray source (snapshot JDBC): getArray()
+        → loop elementConverter.convert
+      TIMETZ/TIMESTAMPTZ elements:
+        re-offset JVM TZ applied by PgArray driver
+    end note
+else geometryOid
+    PVC --> [: data → convertGeometry(column, fieldDefn, data)
+else geographyOid
+    PVC --> [: data → convertGeography(column, fieldDefn, data)
+else enum types
+    PVC --> [: data → convertString(column, fieldDefn, data)
+end
+
+deactivate PVC
+deactivate PVC
+
+@enduml

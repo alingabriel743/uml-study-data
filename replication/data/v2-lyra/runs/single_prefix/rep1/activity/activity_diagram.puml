@@ -1,0 +1,132 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+
+title Lyra — Autoregressive Video-to-World Generation Pipeline\n(ARVideo2WorldGenerationPipeline.generate)
+
+|#DDEEFF|Caller|
+|#E9F5E9|ARVideo2WorldGenerationPipeline|
+|#FFF3CD|Tokenizer Layer|
+|#FFE8E8|Transformer / AR Model|
+|#EDE5FF|Diffusion Decoder|
+
+|Caller|
+start
+:Provide text prompt,\ninput video tensor,\nnum_input_frames,\nsampling config, seed;
+
+|ARVideo2WorldGenerationPipeline|
+:__init__\nCheckpoint dir & name,\nhas_text_input=True,\noffload flags;
+
+:_load_model\nLoad checkpoint weights;
+
+fork
+  :Load AutoRegressiveModel\n(Transformer + embeddings);
+fork again
+  :Load ImageTextTokenizer\n(text + image tokenizer);
+fork again
+  :Load DiscreteVideoFSQ Tokenizer\n(CausalDiscreteVideoTokenizer);
+fork again
+  if (disable_diffusion_decoder?) then (no)
+    :Load LatentDiffusionDecoderModel;
+  else (yes)
+    :Skip diffusion decoder;
+  endif
+end fork
+
+:generate(inp_prompt, inp_vid,\nnum_input_frames, seed, sampling_config);
+
+|Tokenizer Layer|
+:ImageTextTokenizer.encode\nTokenize text prompt → token IDs;
+:Compute prompt embedding\n(embed_vision_language_features)\nprompt_embedding, prompt_mask;
+
+:Preprocess input video frames\n(resize, center-crop, normalize)\nvia Augmentor pipeline;
+
+|ARVideo2WorldGenerationPipeline|
+if (offload_network enabled?) then (yes)
+  :_run_model_with_offload\nMove model to GPU on-demand,\noffload back after use;
+else (no)
+  :_run_model\n(standard GPU inference);
+endif
+
+|Transformer / AR Model|
+:Transformer.forward\nPrepare token embeddings\n+ positional encodings (RoPE / SinCos);
+
+repeat
+  :TransformerBlock.forward\n(Attention + MLP + RMSNorm);
+  :Attention.forward\n(QKV projection, RoPE apply,\ncausal mask, KV cache);
+  :MLP.forward\n(SwiGLU activation);
+repeat while (more layers?) is (yes)
+->no;
+
+:Produce logit distributions\nover vocabulary tokens;
+
+|ARVideo2WorldGenerationPipeline|
+:generate_video_from_tokens\n(prompt_tokens, latent_shape,\nvideo_start_boundary,\nmax_gen_len, sampling_config,\nlogit_clipping_range, seed, context);
+
+|Transformer / AR Model|
+repeat
+  :Sample next token\n(top-k / top-p + temperature);
+  :Append token to sequence;
+repeat while (max_gen_len reached?) is (no)
+->yes;
+
+:Return generated token sequences\n(List[torch.Tensor]);
+
+|ARVideo2WorldGenerationPipeline|
+if (diffusion decoder enabled?) then (yes)
+
+  |Diffusion Decoder|
+  :Prepare data_batch\nwith AR latent tokens;
+
+  :LatentDiffusionDecoderModel\n.generate_samples_from_batch\n(guidance, seed, num_steps, n_sample);
+
+  :_get_conditions\n(VideoDiffusionDecoderConditioner.forward\n→ VideoLatentDiffusionDecoderCondition);
+
+  :DiffusionDecoderGeneralDIT.forward\nIterative denoising (35 steps)\nvia score-function guidance;
+
+  :Return refined video latents\n(Tensor);
+
+  |ARVideo2WorldGenerationPipeline|
+  :Decode latents → pixel frames\n(CausalDiscreteVideoTokenizer.decode);
+
+else (no)
+
+  |Tokenizer Layer|
+  :Decode AR tokens → pixel frames\n(CausalDiscreteVideoTokenizer.decode);
+
+  |ARVideo2WorldGenerationPipeline|
+
+endif
+
+:Post-process frames\n(denormalize, clip to [0, 255]);
+
+if (output valid?) then (yes)
+  :Return np.ndarray video\n(T × H × W × C);
+  |Caller|
+  :Receive generated video;
+  stop
+else (no)
+  :Return None\n(generation failed / guardrail blocked);
+  |Caller|
+  :Handle None result\n(log warning, skip output);
+  stop
+endif
+
+@enduml

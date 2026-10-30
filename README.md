@@ -85,3 +85,11 @@ Each project folder contains subfolders by diagram type:
 | Component | Package-level architecture | SINGLE |
 | Deployment | Infrastructure and deployment topology | SINGLE |
 | System Context | C4-style external system integrations | SINGLE |
+
+## Replication package (revision)
+
+The `replication/` folder accompanies the revised manuscript. It contains the corrected IRs with pinned commit
+hashes, the code of the pipeline and of the evaluator, the agent prompts and model parameters, the deterministic
+reverse-engineering references, the generated diagrams of the new experiments, the per-observation results and a
+per-run table of tokens, wall-clock time and cost. See `replication/README.md`. The archived diagrams above are
+unchanged.

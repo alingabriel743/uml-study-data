@@ -1,0 +1,180 @@
+@startuml activity_vcs_downloader_workflow
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleBackgroundColor #E9ECEF
+}
+
+title VCS Downloader Workflow\n(VcsDownloader / GitDownloader — Install, Update, Remove)
+
+|VcsDownloader|
+start
+
+:Receive operation\n(install / update / remove);
+
+if (operation == remove?) then (yes)
+    :Log uninstall via io.writeError();
+    |Filesystem / IO|
+    :filesystem.removeDirectoryAsync(path);
+    if (result == false?) then (yes)
+        #FFB3B3:throw RuntimeException\n'Could not delete path';
+        stop
+    else (no)
+        :Directory removed;
+        stop
+    endif
+else (no)
+
+    |VcsDownloader|
+    if (package.getSourceReference() == null?) then (yes)
+        #FFB3B3:throw InvalidArgumentException\n(sourceReference required);
+        stop
+    else (no)
+
+        :Log operation via io.writeError();
+
+        ' ─── prepare() phase ───────────────────────────────────────
+        note right
+          **prepare() phase**
+          runs before install/update
+        end note
+
+        if (operation == update?) then (yes)
+            :cleanChanges(prevPackage, path, true);
+            if (getLocalChanges() != null?) then (yes)
+                #FFB3B3:throw RuntimeException\n(uncommitted local changes);
+                stop
+            else (no)
+                :Mark hasCleanedChanges\n[uniqueName] = true;
+            endif
+        else (operation == install)
+            |Filesystem / IO|
+            :filesystem.emptyDirectory(path);
+        endif
+
+        ' ─── URL preparation & retry loop ──────────────────────────
+        |VcsDownloader|
+        :prepareUrls(package.getSourceUrls())\nnormalize local file:// paths;
+
+        repeat
+
+            :Shift next URL from list;
+
+            if (operation == install?) then (yes)
+
+                ' ─── doInstall / GitDownloader ──────────────────────
+                |GitDownloader|
+                :cleanEnv(), normalizePath();
+
+                if (cachedRef available in\ncachedPackages[id][ref]?) then (yes)
+                    :git clone from local cache\n(--dissociate --reference flags);
+                else (no)
+                    :git clone --no-checkout\nfrom remote URL;
+                    :git remote add composer;
+                    :git fetch composer;
+                endif
+
+                :updateOriginUrl / setPushUrl;
+                :updateToCommit(package, path, ref)\n→ checkout target ref;
+
+                if (newRef returned?) then (yes)
+                    :Update package source/dist references;
+                endif
+
+            else (update)
+
+                ' ─── doUpdate / GitDownloader ───────────────────────
+                |GitDownloader|
+                :cleanEnv(), normalizePath();
+
+                if (hasMetadataRepository(path)\n(.git dir present)?) then (no)
+                    #FFB3B3:throw RuntimeException\n(not a VCS checkout);
+                    |VcsDownloader|
+                else (yes)
+                    if (cachedRef available?) then (yes)
+                        :Set remoteUrl = cachePath\n(local VCS mirror);
+                    else (no)
+                        :Set remoteUrl = remote URL;
+                    endif
+
+                    :git rev-parse — check if\nref already local;
+
+                    if (ref not local?) then (yes)
+                        :git remote set-url composer <remoteUrl>;
+                        :git fetch composer;
+                        :git fetch --tags;
+                    endif
+
+                    :updateToCommit(target, path, ref)\n→ checkout target ref;
+
+                    |VcsDownloader|
+                endif
+
+            endif
+
+        repeat while (exception thrown AND more URLs remain?) is (yes — try next URL)
+        -> all URLs exhausted OR success;
+
+        if (exception on last URL?) then (yes)
+            #FFB3B3:Rethrow last exception;
+            ' ─── cleanup on failure ─────────────────────────────────
+            |VcsDownloader|
+        else (no)
+
+            ' ─── verbose commit log (update only) ───────────────────
+            |Filesystem / IO|
+            if (io.isVerbose() AND\nhasMetadataRepository(path)?) then (yes)
+                :getCommitLogs(initial.ref, target.ref, path);
+                if (commit logs empty?) then (yes)
+                    :getCommitLogs(target.ref, initial.ref, path)\n(try rollback direction);
+                endif
+                :Format and print commit log\nsummary via io;
+            endif
+
+        endif
+
+        ' ─── cleanup() phase (always runs) ─────────────────────────
+        |VcsDownloader|
+        note right
+          **cleanup() phase**
+          runs after install/update
+          regardless of success
+        end note
+
+        if (operation == update AND\nhasCleanedChanges[uniqueName] exists?) then (yes)
+            :reapplyChanges(path)\n— reapply stashed local changes;
+            :unset hasCleanedChanges[uniqueName];
+        endif
+
+        :Return resolved PromiseInterface;
+
+    endif
+endif
+
+stop
+
+@enduml

@@ -1,0 +1,171 @@
+@startuml activity_main_agent_run_loop
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #198754
+    EndColor #DC3545
+    BarColor #0D6EFD
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam noteBackgroundColor #E7F3FF
+skinparam noteBorderColor #6EA8FE
+
+title Main Agent Run Loop\n<size:11><color:#6C757D>index.js — main() entry point: lock acquisition, state loading, run dispatch, adaptive sleep</color></size>
+
+|#E8F5E9|Entrypoint|
+start
+:Parse argv\n(command, --loop / --mad-dog, --verbose);
+
+if (isLoop?) then (yes — daemon mode)
+    |#E3F2FD|Lock Manager|
+    :Patch console.log/warn/error\nwith ISO timestamps;
+    :acquireLock()\nWrite evolver.pid with flag 'wx';
+
+    if (Lock acquired?) then (no — process already running)
+        :Read existing PID\nProbe liveness via signal(0);
+        if (Existing process alive?) then (yes)
+            #FFC2C2:process.exit(0)\n(another instance is running);
+            stop
+        else (no — stale PID)
+            :Overwrite evolver.pid\nwith current PID;
+        endif
+    endif
+
+    :Register signal handlers\n(SIGINT, SIGTERM → releaseLock + stopEventStream + exit\nuncaughtException → releaseLock + exit(1)\nunhandledRejection ≥5 → releaseLock + exit(1));
+    note right
+        PID file: evolver.pid
+        Lock owner: process.pid
+    end note
+
+    |Entrypoint|
+    :Set EVOLVE_LOOP=true\nSet EVOLVE_BRIDGE (default 'false');
+    :Resolve config\n(minSleepMs, maxSleepMs, idleThresholdMs,\npendingSleepMs, maxCyclesPerProcess, maxRssMb,\nsuicideEnabled);
+
+    |#E3F2FD|Lock Manager|
+    if (EVOMAP_PROXY=1 or A2A_TRANSPORT=mailbox?) then (yes)
+        :startProxy() + startMailbox()\n(Proxy + Mailbox transport);
+    else (no)
+        :startHeartbeat() + startEventStream()\n(A2A SSE heartbeat);
+    endif
+
+    if (atpMode = auto|on AND hubUrl set?) then (yes)
+        :Auto-start ATP merchantAgent;
+    endif
+
+    |#FFF8E1|Evolution Engine|
+    repeat
+        :cycleCount += 1\nreadJsonSafe(solidifyStatePath) → st0;
+
+        if (isPendingSolidify(st0)?\nlast_run.run_id exists AND\nno matching last_solidify.run_id) then (yes — solidify pending)
+            :sleepMs(max(pendingSleepMs, minSleepMs));
+            note right: Skip evolution cycle;\nwait for solidify to complete
+        else (no — safe to run)
+            :Record t0 = Date.now();
+
+            :await evolve.run()\n(gene selection, mutation, validation);
+
+            if (Run succeeded?) then (yes — ok = true)
+                if (EVOLVE_BRIDGE === 'false'?) then (yes — bridge disabled)
+                    :readJsonSafe(solidifyStatePath) → stAfterRun;
+                    if (isPendingSolidify(stAfterRun)?) then (yes)
+                        :rejectPendingRun(solidifyStatePath)\nWrite last_solidify.rejected=true\n(no git rollback);
+                        note right: State-only update;\nreason: loop_bridge_disabled_\nautoreject_no_rollback
+                    endif
+                endif
+            else (no — ok = false)
+                :Log error\n(ok stays false);
+            endif
+
+            |#FFF3E0|Scheduler|
+            :dt = Date.now() - t0;
+
+            if (!ok OR dt < idleThresholdMs?) then (yes — idle / failed)
+                :currentSleepMs = min(maxSleepMs,\nmax(minSleepMs, currentSleepMs × 2))\n[exponential backoff];
+            else (no — productive cycle)
+                :currentSleepMs = minSleepMs\n[reset sleep];
+            endif
+
+            :getScheduleRecommendation()\n(OMLS idle scheduler);
+
+            if (schedule.enabled?) then (yes)
+                :omlsMultiplier = schedule.sleep_multiplier;
+                if (schedule.should_distill?) then (yes)
+                    :shouldDistillFromFailures()?\n→ autoDistillFromFailures();
+                endif
+                if (schedule.should_explore?) then (yes)
+                    :tryExplore([]);
+                endif
+            else (no)
+                :omlsMultiplier = 1;
+            endif
+
+            |#E3F2FD|Lock Manager|
+            if (suicideEnabled AND\n(cycleCount ≥ maxCyclesPerProcess\nOR rss > maxRssMb)?) then (yes — self-restart)
+                :spawn(process.execPath, [__filename, ...args],\n{detached: true})\n[new detached child process];
+                :releaseLock()\nDelete evolver.pid;
+                #FFC2C2:process.exit(0)\n(parent exits; child continues);
+                stop
+            endif
+
+            |#FFF3E0|Scheduler|
+            :Read solidifyStatePath → st1\nCheck st1.last_run.signals;
+
+            if (signals include 'force_steady_state'?) then (yes)
+                :saturationMultiplier = 4;
+            elseif (signals include 'evolution_saturation'?) then (yes)
+                :saturationMultiplier = 2;
+            else (no signal)
+                :saturationMultiplier = 1;
+            endif
+
+            :totalSleepMs = max(minSleepMs,\n(currentSleepMs + jitter)\n× saturationMultiplier × omlsMultiplier);
+            :sleepMs(totalSleepMs);
+        endif
+
+    repeat while (Daemon loop — while(true)) is (next cycle)
+    ->loop error caught: log + sleepMs(max(minSleepMs, 10000));
+
+else (no — single run)
+    |#FFF8E1|Evolution Engine|
+    :await evolve.run();
+
+    if (Run succeeded?) then (yes)
+        |Entrypoint|
+        :Print post-run hint banner;
+    else (no)
+        |Entrypoint|
+        :console.error(err);
+        #FFC2C2:process.exit(1);
+        stop
+    endif
+endif
+
+|Entrypoint|
+stop
+
+@enduml

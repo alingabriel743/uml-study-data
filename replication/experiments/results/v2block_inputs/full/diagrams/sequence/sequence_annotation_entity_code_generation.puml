@@ -1,0 +1,170 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #6C757D
+    GroupBackgroundColor #E9ECEF
+    GroupBorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #F9A825
+}
+
+title Annotation Processor: Entity Code Generation
+
+participant "AnnotationCompiler" as AC
+participant "EntityProcess" as EP
+participant "TypeIOResolver" as TIR
+participant "EntityIO" as EIO
+participant "JavaPoet\n(TypeSpec/MethodSpec)" as JP
+participant "Fi\n(Revision Files)" as FI
+
+== Round 1: Generate Component Interfaces ==
+
+AC -> EP : process(RoundEnvironment) [round=1]
+activate EP
+
+EP -> TIR : resolve(this)
+activate TIR
+TIR --> EP : ClassSerializer serializer
+deactivate TIR
+
+EP -> EP : collect allComponents(@Component)\ncollect allGroups(@GroupDef)\ncollect allDefs(@EntityDef)
+EP -> EP : store varInitializers (field init trees)\nstore methodBlocks (method body strings)
+
+loop for each @Component
+    EP -> EP : interfaceName(comp)\ngetDependencies(comp)
+    EP -> JP : TypeSpec.interfaceBuilder(interfaceName)
+    activate JP
+    JP --> EP : InterfaceBuilder
+    deactivate JP
+    EP -> JP : add methods / getters / setters
+    EP -> EP : write(interfaceSpec) — emit component interface source file
+    opt component.base() == true
+        EP -> EP : build base class TypeSpec.Builder\nadd to baseClasses queue
+    end
+end
+
+deactivate EP
+
+== Round 2: Generate Entity Implementation Classes ==
+
+AC -> EP : process(RoundEnvironment) [round=2]
+activate EP
+
+EP -> EP : parse @GroupDef → groupDefs\n(name, baseType, spatial, mapping, collides)
+
+loop for each @EntityDef
+    EP -> EP : allComponents(type)\ngetDependencies(comp) — recursively
+    EP -> JP : TypeSpec.classBuilder(name)\nadd fields (with SyncField _TARGET_/_LAST_ extras)
+    activate JP
+    JP --> EP : ClassBuilder
+    deactivate JP
+
+    EP -> EIO : new EntityIO(name, builder, allFieldSpecs, serializer, revisionDir)
+    activate EIO
+    EIO -> FI : load existing *.json revision files
+    activate FI
+    FI --> EIO : Revision list
+    deactivate FI
+    EIO -> EIO : compare current fields vs latest revision\nif changed → write new N.json revision
+    deactivate EIO
+
+    EP -> EIO : io.write(mbuilder, isWrite=true, allFields)
+    activate EIO
+    note right of EIO : **Persistent write method**\nEmits: write.s(revisionVersion)\nfor each field → io(type, 'this.field', false)
+    EIO -> EIO : st('write.s(revisionVersion)')\nfor each field → io(type, 'this.field', false)
+    EIO --> EP : MethodSpec (write body)
+    deactivate EIO
+
+    EP -> EIO : io.write(mbuilder, isWrite=false, allFields)
+    activate EIO
+    note right of EIO : **Persistent read method**\nEmits: short REV = read.s()\nper revision → if/else chain of field reads
+    EIO -> EIO : st('short REV = read.s()')\nper revision → if/else chain\n→ io(type, 'this.field = ', false)
+    EIO --> EP : MethodSpec (read body)
+    deactivate EIO
+
+    EP -> EIO : io.writeSync(mbuilder, isWrite=true, allFields)
+    activate EIO
+    note right of EIO : **Network sync write**\nEmits: each non-@NoSync field value
+    EIO -> EIO : for each non-@NoSync field\n→ io(type, 'this.field', true)
+    EIO --> EP : MethodSpec (writeSync body)
+    deactivate EIO
+
+    EP -> EIO : io.writeSync(mbuilder, isWrite=false, allFields)
+    activate EIO
+    note right of EIO : **Network sync read**\nUpdates timing; sets _LAST_ / _TARGET_;\ncalls afterSync()
+    EIO -> EIO : update lastUpdated / updateSpacing\nper field: set _LAST_, read into _TARGET_\ncall afterSync()
+    EIO --> EP : MethodSpec (readSync body)
+    deactivate EIO
+
+    EP -> EIO : io.writeSyncManual(mbuilder, isWrite=true, syncedFields)
+    activate EIO
+    EIO -> EIO : write → buffer.put(field)
+    EIO --> EP : MethodSpec (writeSyncManual body)
+    deactivate EIO
+
+    EP -> EIO : io.writeSyncManual(mbuilder, isWrite=false, syncedFields)
+    activate EIO
+    EIO -> EIO : read → set _LAST_=field, _TARGET_=buffer.get()
+    EIO --> EP : MethodSpec (readSyncManual body)
+    deactivate EIO
+
+    EP -> EIO : io.writeInterpolate(mbuilder, syncedFields)
+    activate EIO
+    note right of EIO : **Interpolation method**\nalpha = timeSinceUpdate/updateSpacing\nlerp/slerp _LAST_ → _TARGET_ per SyncField
+    EIO -> EIO : compute alpha = timeSinceUpdate / updateSpacing\nlerp/slerp _LAST_ → _TARGET_ per SyncField
+    EIO --> EP : MethodSpec (interpolate body)
+    deactivate EIO
+end
+
+EP -> EP : generate Groups class\n(init/clear/resize/update/queueFree methods)
+EP -> EP : assign stable classIDs from classids.properties\ngenerate EntityMapping class
+EP -> EP : write(groupsBuilder)\nwrite(idBuilder) — emit Groups + EntityMapping source files
+
+deactivate EP
+
+== Round 3: Finalise & Emit Entity Classes ==
+
+AC -> EP : process(RoundEnvironment) [round=3]
+activate EP
+
+loop for each EntityDefinition
+    EP -> EP : set superclass (extend)\naddSuperinterface per component
+    loop for each component interface method
+        EP -> EP : generate getter (return field)\ngenerate setter (this.field = field)\nskip @ReadOnly fields
+    end
+    EP -> EP : write(def.builder, imports) — emit final entity class source file
+end
+
+EP -> EP : write each baseClass builder with imports\nemit base class source files
+
+deactivate EP
+
+@enduml

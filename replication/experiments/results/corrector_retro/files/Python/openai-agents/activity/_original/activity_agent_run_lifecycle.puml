@@ -1,0 +1,202 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 11
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF9E6
+    DiamondBorderColor #856404
+}
+skinparam partition {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+    FontColor #212529
+}
+skinparam note {
+    BackgroundColor #EAF4FB
+    BorderColor #3498DB
+}
+
+title Agent Run Lifecycle
+
+|Caller|
+start
+:Invoke **Runner.run**(starting_agent, input, ...)\nor **Runner.run_sync()** / **Runner.run_streamed()**;
+
+|Runner / AgentRunner|
+:Delegate to **AgentRunner.run()**;
+
+if (input is RunState?\n(resuming interrupted run)) then (yes — resume)
+    :Restore from **RunState**:\ncurrent_turn, current_agent,\ngenerated_items, context_wrapper,\nconversation tracking IDs;
+else (no — fresh run)
+    :Cast input → str | list;
+    :Validate: session ⊕ server-conversation\nexclusivity (mutually exclusive);
+    :prepare_input_with_session()\n→ merge session history into input;
+endif
+
+:Resolve reasoning_item_id_policy\n& OpenAIServerConversationTracker;
+:Initialize: AgentToolUseTracker,\nSandboxRuntime, PromptCacheKeyResolver;
+:Open **workflow trace span** (TraceCtxManager);
+note right
+  current_turn = 0
+  current_agent = starting_agent
+  generated_items = []
+  model_responses = []
+end note
+
+|Runner / AgentRunner|
+repeat
+
+    if (Turn 0?\n(first LLM call in this run)) then (yes)
+        |Guardrails|
+        :Collect **input_guardrails**\n(agent.input_guardrails\n+ run_config.input_guardrails);
+        :Run **sequential** guardrails\n(run_in_parallel=False) — blocking;
+
+        if (InputGuardrail\nTripwire triggered?) then (yes)
+            :Persist session items;
+            #FFB3B3:**raise** InputGuardrailTripwireTriggered;
+            stop
+        else (no)
+        endif
+
+        fork
+            |Runner / AgentRunner|
+            :Schedule **model_task**\n= asyncio.create_task(\n    run_single_turn(...));
+        fork again
+            |Guardrails|
+            if (Parallel guardrails\npresent?) then (yes)
+                :Run **parallel** guardrails\nconcurrently with model_task\n(asyncio.gather);
+                if (Tripwire triggered?) then (yes)
+                    :Cancel model_task;
+                    :Persist session items;
+                    #FFB3B3:**raise** InputGuardrailTripwireTriggered;
+                    stop
+                else (no)
+                endif
+            endif
+        end fork
+
+        |Runner / AgentRunner|
+        :Await **model_task** → SingleStepResult;
+
+    else (no — subsequent turn)
+        |Runner / AgentRunner|
+        :await **run_single_turn()**\n(LLM call + tool execution\n+ tool-level guardrails\n+ human approval checks)\n→ **SingleStepResult**;
+        note right
+          Tool calls within a single
+          LLM response do NOT count
+          as extra turns.
+        end note
+
+    endif
+
+    :Attach usage delta to turn_span;\nClose turn_span;
+    :current_turn += 1;
+
+    if (current_turn > max_turns?) then (yes)
+        :Attach SpanError to agent_span;
+        if (error_handlers["max_turns"]\ndefined?) then (yes)
+            :Invoke **max_turns handler**\n(RunErrorHandlerInput)\n→ RunErrorHandlerResult;
+            :Synthesize fallback message item\n(include_in_history flag respected);
+            |Guardrails|
+            :Run **output_guardrails**\non handler output;
+            |Runner / AgentRunner|
+            :Build **RunResult** (graceful recovery);
+            |Caller|
+            :Return **RunResult**\n(max_turns handled gracefully);
+            stop
+        else (no)
+            #FFB3B3:**raise** MaxTurnsExceeded;
+            stop
+        endif
+    endif
+
+    :Append model_response to model_responses;
+    :Update generated_items\n(pre_step_items + new_step_items);
+    :Extend session_items &\ntool guardrail results;
+
+    if (next_step type?) then (NextStepFinalOutput)
+
+        |Guardrails|
+        :Run **output_guardrails**\n(agent.output_guardrails\n+ run_config.output_guardrails);
+        if (OutputGuardrail\nTripwire triggered?) then (yes)
+            #FFB3B3:**raise** OutputGuardrailTripwireTriggered;
+            stop
+        else (no)
+        endif
+
+        |Runner / AgentRunner|
+        :Persist session items\n(if session_persistence enabled);
+        :Build **RunResult**\n(input, new_items, raw_responses,\nfinal_output, last_agent,\nguardrail_results);
+        :_finalize_result()\n→ finalize conversation tracking\n& apply sandbox metadata;
+
+        |Caller|
+        :Return **RunResult** — final output;
+        stop
+
+    elseif (next_step type?) then (NextStepInterruption)
+
+        |Runner / AgentRunner|
+        :Persist session items\n(skip approval placeholders);
+        :update_run_state_for_interruption();
+        :build_interruption_result()\n→ RunResult with\ninterruptions=[ToolApprovalItem, ...];
+        note right
+          Human-in-the-loop pause.
+          Caller resumes by passing
+          the RunState checkpoint
+          back as input to Runner.run().
+        end note
+
+        |Caller|
+        :Return **RunResult** (paused)\n→ awaiting human approval;
+        stop
+
+    elseif (next_step type?) then (NextStepHandoff)
+
+        |Runner / AgentRunner|
+        :current_agent = next_step.new_agent;
+        :Update run_state._current_agent;
+        :original_input = filtered /\nnested handoff transcript;
+        :Close current agent_span;\nReset should_run_agent_start_hooks = True;
+        note right
+          Agent switch — loop continues.
+          Handoff does NOT reset
+          current_turn counter.
+          Only the first agent's
+          input_guardrails run.
+        end note
+
+    else (NextStepRunAgain)
+
+        |Runner / AgentRunner|
+        :Tool results appended\nto generated_items;
+        :Persist session items if needed;
+        note right
+          Tool calls executed —
+          loop again with same agent
+          and enriched tool context.
+        end note
+
+    endif
+
+repeat while (next_step is RunAgain\nor Handoff — continue loop?) is (yes)
+
+stop
+
+@enduml

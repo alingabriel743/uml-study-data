@@ -1,0 +1,130 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activityBackgroundColor #F8F9FA
+skinparam activityBorderColor #495057
+skinparam activityArrowColor #495057
+skinparam activityFontColor #212529
+skinparam swimlaneBackgroundColor #E9ECEF
+skinparam swimlaneBorderColor #6C757D
+
+title Evolver Proxy — Core Workflow
+
+|#E3F2FD|EvoMapProxy|
+start
+:Initialize Proxy;
+:Start ProxyHttpServer;
+:Start WebUI Server (WebUiServer);
+
+|#E8F5E9|LifecycleManager|
+:hello() — Send Hello to Hub;
+:Build Environment Fingerprint;
+:_resolveNodeSecret();
+
+if (Authentication Successful?) then (yes)
+
+  :startHeartbeatLoop();
+
+  |#FFF8E1|SyncEngine|
+  :start() — Initialize SyncEngine;
+  :_scheduleInbound();
+  :_scheduleOutbound();
+
+  fork
+    |#E8F5E9|LifecycleManager|
+    repeat
+      :heartbeat() — Send periodic pulse;
+      :Report pending event count to Hub;
+    repeat while (Proxy Running?) is (yes)
+
+  fork again
+    |#FFF8E1|SyncEngine|
+    repeat
+      :InboundSync.pull() — Fetch from Hub;
+      if (Auth Error?) then (yes)
+        :_handleAuthError();
+        |#E8F5E9|LifecycleManager|
+        :reAuthenticate();
+        :Retry hello() to Hub;
+        |#FFF8E1|SyncEngine|
+      else (no)
+        :ackDelivered() — Confirm receipt;
+        :writeInboundBatch() to MailboxStore;
+        :Route message to handler;
+
+        if (Message Type?) then (session)
+          |#FCE4EC|SessionHandler|
+          :createSession() — Init session;
+          :sendMessage() — Broadcast to participants;
+          if (Subtask Required?) then (yes)
+            :delegateSubtask();
+            |#EDE7F6|TaskMonitor|
+            :recordClaim(taskId);
+            :subscribe() — Watch task state;
+            |#FCE4EC|SessionHandler|
+          else (no)
+          endif
+          :submitResult();
+          :joinSession() — Finalize;
+          |#FFF8E1|SyncEngine|
+        else (direct message)
+          :DmHandler.send() / ack() / list();
+        else (skill update)
+          |#F3E5F5|SkillUpdater|
+          :pollAndApply();
+          :processSkillUpdate();
+          :Write updated skill.md to disk;
+          |#FFF8E1|SyncEngine|
+        endif
+      endif
+      :_scheduleInbound() — Schedule next pull;
+    repeat while (Running?) is (yes)
+
+  fork again
+    |#FFF8E1|SyncEngine|
+    repeat
+      :Check countPending() outbound;
+      if (Pending Outbound?) then (yes)
+        :OutboundSync.flush();
+        :updateStatusBatch() in MailboxStore;
+      else (no)
+        :Wait for notifyNewOutbound();
+      endif
+      :_scheduleOutbound() — Reschedule;
+    repeat while (Running?) is (yes)
+
+  end fork
+
+  |#E3F2FD|EvoMapProxy|
+  :stop() — Graceful shutdown;
+  :stopHeartbeatLoop();
+  :Close HTTP Server;
+  stop
+
+else (auth failed)
+
+  |#E8F5E9|LifecycleManager|
+  :_handleAuthError();
+  :Emit manual reset needed signal;
+
+  |#E3F2FD|EvoMapProxy|
+  :stop() — Abort startup;
+  :Close HTTP Server;
+  stop
+
+endif
+
+@enduml

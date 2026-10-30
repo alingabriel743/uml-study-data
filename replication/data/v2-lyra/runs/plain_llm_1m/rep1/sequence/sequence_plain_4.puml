@@ -1,0 +1,103 @@
+@startuml lyra2_ar_spatial_inference
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequenceArrowThickness 2
+skinparam SequenceBoxBackgroundColor #E9ECEF
+skinparam SequenceBoxBorderColor #6C757D
+skinparam ParticipantBackgroundColor #F8F9FA
+skinparam ParticipantBorderColor #495057
+skinparam ActorBorderColor #495057
+
+title Lyra-2 Autoregressive Spatial Video Inference
+
+actor User
+participant "run_lyra2_sample()" as runner
+participant "Lyra2InferencePipeline" as pipeline
+participant "Lyra2Model" as model
+participant "Wan2pt1VAEInterface" as vae
+participant "Sparse3DCache" as cache_3d
+participant "Lyra2WanModel\n(network)" as net
+participant "DepthModel\n(DA3)" as depth_model
+participant "UMT5EncoderModel" as t5
+
+User -> runner: run_lyra2_sample(model, data_batch, args,\n  da3_model, process_group)
+activate runner
+
+runner -> pipeline: new Lyra2InferencePipeline(\n  model, args, first_frame, first_depth,\n  first_cam_w2c, first_intrinsics, da3_model)
+activate pipeline
+
+pipeline -> vae: encode(init_video_segment)
+activate vae
+vae --> pipeline: initial_latents: Tensor
+deactivate vae
+
+pipeline -> cache_3d: add(depth_B_1_H_W, w2c_B_4_4, K_B_3_3, latent_index=0)
+activate cache_3d
+cache_3d --> pipeline: cache_initialized
+deactivate cache_3d
+
+loop for each camera trajectory chunk
+    runner -> pipeline: autoregressive_step(\n  cam_w2c_chunk, intrinsics_chunk,\n  t5_text_embeddings, neg_t5_embeddings)
+    activate pipeline
+
+    pipeline -> cache_3d: render_cache(target_w2cs, target_intrinsics,\n  render_depth=True)
+    activate cache_3d
+    cache_3d --> pipeline: rendered_warp_images\nrendered_warp_masks
+    deactivate cache_3d
+
+    pipeline -> model: prepare_latent_conditon(\n  condition_state, condition_state_mask, dtype)
+    activate model
+    model --> pipeline: condition_latent: Tensor
+    deactivate model
+
+    pipeline -> model: get_x0_fn_from_batch(data_batch, guidance, seed)
+    activate model
+    model -> model: _apply_camera_controls(\n  cond_latent, selected_idx, video_indices,\n  spatial_selected_frame_ids, spatial_cache)
+    model --> pipeline: x0_fn: Callable
+    deactivate model
+
+    pipeline -> model: inference_dmd(\n  history_latents, cond_latent, guidance,\n  seed, num_steps, shift)
+    activate model
+
+    model -> net: forward(x_B_C_T_H_W, timesteps_B_T,\n  crossattn_emb, y_B_C_T_H_W, ...)
+    activate net
+    net --> model: denoised_output: Tensor
+    deactivate net
+
+    model --> pipeline: new_latents: Tensor
+    deactivate model
+
+    pipeline -> vae: decode(new_latents)
+    activate vae
+    vae --> pipeline: new_frames: Tensor
+    deactivate vae
+
+    pipeline -> depth_model: predict depth & intrinsics(new_frames)
+    activate depth_model
+    depth_model --> pipeline: new_depths: Tensor\nintrinsics: Tensor
+    deactivate depth_model
+
+    pipeline -> pipeline: _update_depth_cache(end_px_idx)
+
+    pipeline -> cache_3d: add(new_depths, w2c, K, latent_index)
+    activate cache_3d
+    cache_3d --> pipeline: cache_updated
+    deactivate cache_3d
+
+    pipeline --> runner: step_frames: Tensor
+    deactivate pipeline
+end
+
+runner -> pipeline: build_outputs(da3_gs_export_stem, log_prefix)
+activate pipeline
+pipeline --> runner: output_videos, gaussians_ply
+deactivate pipeline
+
+runner --> User: (output_videos, point_cloud)
+deactivate runner
+
+@enduml

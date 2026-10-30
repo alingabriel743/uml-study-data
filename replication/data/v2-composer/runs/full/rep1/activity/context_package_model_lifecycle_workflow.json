@@ -1,0 +1,173 @@
+{
+  "scope": "package_model_lifecycle_workflow",
+  "title": "Package Model Lifecycle Workflow",
+  "diagram_type": "activity",
+  "key_participants": ["Package", "AliasPackage", "CompletePackage", "CompleteAliasPackage", "BasePackage", "VersionParser", "ComposerMirror"],
+
+  "class_hierarchy": [
+    "BasePackage (abstract) implements PackageInterface",
+    "Package extends BasePackage",
+    "AliasPackage extends BasePackage",
+    "CompletePackage extends Package implements CompletePackageInterface",
+    "CompleteAliasPackage extends AliasPackage implements CompletePackageInterface"
+  ],
+
+  "construction_flows": [
+    {
+      "class": "Package",
+      "constructor": "__construct(string $name, string $version, string $prettyVersion)",
+      "steps": [
+        "parent::__construct($name) — sets $this->name via BasePackage",
+        "$this->version = $version",
+        "$this->prettyVersion = $prettyVersion",
+        "$this->stability = VersionParser::parseStability($version) — returns 'stable'|'RC'|'beta'|'alpha'|'dev'",
+        "$this->dev = ($this->stability === 'dev')"
+      ]
+    },
+    {
+      "class": "CompletePackage",
+      "constructor": "inherits Package constructor exactly; adds extra fields defaulted to null/[]",
+      "extra_fields": ["repositories", "license", "keywords", "authors", "description", "homepage", "scripts", "support", "funding", "abandoned", "archiveName", "archiveExcludes"]
+    },
+    {
+      "class": "AliasPackage",
+      "constructor": "__construct(BasePackage $aliasOf, string $version, string $prettyVersion)",
+      "steps": [
+        "parent::__construct($aliasOf->getName()) — name copied from aliasOf",
+        "$this->version = $version",
+        "$this->prettyVersion = $prettyVersion",
+        "$this->aliasOf = $aliasOf",
+        "$this->stability = VersionParser::parseStability($version)",
+        "$this->dev = ($this->stability === 'dev')",
+        "foreach Link::$TYPES as $type: $links = $aliasOf->{'get'.ucfirst($type)}()",
+        "  $this->{$type} = $this->replaceSelfVersionDependencies($links, $type)"
+      ]
+    },
+    {
+      "class": "CompleteAliasPackage",
+      "constructor": "__construct(CompletePackage $aliasOf, string $version, string $prettyVersion)",
+      "steps": [
+        "parent::__construct($aliasOf, $version, $prettyVersion) — calls AliasPackage constructor",
+        "aliasOf is typed as CompletePackage (narrower than AliasPackage's BasePackage)"
+      ]
+    }
+  ],
+
+  "mutation_flows": {
+    "version_replacement": {
+      "method": "Package::replaceVersion(string $version, string $prettyVersion)",
+      "steps": [
+        "$this->version = $version",
+        "$this->prettyVersion = $prettyVersion",
+        "$this->stability = VersionParser::parseStability($version)",
+        "$this->dev = ($this->stability === 'dev')"
+      ],
+      "note": "Only available on Package/CompletePackage; AliasPackage does not expose replaceVersion"
+    },
+    "set_source_dist_references": {
+      "method": "Package::setSourceDistReferences(string $reference)",
+      "steps": [
+        "setSourceReference($reference)",
+        "check: getDistUrl() !== null AND distUrl matches github/bitbucket/gitlab pattern (Preg::isMatch)",
+        "  [YES] → setDistReference($reference) + setDistUrl(regex_replace SHA in distUrl with reference)",
+        "  [NO, but distReference exists] → setDistReference($reference) only",
+        "  [NO distReference at all] → skip dist update"
+      ]
+    },
+    "set_dist_mirrors": {
+      "method": "Package::setDistMirrors(?array $mirrors)",
+      "delegate_in_alias": "AliasPackage::setDistMirrors → $this->aliasOf->setDistMirrors($mirrors)"
+    },
+    "set_source_mirrors": {
+      "method": "Package::setSourceMirrors(?array $mirrors)",
+      "delegate_in_alias": "AliasPackage::setSourceMirrors → $this->aliasOf->setSourceMirrors($mirrors)"
+    },
+    "set_autoload": {
+      "method": "Package::setAutoload(array $autoload) — stores psr-0/psr-4/classmap/files rules",
+      "delegate_in_alias": "AliasPackage::getAutoload → $this->aliasOf->getAutoload() [read-only delegation]"
+    },
+    "set_requires_links": {
+      "method": "Package::setRequires(array $requires)",
+      "steps": [
+        "if indexed array (isset($requires[0])) → convertLinksToMap($requires, 'setRequires') — triggers deprecation",
+        "$this->requires = $requires (map: packageName => Link)"
+      ],
+      "same_pattern_for": ["setConflicts", "setProvides", "setReplaces", "setDevRequires"]
+    }
+  },
+
+  "url_resolution_flow": {
+    "getDistUrls": "calls getUrls(distUrl, distMirrors, distReference, distType, 'dist')",
+    "getSourceUrls": "calls getUrls(sourceUrl, sourceMirrors, sourceReference, sourceType, 'source')",
+    "getUrls_logic": [
+      "if no base URL → return []",
+      "if urlType=dist and URL contains '%' → ComposerMirror::processUrl(url, name, version, ref, type, prettyVersion)",
+      "$urls = [baseUrl]",
+      "foreach mirror: compute mirrorUrl via ComposerMirror::processUrl/processGitUrl/processHgUrl",
+      "  if mirror.preferred → array_unshift (prepend); else → array_push (append)",
+      "return $urls"
+    ]
+  },
+
+  "alias_delegation_pattern": {
+    "description": "AliasPackage and CompleteAliasPackage delegate almost all calls to aliasOf",
+    "own_state": ["version", "prettyVersion", "stability", "dev", "rootPackageAlias", "hasSelfVersionRequires", "requires/conflicts/provides/replaces/devRequires (replaced self.version links)"],
+    "delegated_getters": ["getType", "getTargetDir", "getExtra", "getSourceType", "getSourceUrl", "getDistType", "getDistUrl", "getAutoload", "getDevAutoload", "getBinaries", "getSuggests", "getNotificationUrl", "isDefaultBranch"],
+    "delegated_setters": ["setInstallationSource", "setSourceReference", "setSourceMirrors", "setDistReference", "setDistMirrors", "setDistUrl", "setDistType", "setTransportOptions", "setSourceDistReferences"],
+    "complete_alias_delegates": "All CompletePackageInterface methods (scripts, license, keywords, authors, description, homepage, support, funding, abandoned, archiveName, archiveExcludes) → aliasOf"
+  },
+
+  "replaceSelfVersionDependencies_logic": {
+    "purpose": "Rewrite 'self.version' constraint links with the alias's actual version",
+    "for_conflict_provide_replace": "append new Link with Constraint('=', aliasVersion) alongside original",
+    "for_require_devRequire": "replace Link in-place; sets hasSelfVersionRequires=true if TYPE_REQUIRE",
+    "prettyVersion_override": "if prettyVersion === VersionParser::DEFAULT_BRANCH_ALIAS → use aliasOf.getPrettyVersion() instead"
+  },
+
+  "activity_workflow_summary": [
+    "[START] Decide package type",
+    "[FORK] Plain Package | CompletePackage | AliasPackage | CompleteAliasPackage",
+    "  Package/CompletePackage path:",
+    "    construct(name, version, prettyVersion) → parseStability → set dev flag",
+    "    [optional] setType | setTargetDir | setExtra | setBinaries | setReleaseDate",
+    "    [optional] setSourceType → setSourceUrl → setSourceReference → setSourceMirrors",
+    "    [optional] setDistType → setDistUrl → setDistReference → setDistSha1Checksum → setDistMirrors",
+    "    [optional] setRequires → setConflicts → setProvides → setReplaces → setDevRequires → setSuggests",
+    "    [optional] setAutoload → setDevAutoload → setIncludePaths",
+    "    [optional] setNotificationUrl | setIsDefaultBranch | setTransportOptions | setPhpExt",
+    "    [CompletePackage only] setLicense → setKeywords → setAuthors → setDescription → setHomepage",
+    "    [CompletePackage only] setSupport → setFunding → setAbandoned → setScripts → setRepositories",
+    "    [CompletePackage only] setArchiveName → setArchiveExcludes",
+    "    [IF version update needed] replaceVersion(newVersion, newPrettyVersion) → parseStability again",
+    "    [IF reference update needed] setSourceDistReferences(ref) → conditional dist URL patch",
+    "  AliasPackage/CompleteAliasPackage path:",
+    "    construct(aliasOf, version, prettyVersion) → copy name → parseStability",
+    "    iterate Link::$TYPES → replaceSelfVersionDependencies(links, type)",
+    "    [optional] setRootPackageAlias(true) — for root package aliases",
+    "    [IF mirrors needed] setDistMirrors/setSourceMirrors → delegates to aliasOf",
+    "    [IF installation source] setInstallationSource → delegates to aliasOf",
+    "[JOIN]",
+    "[URL resolution on demand]",
+    "  getDistUrls → getUrls → [for each mirror] ComposerMirror::processUrl → [preferred?] prepend : append",
+    "  getSourceUrls → getUrls → [git mirror] processGitUrl | [hg mirror] processHgUrl",
+    "[END]"
+  ],
+
+  "key_notes": [
+    "Package is the core installable unit; CompletePackage adds human-facing metadata not used by solver",
+    "AliasPackage wraps an existing package under a different version string (used for branch-alias)",
+    "CompleteAliasPackage = AliasPackage of a CompletePackage; satisfies CompletePackageInterface via delegation",
+    "All setters in AliasPackage for dist/source data delegate to aliasOf — alias and original share dist state",
+    "replaceVersion recalculates stability from scratch (same logic as constructor)",
+    "setSourceDistReferences only patches distUrl for github/bitbucket/gitlab hosted packages (regex on SHA)",
+    "convertLinksToMap triggers deprecation warning — callers must pass name-keyed maps, not indexed arrays",
+    "VersionParser::parseStability returns one of: 'stable'|'RC'|'beta'|'alpha'|'dev'"
+  ],
+
+  "source_files_analyzed": [
+    "src/src/Composer/Package/Package.php",
+    "src/src/Composer/Package/AliasPackage.php",
+    "src/src/Composer/Package/CompletePackage.php",
+    "src/src/Composer/Package/CompleteAliasPackage.php"
+  ]
+}

@@ -1,0 +1,184 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipant underline
+skinparam sequenceBoxBorderColor #6C757D
+skinparam sequenceBoxBackgroundColor #E9ECEF
+skinparam sequenceLifeLineBorderColor #495057
+skinparam sequenceGroupBorderColor #6C757D
+skinparam sequenceGroupBackgroundColor #DEE2E6
+skinparam noteBackgroundColor #FFF3CD
+skinparam noteBorderColor #FFC107
+
+title Mod Loading and Script Initialization
+
+participant "ContentLoader\n(Logic init)" as CL
+participant "Mods" as Mods
+participant "platform" as Plat
+participant "ModClassLoader\n(mainLoader)" as MCL
+participant "ZipFi / Fi" as ZipFi
+participant "LoadedMod" as LM
+participant "content\n(ContentLoader)" as content
+participant "ContentParser" as CP
+participant "Scripts\n(Rhino)" as Scripts
+participant "Events" as Events
+
+== Phase 1: Discover and Load Mods ==
+
+CL -> Mods : load()
+activate Mods
+
+Mods -> ZipFi : list() — scan mod directory for .jar/.zip/dirs
+Mods -> Plat : getWorkshopContent(LoadedMod.class) — Steam workshop mods
+note right : Collects all mod candidates\n(local + workshop)
+
+Mods -> Mods : findMeta(zipFi) — read mod.json / mod.hjson per candidate
+Mods -> Mods : resolveDependencies(metas) — topological sort → ordered ModMeta→ModState map
+
+loop for each resolved mod
+    Mods -> Mods : loadMod(file, overwrite=false, initialize=enabled)
+    activate Mods
+
+    Mods -> ZipFi : new ZipFi(sourceFile) — open archive
+    Mods -> Mods : findMeta(zip) — parse ModMeta (name, main, minGameVersion, …)
+
+    alt JAR mod: main class present, enabled, version OK, not blacklisted
+        Mods -> Plat : loadJar(sourceFile, mainLoader) → ClassLoader loader
+        Plat --> Mods : loader
+        Mods -> MCL : addChild(loader)
+        Mods -> Mods : Class.forName(mainClass, true, loader) — load Mod subclass
+        Mods -> Mods : getDeclaredConstructor().newInstance() — instantiate Mod
+        Mods -> Mods : metas.put(mainClass, meta)
+    else script / resource-only mod
+        note right of Mods : mainMod = null
+    end
+
+    Mods -> LM : new LoadedMod(file, zip, mainMod, loader, meta)
+    LM --> Mods : loaded
+    deactivate Mods
+
+    Mods -> Mods : mods.add(loaded)
+end
+
+Mods -> Mods : updateDependencies(mod) — resolve dependency references
+Mods -> Mods : sortMods() — order by state + name
+Mods -> Mods : buildFiles() — walk mod roots, populate virtual file tree, load bundles
+
+== Phase 2: Async Sprite Packing ==
+
+CL -> Mods : loadAsync()
+Mods -> Mods : new MultiPacker()
+note right of Mods : packSprites() runs per-mod\nin parallel Future tasks
+Mods -> Mods : merge packed pages into TextureAtlas
+
+== Phase 3: Sync Icon Load ==
+
+CL -> Mods : loadSync()
+Mods -> Mods : loadIcons() — load mod icon textures
+
+== Phase 4: Load Content JSON ==
+
+CL -> Mods : loadContent()
+activate Mods
+
+loop each enabled mod with main class (ordered)
+    Mods -> content : setCurrentMod(mod)
+    Mods -> LM : mod.main.loadContent() — Java mod registers content programmatically
+end
+
+Mods -> content : setCurrentMod(null)
+
+loop each .json/.hjson under content/<type>s/ across ordered mods
+    Mods -> CP : parse(mod, name, jsonString, file, ContentType) → Content
+    activate CP
+
+    CP -> CP : checkInit() — lazy-init type/parser registries
+    CP -> CP : Jval.read(json) → JsonValue
+    CP -> CP : parsers[type].parse(mod.name, name, value) — instantiate Content
+    CP -> CP : toBeParsed.add(content) — defer field reads
+
+    alt parse exception
+        CP --> Mods : markError(content, mod, file, e)
+        note right : Error recorded on content object;\nloading continues
+    end
+
+    deactivate CP
+end
+
+Mods -> CP : finishParsing()
+activate CP
+CP -> CP : execute deferred reads[]
+CP -> CP : execute deferred postreads[]
+CP -> Events : fire(ModContentLoadEvent)
+deactivate CP
+
+deactivate Mods
+
+== Phase 5: Load Scripts (Rhino JS Engine) ==
+
+CL -> Mods : loadScripts()
+activate Mods
+
+loop each enabled mod with scripts/ folder
+    Mods -> content : setCurrentMod(mod)
+
+    alt scripts == null (first JS mod encountered)
+        Mods -> Plat : createScripts() → Scripts
+        activate Scripts
+        Plat --> Mods : scripts instance
+
+        Scripts -> Plat : getScriptContext() → Rhino Context
+        Scripts -> Scripts : new ImporterTopLevel(context) → Scriptable scope
+        Scripts -> Scripts : RequireBuilder\n  .setModuleScriptProvider(SoftCachingModuleScriptProvider)\n  .setSandboxed(true)\n  .createRequire(context, scope)\n  .install(scope)
+        Scripts -> Scripts : context.evaluateString(scope, global.js, 'global.js') — bootstrap globals
+        deactivate Scripts
+    end
+
+    Mods -> Scripts : run(mod, main.js)
+    activate Scripts
+
+    Scripts -> Scripts : currentMod = mod
+    Scripts -> Scripts : context.evaluateString(scope,\n  'modName=…; scriptName=…', 'initscript.js') — inject mod metadata
+    Scripts -> Scripts : context.evaluateString(scope,\n  '(function(){"use strict";\n<script>\n})();', file) — execute main.js
+    Scripts -> Scripts : currentMod = null
+
+    deactivate Scripts
+end
+
+Mods -> content : setCurrentMod(null)
+deactivate Mods
+
+== mod.require() from script (ScriptModuleProvider) ==
+
+Scripts -> ZipFi : currentMod.root.child('scripts') — locate module root
+
+alt moduleId matches '<modName>/<script>' (cross-mod require)
+    Scripts -> Mods : Vars.mods.locateMod(modName) → LoadedMod
+    Scripts -> Scripts : currentMod = requiredMod
+end
+
+Scripts -> Scripts : new ModuleSource(module.reader(), URI, validator)
+
+== Mod Removal ==
+
+note over Mods : On removeMod() / loadSync ClassLoaderCloser
+Mods -> MCL : ClassLoaderCloser.close(mod.loader) — release JAR (desktop only)
+Mods -> ZipFi : delete() — close zip handle
+Mods -> LM : mod.dispose()
+
+@enduml

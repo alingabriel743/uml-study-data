@@ -1,0 +1,212 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 11
+skinparam backgroundColor #FEFEFE
+skinparam ActivityBackgroundColor #F8F9FA
+skinparam ActivityBorderColor #495057
+skinparam ActivityArrowColor #495057
+skinparam ActivityFontColor #212529
+skinparam ActivityDiamondBackgroundColor #E9ECEF
+skinparam ActivityDiamondBorderColor #6C757D
+skinparam PartitionBackgroundColor #E9ECEF
+skinparam PartitionBorderColor #6C757D
+
+title AI Controller Behavior Pipeline\n(Unit AI decision cycle: stance evaluation, movement, targeting, and shooting)
+
+|AIController|
+start
+:controller.updateUnit()  ← called each game tick;
+
+if (useFallback() AND fallback != null?) then (yes)
+  :fallback.updateUnit();
+  stop
+else (no)
+endif
+
+:updateVisuals()\n[flying unit: wobble animation + lookAt(prefRotation())];
+
+|Targeting & Weapons|
+if (unit.hasWeapons()?) then (yes)
+  :updateWeapons();
+
+  if (retarget()?\n[timer slot 0: 40t if no target / 90t if has target]) then (fires)
+    :findMainTarget(x, y, range, targetAir, targetGround);
+    :target = result;
+  else (skip — on cooldown)
+  endif
+
+  if (invalid(target)?) then (yes)
+    :target = null;
+    :increment noTargetTime;
+  else (valid)
+    :reset noTargetTime;
+  endif
+
+  repeat
+    :Next weapon mount;
+    if (mount.controllable AND aiControllable\nAND NOT noAttack?) then (process)
+      if (singleTarget mode?) then (yes)
+        :mount.target = target;
+      else (per-mount targeting)
+        if (retarget?) then (yes)
+          :mount.target = findTarget(\n  mountX, mountY, wrange);
+        endif
+      endif
+      :Predict intercept position;
+      :Set mount.aimX, mount.aimY;
+      if (mount.target in range\nAND shouldShoot()?) then (yes)
+        :shoot = true;
+      else (out of range)
+        if (autoDropBombs?) then (yes)
+          :Find bomberTarget near unit;
+        endif
+        :shoot = false;
+      endif
+      if (shouldFire()?) then (yes)
+        :mount.shoot = mount.rotate = shoot;
+        :unit.isShooting |= mount.shoot;
+      else (holdFire stance)
+        :mount.shoot = false;
+      endif
+    else (skip — not controllable)
+    endif
+  repeat while (more mounts?) is (yes)
+  ->no;
+
+  if (no target AND noTargetTime >= 300?) then (yes)
+    :Rotate mount back to baseRotation;
+  endif
+else (no weapons)
+endif
+
+|Movement|
+:updateMovement()  ← dispatched to AI subclass;
+
+if (AI subtype?) then (FlyingAI)
+
+  :unloadPayloads();
+  if (target != null AND hasWeapons?) then (yes)
+    if (unit.type.circleTarget?) then (yes)
+      :circleAttack(circleTargetRadius);
+    else (no)
+      :moveTo(target, range * 0.8f);
+      :lookAt(target);
+    endif
+  else (no target)
+    if (state.rules.waves AND unit.team == defaultTeam?) then (yes)
+      :moveTo(getClosestSpawner(),\n  dropZoneRadius + 130f);
+    endif
+  endif
+
+elseif (AI subtype?) then (GroundAI)
+
+  :Compute stuckThreshold\n= max(1, stuckRange*2 / unit.speed);
+  if (closestEnemyCore within range?) then (yes)
+    :target = core;
+    :assign core as each mount target;
+  else (core far away)
+    if (wave/spawn rules allow movement?) then (yes)
+      :pathfind(fieldCore, stopAtTargetTile,\n  avoidance = stuckTime >= threshold);
+    endif
+    if (canBoost AND elevation > 0?) then (yes)
+      :Descend elevation toward 0;
+    endif
+  endif
+  :faceTarget();
+  :Track stuckX / stuckY;
+  if (unit is stuck?) then (yes)
+    :Notify nearby GroundAI units;
+  endif
+
+elseif (AI subtype?) then (SuicideAI)
+
+  note right
+    SuicideAI overrides updateUnit() entirely —
+    skips standard updateVisuals / updateTargeting.
+    Shown here for completeness.
+  end note
+  :Validate and optionally clear target;
+  if (retarget()?) then (yes)
+    :target = findTarget(x, y, range, targetAir, targetGround);
+  endif
+  :findClosestEnemyCore();
+  if (target == null?) then (yes)
+    :target = core;
+  endif
+  if (target valid AND in range?) then (yes)
+    :rotate = true;
+    if (path blocked by wall/block?) then (yes)
+      :shoot = true;
+    else (path clear)
+      :moveToTarget = true;
+      :movePref directly toward target;
+    endif
+  else (out of range)
+    :pathfind(fieldCore)\n[respects dropZone rules];
+  endif
+  :unit.controlWeapons(rotate, shoot);
+  :faceTarget();
+
+elseif (AI subtype?) then (DefenderAI)
+
+  :unloadPayloads();
+  note right
+    Overrides updateTargeting(): sorts friendly units
+    by maxHealth desc + proximity; falls back to own
+    core or enemy core for wave teams.
+  end note
+  if (target != null?) then (yes)
+    :moveTo(target, hitSize offset + 15f, smooth=50f);
+    :lookAt(target);
+  endif
+
+else (CommandAI)
+
+  :Check / set stances\n[mineAuto, pursueTarget, patrol, holdFire];
+  if (pursueTarget stance AND no explicit attackTarget?) then (yes)
+    :commandTarget(target);
+  endif
+  :Purge invalid entries from commandQueue;
+  :Resolve commandController from current UnitCommand;
+  if (commandController != null?) then (yes)
+    :Delegate to commandController.updateUnit();
+  else (no controller)
+    :defaultBehavior();
+    :updateVisuals() + updateTargeting();
+    if (attackTarget valid?) then (yes)
+      :Track targetPos; find edge of solid building\nif unit is grounded;
+      :Compute engageRange = weaponRange - 10f;
+      if (withinAttackRange?) then (yes)
+        if (unit.type.circleTarget?) then (yes)
+          :circleAttack();
+        else (no)
+          :moveTo(vecOut, engageRange);
+        endif
+      else (outside range)
+        if (blockingUnit AND timeSpentBlocked > maxBlockTime?) then (yes)
+          :Reset blocking state;
+        else (no)
+          :controlPath.getPathPosition(\n  fieldCore);
+        endif
+      endif
+      if (flying AND currently moving?) then (yes)
+        :lookAt(vecMovePos);
+      else (no)
+        :faceTarget();
+      endif
+      if (stopAtTarget AND within engageRange?) then (yes)
+        :clear attackTarget;
+      endif
+    else (no target)
+      if (destination reached — within hitSize/2?) then (yes)
+        :finishPath();
+      endif
+    endif
+  endif
+
+endif
+
+stop
+@enduml

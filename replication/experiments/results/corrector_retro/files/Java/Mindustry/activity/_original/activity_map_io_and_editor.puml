@@ -1,0 +1,292 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activityBackgroundColor #F8F9FA
+skinparam activityBorderColor #495057
+skinparam activityArrowColor #495057
+skinparam activityFontColor #212529
+skinparam activityDiamondBackgroundColor #E9ECEF
+skinparam activityDiamondBorderColor #6C757D
+skinparam swimlaneBorderColor #6C757D
+skinparam swimlaneTitleBackgroundColor #E9ECEF
+skinparam swimlaneTitleFontColor #212529
+
+title Map IO & Editor Workflow
+
+' ═══════════════════════════════════════════
+' WORKFLOW 1: Save Map
+' ═══════════════════════════════════════════
+
+|#EAF4FB|Editor / User|
+|#EBF7EE|Maps|
+|#FFF8E8|MapIO|
+|#F5EEF8|Assets & Preview|
+
+|Editor / User|
+start
+:saveMap(StringMap tags);
+
+|Maps|
+if (tags 'name' is null?) then (yes)
+  #FFAAAA:Throw IOException\n"Map name required";
+  detach
+else (no)
+endif
+:Find existing map by display name;
+if (Existing map found?) then (yes)
+  :Dispose old texture;\nRemove from list;\nReuse existing file path;
+else (no)
+  :findFile(name):\nSanitize filename;\nFind unique path in\ncustomMapDirectory;
+endif
+:Create Map object\n(file, width, height, tags);
+:fogControl.resetFog();
+
+|MapIO|
+:writeMap(file, map);
+note right
+  SaveIO.write() wraps map data
+  in deflate (ZLIB) compression
+end note
+
+|Maps|
+if (Headless mode?) then (yes)
+  :Skip preview &\ntile scanning;
+else (no)
+  :Scan all tiles for CoreBlock\n→ collect teams;
+  :Count spawn blocks;
+  if (Preview already\nin Core.assets?) then (yes)
+    :Unload existing\npreview asset;
+  endif
+
+  |MapIO|
+  :generatePreview(world.tiles);
+  repeat
+    if (Non-synthetic,\nnon-air block?) then (yes)
+      :color = block.minimapColor(tile);
+    elseif (Overlay==air\nAND block==air?) then (yes)
+      :color = floor.minimapColor(tile);
+    else (fallback)
+      :color = colorFor(block,\nfloor, overlay, team);
+    endif
+    :pixmap.set(x, height-1-y, color);
+  repeat while (More tiles?) is (yes)
+  ->no;
+  :Return Pixmap;
+
+  |Maps|
+  :writeCache(map)\n→ write spawns + teams\nto .cache file;
+  :map.texture = new Texture(pixmap);
+
+  |Assets & Preview|
+  fork
+    :map.previewFile().writePng(pixmap);
+    :pixmap.dispose();
+  end fork
+  note right: Async via mainExecutor
+endif
+
+|Maps|
+:maps.add(map);
+:maps.sort();
+:Return saved Map;
+stop
+
+' ═══════════════════════════════════════════
+' WORKFLOW 2: Import Map
+' ═══════════════════════════════════════════
+
+|Editor / User|
+start
+:importMap(Fi file);
+
+|Maps|
+:findFile(file.name())\n→ determine dest path;
+:file.copyTo(dest);
+:loadMap(dest)\n→ MapIO.createMap(dest);
+
+|MapIO|
+:Open InflaterInputStream on file;
+:SaveIO.readHeader(stream);
+:Read version int;
+:getSaveWriter(version)\n→ SaveVersion;
+if (SaveVersion == null?) then (yes)
+  #FFAAAA:Throw IOException\n"Unknown map version";
+  detach
+else (no)
+endif
+:readRegion('meta')\n→ readStringMap\n→ tags (name, width, height...);
+:Return new Map(file, w, h, tags,\ncustom=true, version, build);
+
+|Maps|
+:createNewPreview(map);
+
+|MapIO|
+:generatePreview(map) [from file]:;
+:Open InflaterInputStream;
+:readHeader + read version → SaveVersion;
+:Create Pixmap floors(w,h)\n+ Pixmap walls(w,h);
+:readRegion('content')\n→ readContentHeader;
+if (version >= 11?) then (yes)
+  :readRegion('content')\n→ skipContentPatches;
+endif
+:readRegion('preview_map')\n→ readMap via WorldContext:;
+note right
+  create(x,y,floorID,wallID):
+    set floor pixel; count spawns
+  onReadBuilding:
+    draw team color; track CoreBlocks
+  onReadTileData:
+    draw block/floor minimapColor
+  setBlock override:
+    draw non-air wall + shadow
+end note
+:floors.draw(walls, true)\n[composite walls over floors];
+:walls.dispose();
+:content.setTemporaryMapper(null);
+:Return floors Pixmap;
+
+|Maps|
+if (Preview generation\nthrew exception?) then (yes)
+  #FFAAAA:maps.remove(map);\nmap.file.delete();\nRethrow as IOException;
+  detach
+else (no)
+endif
+:map.texture = new Texture(pixmap);
+
+|Assets & Preview|
+fork
+  :map.previewFile().writePng(pixmap);
+  :writeCache(map);
+  :pixmap.dispose();
+end fork
+note right: Async via mainExecutor
+
+|Maps|
+:Return imported Map;
+stop
+
+' ═══════════════════════════════════════════
+' WORKFLOW 3: Load Map Previews
+' ═══════════════════════════════════════════
+
+|Editor / User|
+start
+:loadPreviews();
+
+|Maps|
+repeat
+  if (previewFile() exists?) then (yes)
+
+    |Assets & Preview|
+    :Core.assets.load\n(AssetDescriptor,\nMapPreviewParameter);
+    if (loadAsync succeeds?) then (yes)
+      :loadSync → map.texture = t;
+    else (error)
+      |Maps|
+      :queueNewPreview(map)\n→ Core.app.post:\npreviewList.add(map);
+    endif
+
+    |Maps|
+    :readCache(map)\n→ spawns + teams\nfrom .cache file;
+    if (readCache failed?) then (yes)
+      :queueNewPreview(map);
+    endif
+
+  else (no)
+    :queueNewPreview(map)\n→ previewList.add(map);
+  endif
+repeat while (More maps?) is (yes)
+->no;
+
+:createAllPreviews():;
+:Core.app.post → for each map\nin previewList:;
+
+|MapIO|
+:generatePreview(map);
+
+|Maps|
+:map.texture = new Texture(pixmap);
+
+|Assets & Preview|
+fork
+  :writePng(pixmap);\nwriteCache(map);\npixmap.dispose();
+end fork
+note right: Async via mainExecutor
+
+|Maps|
+:All previews queued or loaded;
+stop
+
+' ═══════════════════════════════════════════
+' WORKFLOW 4: Map Processors Dialog
+' ═══════════════════════════════════════════
+
+|#EAF4FB|Editor / User|
+|#FFF3E8|MapProcessorsDialog|
+|#EBF7EE|Maps|
+|#FFF8E8|MapIO|
+|#F5EEF8|Assets & Preview|
+
+|Editor / User|
+start
+:Open MapProcessorsDialog;
+
+|MapProcessorsDialog|
+:shown() → setup();
+:Scan world.tiles.eachTile\nfor isCenter + worldProcessor blocks;
+:Collect into processors Seq;
+:rebuild() → clear list UI;
+
+if (Processors list empty?) then (yes)
+  :Display "No world processors"\nmessage;
+else (no)
+  :For each LogicBuild\nmatching search text:;
+  fork
+    :Icon button\n→ iconSelect.show()\nto change iconTag;
+  fork again
+    :Name/position button\n→ log.showEditDialog(true);
+  fork again
+    :Pencil/edit button\n→ ui.showTextInput\n→ rename tag → setup();
+  fork again
+    if (state.isGame\n&& isEditor?) then (yes)
+      :Eye button → hide();\nshowConfig(build);\npanCamera(build);
+    endif
+  end fork
+  :Trash button shown;
+  if (User confirms delete?) then (yes)
+    :Check surrounding tiles;
+    if (Surrounded by\nprivileged/static tiles?) then (yes)
+      :setNet(Blocks.wall);
+    else (no)
+      :setNet(Blocks.air);
+    endif
+    :processors.remove(build);
+    :rebuild();
+  endif
+endif
+
+:ADD button pressed;
+:Scan world grid for first\nnon-synthetic empty tile;
+if (Empty tile found?) then (yes)
+  :tile.setNet(Blocks.worldProcessor,\nTeam.sharded, 0);
+  :editor.renderer.updateStatic(x, y);
+  :setup();
+else (no)
+  #FFAAAA:ui.showErrorMessage\n"No space for world processor";
+endif
+stop
+
+@enduml

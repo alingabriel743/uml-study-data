@@ -1,0 +1,150 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequence {
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ActorBackgroundColor #F8F9FA
+    ActorBorderColor #495057
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    GroupBorderColor #6C757D
+}
+skinparam NoteBackgroundColor #FFF3CD
+skinparam NoteBorderColor #856404
+
+title Logic Script Execution
+
+actor "User/Config" as User
+participant "GameEngine" as GameEngine
+participant "LogicBuild" as LogicBuild
+participant "LogicLink" as LogicLink
+participant "LAssembler" as LAssembler
+participant "LParser" as LParser
+participant "LExecutor" as LExecutor
+participant "LInstruction" as LInstruction
+
+== Code Loading (updateCode) ==
+
+User -> LogicBuild : updateCode(str, keep, assemble)
+activate LogicBuild
+
+LogicBuild -> LAssembler : assemble(str, privileged)  [static]
+activate LAssembler
+
+LAssembler -> LParser : new LParser(text, privileged).parse()
+activate LParser
+
+loop for each line / char
+    LParser -> LParser : statement() — tokenize line
+    note right: max 16 tokens/line\n# comments, ; separators
+end
+
+LParser -> LParser : resolve jump labels (2nd pass)\nset JumpStatement.destIndex
+
+LParser --> LAssembler : Seq<LStatement>
+deactivate LParser
+
+LAssembler -> LAssembler : st.map(l -> l.build(asm))\n→ LInstruction[]
+LAssembler -> LAssembler : store instructions[], vars map
+
+LAssembler --> LogicBuild : LAssembler (asm)
+deactivate LAssembler
+
+loop for each valid LogicLink
+    LogicBuild -> LogicLink : get link.name
+    activate LogicLink
+    LogicLink --> LogicBuild : name, building ref
+    deactivate LogicLink
+    LogicBuild -> LAssembler : putConst(link.name, building)
+end
+
+LogicBuild -> LAssembler : putConst("@links", count)
+LogicBuild -> LAssembler : putConst("@ipt", ipt)
+LogicBuild -> LAssembler : getVar("@this").setconst(this)\nputConst("@thisx"), putConst("@thisy")
+
+LogicBuild -> LExecutor : load(asm)
+activate LExecutor
+LExecutor -> LExecutor : vars = asm.vars (non-constant only)\nassign ids
+LExecutor -> LExecutor : instructions = asm.instructions
+LExecutor -> LExecutor : counter = asm.getVar("@counter")\nunit = getVar("@unit")\nthisv = getVar("@this")
+deactivate LExecutor
+
+deactivate LogicBuild
+
+== Per-Tick Execution (updateTile) ==
+
+GameEngine -> LogicBuild : updateTile()  [each game tick]
+activate LogicBuild
+
+opt deferred post-read setup pending
+    LogicBuild -> LogicBuild : loadBlock.run()
+end
+
+LogicBuild -> LogicBuild : check link validity
+opt links changed
+    LogicBuild -> LogicBuild : updateLinks()
+end
+
+LogicBuild -> LExecutor : executor.team = team
+
+alt enabled && executor.initialized()
+    LogicBuild -> LogicBuild : accumulator += edelta() * ipt
+    note right: capped at maxInstructionScale * ipt (5×)
+
+    loop accumulator >= 1f
+        LogicBuild -> LExecutor : runOnce()
+        activate LExecutor
+
+        alt counter out of bounds
+            LExecutor -> LExecutor : reset counter to 0\n(wrap at end of program)
+        end
+
+        LExecutor -> LInstruction : instructions[(int)(counter.numval++)].run(executor)
+        activate LInstruction
+        LInstruction -> LExecutor : read/write LVar values\nmay set yield, modify counter
+        deactivate LInstruction
+
+        LExecutor --> LogicBuild : (return)
+        deactivate LExecutor
+
+        opt executor.yield == true
+            LogicBuild -> LogicBuild : yield = false; break loop
+            note right: WaitI/StopI set yield=true\nand decrement counter to\nre-run next tick
+        end
+    end
+end
+
+deactivate LogicBuild
+
+== Static Script Execution (runLogicScript) ==
+
+actor "Caller" as Caller
+
+Caller -> LExecutor : runLogicScript(code, maxInstructions=100_000, loop=false)  [static]
+activate LExecutor
+
+LExecutor -> LExecutor : new LExecutor()\nexecutor.privileged = true
+
+LExecutor -> LAssembler : assemble(code, privileged=true)
+activate LAssembler
+LAssembler --> LExecutor : asm
+deactivate LAssembler
+
+LExecutor -> LExecutor : executor.load(asm)
+
+loop i in 0..maxInstructions
+    LExecutor -> LExecutor : runOnce()
+    note right: exits when counter overflows\nor yield is set
+end
+
+LExecutor --> Caller : (complete)
+deactivate LExecutor
+
+@enduml

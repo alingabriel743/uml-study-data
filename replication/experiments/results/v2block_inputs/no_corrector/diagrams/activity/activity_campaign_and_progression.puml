@@ -1,0 +1,176 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #212529
+    EndColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+
+title Campaign and Progression Flow
+
+|Player|
+start
+:Select sector on planet map;
+
+|Logic|
+:Logic.play()\n- state = PLAYING\n- init wavetime (waveSpacing × difficulty.waveTimeMultiplier)\n- fire PlayEvent;
+
+if (Campaign mode?) then (yes)
+    |CampaignRules|
+    :CampaignRules.apply(planet, rules)\n- set fog, showSpawns, randomWaveAI\n- apply enemy health/spawn multipliers\n- toggle RTS AI if attackMode & planet.showRtsAIRule\n- set pauseDisabled;
+else (no)
+endif
+
+|Logic|
+:Enter game update loop;
+
+repeat
+    fork
+        :Wave timer tick;
+        if (waveTimer active\n&& !gameOver?) then (yes)
+            :Logic.runWave()\n- spawner.spawnEnemies()\n- state.wave++\n- reset wavetime\n- fire WaveEvent;
+
+            |CampaignStats|
+            :CampaignStats.wavesLasted++;
+
+            |GameService|
+            :SStat.maxWavesSurvived.max(wave);
+
+            |Logic|
+        else (no)
+        endif
+    fork again
+        :Periodic stat update (every 2s, campaign only);
+        |GameService|
+        :GameService.checkUpdate()\n- SStat.maxUnitActive.max(player unit count)\n- check 10 polys active → active10Polys\n- check all core items full → fillCoreAllCampaign\n- check power balance achievements\n  (<-10k, >100k, battery>1M);
+        |Logic|
+    end fork
+
+    :Logic.checkGameState();
+
+    if (Campaign mode?) then (yes)
+        if (attackAfterWaves &&\n!attackMode?) then (yes)
+            :Enable attackMode\nDisable wave spawning\n[transition to attack phase];
+        elseif (LOSE: playerCores.size == 0?) then (yes)
+            :state.gameOver = true\nfire GameOverEvent(waveTeam);
+
+            |CampaignStats|
+            :CampaignStats.sectorsLost++;
+
+            |Logic|
+            if (clearSectorOnLose?) then (yes)
+                :Clear sector data;
+            else (no)
+            endif
+            :Logic.gameOver(waveTeam)\n- state.stats.wavesLasted = state.wave\n- state.won = false\n- show restart UI after 3s delay;
+            stop
+        elseif (WIN via waves:\nenemies==0 && wave>=winWave\n&& !spawning?) then (yes)
+            :Call.sectorCapture();
+        elseif (WIN via attack:\nattackMode &&\nwaveTeam not alive?) then (yes)
+            :Call.sectorCapture();
+        else (continue)
+        endif
+    else (no — non-campaign)
+        if (LOSE: !attackMode &&\nplayerCores empty?) then (yes)
+            :fire GameOverEvent;
+            stop
+        elseif (LOSE: attackMode &&\ncountAlive <= 1?) then (yes)
+            :fire GameOverEvent(surviving team);
+            stop
+        elseif (WIN: waves &&\nenemies==0 && wave>=winWave?) then (yes)
+            :fire GameOverEvent(defaultTeam wins);
+            stop
+        else (continue)
+        endif
+    endif
+
+repeat while (sector not captured\n&& game not over?) is (continue)
+
+|Logic|
+:Logic.sectorCapture() [@Remote]\n- state.rules.waves = false\n- sector.info.wasCaptured = true\n  (initial = !wasCaptured before)\n- fire SectorCaptureEvent(sector, initial)\n- state.rules.attackMode = false\n- state.rules.disableWorldProcessors = true\n- Call.clearObjectives()\n- control.saves.saveSector(sector);
+
+fork
+    :SectorCaptureEvent → Logic handler\n- if server: enemy team destroyToDerelict()\n- apply planet.sectorCaptureReplacements\n  (floor swaps)\n- planet.generator.onSectorCaptured(sector);
+
+    |CampaignStats|
+    :CampaignStats.sectorsCaptured++;
+
+fork again
+    |GameService|
+    :SectorCaptureEvent → GameService handler\n(achievement checks)\n- if attackMode && wave<=5 → defeatAttack5Waves\n- if no buildingsDestroyed → captureNoBlocksBroken\n- if attackMode → SStat.attacksWon++\n- SStat.sectorsControlled.set(count of serpulo bases);
+
+    if (All Serpulo sectors captured?) then (yes)
+        :captureAllSectors.complete();
+    else (no)
+    endif
+
+    if (Erekir lastSector?) then (yes)
+        :completeErekir.complete();
+    elseif (Serpulo lastSector?) then (yes)
+        :completeSerpulo.complete();
+    else (no)
+    endif
+end fork
+
+|GameService|
+:Tech Tree / Research Progression\n(on UnlockEvent / ResearchEvent)\nGameService.checkUnlocks();
+
+fork
+    if (Router unlocked?) then (yes)
+        :researchRouter.complete();
+    else (no)
+    endif
+fork again
+    if (microProcessor unlocked?) then (yes)
+        :researchLogic.complete();
+    else (no)
+    endif
+fork again
+    if (All TechTree content unlocked?) then (yes)
+        :researchAll.complete();
+    else (no)
+    endif
+fork again
+    if (thorium unlocked?) then (yes)
+        :obtainThorium.complete();
+    else (no)
+    endif
+fork again
+    if (titanium unlocked?) then (yes)
+        :obtainTitanium.complete();
+    else (no)
+    endif
+end fork
+
+:TurnEvent — inter-sector simulation\n- Calculate total production across all sector bases\n  → SStat.maxProduction.max(total)\n- Calculate total campaign items\n  → SStat.totalCampaignItems.max(total);
+
+|Player|
+:Sector captured — campaign progresses;
+stop
+
+@enduml

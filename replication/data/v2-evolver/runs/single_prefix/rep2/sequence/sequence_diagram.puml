@@ -1,0 +1,167 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequence {
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #DEE2E6
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+}
+
+title EvoMap Proxy — Startup & Message Sync Flow
+
+actor "Operator / main()" as main
+
+participant "EvoMapProxy" as proxy
+participant "LifecycleManager" as lifecycle
+participant "ProxyHttpServer" as httpServer
+participant "TaskMonitor" as taskMonitor
+participant "SyncEngine" as syncEngine
+participant "InboundSync" as inbound
+participant "OutboundSync" as outbound
+participant "MailboxStore" as store
+participant "DmHandler" as dmHandler
+participant "SessionHandler" as sessionHandler
+participant "SkillUpdater" as skillUpdater
+participant "WebUiServer" as webui
+
+== Proxy Startup ==
+
+main -> proxy: start()
+activate proxy
+
+proxy -> lifecycle: hello()
+activate lifecycle
+lifecycle -> lifecycle: _buildHeaders()
+lifecycle -> lifecycle: _getEnvFingerprint()
+lifecycle --> proxy: authToken / nodeId
+deactivate lifecycle
+
+proxy -> taskMonitor: new TaskMonitor()
+activate taskMonitor
+taskMonitor --> proxy: taskMonitor instance
+deactivate taskMonitor
+
+proxy -> httpServer: new ProxyHttpServer(routes)
+activate httpServer
+httpServer --> proxy: httpServer instance
+deactivate httpServer
+
+proxy -> httpServer: start()
+activate httpServer
+httpServer -> httpServer: randomBytes() [generate token]
+httpServer --> proxy: listening
+deactivate httpServer
+
+proxy -> webui: start()
+activate webui
+webui --> proxy: webui listening
+deactivate webui
+
+proxy -> syncEngine: start()
+activate syncEngine
+syncEngine -> syncEngine: _scheduleOutbound(delayMs)
+syncEngine -> syncEngine: _scheduleInbound(delayMs)
+syncEngine --> proxy: sync running
+deactivate syncEngine
+
+== Inbound Sync Cycle ==
+
+syncEngine -> inbound: pull()
+activate inbound
+inbound -> inbound: getHeaders()
+inbound -> store: writeInboundBatch(messages)
+activate store
+store -> store: _rebuildIndex()
+store --> inbound: persisted
+deactivate store
+inbound -> inbound: ackDelivered()
+inbound --> syncEngine: pulled
+deactivate inbound
+
+== Message Handling ==
+
+httpServer -> dmHandler: send() / list() / poll()
+activate dmHandler
+dmHandler -> store: store.send() / store.list() / store.poll()
+activate store
+store --> dmHandler: result
+deactivate store
+dmHandler --> httpServer: response
+deactivate dmHandler
+
+httpServer -> sessionHandler: createSession() / sendMessage() / joinSession()
+activate sessionHandler
+sessionHandler -> store: store.send()
+activate store
+store --> sessionHandler: saved
+deactivate store
+sessionHandler --> httpServer: response
+deactivate sessionHandler
+
+== Outbound Sync Cycle ==
+
+syncEngine -> outbound: flush()
+activate outbound
+outbound -> store: countPending()
+activate store
+store --> outbound: pendingMessages
+deactivate store
+outbound -> outbound: updateStatusBatch()
+outbound -> store: writeInboundBatch(inboundMessages)
+activate store
+store --> outbound: ok
+deactivate store
+outbound --> syncEngine: flushed
+deactivate outbound
+
+syncEngine -> syncEngine: notifyNewOutbound()
+
+== Skill Update ==
+
+skillUpdater -> skillUpdater: pollAndApply()
+activate skillUpdater
+skillUpdater -> store: store.poll()
+activate store
+store --> skillUpdater: skillMessage
+deactivate store
+skillUpdater -> skillUpdater: processSkillUpdate(message)
+note right of skillUpdater: writes updated\nskill.md to disk
+skillUpdater -> store: store.ack(messageIds)
+deactivate skillUpdater
+
+== Heartbeat Loop ==
+
+lifecycle -> lifecycle: startHeartbeatLoop(intervalMs)
+activate lifecycle
+loop every interval
+    lifecycle -> lifecycle: heartbeat()
+    lifecycle -> lifecycle: hello() [if re-auth needed]
+end
+deactivate lifecycle
+
+== Shutdown ==
+
+main -> proxy: stop()
+activate proxy
+proxy -> syncEngine: stop()
+proxy -> httpServer: stop()
+activate httpServer
+httpServer --> proxy: closed
+deactivate httpServer
+proxy -> webui: stop()
+activate webui
+webui --> proxy: closed
+deactivate webui
+proxy -> lifecycle: stopHeartbeatLoop()
+proxy --> main: stopped
+deactivate proxy
+
+@enduml

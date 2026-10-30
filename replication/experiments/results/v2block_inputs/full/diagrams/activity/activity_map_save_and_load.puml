@@ -1,0 +1,188 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #495057
+    StartColor #212529
+    EndColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+
+title Map Save and Load
+
+|Maps|
+start
+fork
+  :== LOAD ALL MAPS (startup) ==;
+  :Iterate defaultMapNames\n+ customMapDirectory files\n+ workshop/mod files;
+  repeat
+    :Maps.loadMap(file, custom);
+    |MapIO / SaveIO|
+    :new InflaterInputStream(file.read)\n→ DataInputStream;
+    :SaveIO.readHeader(stream)\n[validate magic bytes];
+    :stream.readInt() → version\nSaveIO.getSaveWriter(version)\n→ SaveVersion;
+    |SaveVersion|
+    :readRegion('meta', stream)\n→ readStringMap → tags\n(width, height, name, ...);
+    |Maps|
+    :new Map(file, width, height,\ntags, custom, version);
+    :maps.add(map); maps.sort();
+  repeat while (more files?)
+  note right: IOException on default maps\n→ RuntimeException;\ncustom/workshop → Log.err
+
+fork again
+  :== SAVE CUSTOM MAP ==;
+  :Maps.saveMap(baseTags);
+  :Copy baseTags → StringMap tags;\nextract name;
+  if (Existing map with same name?) then (yes)
+    :Dispose old texture;
+    :Remove from maps list;
+    :Reuse existing file;
+  else (no)
+    :findFile(name)\n→ Strings.sanitizeFilename\n→ unused Fi in customMapDirectory;
+  endif
+  :new Map(file, world.width(),\nworld.height(), tags, custom=true);
+  :fogControl.resetFog();
+  |MapIO / SaveIO|
+  :MapIO.writeMap(file, map)\n→ SaveIO.write(file, map.tags)\n[Deflate-compressed binary:\nheader + meta + content + map regions];
+  |Maps|
+  if (Headless mode?) then (no)
+    :Scan world tiles:\ncount CoreBlock teams,\ncount spawn overlays;
+    :Unload stale preview asset;
+    |MapIO / SaveIO|
+    :MapIO.generatePreview(world.tiles)\n→ Pixmap;
+    note right: For each tile:\nblock.minimapColor or\ncolorFor(block,floor,overlay,team)
+    |Maps|
+    :Maps.writeCache(map)\n→ write version, spawns,\nteams to map.cacheFile();
+    :map.texture = new Texture(pix);
+    fork
+      :map.previewFile().writePng(pix);
+    fork again
+      :writeCache(map)\n[async via mainExecutor];
+    end fork
+    :pix.dispose();
+  else (yes)
+    note right: Skip preview/texture\nin headless mode
+  endif
+  :maps.add(map); maps.sort();
+  note right: IOException\n→ RuntimeException
+
+fork again
+  :== IMPORT MAP ==;
+  :Maps.importMap(Fi file);
+  :findFile(file.name())\n→ dest Fi in customMapDirectory;
+  :file.copyTo(dest);
+  |MapIO / SaveIO|
+  :MapIO.createMap(dest, custom=true)\n→ Map (read metadata only);
+  |Maps|
+  :createNewPreview(map, errorHandler);
+  if (Preview generation error?) then (yes)
+    :maps.remove(map);
+    :map.file.delete();
+    :throw IOException;
+    stop
+  else (no)
+  endif
+
+fork again
+  :== LOAD MAP INTO WORLD ==;
+  :MapIO.loadMap(Map map\n[, WorldContext cons]);
+  |MapIO / SaveIO|
+  :SaveIO.load(map.file)\n→ new InflaterInputStream\n→ DataInputStream;
+  :SaveIO.readHeader(stream);
+  :version = stream.readInt()\nver = getSaveWriter(version);
+  |SaveVersion|
+  :ver.readRegion('meta')\n→ read tags;
+  :ver.readRegion('content')\n→ readContentHeader;
+  if (version >= 11?) then (yes)
+    :ver.readRegion('content')\n→ skipContentPatches;
+  else (no)
+  endif
+  :ver.readRegion('map')\n→ ver.readMap(stream, WorldContext);
+  |WorldContext|
+  :WorldContext.resize(w, h);
+  :WorldContext.begin();
+  :tile creation callbacks\n[create(x,y,floorID,overlayID,wallID)\nonReadBuilding()\nonReadTileData()];
+  :WorldContext.end();
+  |Maps|
+  note right: SaveException wraps\nIOException on failure
+
+end fork
+
+:== LOAD PREVIEWS (asset manager) ==;
+:Maps.loadPreviews();
+repeat
+  :For each map in maps list;
+  if (preview file exists?) then (yes)
+    :Core.assets.load(\n  AssetDescriptor(previewFile,\n  Texture, MapPreviewParameter));
+    note right
+      MapPreviewLoader.loadAsync()\n→ super.loadAsync; on error\n→ queueNewPreview(map)
+      MapPreviewLoader.loadSync()\n→ super.loadSync; fallback:\nnew Texture(file) or\nnew Texture('sprites/error.png')
+    end note
+    :.loaded callback: map.texture = t;
+    :readCache(map)\n→ read spawns and teams\nfrom cacheFile;
+    if (readCache failure?) then (yes)
+      :queueNewPreview(map);
+    else (no)
+    endif
+  else (no)
+    :queueNewPreview(map)\n→ previewList.add(map);
+  endif
+repeat while (more maps?)
+:After ContentLoader loaded:\ncreateAllPreviews()\n→ iterate previewList;
+:createNewPreview(map, errorHandler)\nfor each queued map;
+
+:== CREATE NEW PREVIEW ==;
+:Maps.createNewPreview(Map map);
+|MapIO / SaveIO|
+:MapIO.generatePreview(map)\n[Read map file, inflate regions:\nmeta → content → preview_map];
+|SaveVersion|
+:readRegion('preview_map')\n→ ver.readMap(stream,\nanonymous WorldContext);
+|WorldContext|
+:WorldContext.create(x,y,...)\n→ set floor pixel, count spawns;
+:WorldContext.onReadBuilding()\n→ draw team color for buildings;
+:WorldContext.onReadTileData()\n→ apply minimapColor for blocks;
+|MapIO / SaveIO|
+:floors.draw(walls, blend=true)\nwalls.dispose()\nreturn floors (Pixmap);
+|Maps|
+:map.texture = new Texture(pix);
+fork
+  :map.previewFile().writePng(pix)\n[async via mainExecutor];
+fork again
+  :writeCache(map): write version byte,\nspawns int, team IDs to cacheFile\n[async via mainExecutor];
+end fork
+:pix.dispose();
+note right: Exception → failed.get(e);\nLog.err on failure
+
+:== REMOVE MAP ==;
+:Maps.removeMap(Map map);
+if (map.texture != null?) then (yes)
+  :map.texture.dispose();
+else (no)
+endif
+:maps.remove(map);
+:map.file.delete();
+
+stop
+@enduml

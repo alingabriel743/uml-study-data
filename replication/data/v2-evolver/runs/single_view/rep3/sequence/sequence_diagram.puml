@@ -1,0 +1,224 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequence {
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #DEE2E6
+    ActorBackgroundColor #E9ECEF
+    ActorBorderColor #495057
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #F0AD4E
+}
+skinparam participant {
+    FontColor #212529
+}
+
+title EvoMapProxy — Startup, Sync Cycle & Request Handling
+
+actor "External Client" as Client
+
+box "Proxy Core" #EAF4FB
+    participant "EvoMapProxy" as Proxy
+    participant "LifecycleManager" as LC
+    participant "ProxyHttpServer" as HttpSrv
+    participant "SyncEngine" as Sync
+    participant "WebUiServer" as WebUI
+end box
+
+box "Sync Layer" #EAF7EA
+    participant "InboundSync" as Inbound
+    participant "OutboundSync" as Outbound
+    participant "MailboxStore" as Store
+end box
+
+box "Extension Layer" #FFF4E6
+    participant "SessionHandler" as Session
+    participant "DmHandler" as DM
+    participant "SkillUpdater" as Skill
+    participant "TaskMonitor" as Task
+end box
+
+== Proxy Startup ==
+
+[-> Proxy: start()
+activate Proxy
+
+Proxy -> LC: hello()
+activate LC
+LC -> LC: _buildHeaders()
+LC -> LC: _getEnvFingerprint()
+LC --> Proxy: {nodeId, headers}
+deactivate LC
+
+Proxy -> Task: new TaskMonitor()
+activate Task
+Task --> Proxy: taskMonitor instance
+deactivate Task
+
+Proxy -> HttpSrv: new ProxyHttpServer(routes)
+activate HttpSrv
+HttpSrv -> HttpSrv: constructor(routes)
+HttpSrv --> Proxy: httpServer instance
+deactivate HttpSrv
+
+Proxy -> HttpSrv: start()
+activate HttpSrv
+HttpSrv -> HttpSrv: _handleRequest handler registered
+HttpSrv --> Proxy: server listening
+deactivate HttpSrv
+
+Proxy -> WebUI: start()
+activate WebUI
+WebUI -> WebUI: buildWebUiRoutes()
+WebUI --> Proxy: webui listening
+deactivate WebUI
+
+Proxy -> Sync: start()
+activate Sync
+Sync -> Sync: _scheduleInbound(delayMs)
+Sync -> Sync: _scheduleOutbound(delayMs)
+Sync --> Proxy: sync engine running
+deactivate Sync
+
+Proxy -> LC: startHeartbeatLoop(intervalMs)
+activate LC
+LC --> Proxy: heartbeat loop started
+deactivate LC
+
+== Heartbeat Loop ==
+
+LC -> LC: heartbeat()
+activate LC
+LC -> LC: this.hello()
+note right: Refreshes auth headers\nand env fingerprint
+LC -> LC: countPending()
+LC --> LC: heartbeat payload sent
+deactivate LC
+
+== Inbound Sync Cycle ==
+
+Sync -> Inbound: pull()
+activate Inbound
+Inbound -> Inbound: getHeaders()
+Inbound -> Inbound: getState()
+note right: Fetches pending\nmessages from hub
+Inbound -> Store: writeInboundBatch(messages)
+activate Store
+Store -> Store: _rebuildIndex()
+Store -> Store: _persistState()
+Store --> Inbound: batch written
+deactivate Store
+Inbound --> Sync: inbound messages processed
+deactivate Inbound
+
+Sync -> Inbound: ackDelivered()
+activate Inbound
+Inbound -> Inbound: getHeaders()
+Inbound --> Sync: acknowledgement sent
+deactivate Inbound
+
+== Outbound Sync Cycle ==
+
+Sync -> Sync: notifyNewOutbound()
+note right: Triggered when new\noutbound messages queued
+Sync -> Outbound: flush()
+activate Outbound
+Outbound -> Store: updateStatusBatch(updates)
+activate Store
+Store -> Store: entries.sort()
+Store --> Outbound: status updated
+deactivate Store
+Outbound -> Store: writeInboundBatch(inboundMessages)
+activate Store
+Store --> Outbound: done
+deactivate Store
+Outbound --> Sync: flush complete
+deactivate Outbound
+
+== Inbound HTTP Request Handling ==
+
+Client -> HttpSrv: HTTP request (method, path, body)
+activate HttpSrv
+HttpSrv -> HttpSrv: _matchRoute(method, pathname)
+HttpSrv -> HttpSrv: parseBody(req)
+note right: Dispatches to\nregistered handler
+alt Session request
+    HttpSrv -> Session: createSession()
+    activate Session
+    Session -> DM: send(message)
+    activate DM
+    DM -> Store: send(payload)
+    activate Store
+    Store --> DM: message queued
+    deactivate Store
+    DM --> Session: message sent
+    deactivate DM
+    Session --> HttpSrv: session created
+    deactivate Session
+else DM request
+    HttpSrv -> DM: list() / poll()
+    activate DM
+    DM -> Store: list() / poll()
+    activate Store
+    Store --> DM: messages
+    deactivate Store
+    DM --> HttpSrv: message list
+    deactivate DM
+else Task monitoring
+    HttpSrv -> Task: recordClaim(taskId)
+    activate Task
+    Task -> Task: getMetrics()
+    Task --> HttpSrv: task claimed
+    deactivate Task
+end
+HttpSrv -> HttpSrv: sendJson(res, payload)
+HttpSrv --> Client: HTTP response (JSON)
+deactivate HttpSrv
+
+== Skill Update Polling ==
+
+Skill -> Skill: pollAndApply()
+activate Skill
+Skill -> Store: poll()
+activate Store
+Store --> Skill: pending skill updates
+deactivate Store
+Skill -> Skill: processSkillUpdate(message)
+note right: Writes updated skill\ncontent to filesystem
+Skill -> Store: ack(messageIds)
+activate Store
+Store --> Skill: acknowledged
+deactivate Store
+deactivate Skill
+
+== Proxy Shutdown ==
+
+[-> Proxy: stop()
+activate Proxy #LightCoral
+Proxy -> LC: stopHeartbeatLoop()
+activate LC
+LC --> Proxy: loop stopped
+deactivate LC
+Proxy -> HttpSrv: stop()
+activate HttpSrv
+HttpSrv -> HttpSrv: server.close()
+HttpSrv --> Proxy: closed
+deactivate HttpSrv
+Proxy -> WebUI: stop()
+activate WebUI
+WebUI -> WebUI: server.close()
+WebUI --> Proxy: closed
+deactivate WebUI
+Proxy --> [: shutdown complete
+deactivate Proxy
+
+@enduml

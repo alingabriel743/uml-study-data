@@ -1,0 +1,183 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+}
+
+title Map Generation and Loading
+
+participant "Caller\n(Control/NetServer)" as caller
+participant "Maps" as maps
+participant "MapIO" as mapio
+participant "World" as world
+participant "WorldContext\n(Context/FilterContext)" as ctx
+participant "WorldParams" as params
+participant "SaveIO" as saveio
+participant "Tiles" as tiles
+participant "Tile" as tile
+participant "TileGen" as tilegen
+participant "GenerateFilter" as filter
+participant "Generator\n(planet/preset)" as generator
+
+== Path A: Procedural Sector Generation ==
+
+caller -> world : loadSector(sector, params)
+activate world
+
+world -> world : setSectorRules(sector, params.saveInfo)
+note right : sets state.map, state.rules,\nweather, env, planet rules
+
+world -> world : loadGenerator(width, height, generatorLambda)
+activate world #DDD
+
+world -> world : beginMapLoad()
+note right : generating = true
+world -> caller : <<fire>> WorldLoadBeginEvent
+
+world -> tiles : resize(width, height)
+activate tiles
+tiles --> world : new Tiles array
+deactivate tiles
+
+world -> generator : generate(tiles, sector, params)
+activate generator
+note right of generator : Uses TileGen DTO\nto stage floor/overlay/wall\nvalues before creating tiles
+generator -> tilegen : reset()
+activate tilegen
+tilegen --> generator : floor=stone, block/overlay=air
+deactivate tilegen
+generator -> ctx : create(x, y, floorID, overlayID, wallID)
+activate ctx
+ctx -> tile : new Tile(x, y, floor, overlay, wall)
+activate tile
+tile --> ctx : tile instance
+deactivate tile
+ctx -> tiles : set(x, y, tile)
+ctx --> generator
+deactivate ctx
+deactivate generator
+
+world -> world : endMapLoad()
+deactivate world
+world -> caller : <<fire>> WorldLoadEndEvent
+
+loop for each tile with a building
+    world -> tile : updateProximity()
+end
+
+world -> world : addDarkness(tiles)
+world -> caller : <<fire>> WorldLoadEvent
+note right : generating = false
+
+deactivate world
+
+== Path B: File-Based Map Loading ==
+
+caller -> world : loadMap(map, rules)
+activate world
+
+alt customMapLoaders present
+    world -> world : runCustomLoader(map)
+    note right : returns early
+else standard file load
+    world -> saveio : load(map.file, new FilterContext(map))
+    activate saveio
+    activate ctx
+
+    saveio -> ctx : begin()
+    ctx -> world : beginMapLoad()
+    note right : generating = true
+    world -> caller : <<fire>> WorldLoadBeginEvent
+
+    saveio -> ctx : resize(width, height)
+    ctx -> world : resize(width, height)
+
+    loop for each tile in file
+        saveio -> ctx : create(x, y, floorID, overlayID, wallID)
+        ctx -> tile : new Tile(x, y, floor, overlay, wall)
+        activate tile
+        tile --> ctx : tile instance
+        deactivate tile
+        ctx -> tiles : set(x, y, tile)
+        saveio -> ctx : onReadTileData()
+    end
+
+    loop for each building in file
+        saveio -> ctx : onReadBuilding()
+    end
+
+    saveio -> ctx : end()
+    note right of ctx : FilterContext.end()\ncalls applyFilters() first
+
+    ctx -> filter : randomize()
+    activate filter
+    ctx -> filter : begin(width, height, tileAccessor)
+    ctx -> filter : apply(tiles, input)
+    note right of filter : OreFilter places ore overlays;\nScatterFilter adds floor decorations
+    filter --> ctx
+    deactivate filter
+
+    ctx -> world : endMapLoad()
+    deactivate ctx
+    deactivate saveio
+
+    world -> caller : <<fire>> WorldLoadEndEvent
+
+    loop for each tile with a building
+        world -> tile : updateProximity()
+    end
+
+    world -> world : addDarkness(tiles)
+    world -> world : state.map = map
+    world -> world : validate core presence\n(pvp/attack/survival modes)
+    world -> caller : <<fire>> WorldLoadEvent
+    note right : generating = false
+end
+
+deactivate world
+
+== Map Registry Loading (Maps class) ==
+
+maps -> mapio : createMap(file, custom)
+activate mapio
+mapio --> maps : Map instance
+deactivate mapio
+maps -> maps : maps.add(map); maps.sort()
+
+maps -> maps : loadPreviews()
+activate maps #DDD
+alt previewFile exists
+    maps -> maps : load via AssetManager + MapPreviewLoader
+else preview missing
+    maps -> mapio : generatePreview(map)
+    activate mapio
+    mapio --> maps : Texture(previewPixmap)
+    deactivate mapio
+    maps -> maps : async write PNG + writeCache(map)
+end
+deactivate maps
+
+@enduml

@@ -1,0 +1,171 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam interface {
+    BackgroundColor #D8EAF9
+    BorderColor #2D6A9F
+}
+skinparam note {
+    BackgroundColor #FFFDE7
+    BorderColor #F9A825
+}
+
+title Adapters Layer
+
+package "src/adapters" {
+
+    interface Adapter {
+        +install(configRoot, evolverRoot, force): object
+        +uninstall(configRoot, evolverRoot?): object
+    }
+
+    class hookAdapter <<module>> {
+        +PLATFORMS: { cursor, claude-code, codex }
+        --
+        +detectPlatform(cwd): string|null
+        +resolveConfigRoot(platformId, cwd): string|null
+        +loadAdapter(platformId): Adapter|null
+        +mergeJsonFile(filePath, patch, options): object
+        +deepMerge(target, source): object
+        +copyHookScripts(destDir, evolverRoot): string[]
+        +appendSectionToFile(filePath, marker, content): boolean
+        +removeEvolverHooks(filePath, options): boolean
+        +removeHookScripts(hooksDir): number
+        +setupHooks(options): Promise
+    }
+
+    class claudeCode <<adapter>> {
+        -HOOK_SCRIPTS_DIR_NAME: string = "hooks"
+        -EVOLVER_MARKER: string
+        --
+        +buildClaudeHooks(evolverRoot): object
+        +buildClaudeMdSection(): string
+        +install(configRoot, evolverRoot, force): object
+        +uninstall(configRoot): object
+    }
+
+    class codex <<adapter>> {
+        -HOOK_SCRIPTS_DIR_NAME: string = "hooks"
+        -EVOLVER_MARKER: string
+        --
+        +buildCodexHooksJson(evolverRoot): object
+        +ensureConfigToml(codexDir): boolean
+        +buildAgentsMdSection(): string
+        +install(configRoot, evolverRoot, force): object
+        +uninstall(configRoot): object
+    }
+
+    class cursor <<adapter>> {
+        -HOOK_SCRIPTS_DIR_NAME: string = "hooks"
+        --
+        +buildHooksJson(evolverRoot, isUserLevel): object
+        +install(configRoot, evolverRoot, force): object
+        +uninstall(configRoot, evolverRoot): object
+    }
+
+}
+
+package "src/adapters/scripts" {
+
+    class EvolverSessionStart <<hook script>> {
+        +trigger: SessionStart / sessionStart
+        --
+        -findEvolverRoot(): string|null
+        -findMemoryGraph(evolverRoot): string|null
+        -readLastN(filePath, n): object[]
+        -formatOutcome(entry): string
+        +main(): void
+    }
+
+    class EvolverSignalDetect <<hook script>> {
+        +trigger: PostToolUse / afterFileEdit
+        -SIGNAL_KEYWORDS: object
+        --
+        -detectSignals(text): string[]
+        +main(): void
+    }
+
+    class EvolverSessionEnd <<hook script>> {
+        +trigger: Stop / stop
+        --
+        -findEvolverRoot(): string|null
+        -findMemoryGraph(evolverRoot): string|null
+        -getGitDiffStats(): object
+        -detectSignals(text): string[]
+        -recordToHub(outcome): boolean
+        -recordToLocal(graphPath, outcome): boolean
+        +main(): void
+    }
+
+}
+
+' External dependencies
+database "memory_graph.jsonl" as MemoryGraph
+cloud "Hub API\n(EVOMAP_HUB_URL)" as HubAPI
+
+' Interface implementations
+claudeCode ..|> Adapter : implements
+codex      ..|> Adapter : implements
+cursor     ..|> Adapter : implements
+
+' hookAdapter factory creates adapters
+hookAdapter ..> claudeCode : <<creates>> loadAdapter()
+hookAdapter ..> codex      : <<creates>> loadAdapter()
+hookAdapter ..> cursor     : <<creates>> loadAdapter()
+
+' Adapters depend on hookAdapter utilities
+claudeCode ..> hookAdapter : uses mergeJsonFile\ncopyHookScripts\nappendSectionToFile\nremoveHookScripts
+codex      ..> hookAdapter : uses mergeJsonFile\ncopyHookScripts\nappendSectionToFile\nremoveHookScripts
+cursor     ..> hookAdapter : uses mergeJsonFile\ncopyHookScripts\nremoveEvolverHooks\nremoveHookScripts
+
+' Adapters register hook scripts
+claudeCode ..> EvolverSessionStart : registers\nSessionStart
+claudeCode ..> EvolverSignalDetect : registers\nPostToolUse
+claudeCode ..> EvolverSessionEnd   : registers\nStop
+
+codex ..> EvolverSessionStart : registers\nSessionStart
+codex ..> EvolverSignalDetect : registers\nPostToolUse
+codex ..> EvolverSessionEnd   : registers\nStop
+
+cursor ..> EvolverSessionStart : registers\nsessionStart
+cursor ..> EvolverSignalDetect : registers\nafterFileEdit
+cursor ..> EvolverSessionEnd   : registers\nstop
+
+' Script I/O
+EvolverSessionStart ..> MemoryGraph : reads last 5 entries
+EvolverSessionEnd   ..> MemoryGraph : appends JSONL entry
+EvolverSessionEnd   ..> HubAPI      : POST (optional fallback)
+
+note bottom of hookAdapter
+  Atomic file writes via .tmp rename.
+  Guards double-install via _evolver_managed key.
+  Supports user-level install (homedir) for Cursor.
+end note
+
+note right of EvolverSignalDetect
+  stdin: {content|file_content|diff, path}
+  stdout: {additional_context, additionalContext}
+  1500 ms timeout guard
+end note
+
+note right of EvolverSessionEnd
+  stdin: session end JSON
+  stdout: {followup_message, stopMessage, additionalContext}
+  7000 ms timeout guard
+end note
+
+@enduml

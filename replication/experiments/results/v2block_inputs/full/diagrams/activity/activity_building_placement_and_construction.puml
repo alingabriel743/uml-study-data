@@ -1,0 +1,178 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #495057
+    StartColor #212529
+    EndColor #212529
+    BarColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+
+title Building Placement and Construction
+
+|Player / InputHandler|
+start
+
+:Select block type;
+note right: InputHandler.block = selected Block
+
+:Set rotation;
+note right: InputHandler.rotation
+
+|Player / InputHandler|
+:Move cursor over map;
+
+:Compute cursor tile coords;
+note right: tileX(cursorX) / tileY(cursorY)
+
+|Build (static)|
+:validPlace(Block, Team, x, y, rotation);
+
+:Block.canPlaceOn(tile, team, rotation)?;
+
+fork
+    :checkNoUnitOverlap(Block, x, y);
+fork again
+    :getEnemyOverlap(Block, Team, x, y);
+fork again
+    :contactsGround / contactsShallows(x, y, Block);
+end fork
+
+|Player / InputHandler|
+if (All placement checks pass?) then (valid)
+    :Render ghost preview (drawPlan / drawOverPlan);
+    :Show overlap indicator (drawOverlapCheck);
+else (invalid)
+    :Show invalid placement indicator;
+    :Wait for player to reposition;
+    stop
+endif
+
+if (Player confirms placement?) then (yes)
+    if (Placement mode?) then (single tile)
+        :Create BuildPlan(x, y, rotation, block [, config]);
+        :Add plan to selectPlans queue;
+    elseif (line / area drag) then
+        :updateLine(x1, y1, x2, y2);
+        :iterateLine → BuildPlan per PlaceLine(x, y, rotation);
+        :Add plans to linePlans;
+    else (schematic)
+        :useSchematic(Schematic schem);
+        :Create bulk BuildPlans from schematic layout;
+        :Queue plans in lastSchematic;
+    endif
+else (no)
+    stop
+endif
+
+:BuildPlan.placeable(team) checked;
+
+:flushPlans / flushSelectPlans called;
+note right: Plans pushed to player build queue\nvia getSyncedPlans()
+
+:Store plans in playerPlanTree (QuadTree<BuildPlan>);
+note right: Spatial lookup for collision / retrieval
+
+|Builder Unit|
+:Pick up BuildPlan from queue;
+:Move to construction site;
+
+|Build (static)|
+:beginPlace(Unit, Block, Team, x, y, rotation, config);
+
+:ConstructBlock.get(block.size);
+note right: Returns size-specific ConstructBlock singleton\n(1×1, 2×2, … up to maxBlockSize)
+
+:Replace tile with ConstructBlock;
+
+|ConstructBlock / ConstructBuild|
+:Instantiate ConstructBuild entity on tile;
+:setConstruct(previousBlock, targetBlock);
+note right: progress = 0, buildCost = block.buildCost\nallocates accumulator[], itemsLeft[]
+
+repeat
+
+    :updateTile() — game tick;
+
+    |Builder Unit|
+    :construct(builder, core, amount, config);
+
+    |ConstructBlock / ConstructBuild|
+    :checkRequired(inventory, amount, dryRun=false);
+
+    if (Materials sufficient?) then (yes)
+        :Consume items from core / inventory;
+        :progress += amount / buildCost;
+        :wasConstructing = true;
+        :playRepairSound(team, tile);
+    else (no)
+        :BuildPlan.stuck = true;
+        :Pause — wait for resources;
+    endif
+
+repeat while (progress < 1.0?) is (not done)
+->done;
+
+|Build (static)|
+:constructFinish(Tile, Block, Unit, rotation, Team, config);
+
+:Fire ConstructBlock.constructed(…) event;
+
+:Replace ConstructBlock tile with final Block building;
+
+|ConstructBlock / ConstructBuild|
+:BlockIndexer.addIndex(Tile);
+note right: Registers building in quadrant spatial index\n(quadrantSize = 20 tiles)
+
+:BlockIndexer.getFlagged(team, BlockFlag) updated;
+
+:playRepairSound — completion sound;
+
+|Player / InputHandler|
+:Construction complete event fired;
+note right: Units and logic systems notified
+
+stop
+
+|Player / InputHandler|
+detach
+
+note as DeconstructNote
+  **Deconstruction Path (parallel)**
+  Player triggers tryBreakBlock(x, y)
+  Build.validBreak(Team, x, y) checked
+  Build.beginBreak(Unit, Team, x, y) →
+    ConstructBuild.setDeconstruct(previousBlock)
+    (current = air, activeDeconstruct = true)
+  Builder calls deconstruct(builder, core, amount)
+    → progress advances, materials partially returned
+  On completion: deconstructFinish(Tile, Block, Unit)
+    → Tile cleared / set to floor
+    → BlockIndexer.removeIndex(Tile)
+end note
+
+@enduml

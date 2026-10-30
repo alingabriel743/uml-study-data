@@ -1,0 +1,99 @@
+@startuml evolver_atp_task_lifecycle
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequenceParticipant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    GroupBackgroundColor #E9ECEF
+    GroupBorderColor #6C757D
+}
+
+title ATP (Agent Task Protocol) — Full Task Lifecycle
+
+actor "Evolution\nLoop" as Evo
+participant "autoBuyer.js" as AB
+participant "consumerAgent.js" as CA
+participant "hubClient.js" as HC
+participant "A2A Hub" as Hub
+participant "atpTaskPickup.js" as Pickup
+participant "merchantAgent.js" as MA
+participant "atpExecute.js" as Execute
+participant "assetStore.js" as Store
+
+== Auto-Buy: Place Order ==
+Evo -> AB: considerOrder({capabilities, signals})
+activate AB
+AB -> AB: _readLedger() / _rotateIfNewDay()
+AB -> AB: _questionHash(opts) [dedup check]
+AB -> CA: orderAndWait({capabilities,\n budget, question})
+activate CA
+CA -> HC: placeOrder({capabilities, budget,\n routing_mode})
+activate HC
+HC -> Hub: POST /a2a/atp/order
+Hub --> HC: {order_id, status: "placed"}
+HC --> CA: orderResult
+deactivate HC
+CA --> AB: {ok, order_id}
+deactivate CA
+AB -> AB: _writeLedger() [track spend]
+AB --> Evo: {ok, order_id}
+deactivate AB
+
+== Merchant: Pick Up Task ==
+MA -> Pickup: pickOne({limit})
+activate Pickup
+Pickup -> HC: listMyTasks(limit)
+activate HC
+HC -> Hub: GET /a2a/task/my?node_id=
+Hub --> HC: {tasks[]}
+HC --> Pickup: tasks[]
+deactivate HC
+Pickup -> Pickup: _isEligible(task)
+Pickup -> Pickup: _buildSpawnTask(task)
+Pickup --> MA: spawnTask {task_id, question, tools}
+deactivate Pickup
+
+MA -> MA: processTask(spawnTask)
+note right: Agent executes work,\nwrites answer to file
+
+== Merchant: Complete Task ==
+MA -> Execute: completeAtpTask({taskId,\n orderId, answerFile})
+activate Execute
+Execute -> Execute: _readAnswer(answerFile)
+Execute -> Execute: _ensureNodeSecret()
+Execute -> Execute: _buildGene(capabilities, signals)
+Execute -> Execute: _buildCapsule()
+Execute -> Execute: _publishBundle(gene, capsule)
+Execute -> Hub: POST /a2a/publish\n{gene, capsule, signature}
+Hub --> Execute: {asset_id, published}
+Execute -> Execute: _completeTaskOnHub(taskId, assetId)
+Execute -> Hub: POST /a2a/task/complete\n{task_id, asset_id}
+Hub --> Execute: {ok: true, credits_held}
+Execute -> Execute: submitDelivery(orderId, proofPayload)
+Execute -> Hub: POST /a2a/atp/deliver\n{order_id, proof}
+Hub --> Execute: {ok: true}
+Execute --> MA: {ok: true, stage: "delivered"}
+deactivate Execute
+
+MA -> Store: appendCapsule(capsule)
+
+== Consumer: Verify Delivery ==
+Evo -> CA: confirmDelivery(orderId)
+activate CA
+CA -> HC: verifyDelivery(orderId, "confirm")
+activate HC
+HC -> Hub: POST /a2a/atp/verify\n{order_id, action: "confirm"}
+Hub --> HC: {verified, credits_released}
+HC --> CA: verifyResult
+deactivate HC
+CA --> Evo: {ok: true}
+deactivate CA
+
+@enduml

@@ -1,0 +1,155 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+}
+skinparam partition {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+title Evolver — Evolution Cycle Workflow
+
+|Main Process|
+start
+:Read configuration & environment variables;
+:Parse CLI flags and environment settings\n(parseBoolEnv, parseMs, flag, list);
+
+:acquireLock();
+if (Lock acquired?) then (no)
+    :Log error — another instance running;
+    stop
+else (yes)
+endif
+
+:readJsonSafe(statePath) — load previous state;
+if (Pending solidify? (isPendingSolidify)) then (yes)
+    :rejectPendingRun(statePath)\n(rename state file, write rejection record);
+endif
+
+:Initialise EvoMapProxy;
+
+|EvoMapProxy / LifecycleManager|
+:_resolveNodeSecret()\n(read secret from store or env);
+:hello()\n(POST handshake to Hub — send fingerprint & node info);
+
+if (Hello succeeded?) then (no)
+    :AuthError — emit manual reset needed;
+    :reAuthenticate();
+else (yes)
+endif
+
+fork
+    :startHeartbeatLoop(intervalMs)\n(periodic heartbeat to Hub);
+    repeat
+        :heartbeat()\n(countPending, send events snapshot);
+    repeat while (Running?) is (yes)
+    ->no;
+fork again
+    :EvoMapProxy.start()\n— create TaskMonitor\n— create ProxyHttpServer\n— start WebUiServer;
+    :ProxyHttpServer.start()\n(bind port, register routes);
+    :WebUiServer.start()\n(bind UI port);
+end fork
+
+|SyncEngine|
+:SyncEngine.start();
+
+fork
+    :_scheduleInbound(delayMs);
+    repeat
+        :InboundSync.pull()\n(GET messages from Hub);
+        if (Auth error?) then (yes)
+            :_handleAuthError()\n→ trigger reAuthenticate;
+        else (no)
+            :MailboxStore — write inbound batch\n(store.writeInboundBatch);
+            :InboundSync.ackDelivered()\n(confirm receipt to Hub);
+        endif
+        :_scheduleInbound(nextDelay);
+    repeat while (Running?) is (yes)
+    ->stop;
+fork again
+    :_scheduleOutbound(delayMs);
+    repeat
+        :store.countPending()\n(check outbound queue depth);
+        if (Pending messages?) then (yes)
+            :OutboundSync.flush()\n(POST batch to Hub);
+            :store.updateStatusBatch()\n(mark as sent);
+        endif
+        :_scheduleOutbound(nextDelay);
+    repeat while (Running?) is (yes)
+    ->stop;
+end fork
+
+|Skill & Session Handlers|
+fork
+    :SkillUpdater.pollAndApply();
+    repeat
+        :store.poll() — fetch skill update messages;
+        if (Skill update received?) then (yes)
+            :processSkillUpdate(message)\n(validate, write skill.md file);
+            :store.ack(messageIds);
+        endif
+    repeat while (Running?) is (yes)
+    ->done;
+fork again
+    :DmHandler listens for DM messages;
+    repeat
+        :DmHandler.poll() → store.poll();
+        if (DM received?) then (yes)
+            :DmHandler.send() — route reply;
+            :DmHandler.ack(messageIds);
+        endif
+    repeat while (Running?) is (yes)
+    ->done;
+fork again
+    :SessionHandler handles multi-agent sessions;
+    repeat
+        if (New session request?) then (yes)
+            :SessionHandler.createSession()\n(validate inviteNodeIds, set expiry);
+        elseif (Incoming message?) then
+            :SessionHandler.sendMessage()\n(validate session, relay via store);
+        elseif (Subtask delegation?) then
+            :SessionHandler.delegateSubtask()\n(validate role, send subtask);
+        elseif (Result submitted?) then
+            :SessionHandler.submitResult()\n(slice summary, close subtask);
+        elseif (Join request?) then
+            :SessionHandler.joinSession();
+        endif
+    repeat while (Running?) is (yes)
+    ->done;
+end fork
+
+|TaskMonitor|
+:TaskMonitor.subscribe()\n(register observer via WebUI/client);
+repeat
+    if (Task claimed?) then (yes)
+        :TaskMonitor.recordClaim(taskId)\n(timestamp, update metrics);
+    elseif (Task completed?) then
+        :TaskMonitor.recordComplete(taskId, startedAt)\n(compute duration, update metrics);
+    elseif (Task failed?) then
+        :TaskMonitor.recordFailed(taskId)\n(update metrics, notify subscribers);
+    endif
+    :Broadcast metrics snapshot to subscribers;
+repeat while (Running?) is (yes)
+->stop;
+
+|Main Process|
+:Receive shutdown signal (SIGINT / SIGTERM);
+:shutdown()\n(releaseLock, stopEventStream, require cleanup);
+:EvoMapProxy.stop()\n(stopHeartbeatLoop, close servers);
+:ProxyHttpServer.stop() + WebUiServer.stop();
+:MailboxStore.compact()\n(persist and prune message log);
+:releaseLock()\n(remove lock file);
+stop
+
+@enduml

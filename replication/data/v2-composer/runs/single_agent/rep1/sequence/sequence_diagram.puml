@@ -1,0 +1,213 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceParticipant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequenceArrow {
+    Color #495057
+    FontColor #212529
+}
+skinparam activationBorderColor #495057
+skinparam activationBackgroundColor #E9ECEF
+
+title Composer v2 — Package Installation Flow (composer install)
+
+actor User as user
+
+participant "InstallCommand" as cmd
+participant "Composer" as composer
+participant "EventDispatcher" as events
+participant "Installer" as installer
+participant "Locker" as locker
+participant "RepositoryManager" as repoMgr
+participant "RepositorySet" as repoSet
+participant "Solver" as solver
+participant "LocalRepoTransaction" as localTx
+participant "InstallationManager" as installMgr
+participant "AutoloadGenerator" as autoload
+participant "Auditor" as auditor
+
+== Command Dispatch ==
+
+user -> cmd : execute(InputInterface, OutputInterface)
+activate cmd
+
+cmd -> composer : requireComposer()
+activate composer
+composer --> cmd : $composer
+deactivate composer
+
+cmd -> events : dispatch("command", CommandEvent)
+activate events
+events --> cmd : (listeners notified)
+deactivate events
+
+cmd -> installer : Installer::create($io, $composer)
+activate installer
+
+note right of cmd
+  Configure installer:
+  preferSource / preferDist,
+  dryRun, devMode, dumpAutoloader,
+  optimizeAutoloader, auditConfig …
+end note
+
+cmd -> installer : run()
+
+== Installer.run() ==
+
+installer -> locker : isLocked()
+activate locker
+locker --> installer : bool
+deactivate locker
+
+alt No lock file present
+    installer -> installer : $update = true
+end
+
+installer -> events : dispatchScript(PRE_INSTALL_CMD, devMode)
+activate events
+events --> installer : (scripts executed)
+deactivate events
+
+installer -> repoMgr : getLocalRepository()
+activate repoMgr
+repoMgr --> installer : InstalledRepository $localRepo
+deactivate repoMgr
+
+== doInstall() — Install from Lock File ==
+
+installer -> locker : getLockedRepository(devMode)
+activate locker
+locker --> installer : LockArrayRepository $lockedRepository
+deactivate locker
+
+installer -> installer : createPlatformRepo(false)
+note right : PlatformRepository with platform overrides
+
+installer -> installer : createPolicy(false)
+installer -> installer : createRepositorySet(false, platformRepo, [], lockedRepository)
+activate repoSet #E9ECEF
+repoSet --> installer : RepositorySet
+deactivate repoSet
+
+installer -> installer : createRequest(fixedRootPackage, platformRepo, lockedRepository)
+
+loop for each locked package
+    installer -> installer : request.fixLockedPackage($package)
+end
+
+installer -> repoSet : createPool(request, io, eventDispatcher, …)
+activate repoSet
+repoSet --> installer : Pool $pool
+deactivate repoSet
+
+== Dependency Resolution ==
+
+installer -> solver : new Solver(policy, pool, io)
+activate solver
+
+installer -> solver : solve(request, platformRequirementFilter)
+activate solver
+note right of solver
+  Builds rule set from pool,
+  runs DPLL-based SAT solver
+end note
+solver --> installer : LockTransaction $lockTransaction
+deactivate solver
+deactivate solver
+
+alt SolverProblemsException thrown
+    solver --> installer : SolverProblemsException
+    installer -> installer : writeError("requirements could not be resolved")
+    installer --> cmd : ERROR_DEPENDENCY_RESOLUTION_FAILED
+end
+
+== Plan Local Operations ==
+
+installer -> localTx : new LocalRepoTransaction(lockedRepository, localRepo)
+activate localTx
+localTx --> installer : $localRepoTransaction (operations list)
+deactivate localTx
+
+installer -> events : dispatchInstallerEvent(PRE_OPERATIONS_EXEC, devMode, executeOperations, localRepoTransaction)
+activate events
+events --> installer : (listeners notified)
+deactivate events
+
+== Execute Package Operations ==
+
+installer -> installMgr : execute(localRepo, operations, devMode, runScripts, downloadOnly)
+activate installMgr
+
+loop for each operation (Install / Update / Uninstall)
+    installMgr -> installMgr : getInstaller(package.type)
+    note right : Selects LibraryInstaller\nor plugin-provided installer
+    installMgr -> installMgr : download(op) / install(op) / update(op) / uninstall(op)
+end
+
+installMgr --> installer : (operations complete)
+deactivate installMgr
+
+installer -> installMgr : notifyInstalls(io)
+activate installMgr
+installMgr --> installer : void
+deactivate installMgr
+
+== Autoload Generation ==
+
+installer -> autoload : dump(config, localRepo, package, installationManager, "composer", optimize, null, locker)
+activate autoload
+note right of autoload
+  Generates vendor/autoload.php
+  and vendor/composer/autoload_*.php
+end note
+autoload --> installer : ClassMap
+deactivate autoload
+
+installer -> installMgr : ensureBinariesPresence(package) [for each package]
+activate installMgr
+installMgr --> installer : void
+deactivate installMgr
+
+== Post-Install Scripts ==
+
+installer -> events : dispatchScript(POST_INSTALL_CMD, devMode)
+activate events
+events --> installer : (scripts executed)
+deactivate events
+
+== Security Audit (optional) ==
+
+opt auditConfig.audit == true
+    installer -> auditor : new Auditor()
+    activate auditor
+    installer -> auditor : audit(io, repoSet, policyConfig, packages, auditFormat, true, filterListProviderSet)
+    auditor --> installer : int $advisoryCount
+    deactivate auditor
+end
+
+installer --> cmd : 0 (ERROR_NONE)
+deactivate installer
+
+cmd --> user : exit code 0
+deactivate cmd
+
+@enduml

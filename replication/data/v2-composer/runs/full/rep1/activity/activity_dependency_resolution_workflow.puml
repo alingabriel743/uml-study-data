@@ -1,0 +1,186 @@
+@startuml activity_dependency_resolution_workflow
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleBackgroundColor #DEE2E6
+}
+skinparam ArrowColor #495057
+
+title Dependency Resolution Workflow
+
+|Installer|
+start
+:Installer::run() called;
+
+if (update mode?) then (yes — doUpdate)
+
+    :createPlatformRepo()\n→ PlatformRepository;
+    :getRootAliases()\n→ $aliases[];
+
+    |Locker|
+    if (locker->isLocked()?) then (yes)
+        :getLockedRepository(true)\n→ LockArrayRepository;
+    else (no)
+        :$lockedRepository = null;
+    endif
+
+    |Installer|
+    :createPolicy(true, $lockedRepository)\n→ DefaultPolicy;
+    :createRepositorySet(true, $platformRepo, $aliases)\n→ RepositorySet\n[minimumStability, stabilityFlags, rootRequires];
+
+    |RepositorySet|
+    :repositoryManager->getRepositories()\nLoop: addRepository($repo);
+    if (lockedRepository != null?) then (yes)
+        :addRepository($lockedRepository);
+    endif
+
+    |Installer|
+    :createRequest($rootPackage, $platformRepo, $lockedRepository)\n→ Request\n[fixPackage(root), fixPackage(platform), requirePackage(requires)];
+
+    if (updateAllowList != null?) then (yes — partial update)
+        :request->setUpdateAllowList(\n  $updateAllowList,\n  $updateAllowTransitiveDependencies);
+    endif
+
+    |RepositorySet|
+    :createPool($request, $io, $eventDispatcher)\n→ Pool\n[PoolBuilder lazy-loads packages from repositories];
+
+    |Solver|
+    :new Solver($policy, $pool, $io);
+    :setupFixedMap($request);
+    :RuleSetGenerator->getRulesFor($request)\n→ RuleSet;
+    :checkForRootRequireProblems($request);
+    :new Decisions($pool);
+    :new RuleWatchGraph\n→ insert RuleWatchNode per rule;
+    :makeAssertionRuleDecisions()\n[decisions->decide(literal, level, rule)];
+
+    repeat
+        :propagate();
+        if (conflict detected?) then (yes)
+            :analyze conflict\n→ learn new rule;
+            if (backtrack possible?) then (yes)
+                :backtrackTo(level);
+            else (no)
+                :problems++;
+            endif
+        endif
+    repeat while (unresolved literals remain?) is (yes)
+    ->no;
+
+    if (problems > 0?) then (yes)
+        :throw SolverProblemsException;
+
+        |Installer|
+        :catch SolverProblemsException\nlog dependency resolution error;
+        :return ERROR_DEPENDENCY_RESOLUTION_FAILED (2);
+        stop
+    else (no)
+        :return new LockTransaction(\n  $pool, presentMap,\n  fixedPackagesMap, $decisions);
+    endif
+
+    |Installer|
+    if (lockTransaction->getOperations() empty?) then (yes)
+        :log "Nothing to modify";
+        :return ERROR_NONE (0);
+        stop
+    endif
+
+    :extractDevPackages(\n  $lockTransaction, $platformRepo,\n  $aliases, $policy, $lockedRepository);
+
+    if (package->getDevRequires() empty?) then (yes)
+        :skip dev extraction;
+    else (no)
+
+        |RepositorySet|
+        :new ArrayRepository([])\n[will hold non-dev result packages];
+        :lockTransaction->getNewLockPackages(false)\nLoop: ArrayRepository->addPackage(pkg);
+        :createRepositorySet(true, $platformRepo, $aliases)\n→ new RepositorySet;
+        :addRepository($resultRepo);
+        :createRequest($rootPackage, $platformRepo)\n[no lockedRepository — non-dev only];
+        :createPoolWithAllPackages() → Pool;
+
+        |Solver|
+        :new Solver($policy, $pool, $io);
+        :solver->solve($request)\n→ nonDevLockTransaction;
+
+        if (SolverProblemsException?) then (yes)
+            |Installer|
+            :return ERROR_DEPENDENCY_RESOLUTION_FAILED (2);
+            stop
+        else (no)
+            |Installer|
+            :lockTransaction->setNonDevPackages(\n  nonDevLockTransaction);
+        endif
+    endif
+
+    :extractPlatformRequirements()\n→ $platformReqs, $platformDevReqs;
+    :Classify operations:\nInstallOperation / UpdateOperation / UninstallOperation;
+
+    |Locker|
+    :locker->setLockData(\n  getNewLockPackages(false),\n  getNewLockPackages(true),\n  $platformReqs, $platformDevReqs,\n  $aliases, ...)\n→ write composer.lock file;
+
+    if (doInstall == true?) then (yes — chain to install)
+        |Installer|
+        :doInstall($localRepo, alreadySolved=true);
+        note right: alreadySolved=true\nskips re-solving
+    else (no)
+        |Installer|
+        :return ERROR_NONE (0);
+        stop
+    endif
+
+else (no — doInstall only)
+
+    if (alreadySolved == false?) then (yes)
+        :createRepositorySet(false, $platformRepo, [],\n  $lockedRepository)\nusing locker stability data;
+        :createRequest from locked packages\n[constraint "=" per version];
+
+        |RepositorySet|
+        :createPool($request, ...) → Pool;
+
+        |Solver|
+        :new Solver($policy, $pool, $io);
+        :solver->solve($request) → LockTransaction;
+
+        |Installer|
+        if (lockTransaction->getOperations() not empty?) then (yes)
+            :warn "lock file not in sync";
+        endif
+    endif
+
+endif
+
+|Installer|
+:new LocalRepoTransaction($localRepo, $lockTransaction)\n→ compute install/update/uninstall ops;
+
+|InstallationManager|
+:execute all operations\n(install / update / uninstall packages);
+
+|Installer|
+:return ERROR_NONE (0);
+stop
+
+@enduml

@@ -1,0 +1,189 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #212529
+    EndColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+
+title Cosmos Predict1 — Video-to-World Generation Pipeline\n(ARVideo2WorldGenerationPipeline)
+
+|User / Script|
+start
+:Parse arguments\n(checkpoint_dir, ar_model_dir,\nprompt, num_gpus, seed, ...);
+
+if (num_gpus > 1?) then (yes)
+    :Initialize distributed process group\n(megatron.core parallel_state);
+endif
+
+:Load vision inputs\n(images or videos → tensors);
+:Load text prompts\n(from file or CLI argument);
+
+|Pipeline Initialisation|
+:Detect model size from checkpoint path\n(4B / 5B / 12B / 13B);
+:Create InferenceConfig\n(model config, tokenizer config,\ndata shape config);
+
+fork
+    :Load AR model\n(AutoRegressiveModel + optional tensor parallelism);
+    :Load AR network weights\n(shard checkpoint per TP rank if multi-GPU);
+    :Load video tokenizer\n(Cosmos-Tokenize1-DV8x16x16-720p);
+fork again
+    if (disable_diffusion_decoder?) then (no)
+        :Load LatentDiffusionDecoderModel\n(Cosmos-Predict1-7B-Decoder);
+        :Load diffusion decoder tokenizer\n(Cosmos-Tokenize1-CV8x8x8-720p);
+        :Load aux_vars (generic T5 prompt embeddings);
+    else (yes)
+        :Skip diffusion decoder initialisation;
+    endif
+fork again
+    if (disable_guardrail?) then (no)
+        :Load guardrail models\n(Aegis, LlamaGuard3,\nFaceBlurFilter, VideoContentSafetyFilter);
+    else (yes)
+        :Skip guardrail initialisation;
+    endif
+end fork
+
+|Generation Loop|
+:Iterate over prompt entries;
+
+repeat
+    :Select current prompt entry\n(visual_input path + text prompt);
+
+    if (Input file exists in loaded videos?) then (no)
+        :Log critical warning — skip entry;
+    else (yes)
+        |Guardrail — Input|
+        if (guardrail enabled?) then (yes)
+            :Run guardrail on text prompt\n(_run_guardrail_on_prompt_with_offload);
+            if (Prompt is safe?) then (no)
+                :Log critical: prompt blocked;
+                :Return None — skip to next entry;
+            else (yes)
+                :Pass prompt guardrail check;
+                if (offload_guardrail_models?) then (yes)
+                    :Offload guardrail models to CPU / free VRAM;
+                endif
+            endif
+        endif
+
+        |Text Encoding|
+        :Run T5 text encoder on prompt\n(_run_text_embedding_on_prompt_with_offload);
+        :Obtain prompt_embedding + prompt_mask;
+        if (offload_text_encoder_model?) then (yes)
+            :Offload T5 encoder to CPU / free VRAM;
+        endif
+
+        |AR Model Generation|
+        if (parallel_size > 1?) then (yes)
+            :Initialize tensor model parallelism\n(megatron parallel_state);
+        endif
+
+        :Prepare data_batch\n(video frames + context embeddings + context_mask);
+        :Tokenize input video\n(model.tokenizer.tokenize → data_tokens);
+
+        :Determine context length\n(select from supported context lengths);
+        :Compute num_gen_tokens\n(T × H × W − context_latent_frames);
+
+        :For each sample in batch;
+        repeat
+            :Slice input condition tokens\n(excluding tokens to generate);
+            :Generate new video tokens autoregressively\n(model.generate with top-p / temperature);
+            if (Generated sequence too short?) then (yes)
+                :Pad with repeated last token;
+            endif
+            :Reshape tokens → B × T × H × W;
+            :Offset token indices by logit_clipping_range[0];
+            :Decode tokens to video frames\n(video_tokenizer.decode → pixel space);
+            :Normalize pixels to [0, 1];
+        repeat while (more samples?) is (yes)
+        -> (no);
+
+        if (parallel_size > 1?) then (yes)
+            :Destroy model parallel state;
+        endif
+
+        if (offload_network?) then (yes)
+            :Offload AR model to CPU / free VRAM;
+        endif
+        if (offload_tokenizer?) then (yes)
+            :Offload tokenizer to CPU / free VRAM;
+        endif
+
+        |Diffusion Decoder|
+        if (disable_diffusion_decoder?) then (no)
+            if (offload_diffusion_decoder?) then (yes)
+                :Load diffusion decoder on demand;
+            endif
+
+            if (parallel_size > 1?) then (yes)
+                :Initialize context parallelism\n(enable context parallel in decoder net);
+            endif
+
+            :Run diffusion decoder on generated tokens\n(diffusion_decoder_process_tokens);
+            :Obtain enhanced video tensors\n(higher quality, upsampled);
+
+            if (parallel_size > 1?) then (yes)
+                :Destroy model parallel state;
+            endif
+
+            if (offload_diffusion_decoder?) then (yes)
+                :Offload diffusion decoder to CPU / free VRAM;
+            endif
+        else (yes)
+            :Use AR-decoded video as-is;
+        endif
+
+        :Prepare video batch for saving\n(prepare_video_batch_for_saving → numpy);
+
+        |Guardrail — Output|
+        if (guardrail enabled?) then (yes)
+            :Run guardrail on generated video\n(_run_guardrail_on_video_with_offload);
+            if (Video is safe?) then (no)
+                :Log critical: video blocked;
+                :Return None — skip saving;
+            else (yes)
+                :Pass video guardrail check;
+            endif
+        endif
+
+        |User / Script|
+        :Save generated video as MP4\n(imageio.mimsave at 25 fps);
+        :Log output path;
+    endif
+
+repeat while (more prompt entries?) is (yes)
+-> (no);
+
+if (num_gpus > 1?) then (yes)
+    :Destroy model parallel state;
+    :Destroy distributed process group;
+endif
+
+stop
+
+@enduml

@@ -1,0 +1,130 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #E9ECEF
+}
+
+title Lyra — Autoregressive Video-to-World Generation: Inference Sequence
+
+actor User
+participant "ARVideo2World\nGenerationPipeline" as Pipeline
+participant "ImageText\nTokenizer" as Tokenizer
+participant "AutoRegressive\nModel" as ARModel
+participant "Vision\nTransformer" as ViT
+participant "Multimodal\nProjector" as MMProjector
+participant "Transformer" as Transformer
+participant "TransformerBlock\n(×N)" as TBlock
+participant "Attention" as Attn
+participant "RotaryPosition\nEmbedding" as RoPE
+participant "MLP" as MLP
+participant "LatentDiffusion\nDecoderModel" as DiffDecoder
+participant "CausalDiscrete\nVideoTokenizer" as VideoTokenizer
+
+User -> Pipeline: generate(inp_prompt, inp_vid,\n  num_input_frames, seed, sampling_config)
+activate Pipeline
+
+Pipeline -> Tokenizer: encode(text=inp_prompt, images=inp_vid)
+activate Tokenizer
+Tokenizer --> Pipeline: token_ids: List[int]
+deactivate Tokenizer
+
+Pipeline -> Pipeline: _load_model()
+activate Pipeline
+note right: Loads AR model weights\nand tokenizer from checkpoint
+deactivate Pipeline
+
+Pipeline -> ARModel: embed_vision_language_features(\n  input_ids, images)
+activate ARModel
+
+ARModel -> ViT: forward(x: Tensor)
+activate ViT
+ViT --> ARModel: vision_features: Tensor
+deactivate ViT
+
+ARModel -> MMProjector: forward(vision_features)
+activate MMProjector
+MMProjector --> ARModel: projected_embeddings: Tensor
+deactivate MMProjector
+
+ARModel --> Pipeline: multimodal_embeddings: Tensor
+deactivate ARModel
+
+Pipeline -> Pipeline: _run_model(prompt_embedding,\n  prompt_mask, inp_vid,\n  num_input_frames, seed, sampling_config)
+activate Pipeline
+
+Pipeline -> Transformer: forward(tokens, input_pos,\n  token_embeddings=multimodal_embeddings,\n  context, context_mask)
+activate Transformer
+
+Transformer -> RoPE: forward(seq_len)
+activate RoPE
+RoPE --> Transformer: rotary_embeddings: Tensor
+deactivate RoPE
+
+loop for each TransformerBlock layer
+  Transformer -> TBlock: forward(x, rope, input_pos,\n  mask, context, context_mask)
+  activate TBlock
+
+  TBlock -> Attn: forward(x, rope, input_pos,\n  mask, context)
+  activate Attn
+  note right: QKV projection,\nRoPE-based attention,\noptional cross-attention
+  Attn --> TBlock: attn_output: Tensor
+  deactivate Attn
+
+  TBlock -> MLP: forward(x)
+  activate MLP
+  MLP --> TBlock: mlp_output: Tensor
+  deactivate MLP
+
+  TBlock --> Transformer: block_output: Tensor
+  deactivate TBlock
+end
+
+Transformer --> Pipeline: logits: Tensor
+deactivate Transformer
+
+Pipeline -> Pipeline: generate_video_from_tokens(\n  prompt_tokens, latent_shape,\n  video_start_boundary,\n  max_gen_len, sampling_config,\n  logit_clipping_range, seed)
+activate Pipeline
+note right: Autoregressive decoding loop:\nsamples next token from logits,\nappends to sequence until EOS
+deactivate Pipeline
+
+Pipeline --> Pipeline: video_tokens, input_tokens, ar_tokens
+deactivate Pipeline
+
+Pipeline -> DiffDecoder: generate_samples_from_batch(\n  data_batch, guidance, seed,\n  state_shape, n_sample, num_steps)
+activate DiffDecoder
+
+DiffDecoder -> DiffDecoder: _get_conditions(data_batch,\n  is_negative_prompt, apply_corruptor)
+activate DiffDecoder
+note right: Builds conditioner inputs\nfor diffusion model
+deactivate DiffDecoder
+
+DiffDecoder -> DiffDecoder: _add_latent_conditions_to_data_batch(\n  data_batch, apply_corruptor)
+activate DiffDecoder
+deactivate DiffDecoder
+
+DiffDecoder --> Pipeline: latent_frames: Tensor
+deactivate DiffDecoder
+
+Pipeline -> VideoTokenizer: decode(latent_frames)
+activate VideoTokenizer
+note right: Decodes discrete latents\nback to pixel space via\nDecoderFactorized
+VideoTokenizer --> Pipeline: video_frames: np.ndarray
+deactivate VideoTokenizer
+
+Pipeline --> User: video_frames: np.ndarray | None
+deactivate Pipeline
+
+@enduml

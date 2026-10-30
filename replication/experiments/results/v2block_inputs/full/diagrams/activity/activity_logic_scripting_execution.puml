@@ -1,0 +1,287 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #495057
+    EndColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #DEE2E6
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam note {
+    BackgroundColor #FFF3CD
+    BorderColor #FFC107
+    FontColor #212529
+}
+
+title Logic Scripting Execution\n<size:11>(LogicBuild · LExecutor · LAssembler · LogicAI lifecycle)</size>
+
+' ─────────────────────────────────────────────
+' SECTION 1 — Script Load
+' ─────────────────────────────────────────────
+|LogicBuild|
+start
+
+:updateCode(code)\n[triggered by config receive or link change];
+
+|LAssembler / LParser|
+:LParser.parse(code) → Seq<LStatement>;
+:LStatement.build(asm) per statement → LInstruction[];
+
+|LogicBuild|
+:Validate each LogicLink:\nvalidLink(world.build(x, y));
+
+if (link valid?) then (yes)
+  :asm.putConst(link.name, building)\nlink.logicVar set;
+else (no)
+  :Skip invalid link;
+endif
+
+:asm.putConst('@links', count)\nasm.putConst('@ipt', instructionsPerTick)\nasm.putConst('@this', thisv)\nasm.putConst('@thisx' / '@thisy', coords);
+
+if (keep = true?) then (yes)
+  :Copy old non-constant LVar values\ninto new assembler vars;
+endif
+
+|LExecutor|
+if (assembly succeeds?) then (yes)
+  :executor.load(asm):\nReset nameMap · build vars[]\nSet counter / unit / ipt / thisv;
+else (exception)
+  :executor.load(empty assembly)\n— clear executor state;
+endif
+
+' ─────────────────────────────────────────────
+' SECTION 2 — Per-Tick Execution Loop
+' ─────────────────────────────────────────────
+|LogicBuild|
+:updateTile() called [every game tick];
+
+if (loadBlock != null?) then (yes)
+  :loadBlock.run()\nloadBlock = null;
+endif
+
+:executor.team = team;
+
+if (!checkedDuplicates?) then (yes)
+  :Remove duplicate LogicLink entries\nby building id;
+endif
+
+:Re-validate each LogicLink:\ncheck validLink(world.build(x, y));
+
+if (validity or build changed?) then (yes)
+  :l.trySet(executor, null) — clear old var;
+  if (now valid?) then (yes)
+    :findLinkName() → l.trySet(executor, build);
+  endif
+  :updateLinks():\nRebuild executor.links[] · linkIds · linksVar;
+endif
+
+if (!privileged?) then (yes)
+  :Reset ipt to block default\n(instructionsPerTick);
+endif
+
+if (disableWorldProcessors && privileged?) then (yes)
+  :Skip execution (return);
+  stop
+endif
+
+if (!enabled || !executor.initialized()?) then (yes)
+  :Skip execution (return);
+  stop
+endif
+
+:Cap accumulator:\nif accumulator > maxInstructionScale × ipt → clamp;
+note right: maxInstructionScale = 5\ninstructionsPerTick default = 1\nprivileged max = 40
+
+while (accumulator >= 1f?) is (yes)
+  |LExecutor|
+  :runOnce();
+
+  if (counter out of range\n(>= length or < 0)?) then (yes)
+    :Wrap counter.numval = 0;
+  endif
+
+  :counter.isobj = false;
+  :instructions[(int)(counter.numval++)].run(this);
+
+  if (executor.yield == true?) then (yes)
+    :executor.yield = false;
+    break
+  endif
+
+  |LogicBuild|
+  :accumulator--;
+endwhile (no)
+
+:accumulator += edelta() × ipt;
+
+' ─────────────────────────────────────────────
+' SECTION 3 — Static Script Execution
+' ─────────────────────────────────────────────
+|LExecutor|
+:runLogicScript(code)\n[called externally — e.g. map scripts];
+
+if (code null or empty?) then (yes)
+  :return immediately;
+  stop
+endif
+
+:new LExecutor()\nexecutor.privileged = true;
+:executor.load(\n  LAssembler.assemble(code, privileged=true));
+
+repeat
+  if (!loop && counter >= instructions.length\n|| counter < 0\n|| executor.yield?) then (exit)
+    break
+  endif
+  :runOnce();
+repeat while (i < maxInstructions 100 000?) is (yes)
+note right: Runs up to 100 000 instructions\n(static / map script budget)
+
+' ─────────────────────────────────────────────
+' SECTION 4 — Special Instruction Handling
+' ─────────────────────────────────────────────
+
+fork
+  ' --- WaitI ---
+  :WaitI.run(exec)\n[wait instruction];
+  if (value <= 0?) then (yes)
+    :exec.yield = true\ncurTime = 0\n(yield, no wait);
+  elseif (curTime >= value?) then (done)
+    :curTime = 0\n(wait complete, continue next tick);
+  else (waiting)
+    :counter-- (re-run self next tick)\nexec.yield = true\ncurTime += Time.delta / 60f;
+  endif
+
+fork again
+  ' --- StopI ---
+  :StopI.run(exec)\n[stop instruction];
+  :counter-- (always re-run self on next tick);
+  :exec.yield = true\n(halt execution for this tick);
+
+fork again
+  ' --- SyncI ---
+  :SyncI.run(exec)\n[sync instruction];
+  if (variable.constant?) then (yes)
+    :Skip — constants are not synced;
+  else (no)
+    if (timeSinceMillis(syncTime) > 50ms\n&& exec.build != null?) then (yes)
+      :variable.syncTime = Time.millis();
+      :Call.syncVariable(build, var.id,\n  isobj ? objval : numval) → RPC;
+      note right: @Remote syncVariable:\n  Get LVar at index in LogicBuild\n  If !constant: update numval or objval\n  Sync rate capped at 20 Hz
+    endif
+  endif
+
+fork again
+  ' --- SetRuleI / mapArea ---
+  :SetRuleI.run(exec) [rule = mapArea]\n[map area restriction instruction];
+  :Extract x=p1.numi(), y=p2.numi()\nw=p3.numi(), h=p4.numi();
+  :checkMapArea(x, y, w, h, false)\n— check without setting;
+  if (area already matches rules state?) then (yes)
+    :No-op — skip RPC;
+  else (no)
+    :Call.setMapArea(x, y, w, h) → RPC to server;
+    note right: @Remote setMapArea:\n  Clamp: x=max(x,0) · y=max(y,0)\n  w=min(w,world.width())\n  h=min(h,world.height())
+    if (full area && limitMapArea set?) then (yes)
+      :Disable limitMapArea\nworld.checkMapArea(prevBounds)\nrenderer.updateAllDarkness();
+    elseif (full area && !limitMapArea?) then (no-op)
+      :return — already full, no change;
+    else (restricted area)
+      :state.rules.limitMapArea = true\nSet limitX / limitY / limitWidth / limitHeight\nworld.checkMapArea(prevBounds)\nrenderer.updateAllDarkness();
+    endif
+  endif
+
+end fork
+
+' ─────────────────────────────────────────────
+' SECTION 5 — LogicAI Unit Control & Timeout
+' ─────────────────────────────────────────────
+|LogicAI|
+:updateMovement()\n[called each AI tick on logic-controlled units];
+
+if (targetTimer > 0?) then (yes)
+  :targetTimer -= Time.delta;
+else (reset)
+  :radars.clear()\ntargetTimer = 40f;
+endif
+
+if (controlTimer > 0\n&& controller != null\n&& controller.isValid()?) then (yes)
+  :controlTimer -= Time.delta;
+else (timeout)
+  :unit.resetController()\nreturn — unit reverts to default AI;
+  note right: Timeout = 600 ticks (10 sec)\nController field is the LogicBuild
+  stop
+endif
+
+:Dispatch on control enum;
+
+if (control == move?) then (yes)
+  :moveTo(moveX, moveY, 1f, 30f);
+elseif (control == approach?) then (yes)
+  :moveTo(moveX, moveY, moveRad-7f, 7, true, null);
+elseif (control == pathfind?) then (yes)
+  if (unit is flying?) then (yes)
+    :moveTo(targetX, targetY);
+  else (ground)
+    :controlPath.getPathPosition() → moveTo();
+  endif
+elseif (control == autoPathfind?) then (yes)
+  :Find enemy core or spawner\nmoveTo() or pathfind(Pathfinder.fieldCore);
+else (stop)
+  :unit.clearBuilding();
+endif
+
+if (canBoost?) then (yes)
+  :Update unit.elevation via\nMathf.approachDelta(boost flag);
+endif
+
+if (!shoot || !omniMovement?) then (yes)
+  :unit.lookAt(prefRotation());
+else (aiming)
+  :Aim at weapon mount;
+endif
+
+' --- Unit Binding ---
+:UnitControlI: checkLogicAI(exec, unitObj)\n[before any unit control instruction];
+
+if (unitObj instanceof Unit\n&& unit.isValid()\n&& exec.unit.obj() == unit?) then (yes)
+  if (unit.team == exec.team\nor exec.privileged?) then (yes)
+    if (unit.controller().isLogicControllable()?) then (yes)
+      if (controller already instanceof LogicAI?) then (yes)
+        :la.controller = exec.thisv.building()\nreturn la;
+      else (new)
+        :new LogicAI()\nla.controller = exec.thisv.building()\nunit.controller(la)\nunit.mineTile = null\nunit.clearBuilding()\nreturn la;
+      endif
+    else (no)
+      :return null — instruction skipped;
+    endif
+  else (team mismatch)
+    :return null — instruction skipped;
+  endif
+else (invalid)
+  :return null — instruction skipped;
+endif
+
+' --- Transfer Timeout ---
+:UnitControlI transfer action\n(payDrop / payTake / itemDrop / itemTake);
+
+if (timeoutDone(unit, transferDelay)?\n[Time.time >= unitTimeouts[unit.id] + 90 ticks]) then (yes)
+  :Execute transfer;
+  :updateTimeout(unit):\nunitTimeouts.put(unit.id, Time.time);
+else (throttled)
+  :Return early — transfer skipped\n(rate-limited to one per 90 ticks);
+endif
+
+stop
+@enduml

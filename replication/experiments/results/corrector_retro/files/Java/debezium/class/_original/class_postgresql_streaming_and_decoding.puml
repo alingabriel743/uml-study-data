@@ -1,0 +1,319 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam note {
+    BackgroundColor #FFF9E6
+    BorderColor #E6C84A
+}
+
+title PostgreSQL Streaming & Logical Decoding
+
+'─────────────────────────────────────
+' External / framework interfaces
+'─────────────────────────────────────
+interface "StreamingChangeEventSource\n<PostgresPartition, PostgresOffsetContext>" as StreamingChangeEventSource {
+    +execute(ChangeEventSourceContext, P, O): void
+    +init(O): void
+}
+
+interface AutoCloseable {
+    +close(): void
+}
+
+'─────────────────────────────────────
+' Package: io.debezium.connector.postgresql
+'─────────────────────────────────────
+package "io.debezium.connector.postgresql" {
+
+    class PostgresStreamingChangeEventSource {
+        -connection: PostgresConnection
+        -dispatcher: PostgresEventDispatcher<TableId>
+        -errorHandler: ErrorHandler
+        -clock: Clock
+        -schema: PostgresSchema
+        -connectorConfig: PostgresConnectorConfig
+        -taskContext: PostgresTaskContext
+        -replicationConnection: ReplicationConnection
+        -replicationStream: AtomicReference<ReplicationStream>
+        -snapshotterService: SnapshotterService
+        -lastCompletelyProcessedLsn: Lsn
+        -effectiveOffset: PostgresOffsetContext
+        -lsnFlushingAllowed: volatile boolean
+        -isClosing: volatile boolean
+        --
+        +init(PostgresOffsetContext): void
+        +execute(ChangeEventSourceContext, PostgresPartition, PostgresOffsetContext): void
+        +close(): void
+        +commitOffset(Map, Map): void
+        +getOffsetContext(): PostgresOffsetContext
+        -processMessages(ChangeEventSourceContext, PostgresPartition, PostgresOffsetContext, ReplicationStream): void
+        -processReplicationMessages(PostgresPartition, PostgresOffsetContext, ReplicationStream, ReplicationMessage): void
+        -searchWalPosition(ChangeEventSourceContext, PostgresPartition, PostgresOffsetContext, ReplicationStream, WalPositionLocator): void
+        -commitMessage(PostgresPartition, PostgresOffsetContext, Lsn): void
+        -probeConnectionIfNeeded(): void
+        -isInPreSnapshotCatchUpStreaming(PostgresOffsetContext): boolean
+    }
+
+    interface PgConnectionSupplier <<FunctionalInterface>> {
+        +get(): BaseConnection
+    }
+}
+
+'─────────────────────────────────────
+' Package: io.debezium.connector.postgresql.connection
+'─────────────────────────────────────
+package "io.debezium.connector.postgresql.connection" {
+
+    interface ReplicationConnection {
+        +startStreaming(WalPositionLocator): ReplicationStream
+        +startStreaming(Lsn, WalPositionLocator): ReplicationStream
+        +createReplicationSlot(): Optional<SlotCreationResult>
+        +initConnection(): void
+        +isConnected(): boolean
+        +reconnect(): void
+        {static} +builder(PostgresConnectorConfig): Builder
+    }
+
+    interface "ReplicationConnection.Builder" as ReplicationConnectionBuilder {
+        +withSlot(String): Builder
+        +withPublication(String): Builder
+        +withPlugin(LogicalDecoder): Builder
+        +dropSlotOnClose(boolean): Builder
+        +withTypeRegistry(TypeRegistry): Builder
+        +build(): ReplicationConnection
+    }
+
+    class PostgresReplicationConnection {
+        -slotName: String
+        -publicationName: String
+        -tableFilter: RelationalTableFilters
+        -plugin: PostgresConnectorConfig.LogicalDecoder
+        -dropSlotOnClose: boolean
+        -createFailOverSlot: boolean
+        -connectorConfig: PostgresConnectorConfig
+        -statusUpdateInterval: Duration
+        --
+        +startStreaming(WalPositionLocator): ReplicationStream
+        +startStreaming(Lsn, WalPositionLocator): ReplicationStream
+        +createReplicationSlot(): Optional<SlotCreationResult>
+        +reconnect(): void
+    }
+
+    interface ReplicationStream {
+        +read(ReplicationMessageProcessor): void
+        +readPending(ReplicationMessageProcessor): boolean
+        +flushLsn(Lsn): void
+        +lastReceivedLsn(): Lsn
+        +startLsn(): Lsn
+        +startKeepAlive(ExecutorService): void
+        +stopKeepAlive(): void
+        +close(): void
+    }
+
+    interface "ReplicationStream.ReplicationMessageProcessor" as ReplicationMessageProcessor <<FunctionalInterface>> {
+        +process(ReplicationMessage): void
+    }
+
+    interface MessageDecoder {
+        +processMessage(ByteBuffer, ReplicationMessageProcessor, TypeRegistry): void
+        +defaultOptions(ChainedLogicalStreamBuilder, Function): ChainedLogicalStreamBuilder
+        +shouldMessageBeSkipped(ByteBuffer, Lsn, Lsn, WalPositionLocator): boolean
+        +close(): void
+    }
+
+    abstract class AbstractMessageDecoder {
+        +processMessage(ByteBuffer, ReplicationMessageProcessor, TypeRegistry): void
+        +shouldMessageBeSkipped(ByteBuffer, Lsn, Lsn, WalPositionLocator): boolean
+        +close(): void
+        #processNotEmptyMessage(ByteBuffer, ReplicationMessageProcessor, TypeRegistry): void
+    }
+
+    interface ReplicationMessage {
+        +getOperation(): Operation
+        +getCommitTime(): Instant
+        +getTransactionId(): OptionalLong
+        +getTable(): String
+        +getOldTupleList(): List<Column>
+        +getNewTupleList(): List<Column>
+        +isLastEventForLsn(): boolean
+        +shouldSchemaBeSynchronized(): boolean
+        +isTransactionalMessage(): boolean
+        +isSkippedMessage(): boolean
+    }
+
+    enum "ReplicationMessage.Operation" as Operation {
+        INSERT
+        UPDATE
+        DELETE
+        TRUNCATE
+        MESSAGE
+        BEGIN
+        COMMIT
+        ORIGIN
+        NOOP
+    }
+
+    interface "ReplicationMessage.Column" as Column {
+        +getName(): String
+        +getType(): PostgresType
+        +getTypeMetadata(): ColumnTypeMetadata
+        +getValue(PgConnectionSupplier, boolean): Object
+        +isOptional(): boolean
+        +isToastedColumn(): boolean
+    }
+
+    class "ReplicationMessage.NoopMessage" as NoopMessage {
+        +isSkippedMessage(): boolean
+        +getTable(): String
+    }
+
+    class WalPositionLocator {
+        -lastCommitStoredLsn: Lsn
+        -lastEventStoredLsn: Lsn
+        -lastProcessedMessageType: Operation
+        -txStartLsn: Lsn
+        -passMessages: boolean
+        -lsnSeen: Set<Lsn>
+        --
+        +resumeFromLsn(Lsn, ReplicationMessage): Optional<Lsn>
+        +skipMessage(Lsn): boolean
+        +searchingEnabled(): boolean
+        +enableFiltering(): void
+        +getLastEventStoredLsn(): Lsn
+    }
+
+    class Lsn {
+        {static} +valueOf(Long): Lsn
+        +compareTo(Lsn): int
+        +toString(): String
+    }
+
+    class JdbcConnection {
+    }
+}
+
+'─────────────────────────────────────
+' Package: io.debezium.connector.postgresql.connection.pgoutput
+'─────────────────────────────────────
+package "io.debezium.connector.postgresql.connection.pgoutput" {
+
+    class PgOutputMessageDecoder {
+        -decoderContext: MessageDecoderContext
+        -connection: PostgresConnection
+        -commitTimestamp: Instant
+        -transactionId: Long
+        --
+        +shouldMessageBeSkipped(ByteBuffer, Lsn, Lsn, WalPositionLocator): boolean
+        +processNotEmptyMessage(ByteBuffer, ReplicationMessageProcessor, TypeRegistry): void
+        +defaultOptions(ChainedLogicalStreamBuilder, Function): ChainedLogicalStreamBuilder
+        -handleBeginMessage(ByteBuffer, ReplicationMessageProcessor): void
+        -handleCommitMessage(ByteBuffer, ReplicationMessageProcessor): void
+        -handleRelationMessage(ByteBuffer, TypeRegistry): void
+        -decodeInsert(ByteBuffer, TypeRegistry, ReplicationMessageProcessor): void
+        -decodeUpdate(ByteBuffer, TypeRegistry, ReplicationMessageProcessor): void
+        -decodeDelete(ByteBuffer, TypeRegistry, ReplicationMessageProcessor): void
+        -decodeTruncate(ByteBuffer, TypeRegistry, ReplicationMessageProcessor): void
+    }
+
+    enum "PgOutputMessageDecoder.MessageType" as MessageType {
+        RELATION
+        BEGIN
+        COMMIT
+        INSERT
+        UPDATE
+        DELETE
+        TYPE
+        ORIGIN
+        TRUNCATE
+        LOGICAL_DECODING_MESSAGE
+    }
+
+    class PgOutputReplicationMessage {
+        -op: Operation
+        -commitTimestamp: Instant
+        -transactionId: Long
+        -table: String
+        -oldColumns: List<Column>
+        -newColumns: List<Column>
+        --
+        +getOperation(): Operation
+        +getCommitTime(): Instant
+        +getTransactionId(): OptionalLong
+        +getTable(): String
+        +getOldTupleList(): List<Column>
+        +getNewTupleList(): List<Column>
+    }
+}
+
+'─────────────────────────────────────
+' Package: io.debezium.connector.postgresql.connection.pgproto
+'─────────────────────────────────────
+package "io.debezium.connector.postgresql.connection.pgproto" {
+
+    class PgProtoMessageDecoder {
+        --
+        +processNotEmptyMessage(ByteBuffer, ReplicationMessageProcessor, TypeRegistry): void
+    }
+
+    note bottom of PgProtoMessageDecoder
+      Decodes protobuf messages from
+      postgres-decoderbufs plugin.
+      Supports INSERT/UPDATE/DELETE/BEGIN/COMMIT.
+    end note
+}
+
+'─────────────────────────────────────
+' Inheritance & Implementation
+'─────────────────────────────────────
+PostgresStreamingChangeEventSource ..|> StreamingChangeEventSource
+PostgresReplicationConnection --|> JdbcConnection
+PostgresReplicationConnection ..|> ReplicationConnection
+AbstractMessageDecoder ..|> MessageDecoder
+PgOutputMessageDecoder --|> AbstractMessageDecoder
+PgProtoMessageDecoder --|> AbstractMessageDecoder
+PgOutputReplicationMessage ..|> ReplicationMessage
+NoopMessage ..|> ReplicationMessage
+ReplicationStream ..|> AutoCloseable
+ReplicationConnection ..|> AutoCloseable
+
+'─────────────────────────────────────
+' Associations & Dependencies
+'─────────────────────────────────────
+PostgresStreamingChangeEventSource o-- ReplicationConnection : replicationConnection
+PostgresStreamingChangeEventSource o-- "AtomicReference\n<ReplicationStream>" as ARStream : replicationStream
+PostgresStreamingChangeEventSource ..> WalPositionLocator : uses
+PostgresStreamingChangeEventSource ..> ReplicationMessage : processes
+
+ReplicationConnection +-- ReplicationConnectionBuilder
+ReplicationStream +-- ReplicationMessageProcessor
+ReplicationConnection ..> ReplicationStream : creates >
+
+PostgresReplicationConnection ..> MessageDecoder : decodes WAL with
+
+ReplicationMessage +-- Operation
+ReplicationMessage +-- Column
+ReplicationMessage +-- NoopMessage
+
+PgOutputMessageDecoder ..> PgOutputReplicationMessage : creates >
+PgOutputMessageDecoder ..> ReplicationMessageProcessor : calls process() >
+PgOutputMessageDecoder +-- MessageType
+PgOutputMessageDecoder ..> WalPositionLocator : shouldMessageBeSkipped()
+
+WalPositionLocator ..> Lsn : tracks LSNs
+ReplicationStream ..> Lsn : flushLsn / lastReceivedLsn
+
+@enduml

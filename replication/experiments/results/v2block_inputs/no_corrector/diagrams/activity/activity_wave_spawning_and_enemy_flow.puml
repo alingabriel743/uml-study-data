@@ -1,0 +1,190 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+
+title Wave Spawning and Enemy Deployment
+
+|Logic|
+start
+
+:Logic.update() called each game tick;
+
+if (rules.waves && waveTimer && !gameOver?) then (yes)
+else (no)
+  stop
+endif
+
+if (isWaitingWave()?\n(waitEnemies && enemies > 0)) then (yes)
+  :Hold wave timer\n(enemies still alive);
+  stop
+else (no)
+  :state.wavetime -= Time.delta;
+endif
+
+if (wavetime <= 0 && waves && !net.client()?) then (yes)
+else (no — timer still running)
+  stop
+endif
+
+:Logic.runWave();
+
+|WaveSpawner|
+
+:WaveSpawner.spawnEnemies();
+:spawning = true;
+:eachGroundSpawn(-1, doShockwave)\n→ Fx.spawnShockwave + Damage.damage\non spawn tiles;
+
+|Logic|
+
+:state.wave++;
+:state.wavetime = rules.waveSpacing\n* difficultyMultiplier;
+:Events.fire(WaveEvent);
+
+|WaveSpawner|
+
+:Iterate over each SpawnGroup\nin state.rules.spawns;
+
+while (More SpawnGroups?) is (yes)
+  if (group.type != null?) then (yes)
+  else (no — skip group)
+    :Next group;
+  endif
+
+  :spawned = group.getSpawned(wave - 1)\n[checks begin/end/spacing window];
+
+  if (spawned > 0?) then (yes)
+  else (no — wave outside window)
+    :Next group;
+  endif
+
+  if (Campaign mode?) then (yes)
+    if (Boss unit?) then (yes)
+      :spawned = floor(spawned\n* difficulty.enemySpawnMultiplier);
+    else (no)
+      :spawned = round(spawned\n* difficulty.enemySpawnMultiplier);
+    endif
+  else (no)
+  endif
+
+  if (group.type.flying?) then (yes)
+    :eachFlyerSpawn(group.spawn, ...)\n→ spawn at map edge\n(or spawn tile if airUseSpawns);
+  else (no — ground unit)
+    :eachGroundSpawn(group.spawn, ...)\n→ spawn at spawn tile\nor waveTeam core position;
+  endif
+
+  :FOR i in 0..spawned:\nspawnUnit(group, x + spread, y + spread);
+
+  |SpawnGroup / UnitType|
+
+  :angle = Angles.angle(x, y, worldCenter);
+  :group.createUnit(team, x, y, angle, wave-1, spawnEffect);
+  :unit = UnitType.spawn(team, x, y, rotation, cons)\n[creates Unit entity];
+
+  if (group.effect != null?) then (yes)
+    :unit.apply(effect, 999999f)\n[e.g. boss status effect];
+  else (no)
+  endif
+
+  if (group.shielded?) then (yes)
+    :unit.shield = getShield(wave);
+  else (no)
+  endif
+
+  |WaveSpawner|
+
+  note right
+    spawnEffect callback invoked
+  end note
+
+  :unit.apply(StatusEffects.unmoving, 30f)\n[frozen at spawn];
+  :unit.apply(StatusEffects.invincible, 60f)\n[invincible at spawn];
+  :unit.unloaded();
+  :Events.fire(UnitSpawnEvent(unit));
+  :Call.spawnEffect(x, y, rotation, type)\n→ Fx.unitSpawn + Time.run(30f, Fx.spawn);
+
+endwhile (no more groups)
+
+:Time.run(121f, () -> spawning = false)\n[spawning lock released after 121 ticks];
+
+|AIController / GroundAI|
+
+note left
+  After 30-tick unmoving period,
+  unit begins AI update loop
+end note
+
+:AIController.updateUnit() called each tick;
+
+if (useFallback() && fallback != null?) then (yes)
+  :Delegate to fallback.updateUnit();
+else (no)
+  fork
+    :updateVisuals();
+  fork again
+    :updateTargeting()\n[retarget every 40f / 90f ticks];
+    if (target found?) then (yes)
+      :find mount.target per weapon;
+      if (target in range && shouldShoot()?) then (yes)
+        :mount.shoot = true;\ncompute intercept aim;
+      else (no)
+      endif
+    else (no)
+      :target = null;
+    endif
+  fork again
+    :GroundAI.updateMovement();
+    :core = unit.closestEnemyCore();
+    if (core != null && within close range?) then (yes)
+      :target = core;\naim weapons at core;
+    else (no — pathfind to core)
+      if (near default-team spawner\nwithin dropZoneRadius+120?) then (yes)
+        :move = false\n[avoid spawn drop zone];
+      else (no)
+        if (no core && no spawner?) then (yes)
+          :move = false;
+        else (no)
+          :pathfind(\n  Pathfinder.fieldCore,\n  stopAtTargetTile=true,\n  avoidance=(stuckTime >= threshold)\n);
+          note right
+            costType = unit.type.flowfieldPathType
+            tile = unit.tileOn()
+            targetTile = pathfinder.getField(team, costType, fieldCore)
+                            .getNextTile(tile, avoidanceId)
+            unit.movePref(vec.trns(angleTo(targetTile), prefSpeed()))
+          end note
+        endif
+      endif
+      :faceTarget();
+    endif
+  end fork
+endif
+
+stop
+
+@enduml

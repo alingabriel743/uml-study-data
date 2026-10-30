@@ -1,0 +1,220 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #212529
+    EndColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+
+title Map Editor Workflow
+
+|User|
+start
+
+:Open Map Editor;
+
+|MapEditor|
+
+if (Entry Mode?) then (new map)
+    :beginEdit(width, height)\nreset() → createTiles(w,h);
+else if (Entry Mode?) then (load existing map)
+    :beginEdit(Map map)\nreset() → tags.putAll(map.tags)\nload(MapIO.loadMap(map, context));
+else (load from pixmap)
+    :beginEdit(Pixmap)\ncreateTiles(w,h)\nload(MapIO.readImage(pixmap, tiles()));
+endif
+
+note right
+  reset() clears:
+  clearOp(), brushSize=1,
+  drawBlock=stone, tags=new StringMap()
+  Context.begin() / Context.end()
+  bracket world tile generation
+end note
+
+|EditorRenderer|
+:renderer.resize(w, h)\nDispose old chunks\nInit new chunks[][]\nrecache() → floor.reload + blocks.reload;
+
+|User|
+:Interact with Editor;
+
+|MapEditor|
+fork
+    :=== Tile Draw/Erase ===;
+    :User triggers drawBlocks(x,y)\nor drawBlocksReplace(x,y);
+
+    if (drawBlocksReplace?) then (yes)
+        :Apply tester:\n(tile.block != air || drawBlock.isFloor());
+    endif
+
+    if (Brush Shape?) then (square)
+        :drawSquare(x, y, drawer);
+    else (circle)
+        :drawCircle(x, y, drawer);
+    endif
+
+    if (Block type?) then (multiblock)
+        :Clamp coords\nCheck hasOverlap(x,y)\ntile.setBlock(drawBlock, drawTeam, rotation);
+        :addTileOp(opTeam);
+    else if (Block type?) then (floor/overlay)
+        if (forceOverlay?) then (yes)
+            :tile.setOverlay(drawBlock);
+            :addTileOp(opOverlay);
+        else (no)
+            :tile.setFloor(drawBlock)\nClear overlay if not supported;
+            :addTileOp(opFloor);
+        endif
+    else (building)
+        if (saveData or shouldSaveData?) then (yes)
+            :addTileOp(opData)\naddTileOp(opDataExtra)\n[before change];
+        endif
+        :tile.setBlock(drawBlock, drawTeam, rotation);
+        if (actual change occurred?) then (no)
+            :removeLastOps(2)\n[discard data ops];
+        else (yes)
+            if (rotate?) then (yes)
+                :addTileOp(opRotation);
+            endif
+            if (synthetic?) then (yes)
+                :addTileOp(opTeam);
+            endif
+        endif
+    endif
+
+    if (saveConfig?) then (yes)
+        :drawBlock.placeEnded(...);
+    endif
+
+    :=== Operation Recording ===;
+
+    if (loading flag?) then (true — skip)
+        :No-op;
+    else (false — record)
+        if (currentOp == null?) then (yes)
+            :Create new DrawOperation();
+        endif
+        :currentOp.addOperation(packedTileOp)\n[x:14bit + y:14bit + type:3bit + value:int];
+    endif
+
+    |EditorRenderer|
+    :renderer.updateStatic(x, y)\nfloor.recacheTile for tile + 4 neighbors;
+
+fork again
+    |MapEditor|
+    :=== Undo/Redo ===;
+
+    |User|
+    if (Action?) then (Undo)
+        |MapEditor|
+        :flushOp(): if currentOp not empty\n→ stack.add(currentOp); currentOp=null;
+        if (stack.canUndo()?\n[size-1+index >= 0]) then (yes)
+            :stack.undo()\nindex--;
+            :DrawOperation.undo()\nIterate backwards i=(size-1)..0\n→ updateTile(i);
+            :Read current tile value\nStore in array[i]\nApply old value via setTile();
+            |EditorRenderer|
+            :renderer.updateBlock(tile)\nrenderer.updateStatic(x, y)\n[before and after each tile];
+        else (no — nothing to undo)
+            :Ignore;
+        endif
+    else (Redo)
+        |MapEditor|
+        if (stack.canRedo()?) then (yes)
+            :stack.redo()\nindex++;
+            :DrawOperation.redo()\nIterate forwards i=0..(size-1)\n→ updateTile(i);
+            :Read current tile value\nStore in array[i]\nApply old value via setTile();
+            |EditorRenderer|
+            :renderer.updateBlock(tile)\nrenderer.updateStatic(x, y)\n[before and after each tile];
+        else (no — nothing to redo)
+            :Ignore;
+        endif
+    endif
+
+fork again
+    |MapEditor|
+    :=== Processor Setup ===;
+    :MapProcessorsDialog.shown()\n→ setup(): scan world.tiles\nfor Blocks.worldProcessor;
+    :rebuild(): render each LogicBuild entry;
+
+    |User|
+    if (Processor Action?) then (Add)
+        |MapEditor|
+        :Find first non-synthetic tile\ntile.setNet(Blocks.worldProcessor, Team.sharded, 0);
+        if (space found?) then (yes)
+            |EditorRenderer|
+            :renderer.updateStatic(x, y);
+            |MapEditor|
+            :setup() — refresh list;
+        else (no)
+            :ui.showErrorMessage;
+        endif
+    else if (Processor Action?) then (Edit)
+        :log.showEditDialog(true)\n[opens code editor];
+    else if (Processor Action?) then (Rename)
+        :ui.showTextInput\n→ log.tag = tag → setup();
+    else if (Processor Action?) then (Delete)
+        :ui.showConfirm;
+        if (surrounded by static/privileged blocks?) then (yes)
+            :tile.setNet(StaticWall or stoneWall);
+        else (no)
+            :tile.setNet(Blocks.air);
+        endif
+        :processors.remove(build)\nrebuild();
+    else (Search)
+        :Filter by log.tag.contains(text)\nrebuild();
+    endif
+
+end fork
+
+|User|
+:Trigger Save / Export;
+
+|MapEditor|
+:MapEditorDialog: maps.saveMap(editor.tags);
+
+:Maps.saveMap(baseTags)\nValidate name tag exists;
+
+if (Existing map with same name?) then (yes)
+    :dispose texture\nRemove from list\nReuse existing file;
+else (no)
+    :findFile(name) → new file path;
+endif
+
+:Create Map(file, world.width, world.height, tags, true);
+:fogControl.resetFog();
+
+|Maps / MapIO|
+:MapIO.writeMap(file, map)\nSerialize tiles to disk;
+
+|MapEditor|
+:Update internal maps list\nGenerate thumbnail texture;
+
+|User|
+:Editor Session Complete;
+
+stop
+
+@enduml

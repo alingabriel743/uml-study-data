@@ -1,0 +1,142 @@
+{
+  "scope": "vcs_downloader_workflow",
+  "title": "VCS Downloader Workflow",
+  "diagram_type": "activity",
+  "key_participants": ["VcsDownloader", "GitDownloader", "ProcessExecutor", "Filesystem", "PackageInterface", "IOInterface"],
+
+  "entry_points": [
+    "download(package, path, prevPackage): PromiseInterface",
+    "install(package, path): PromiseInterface",
+    "update(initial, target, path): PromiseInterface",
+    "remove(package, path): PromiseInterface"
+  ],
+
+  "activity_flows": [
+    {
+      "flow": "download()",
+      "steps": [
+        "Validate package has sourceReference — throw InvalidArgumentException if missing",
+        "prepareUrls(package.getSourceUrls()) — normalize local file:// paths",
+        "Loop: shift next URL from list",
+        "  Call doDownload(package, path, url, prevPackage)",
+        "    [Git] If URL is local path → resolve immediately (skip cache)",
+        "    [Git] Get gitVersion via GitUtil::getVersion(process)",
+        "    [Git] If git ≥ 2.3 AND cache usable → fetchRefOrSyncMirror(url, cachePath, ref) to local VCS cache",
+        "    [Git] Else if no git found → throw RuntimeException",
+        "  On exception: log error via IO; if more URLs remain → try next URL",
+        "  On last URL failure → rethrow exception",
+        "Return resolved promise"
+      ]
+    },
+    {
+      "flow": "install()",
+      "steps": [
+        "Validate package has sourceReference — throw InvalidArgumentException if missing",
+        "Log install operation via io.writeError()",
+        "prepareUrls(package.getSourceUrls())",
+        "Loop: shift next URL",
+        "  Call doInstall(package, path, url)",
+        "    [Git] cleanEnv, normalizePath",
+        "    [Git] If cached ref available → clone from local cache with --dissociate --reference flags",
+        "    [Git] Else → clone from remote URL (git clone --no-checkout, remote add composer, fetch)",
+        "    [Git] updateOriginUrl or setPushUrl",
+        "    [Git] updateToCommit(package, path, ref, prettyVersion) → checkout target ref",
+        "    [Git] If newRef returned → update package source/dist references",
+        "  On exception → try next URL or rethrow",
+        "Return resolved promise"
+      ]
+    },
+    {
+      "flow": "update()",
+      "steps": [
+        "Validate target package has sourceReference",
+        "Log update operation",
+        "prepareUrls(target.getSourceUrls())",
+        "Loop: shift next URL",
+        "  Call doUpdate(initial, target, path, url)",
+        "    [Git] cleanEnv, normalizePath",
+        "    [Git] Check hasMetadataRepository(path) → if .git missing throw RuntimeException",
+        "    [Git] If cached ref available → set remoteUrl=cachePath; else remoteUrl=remote",
+        "    [Git] git rev-parse to check if ref already local",
+        "    [Git] If ref not local → git remote set-url + git fetch composer + fetch --tags",
+        "    [Git] updateToCommit(target, path, ref, version) → checkout",
+        "  On exception → log, try next URL",
+        "If no exception AND io.isVerbose AND hasMetadataRepository(path):",
+        "  getCommitLogs(initial.ref, target.ref, path)",
+        "  If empty → getCommitLogs(target.ref, initial.ref, path) [rollback direction]",
+        "  Format and print commit logs to io",
+        "If all URLs exhausted and exception → rethrow",
+        "Return resolved promise"
+      ]
+    },
+    {
+      "flow": "remove()",
+      "steps": [
+        "Log uninstall operation",
+        "filesystem.removeDirectoryAsync(path) → returns PromiseInterface",
+        "On promise resolve: if result is false → throw RuntimeException('Could not delete path')"
+      ]
+    },
+    {
+      "flow": "prepare() — called before install/update/uninstall",
+      "steps": [
+        "If type=update → cleanChanges(prevPackage, path, true); mark hasCleanedChanges[uniqueName]=true",
+        "  cleanChanges: if getLocalChanges(package,path) not null → throw RuntimeException (uncommitted changes)",
+        "If type=install → filesystem.emptyDirectory(path)",
+        "If type=uninstall → cleanChanges(package, path, false)"
+      ]
+    },
+    {
+      "flow": "cleanup() — called after install/update/uninstall regardless of success",
+      "steps": [
+        "If type=update AND hasCleanedChanges[prevPackage.uniqueName] exists:",
+        "  reapplyChanges(path) — reapply stashed changes",
+        "  unset hasCleanedChanges[uniqueName]"
+      ]
+    }
+  ],
+
+  "key_conditions": [
+    "package.getSourceReference() == null → throw (both download and install entry points)",
+    "URL list exhaustion with exception → rethrow last exception",
+    "e instanceof PHPUnit\\Exception → always rethrow (test safety guard)",
+    "io.isDebug() → verbose error logging per failed URL",
+    "Filesystem.isLocalPath(url) → skip cache in doDownload; normalize realpath in prepareUrls",
+    "gitVersion >= 2.3 AND Cache.isUsable(cachePath) → use local VCS mirror cache",
+    "cachedPackages[id][ref] exists → clone/checkout from local cache (faster, offline-capable)",
+    "COMPOSER_DISABLE_NETWORK env set → throw if ref not in cache",
+    "hasMetadataRepository(path) → .git/.svn/.hg directory presence check",
+    "io.isVerbose() → print commit log summary after update",
+    "logs empty after forward direction → try reverse (rollback) direction for logs"
+  ],
+
+  "key_relationships": [
+    "VcsDownloader is abstract — implements DownloaderInterface, ChangeReportInterface, VcsCapableDownloaderInterface",
+    "GitDownloader extends VcsDownloader — implements doDownload, doInstall, doUpdate, getCommitLogs, hasMetadataRepository",
+    "VcsDownloader composes ProcessExecutor (injected or created in constructor)",
+    "VcsDownloader composes Filesystem (injected or created in constructor)",
+    "VcsDownloader depends_on PackageInterface for source URLs and references",
+    "VcsDownloader depends_on IOInterface for logging",
+    "GitDownloader uses GitUtil for git-specific operations (cleanEnv, runCommands, fetchRefOrSyncMirror)",
+    "ProcessExecutor.execute() wraps Symfony Process — synchronous execution",
+    "ProcessExecutor.executeAsync() queues jobs — max 10 concurrent (configurable via COMPOSER_MAX_PARALLEL_PROCESSES)"
+  ],
+
+  "process_executor_key_details": [
+    "execute(command, &output, cwd): int — synchronous, returns exit code",
+    "executeAsync(command, cwd): PromiseInterface<Process> — queued async execution",
+    "doExecute() checks if git command needs GIT_DIR env (bare repos)",
+    "runProcess() registers SIGINT/SIGTERM/SIGHUP handler; uses Symfony Process",
+    "Max concurrent async jobs: 10 (or env COMPOSER_MAX_PARALLEL_PROCESSES)",
+    "Job states: QUEUED → STARTED → COMPLETED/FAILED/ABORTED",
+    "wait(index): spins with usleep(1000) until countActiveJobs == 0"
+  ],
+
+  "important_notes": "VcsDownloader is the abstract base for Git/SVN/Mercurial downloaders. The workflow has three distinct phases: prepare (clean local changes), download+install/update (VCS operations with URL fallback loop), cleanup (reapply stashed changes). React\\Promise is used throughout for async compatibility, but most operations resolve immediately. The URL retry loop is a key resilience pattern — multiple source URLs are tried in order on failure.",
+
+  "source_files_analyzed": [
+    "src/src/Composer/Downloader/VcsDownloader.php",
+    "src/src/Composer/Downloader/GitDownloader.php (lines 61-195)",
+    "src/src/Composer/Util/ProcessExecutor.php"
+  ]
+}

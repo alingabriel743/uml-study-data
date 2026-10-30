@@ -1,0 +1,117 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activityBackgroundColor #F8F9FA
+skinparam activityBorderColor #495057
+skinparam activityArrowColor #495057
+skinparam activityFontColor #212529
+skinparam activityDiamondBackgroundColor #E9ECEF
+skinparam activityDiamondBorderColor #6C757D
+skinparam swimlaneBorderColor #6C757D
+skinparam swimlaneTitleBackgroundColor #E9ECEF
+skinparam swimlaneTitleFontColor #212529
+skinparam noteBackgroundColor #FFF9C4
+skinparam noteBorderColor #F9A825
+
+title AI Pathfinding Flow
+
+|Main Thread|
+start
+:WorldLoadEvent fired;
+:Pathfinder.stop()\nReset tiles[] and cache;
+:Pack all tiles via packTile(tile);
+if (Wave team needs flow field?) then (yes)
+    :preloadPath(getField(\n  waveTeam, costGround, fieldCore));
+endif
+if (Naval spawns exist?) then (yes)
+    :preloadPath(getField(\n  waveTeam, costNaval, fieldCore));
+endif
+:Pathfinder.start()\ndaemon thread (MIN_PRIORITY);
+:ControlPathfinder.start()\nnew daemon thread;
+
+fork
+    |Pathfinder Thread|
+    note right: Global flow-field thread\n— runs every ~16 ms
+    :queue.run()\nprocess main-thread-posted tasks;
+    :Iterate all Flowfields in threadList;
+    if (field.dirty &&\nfrontier empty?) then (yes)
+        :updateTargets(data)\nincrement search counter\nseed target tiles at weight = 0;
+    endif
+    :updateFrontier(maxUpdate = 8 ms)\nBFS / Dijkstra 4-neighbor expansion;
+    if (frontier exhausted?) then (yes)
+        :Swap to completeWeights\n(double-buffer — units read stable copy);
+        :Mark field dirty = false;
+    endif
+    :Thread.sleep(16 ms);
+    detach
+
+fork again
+    |ControlPathfinder Thread|
+    note right: HPA* per-unit thread
+    :Dequeue next PathRequest\nfrom threadPathRequests;
+    if (new PathRequest?) then (yes)
+        :recalculatePath(request)\ninitializePathRequest;
+        :findClosestNode(unit position)\nA* within cluster → nearest portal;
+        :findClosestNode(goal position)\nA* within cluster → nearest portal;
+        :clusterAstar(startNode, endNode)\nHPA* on cluster graph via PathfindQueue\n(min-heap);
+        :Reconstruct path via cameFrom map\n→ resultPath (IntSeq of NodeIndices);
+        :Build or reuse FieldCache for goalPos;
+        :addFlowCluster for each cluster\nalong nodePath\n(lazy allocation);
+    endif
+    :updateFields(cache, maxUpdate = 12 ms)\nDijkstra within cluster weight arrays\n(respects cluster boundaries);
+    if (cluster topology changed?) then (yes)
+        :updateClustersComplete\nrecompute portals on all 4 edges\n→ innerAstar between all portal pairs;
+    elseif (inner-only update?) then (yes)
+        :updateClustersInner\nre-run innerAstar only\n(no portal recompute);
+    endif
+    if (any cluster changed?) then (yes)
+        :clusterChanged flag set\nMark affected PathRequests\nas invalidRequests;
+    endif
+    if (invalidRequests exist\n& ~1 s elapsed?) then (yes)
+        :Remove stale FieldCache entries\nSet oldCache for path continuity\nRe-queue recalculatePath\nfor all affected requests;
+    endif
+    detach
+
+fork again
+    |Main Thread|
+    :Trigger.afterGameUpdate;
+    if (needsRefresh &&\n100 ms elapsed?) then (yes)
+        :updateTargetPositions()\n(synchronized on targets);
+        :queue.post(set all dirty = true);
+    endif
+    :Unit calls getPathPosition\n(unit, destination, out, noResultFound);
+    if (Raycast: clear\nline-of-sight?) then (yes)
+        :out = destination\nreturn true\n(trivial path shortcut);
+    else (no)
+        if (unitRequests has\nmatching entry?) then (cached)
+            :Retrieve existing FieldCache;
+            :Follow flow field:\ngetCost() up to 30 tiles\nfind min-cost neighbour\nraycastRect each candidate step;
+            if (valid next tile found?) then (yes)
+                :out = lastTargetTile world coords\nreturn true;
+            else (not found)
+                :return false;
+            endif
+        else (new request)
+            :Create PathRequest\n(unit, team, costId, destPos);
+            :unitRequests.put(unit, request);
+            :queue.post:\n  threadPathRequests.add(req)\n  recalculatePath(req);
+            :return false\n(path not ready yet);
+        endif
+    endif
+    :Trigger.update — clean up stale state;
+    if (request > 10 game ticks stale\nor unit removed?) then (yes)
+        :Invalidate request\nRemove from unitRequests\nRemove from threadPathRequests;
+    endif
+    if (FieldCache > 30 game ticks stale?) then (yes)
+        :Remove from fieldList and fields map;
+    endif
+    detach
+
+end fork
+
+stop
+
+@enduml

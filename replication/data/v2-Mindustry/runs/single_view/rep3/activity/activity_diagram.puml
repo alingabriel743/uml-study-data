@@ -1,0 +1,160 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #212529
+    EndColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleBackgroundColor #E9ECEF
+}
+
+title Mindustry — Unit Command & Combat Activity Flow
+
+|Player / InputHandler|
+start
+:Player issues unit command\n(InputHandler.commandUnits);
+note right
+  Parameters: Player, unitIds[],
+  buildTarget, unitTarget, posTarget,
+  queueCommand, finalBatch
+end note
+
+if (Queue command or immediate?) then (queueCommand = true)
+    :Append command to unit\ncommand queue;
+else (immediate)
+    :Override current unit command;
+endif
+
+:Broadcast command to server\n(NetServer.clientSnapshot);
+
+|NetServer / NetClient|
+:NetServer receives unit command packet\n(addPacketHandler);
+:Validate player action\n(Administration.allowAction);
+if (Action allowed?) then (no)
+    :Kick or reject request\n(Administration.handleKicked);
+    stop
+else (yes)
+    :Propagate command to\nall registered units;
+endif
+
+|AI Controller (CommandAI / AIController)|
+:CommandAI receives new command\n(commandTarget / commandPosition);
+if (Target is a building or unit?) then (unit/building target)
+    :Set moveTo target with\nstopAtTarget flag\n(CommandAI.commandTarget);
+else (position target)
+    :Set position target\n(CommandAI.commandPosition);
+endif
+
+:AIController initiates movement\n(AIController.moveTo);
+note right
+  Params: target, circleLength,
+  smooth, keepDistance, offset, arrive
+end note
+
+:ControlPathfinder computes path\n(initializePathRequest → innerAstar);
+note right
+  A* search within map bounds;
+  uses PathCost for terrain costs
+end note
+
+repeat
+    :Unit moves along computed path;
+    :AIController.findMainTarget\n(x, y, range, air, ground);
+    if (Enemy target found?) then (yes)
+        :AIController.target\n(lock onto enemy);
+        :Units.closestTarget\nconfirms best target;
+        fork
+            :Check target validity\n(Weapon.checkTarget);
+        fork again
+            :Compute bullet rotation\n(Weapon.bulletRotation);
+        end fork
+        if (In weapon range?) then (yes)
+            :Weapon.shoot\n(unit, mount, shootX, shootY, rotation);
+
+            |Combat System (Weapon / BulletType / Effect)|
+            :BulletType.create\n(owner, team, x, y, angle, damage,\nvelocityScl, lifetimeScl);
+            note right
+              Bullet spawned with
+              velocity and lifetime scaling
+            end note
+            :Bullet travels toward target;
+            if (Bullet hits entity?) then (yes)
+                :BulletType.hitEntity\n(bullet, entity, health);
+                if (Target is a building?) then (yes)
+                    :BuildingComp.damage\n(bullet, source, damage);
+                    if (Building destroyed?) then (yes)
+                        :Remove building from world\n(World tile update);
+                        :Render destruction Effect\n(Effect.at / decal);
+                    else (no)
+                        :Building health reduced;
+                    endif
+                else (unit target)
+                    :UnitComp health reduced;
+                    if (Unit destroyed?) then (yes)
+                        :UnitComp death event\n(Ability.death);
+                        :Effect rendered at unit position;
+                    else (no)
+                        :Unit continues operation;
+                    endif
+                endif
+            else (miss / lifetime expired)
+                :Bullet removed from world;
+            endif
+
+            |AI Controller (CommandAI / AIController)|
+            :Re-evaluate target\n(AIController.findMainTarget);
+        else (out of range)
+            :Continue moving toward target;
+        endif
+    else (no target)
+        :Continue pathing to\ncommand destination;
+    endif
+repeat while (Command active and unit alive?) is (yes)
+-> no;
+
+:Unit reaches destination\nor command completed;
+
+|Building System (BuildingComp / CoreBuild)|
+if (Unit is a builder type?) then (yes)
+    :BuildingComp.init\n(tile, team, shouldAdd, rotation);
+    :Consume resources for construction\n(Consume.efficiency / apply);
+    if (Resources available?) then (yes)
+        :Building placed on tile\n(Tile.setBlock);
+        :Renderer updates visual\n(DrawBlock.draw);
+    else (no)
+        :Construction paused;\nwait for items (ItemModule.has);
+    endif
+else (no)
+    :Unit idles or returns to patrol;
+endif
+
+|Player / InputHandler|
+:InputHandler updates selection display\n(drawSelection / drawBreakSelection);
+:UI updates HUD and status bars\n(UI.showInfoPopup);
+stop
+
+@enduml

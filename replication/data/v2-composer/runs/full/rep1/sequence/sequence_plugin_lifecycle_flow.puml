@@ -1,0 +1,231 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipantBorderColor #495057
+skinparam sequenceParticipantBackgroundColor #F8F9FA
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceGroupBorderColor #495057
+skinparam sequenceGroupBackgroundColor #E9ECEF
+skinparam noteBorderColor #6C757D
+skinparam noteBackgroundColor #FFF9C4
+
+title Plugin Lifecycle Flow
+
+actor Caller as caller
+participant "PluginManager" as pm
+participant "Composer" as composer
+participant "IOInterface" as io
+participant "RepositoryInterface" as repo
+participant "PackageSorter" as sorter
+participant "RepositoryUtils" as repoUtils
+participant "PackageInterface" as pkg
+participant "AutoloadGenerator" as autoload
+participant "PluginInterface" as plugin
+participant "EventDispatcher" as dispatcher
+participant "InstallationManager" as installMgr
+
+== ACTIVATION PHASE — Local Repository ==
+
+caller -> pm : loadInstalledPlugins()
+activate pm
+
+pm -> pm : arePluginsDisabled('local')
+note right: Returns early if local plugins disabled
+
+pm -> composer : getRepositoryManager().getLocalRepository()
+activate composer
+composer --> pm : localRepo: RepositoryInterface
+deactivate composer
+
+pm -> pm : loadRepository(localRepo, isGlobal=false, rootPackage)
+activate pm #LightBlue
+
+pm -> repo : getPackages()
+activate repo
+repo --> pm : packages[]
+deactivate repo
+
+pm -> sorter : sortPackages(packages, weights)
+activate sorter
+note right of sorter: composer/installers &\nplugin-modifies-install-path\nget weight -10000 (load first)
+sorter --> pm : sortedPackages[]
+deactivate sorter
+
+pm -> repoUtils : filterRequiredPackages(packages, rootPackage, true)
+activate repoUtils
+repoUtils --> pm : filteredPackages[]
+deactivate repoUtils
+
+loop for each CompletePackage of type composer-plugin / installer
+
+    pm -> pm : isPluginAllowed(package.getName(), false, optional=true, prompt=false)
+    note right: Pre-check before full register
+
+    alt plugin not required and not allowed
+        pm -> io : writeError("Warning: plugin not allowed")
+    else plugin allowed — proceed to register
+        pm -> pm : registerPackage(package, failOnMissing=false, isGlobal=false)
+        activate pm #LightGreen
+
+        pm -> pm : arePluginsDisabled(type)
+        note right: Returns if disabled by type
+
+        pm -> pkg : getRequires()
+        activate pkg
+        pkg --> pm : requires[] (including composer-plugin-api constraint)
+        deactivate pkg
+
+        pm -> pm : getPluginApiVersion()
+        note right: Returns PluginInterface::PLUGIN_API_VERSION = '2.9.0'
+
+        alt API version mismatch
+            pm -> io : writeError("Warning: plugin API version mismatch")
+        else API version OK
+            pm -> pm : isPluginAllowed(package.getName(), isGlobal=false, optional)
+            activate pm #LightYellow
+
+            alt allow-plugins rules == null (legacy lock) AND non-interactive
+                pm -> pm : throw RuntimeException
+            else rules has matching pattern
+                pm --> pm : return allow / deny
+            else not found AND interactive
+                pm -> io : ask("Do you trust plugin X? [y,n,d,?]")
+                activate io
+                io --> pm : answer (y/n/d)
+                deactivate io
+                pm -> composer : getConfig().getConfigSource().addConfigSetting('allow-plugins', ...)
+                activate composer
+                composer --> pm : ok
+                deactivate composer
+            else not found AND non-interactive
+                pm -> pm : throw PluginBlockedException
+            end
+
+            deactivate pm
+
+            pm -> pm : collectDependencies(installedRepo, {package}, package)
+
+            pm -> autoload : parseAutoloads(autoloads, rootPackage)
+            activate autoload
+            autoload --> pm : autoloadMap
+            deactivate autoload
+
+            pm -> autoload : createLoader(autoloadMap, vendorDir)
+            activate autoload
+            autoload --> pm : classLoader
+            deactivate autoload
+
+            pm -> pm : classLoader.register(false)
+
+            pm -> pm : addPlugin(new $class(), isGlobal=false, package)
+            activate pm #Pink
+
+            pm -> io : writeError("Loading plugin <name>")
+
+            pm -> plugin : activate(composer, io)
+            activate plugin
+            plugin --> pm : (activated)
+            deactivate plugin
+
+            alt plugin instanceof EventSubscriberInterface
+                pm -> dispatcher : addSubscriber(plugin)
+                activate dispatcher
+                dispatcher --> pm : ok
+                deactivate dispatcher
+            end
+
+            deactivate pm
+        end
+
+        deactivate pm
+    end
+
+end
+
+deactivate pm
+
+== ACTIVATION PHASE — Global Repository ==
+
+pm -> pm : arePluginsDisabled('global')
+note right: Skip global load if disabled
+
+pm -> composer : globalComposer.getRepositoryManager().getLocalRepository()
+activate composer
+composer --> pm : globalRepo: RepositoryInterface
+deactivate composer
+
+pm -> pm : loadRepository(globalRepo, isGlobal=true)
+note right: Same loop as local but\nno rootPackage filter;\nuses PartialComposer
+
+== DEACTIVATION PHASE ==
+
+caller -> pm : deactivateInstalledPlugins()
+activate pm
+
+pm -> pm : arePluginsDisabled('local')
+
+pm -> pm : deactivateRepository(localRepo, isGlobal=false)
+activate pm #LightBlue
+
+pm -> repo : getPackages()
+activate repo
+repo --> pm : packages[]
+deactivate repo
+
+pm -> sorter : sortPackages(packages)
+activate sorter
+sorter --> pm : sortedPackages[] (then reversed)
+deactivate sorter
+
+loop for each CompletePackage (reverse order) of type composer-plugin / installer
+
+    pm -> pm : deactivatePackage(package)
+
+    alt plugin instanceof InstallerInterface
+        pm -> installMgr : removeInstaller(plugin)
+        activate installMgr
+        installMgr --> pm : ok
+        deactivate installMgr
+    else regular plugin
+        pm -> pm : removePlugin(plugin)
+
+        pm -> io : writeError("Unloading plugin <name>")
+
+        pm -> plugin : deactivate(composer, io)
+        activate plugin
+        plugin --> pm : (deactivated)
+        deactivate plugin
+
+        pm -> dispatcher : removeListener(plugin)
+        activate dispatcher
+        dispatcher --> pm : ok
+        deactivate dispatcher
+    end
+
+end
+
+deactivate pm
+
+pm -> pm : arePluginsDisabled('global')
+
+pm -> pm : deactivateRepository(globalRepo, isGlobal=true)
+note right: Same loop for global plugins
+
+deactivate pm
+
+@enduml

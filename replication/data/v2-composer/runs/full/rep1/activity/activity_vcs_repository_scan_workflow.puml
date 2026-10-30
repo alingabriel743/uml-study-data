@@ -1,0 +1,206 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontColor #212529
+    BackgroundColor #E9ECEF
+}
+
+title VCS Repository Scan Workflow
+
+|VcsRepository|
+start
+:initialize() called;
+:getDriver() — resolve VCS driver;
+
+if (Driver type explicitly\nset in repoConfig?) then (yes)
+  :Instantiate specified driver class directly;
+else (no)
+  :Iterate drivers: supports(url, strict=false);
+  if (Any driver matches strictly?) then (yes)
+    :Select strictly-matched driver;
+  else (no)
+    :Iterate drivers: supports(url, lenient=true);
+    if (Any driver matches leniently?) then (yes)
+      :Select leniently-matched driver;
+    else (no)
+      #FFB3B3:throw InvalidArgumentException
+      (no driver supports URL);
+      stop
+    endif
+  endif
+endif
+
+|VcsDriver|
+:driver->initialize()
+(parse URL regex; set scheme,
+namespace, repository, originUrl);
+
+|VcsRepository|
+:Instantiate VersionParser and ArrayLoader;
+
+|VcsDriver|
+:hasComposerFile(getRootIdentifier())
+— check root composer.json exists;
+
+|VcsRepository|
+if (Root composer.json exists?) then (yes)
+  :getComposerInformation(rootId)
+  → set packageName from data['name'];
+else (no)
+  :packageName remains null;
+endif
+
+' ─────────── TAG SCANNING LOOP ───────────
+|VcsDriver|
+:getTags()
+→ returns map<tagName, identifier>;
+
+|VcsRepository|
+while (More tags to process?) is (yes)
+  :Strip 'release-' prefix from tag name;
+
+  |CacheLoader|
+  :getCachedPackageVersion(version, identifier);
+  if (Cache hit — Package object?) then (yes)
+    :addPackage(cachedPackage);
+  elseif (Cache hit — empty/false marker?) then (yes)
+    :emptyReferences[] += identifier;
+  else (cache miss)
+    |VersionParser|
+    :validateTag(tag)
+    via VersionParser::normalize();
+    if (Valid tag version?) then (no)
+      |VcsRepository|
+      :Log warning; skip tag;
+    else (yes)
+      |VcsDriver|
+      :getComposerInformation(identifier)
+      — read/parse composer.json at ref;
+      if (Returns null?) then (yes)
+        |VcsRepository|
+        :emptyReferences[] += identifier;
+      else (no)
+        |VcsRepository|
+        if (data['version'] explicitly set?) then (yes)
+          :Normalize data['version'] via VersionParser;
+        else (no)
+          :Use stripped tag name as version;
+        endif
+        :Strip '-dev' suffixes from
+        version and version_normalized;
+        if (version_normalized matches parsedTag?) then (no)
+          :Log version mismatch warning; skip tag;
+        elseif (Package with same name+version\nalready registered?) then (yes)
+          :Log conflict warning; skip tag;
+        else (ok)
+          :preProcess(driver, data, identifier)
+          → fill dist/source from driver if absent;
+          |CacheLoader|
+          :loader->load(processedData)
+          → instantiate Package object;
+          |VcsRepository|
+          :addPackage(package);
+        endif
+      endif
+    endif
+  endif
+endwhile (done)
+
+' ─────────── BRANCH SCANNING LOOP ───────────
+|VcsDriver|
+:getBranches()
+→ returns map<branchName, identifier>;
+
+|VcsRepository|
+:Reorder: promote root-identifier branch to front;
+
+while (More branches to process?) is (yes)
+  |VersionParser|
+  :validateBranch(branch)
+  via normalizeBranch() + parseConstraints();
+  if (Valid branch version?) then (no)
+    |VcsRepository|
+    :Log warning; skip branch;
+  else (yes)
+    |VcsRepository|
+    :Compute version string
+    (dev-{branch} for non-semver,
+    or x.y.z.x for semver patterns);
+
+    |CacheLoader|
+    :getCachedPackageVersion(version, identifier);
+    if (Cache hit — Package object?) then (yes)
+      :addPackage(cachedPackage);
+    elseif (Cache hit — empty/false marker?) then (yes)
+      :emptyReferences[] += identifier;
+    else (cache miss)
+      |VcsDriver|
+      :getComposerInformation(identifier)
+      — read/parse composer.json at ref;
+      if (Returns null?) then (yes)
+        |VcsRepository|
+        :emptyReferences[] += identifier;
+      else (no)
+        |VcsRepository|
+        :Set data['version'] and
+        data['version_normalized'] from branch;
+        if (Is root identifier branch?) then (yes)
+          :Set data['default-branch'] = true;
+        endif
+        :preProcess(driver, data, identifier)
+        → fill dist/source from driver if absent;
+        |CacheLoader|
+        :loader->load(packageData)
+        → instantiate Package object;
+        |VcsRepository|
+        if (ValidatingArrayLoader has warnings?) then (yes)
+          #FFB3B3:throw InvalidPackageException;
+          stop
+        else (no)
+          :addPackage(package);
+        endif
+      endif
+    endif
+
+    :Catch TransportException?;
+    if (HTTP 401 / 403 / 429 / 5xx?) then (yes)
+      #FFB3B3:Rethrow TransportException
+      (fatal auth/rate/server error);
+      stop
+    elseif (Other TransportException?) then (yes)
+      :Record in versionTransportExceptions
+      ['branches']; continue;
+    elseif (Generic Exception?) then (yes)
+      :branchErrorOccurred = true;
+      :Log error; continue;
+    endif
+  endif
+endwhile (done)
+
+|VcsDriver|
+:driver->cleanup()
+— release resources / temp files;
+
+|VcsRepository|
+if (Zero packages loaded?) then (yes)
+  #FFB3B3:throw InvalidRepositoryException
+  (repository contains no valid packages);
+  stop
+else (no)
+  :Repository initialised with all
+  valid tag and branch packages;
+endif
+stop
+
+@enduml

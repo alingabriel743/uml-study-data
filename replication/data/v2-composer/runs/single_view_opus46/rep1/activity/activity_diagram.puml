@@ -1,0 +1,213 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+}
+skinparam swimlane {
+    BorderColor #495057
+    TitleFontSize 14
+}
+
+title Composer Package Installation Workflow
+
+|BaseCommand|
+start
+:Receive CLI command\n(install / update / require);
+:Parse input options\n(prefer-source, prefer-dist, dev/no-dev);
+:createComposerInstance()\nLoad configuration & root package;
+:getPreferredInstallOptions()\nDetermine source vs dist preference;
+
+|Installer|
+:run()\nInitialize installer;
+:Configure DownloadManager\n(preferSource, preferDist, sourceFallback);
+:Get local repository\nfrom RepositoryManager;
+
+if (Lock file exists?) then (yes)
+else (no)
+    :Force update mode\n(no lock file present);
+endif
+
+if (Run scripts enabled?) then (yes)
+    :Dispatch PRE_INSTALL_CMD\nor PRE_UPDATE_CMD event;
+else (no)
+endif
+
+if (Update mode?) then (yes)
+    :__doUpdate()__;
+
+    |RepositoryManager|
+    :Load composer repositories\nwith package information;
+    :createRepositorySet()\nwith platform repo & aliases;
+    :Add all configured repositories\nto RepositorySet;
+
+    |Installer|
+    :createRequest()\nBuild solver request from\nroot package requirements;
+
+    if (Allow-list specified?) then (yes)
+        :Set update allow-list\n(partial update);
+    else (no)
+    endif
+
+    :Create dependency Pool\nfrom RepositorySet;
+
+    |DependencyResolver|
+    :Solver.solve(request)\nResolve dependency graph;
+
+    if (Resolution successful?) then (yes)
+        :Generate LockTransaction\n(installs, updates, removals);
+    else (no)
+        :Report solver problems;
+        |Installer|
+        :Return ERROR_DEPENDENCY_RESOLUTION_FAILED;
+        stop
+    endif
+
+    |Installer|
+    :extractDevPackages()\nSeparate dev from non-dev;
+    :Extract platform requirements;
+
+    if (Lock operations found?) then (yes)
+        :Categorize operations\n(InstallOperation, UpdateOperation,\nUninstallOperation);
+        :Locker.setLockData()\nWrite updated lock file;
+    else (no)
+        :Nothing to modify in lock file;
+    endif
+
+    if (doInstall flag?) then (yes)
+        :Proceed to __doInstall()__;
+    else (no)
+        :Return success (update-only);
+        stop
+    endif
+
+else (no)
+    :__doInstall()__;
+endif
+
+note right
+  doInstall() installs packages
+  from the lock file into vendor/
+end note
+
+:Read locked packages\nfrom Locker;
+
+if (Already solved?) then (no)
+    :Verify lock file compatibility\nwith current platform;
+    :Create RepositorySet\nfrom locked packages;
+    :Solver.solve()\nValidate lock consistency;
+
+    if (Lock valid for platform?) then (yes)
+    else (no)
+        :Return ERROR_LOCK_FILE_INVALID;
+        stop
+    endif
+else (yes)
+endif
+
+:Create LocalRepoTransaction\n(diff locked vs installed);
+:Dispatch PRE_OPERATIONS_EXEC event;
+
+if (Operations to execute?) then (yes)
+
+    |InstallationManager|
+    :execute(operations)\nSet up signal handler;
+    :Split operations into batches\n(plugin-modifies-downloads first);
+
+    :__Batch Loop__;
+    repeat
+        :downloadAndExecuteBatch();
+
+        fork
+            :Download packages\n(parallel promises via Loop);
+        fork again
+            :Prepare install targets\n(create directories);
+        end fork
+
+        if (Download only?) then (no)
+            :executeBatch();
+            repeat
+                :Get InstallerInterface\nfor package type;
+
+                if (Operation type?) then (install)
+                    |DownloadManager|
+                    :download(package, path)\nSelect downloader\n(FileDownloader / VcsDownloader);
+                    :prepare() & install()\nExtract archive or clone repo;
+                    |InstallationManager|
+                    :installer.install(repo, operation);
+                elseif (Operation type?) then (update)
+                    |DownloadManager|
+                    :download(target, path, initial)\nFetch updated version;
+                    :prepare() & update()\nApply update to vendor/;
+                    |InstallationManager|
+                    :installer.update(repo, initial, target);
+                else (uninstall)
+                    :installer.uninstall(repo, operation);
+                endif
+
+                :Dispatch post-operation event;
+            repeat while (more operations?) is (yes)
+            -> no;
+        else (yes)
+            :Cleanup download promises;
+        endif
+
+    repeat while (more batches?) is (yes)
+    -> no;
+
+    :repo.write()\nPersist installed.json;
+
+else (no)
+    |Installer|
+    :Nothing to install, update or remove;
+endif
+
+|Installer|
+if (Dump autoloader?) then (yes)
+    :AutoloadGenerator.dump()\nGenerate autoload files\n(classmap / PSR-4 / PSR-0);
+else (no)
+endif
+
+:Ensure binaries present\nfor all installed packages;
+
+|PluginManager|
+:Activate plugins from\ninstalled repositories;
+
+|Installer|
+if (Run scripts enabled?) then (yes)
+    :Dispatch POST_INSTALL_CMD\nor POST_UPDATE_CMD event;
+else (no)
+endif
+
+if (Audit enabled?) then (yes)
+    :Auditor.audit()\nCheck for security advisories;
+    if (Vulnerabilities found?) then (yes)
+        :Report advisories;
+        :Return ERROR_AUDIT_FAILED\n(if --audit strict);
+        stop
+    else (no)
+    endif
+else (no)
+endif
+
+:Return SUCCESS (exit code 0);
+stop
+
+@enduml

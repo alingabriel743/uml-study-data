@@ -1,0 +1,200 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #495057
+    LifeLineBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    BoxBackgroundColor #E9ECEF
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #DEE2E6
+    DividerBackgroundColor #CED4DA
+    DividerBorderColor #6C757D
+    NoteBackgroundColor #FFF3CD
+    NoteBorderColor #FFC107
+}
+
+title Fog of War Update
+
+participant "Logic\n(game loop)" as Logic
+participant "FogControl" as FogCtrl
+participant "Teams /\nTeamData" as Teams
+participant "Unit" as Unit
+participant "Building" as Building
+participant "BlockIndexer" as BlockIdx
+participant "dynamicEventQueue\n(staging buffer)" as DynQueue
+participant "dynamicEvents\n(synchronized)" as DynEvents
+participant "FogData[team]" as FogData
+
+box "Background Threads" #E8F4FD
+    participant "DynamicFogThread" as DynThread
+    participant "StaticFogThread" as StatThread
+end box
+
+== Game Tick ==
+
+Logic -> FogCtrl : update()
+activate FogCtrl
+
+group Lazy Initialization
+    FogCtrl -> FogCtrl : init fog[256] array (if null)
+    FogCtrl -> FogCtrl : lazy-start StaticFogThread\n(daemon, NORM-1 priority)
+    FogCtrl -> FogCtrl : lazy-start DynamicFogThread\n(daemon, NORM-1 priority)
+    alt !loadedStatic
+        FogCtrl -> FogCtrl : pushStaticBlocks(false)\n+ updateStatic()
+    end
+end
+
+FogCtrl -> DynQueue : clear()
+activate DynQueue
+
+group Building Fog Chunk (1/5 subset per frame)
+    FogCtrl -> Building : updateFogVisibility()
+    activate Building
+    Building --> FogCtrl : (fog visibility refreshed)
+    deactivate Building
+end
+
+group Unit Visibility Pass (non-AI teams)
+    FogCtrl -> Teams : iterate state.teams.present\n(skip isOnlyAI() teams)
+    activate Teams
+    Teams --> FogCtrl : TeamData (with units Seq<Unit>)
+    deactivate Teams
+
+    loop for each Unit in team.units
+        FogCtrl -> Unit : tileX(), tileY(), type.fogRadius
+        activate Unit
+        Unit --> FogCtrl : (x, y, radius)
+        deactivate Unit
+        note right of FogCtrl
+            Pack FogEvent as long:
+            16b x | 16b y | 16b radius | 8b team
+        end note
+
+        alt unit moved since last tick
+            FogCtrl -> FogCtrl : pushEvent(event, false)\n→ staticEvents.add()
+            FogCtrl -> FogData : dynamicUpdated = true
+        end
+    end
+end
+
+group Dynamic Flush Check (rate-limited to 25 FPS / 40 ms)
+    FogCtrl -> FogData : check dynamicUpdated &&\ntimeSinceMillis(lastDynamicMs) > 40ms
+    activate FogData
+    FogData --> FogCtrl : flush condition result
+    deactivate FogData
+
+    alt flush condition met
+        FogCtrl -> BlockIdx : getFlagged(team, BlockFlag.hasFogRadius)
+        activate BlockIdx
+        BlockIdx --> FogCtrl : Seq<Building> with fog radius
+        deactivate BlockIdx
+
+        loop for each Building with fogRadius
+            FogCtrl -> Building : tile.x, tile.y, fogRadius()
+            activate Building
+            Building --> FogCtrl : (x, y, radius)
+            deactivate Building
+            FogCtrl -> DynQueue : add FogEvent (building)
+        end
+
+        FogCtrl -> DynQueue : addAll unit FogEvents
+        FogCtrl -> DynEvents : synchronized: clear()\n+ addAll(dynamicEventQueue)
+        activate DynEvents
+        DynEvents --> FogCtrl : (events staged)
+        deactivate DynEvents
+
+        alt justLoaded (first tick after world load)
+            FogCtrl -> FogCtrl : updateDynamic(new Bits(256))\n[inline, synchronous — avoids fog pop-in]
+        end
+    end
+end
+
+FogCtrl -> DynThread : notifyDynamic.notify()\n(wake DynamicFogThread)
+alt staticEvents.size > 0
+    FogCtrl -> StatThread : notifyStatic.notify()\n(wake StaticFogThread)
+end
+
+deactivate DynQueue
+deactivate FogCtrl
+
+== DynamicFogThread (background) ==
+
+activate DynThread
+DynThread -> FogCtrl : updateDynamic(cleared: Bits)
+activate FogCtrl
+
+DynThread -> DynEvents : synchronized: read all events
+activate DynEvents
+DynEvents --> DynThread : Seq<FogEvent>
+deactivate DynEvents
+
+loop for each FogEvent (x, y, radius, team)
+    alt first event for this team (cleared check)
+        DynThread -> FogData : write.clear()
+        activate FogData
+        FogData --> DynThread
+        deactivate FogData
+    end
+    DynThread -> FogData : circle(data.write, x, y, rad+1)\n→ hline() fills scanlines via Bresenham
+    activate FogData
+    FogData --> DynThread : (tiles marked visible)
+    deactivate FogData
+end
+
+DynThread -> FogData : swap read ↔ write buffers\n(for all cleared teams)
+activate FogData
+FogData --> DynThread : (buffers swapped)
+deactivate FogData
+
+deactivate FogCtrl
+DynThread -> DynThread : wait(notifyDynamic)
+deactivate DynThread
+
+== StaticFogThread (background) ==
+
+activate StatThread
+StatThread -> FogCtrl : updateStatic()
+activate FogCtrl
+
+StatThread -> FogCtrl : synchronized: read staticEvents
+loop for each static FogEvent
+    StatThread -> FogData : circle(data.staticData, x, y, radius)\n→ hline() marks tile range as explored
+    activate FogData
+    FogData --> StatThread : (permanent exploration recorded)
+    deactivate FogData
+end
+
+StatThread -> FogCtrl : staticEvents.clear()
+deactivate FogCtrl
+StatThread -> StatThread : wait(notifyStatic)
+deactivate StatThread
+
+note over FogData
+    FogData per team:
+    • read  — current dynamic visibility (renderer reads)
+    • write — next-frame visibility (DynamicFogThread writes)
+    • staticData — cumulative exploration (never cleared)
+    • dynamicUpdated / lastDynamicMs — rate-limit control
+end note
+
+@enduml

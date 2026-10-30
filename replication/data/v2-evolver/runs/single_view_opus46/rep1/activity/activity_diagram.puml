@@ -1,0 +1,287 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+}
+skinparam swimlane {
+    BorderColor #495057
+    TitleFontSize 14
+}
+
+title Evolver Daemon — Evolution Loop & Proxy Sync Workflow
+
+|#E9ECEF|Main Daemon (index.js)|
+start
+:Load .env and resolve repo root;
+:Parse CLI arguments
+(--loop, --verbose, command);
+
+if (Command?) then (run / --loop)
+  :Preflight: verify **git** on PATH;
+  note right
+    Fail fast if git is missing
+    (Issue #394: silent hang on Windows)
+  end note
+
+  if (--loop mode?) then (yes)
+    :Acquire **singleton lock**
+    (evolver.pid);
+    if (Lock acquired?) then (yes)
+      :Register shutdown handlers
+      (SIGINT, SIGTERM, uncaughtException);
+    else (no)
+      :Log "already running (PID)";
+      stop
+    endif
+  else (no)
+  endif
+
+  |#E3F2FD|EvoMapProxy|
+  if (EVOMAP_PROXY=1?) then (yes)
+    :Initialize **MailboxStore**;
+    :Create **LifecycleManager**;
+    :Create **TaskMonitor**;
+    :Create **SkillUpdater** & **DmHandler**;
+    :Create **SessionHandler**;
+
+    fork
+      :Build HTTP routes (**ProxyHttpServer**)
+      and start server;
+    fork again
+      :Send **hello** to Hub
+      (register node);
+      :Start **heartbeat loop**
+      (360s interval);
+    end fork
+
+    |#E8F5E9|SyncEngine|
+    :Start SyncEngine;
+    fork
+      :Schedule **outbound** flush
+      (OutboundSync.flush);
+      note right
+        Sends queued messages to Hub
+        Re-schedules with adaptive delay
+      end note
+    fork again
+      :Schedule **inbound** pull
+      (InboundSync.pull);
+      note left
+        Pulls messages from Hub
+        On receive → SkillUpdater.pollAndApply()
+        Acknowledges delivered messages
+      end note
+    end fork
+
+  else (no)
+    |#E3F2FD|EvoMapProxy|
+    :Start **a2a heartbeat** (direct);
+    :Start **SSE event stream**;
+  endif
+
+  |#Main Daemon (index.js)|
+  fork
+    :Start **RecallVerify** worker;
+  fork again
+    :Start **ValidatorDaemon**;
+  fork again
+    if (ATP mode = auto/on?) then (yes)
+      :Start **merchantAgent**;
+      :Start **autoBuyer** daemon;
+      :Start **autoDeliver** daemon;
+    else (no)
+    endif
+  end fork
+
+  if (--loop mode?) then (yes)
+    ' ============ MAIN EVOLUTION LOOP ============
+    repeat
+      |#FFF8E1|Evolution Cycle|
+      :cycleCount++;
+
+      :Read **solidify state** JSON;
+      if (Pending solidify?) then (yes)
+        :Sleep pendingSleepMs (120s);
+        note right
+          Ralph-loop gating:
+          wait for solidify to complete
+        end note
+      else (no)
+        :Write **cycle_progress.json**
+        (phase: evolve.run);
+        :Start progress ticker
+        (update every 60s);
+
+        if (Cycle timeout enabled?) then (yes)
+          :Race **evolve.run()** vs
+          timeout (45 min);
+        else (no)
+          :Run **evolve.run()**;
+        endif
+
+        |#F3E5F5|evolve.run() Pipeline|
+        :Detect **signals**
+        (regex, score, LLM signals);
+        :Merge signals
+        (_mergeSignals);
+        :Select **gene** from asset store
+        (selector, guards);
+        :Enrich context
+        (pipeline/enrich);
+        :Dispatch evolution
+        (pipeline/dispatch);
+        :Collect results
+        (pipeline/collect);
+
+        |#FFF8E1|Evolution Cycle|
+        if (Cycle timed out?) then (yes)
+          :Log CycleTimeoutError;
+          :Spawn replacement process;
+          :Release lock, exit(1);
+          stop
+        else (no)
+        endif
+
+        if (Bridge disabled?) then (yes)
+          if (Pending solidify after run?) then (yes)
+            :Auto-reject pending run
+            (state-only, no rollback);
+          else (no)
+          endif
+        else (no)
+        endif
+
+        :Calculate cycle duration (dt);
+
+        ' --- Adaptive sleep ---
+        if (Cycle idle / failed?) then (yes)
+          :Exponential backoff
+          (double sleep, cap at maxSleepMs);
+        else (no)
+          :Reset to minSleepMs;
+        endif
+
+        ' --- OMLS idle scheduling ---
+        :Get **OMLS schedule** recommendation;
+        if (should_distill?) then (yes)
+          :Auto-distill from failures
+          (skillDistiller);
+        else (no)
+        endif
+        if (should_explore?) then (yes)
+          :Run **tryExplore**
+          (discover new signals);
+        else (no)
+        endif
+
+        ' --- Suicide check ---
+        if (cycles >= max OR RSS > maxMb?) then (yes)
+          :Spawn replacement process;
+          if (Spawned OK?) then (yes)
+            :Release lock, exit(0);
+            stop
+          else (no / Windows)
+            :Exit(1) for external supervisor;
+            stop
+          endif
+        else (no)
+        endif
+
+        ' --- Saturation check ---
+        if (force_steady_state signal?) then (4x sleep)
+          :saturationMultiplier = 4;
+        elseif (evolution_saturation signal?) then (2x sleep)
+          :saturationMultiplier = 2;
+        else (normal)
+        endif
+
+        :Sleep = (base + jitter) × saturation × OMLS;
+        :Write cycle_progress
+        (phase: sleep);
+      endif
+
+    repeat while (Loop forever) is (next cycle)
+
+  else (single run)
+    :Run **evolve.run()** once;
+    if (Success?) then (yes)
+      :Print completion banner;
+    else (no)
+      :Log error, exit(1);
+      stop
+    endif
+  endif
+
+elseif (solidify) then
+  |#FFEBEE|Solidify Flow|
+  :Run **solidify()**
+  (validate changes, commit gene);
+  if (Solidify OK?) then (yes)
+    if (Distill threshold reached?) then (yes)
+      :Auto-distill gene
+      (skillDistiller);
+    else (no)
+    endif
+    if (Failure distill needed?) then (yes)
+      :Distill repair gene
+      from failures;
+    else (no)
+    endif
+  else (no)
+    :Generate **urgent questions**;
+    :Send to Hub as bounties
+    (fetchTasks);
+  endif
+  stop
+
+elseif (review) then
+  |#E8EAF6|Review Flow|
+  :Load last run from
+  solidify state;
+  :Display gene, signals,
+  mutation, diff;
+  if (--approve?) then (yes)
+    :Run solidify();
+  elseif (--reject?) then
+    :git checkout & clean;
+    :Mark run as rejected;
+  else (display only)
+  endif
+  stop
+
+elseif (fetch) then
+  |Main Daemon (index.js)|
+  :Register with Hub (hello);
+  :Download skill from Hub store;
+  :Write SKILL.md + bundled files
+  (with path-traversal guards);
+  stop
+
+else (sync)
+  :Fetch purchased & published
+  assets from Hub;
+  :Upsert genes & capsules
+  to local asset store;
+  stop
+endif
+
+stop
+@enduml

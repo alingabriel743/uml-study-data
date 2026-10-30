@@ -1,0 +1,243 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+    StartColor #212529
+    EndColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam note {
+    BackgroundColor #E7F3FF
+    BorderColor #5B9BD5
+    FontSize 11
+}
+
+title Provider Tool Execution (FileSearch / WebSearch / WebFetch)
+
+|#E9ECEF|Agent Loop|
+start
+:Receive tool list containing ProviderTool instances\n(FileSearch, WebSearch, WebFetch + regular Tools);
+
+|#D8EAF8|MapsTools|
+:Iterate tools array;
+
+repeat
+    if (tool instanceof ProviderTool?) then (yes)
+        :Call mapProviderTool(tool, provider);
+
+        if (Tool type?) then (FileSearch)
+
+            if (provider implements\nSupportsFileSearch?) then (yes)
+                :Call provider->fileSearchToolOptions(tool);
+                :Resolve Store objects → string IDs via ids();
+                :Build filter array via resolveFilters()\n(Closure | array | null → FileSearchQuery);
+                note right
+                  OpenAI  → {type: "file_search",
+                             vector_store_ids: [...],
+                             filters: [...]}
+                  Gemini  → {fileSearch: {vector_store_ids: [...],
+                             filters: [...]}}
+                end note
+                :Return provider-specific file_search definition;
+
+            else (no)
+                #FFCCCC:throw RuntimeException\n("Provider does not support file search");
+                kill
+            endif
+
+        elseif (WebSearch) then (WebSearch)
+
+            if (provider implements\nSupportsWebSearch?) then (yes)
+                :Call provider->webSearchToolOptions(tool);
+                note right
+                  OpenAI     → {type: "web_search_preview",
+                               search_context_size, user_location}
+                  Anthropic  → {type: "web_search_20250305",
+                               name: "web_search", max_uses,
+                               allowed_domains}
+                  Gemini     → {google_search: (object)}
+                end note
+                :Return provider-specific web_search definition;
+
+            else (no)
+                #FFCCCC:throw RuntimeException\n("Provider does not support web search");
+                kill
+            endif
+
+        elseif (WebFetch) then (WebFetch)
+
+            if (provider implements\nSupportsWebFetch?) then (yes)
+                :Call provider->webFetchToolOptions(tool);
+                note right
+                  Anthropic → {type: "web_fetch_20250910",
+                              name: "web_fetch", max_uses,
+                              allowed_domains}
+                  Gemini    → {url_context: (object)}
+                end note
+                :Return provider-specific web_fetch definition;
+
+            else (no)
+                #FFCCCC:throw RuntimeException\n("Provider does not support web fetch");
+                kill
+            endif
+
+        else (unknown type)
+
+            if (Anthropic provider?) then (yes)
+                #FFCCCC:throw LogicException\n("ProviderTool not supported by Anthropic");
+                kill
+            else (OpenAI / other)
+                :Return [] (unsupported tool silently ignored);
+            endif
+
+        endif
+
+    else (no — regular Tool)
+        :mapTool(tool) → {type: "function", function: {...}};
+    endif
+
+repeat while (more tools?) is (yes)
+-> no;
+
+|#E9ECEF|Agent Loop|
+:Build complete tool definitions array;
+:Send API request to Provider with mapped tools;
+:Receive response;
+
+if (Streaming mode?) then (yes)
+
+    |#E8F5E9|Streaming Path (HandlesTextStreaming)|
+    :Open SSE stream connection;
+
+    while (SSE events available?) is (next event)
+
+        if (event type?) then (response.created)
+            :yield StreamStart;
+
+        elseif (output_text.delta) then (text delta)
+            :Lazy emit TextStart on first delta;
+            :yield TextDelta(content);
+
+        elseif (output_text.done) then (text done)
+            :yield TextEnd;
+
+        elseif (reasoning_summary_text.delta) then (reasoning)
+            :yield ReasoningDelta(content);
+
+        elseif (output_item.done\n— type ends in "_call"\nbut NOT "function_call") then (provider tool done)
+            :yield ProviderToolEvent\n(id, itemId, type, data[], "completed", timestamp);
+            note right
+              Examples: web_search_call,
+              file_search_call events
+            end note
+
+        elseif (*_call.* events\n— non-function_call) then (tool call status)
+            :yield ProviderToolEvent\n(id, item_id, callType, data[], status, timestamp);
+
+        elseif (output_item.added\n— function_call type) then (fn call added)
+            :Register pendingToolCall entry;
+
+        elseif (function_call_arguments.delta) then (args delta)
+            :Accumulate arguments string;
+
+        elseif (function_call_arguments.done) then (args done)
+            :yield ToolCallEvent(name, arguments);
+
+        elseif (response.completed) then (completed)
+            :Capture usage metrics (tokens);
+
+        endif
+
+    endwhile (stream ended)
+
+    if (pendingToolCalls filled?) then (yes)
+
+        |#FFF8E1|InvokesTools|
+        :handleStreamingToolCalls();
+
+        repeat
+            :executeTool(toolCall);
+            :fire invokingToolCallback;
+            :tool->handle(Request) → string result;
+            :fire toolInvokedCallback;
+            :yield ToolResultEvent(toolCallId, result);
+        repeat while (more pending tool calls?) is (yes)
+        -> no;
+
+        |#E8F5E9|Streaming Path (HandlesTextStreaming)|
+        if (depth + 1 < maxSteps?) then (yes)
+            :POST responses with stream:true,\nprevious_response_id, tool results;
+            :Recursively call processTextStream(depth + 1);
+        else (max depth reached)
+            :yield StreamEnd("stop");
+        endif
+
+    else (no tool calls)
+        :yield StreamEnd(finishReason, usage);
+    endif
+
+else (no — non-streaming)
+
+    |#FFF3E0|Non-Streaming Path (ParsesTextResponses)|
+    :extractText(output) → raw text string;
+    :extractToolCalls(output) → filter items where type="function_call";
+    :extractCitations(output);
+    note right
+      Iterate output items of type="message"
+      → for each annotation where type="url_citation"
+        → new UrlCitation(url, title)
+        → push to citations collection
+    end note
+    :Deduplicate citations by title (unique collection);
+    :extractFinishReason(data) → FinishReason enum;
+
+    if (finishReason == ToolCalls\nAND toolCalls not empty\nAND steps < maxSteps?) then (yes)
+
+        |#FFF8E1|InvokesTools|
+        :executeToolCalls(mappedToolCalls, tools);
+
+        repeat
+            :findTool(toolCall.name, tools);
+            if (Tool found?) then (yes)
+                :fire invokingToolCallback;
+                :tool->handle(Request) → string result;
+                :fire toolInvokedCallback;
+                :create ToolResult(id, name, args, result, resultId);
+            else (not found)
+                :Skip — tool call ignored;
+            endif
+        repeat while (more tool calls?) is (yes)
+        -> no;
+
+        |#FFF3E0|Non-Streaming Path (ParsesTextResponses)|
+        :Build ToolResultMessage → append to messages;
+        :continueWithToolResults()\n→ POST responses with previous_response_id\n   + tool results as input;
+        :Recursively call processResponse(depth + 1);
+
+    else (no more tool calls)
+        :Build TextResponse / StructuredTextResponse;
+        :Attach UrlCitation[] collection to Meta;
+    endif
+
+endif
+
+|#E9ECEF|Agent Loop|
+:Return final response with citations to caller;
+stop
+
+@enduml

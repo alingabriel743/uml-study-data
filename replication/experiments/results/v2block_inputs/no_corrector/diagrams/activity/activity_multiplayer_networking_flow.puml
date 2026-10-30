@@ -1,0 +1,335 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleBackgroundColor #E9ECEF
+}
+skinparam note {
+    BackgroundColor #E8F4F8
+    BorderColor #6C757D
+}
+
+title Multiplayer Networking Flow
+
+|Server|
+start
+:openServer() → net.host(Config.port);
+:Register packet handlers\n(Connect, Disconnect, ConnectPacket);
+:Register client commands\n(/help, /t, /a, /votekick, /vote, /sync);
+note right: Server ready to accept connections
+
+|Client|
+:ArcNetProvider fires Connect event;
+:reset()\n— clear groups, connecting = true;
+:Build ConnectPacket\n(name, locale, mods, mobile,\nversionType, color, usid, uuid);
+:net.send(ConnectPacket, reliable=true);
+
+|Server|
+:Receive ConnectPacket;
+
+if (con.kicked?) then (yes)
+  :Return early — ignore packet;
+  stop
+else (no)
+endif
+
+if (IP banned / subnet banned?) then (yes)
+  :con.kick(KickReason.banned);
+  stop
+else (no)
+endif
+
+if (hasBegunConnecting already?) then (yes)
+  :con.kick(KickReason.idInUse);
+  stop
+else (no)
+endif
+
+if (uuid or usid null?) then (yes)
+  :con.kick(KickReason.idInUse);
+  stop
+else (no)
+endif
+
+if (ID banned / name banned?) then (yes)
+  :con.kick(KickReason.banned);
+  stop
+else (no)
+endif
+
+if (Active kick cooldown?) then (yes)
+  :con.kick(KickReason.recentKick);
+  stop
+else (no)
+endif
+
+if (Player limit exceeded\n(non-admin)?) then (yes)
+  :con.kick(KickReason.playerLimit);
+  stop
+else (no)
+endif
+
+if (Mod incompatibility?) then (yes)
+  :con.kick(formatted mod list);
+  stop
+else (no)
+endif
+
+if (Not whitelisted?) then (yes)
+  :con.kick(KickReason.whitelist);
+  stop
+else (no)
+endif
+
+if (Version mismatch?) then (yes)
+  :con.kick(KickReason.typeMismatch\n/ clientOutdated / serverOutdated);
+  stop
+else (no)
+endif
+
+if (Duplicate name/uuid/usid\n(strict mode)?) then (yes)
+  :con.kick(KickReason.nameInUse\n/ idInUse);
+  stop
+else (no)
+endif
+
+:fixName(packet.name)\n— sanitize and length-limit;
+
+if (Name empty after fix?) then (yes)
+  :con.kick(KickReason.nameEmpty);
+  stop
+else (no)
+endif
+
+:admins.updatePlayerJoined(uuid, ip, name);
+:Player.create()\n— set admin, con, usid, uuid,\nmobile, name, locale, color;
+:assignTeam(player)\n— TeamAssigner.assign()\n(PvP: min team, else defaultTeam);
+:Events.fire(PlayerConnect);
+
+|Server|
+fork
+  :sendWorldData(player);
+  note right
+    TCP stream (reliable)
+  end note
+  :NetworkIO.writeWorld(player,\nDeflaterOutputStream)\n— compress world state;
+  :Build WorldStream packet\nfrom compressed byte array;
+  :player.con.sendStream(worldStream);
+fork again
+  |Client|
+  :Receive WorldStream event;
+  :NetworkIO.loadWorld(InflaterInputStream)\n— decompress and apply world;
+  :finishConnecting()\n— state=playing, connecting=false,\nnet.setClientLoaded(true);
+  :Call.connectConfirm() → sent to server;
+  :platform.updateRPC();\nui.loadfrag.hide();
+end fork
+
+|Server|
+:Receive connectConfirm;
+
+if (con.kicked?) then (yes)
+  :Return — skip join;
+  stop
+else (no)
+endif
+
+:player.add() → add to world;
+:Events.fire(PlayerConnectionConfirmed);
+:con.hasConnected = true;
+:Call.sendMessage('[player] has connected');
+:Send MOTD if configured;
+:Events.fire(PlayerJoin);
+:player.deathTimer = deathDelay;\nplayer.update() → instant respawn;
+
+note right
+  Connection fully established.
+  Enter ongoing sync loop.
+end note
+
+|Server|
+fork
+  repeat
+    :Sync interval elapsed?;
+    :writeEntitySnapshot(player):\n— stateSnapshot (wavetime, wave,\nenemies, paused, tps, rand)\n— entitySnapshot (Syncc entities)\n— hiddenSnapshot (hidden entity IDs);
+    if (blockSyncTime elapsed?) then (yes)
+      :writeBlockSnapshots()\n→ Call.blockSnapshot;
+    else (no)
+    endif
+    if (healthSyncTime elapsed\n& buildHealthChanged?) then (yes)
+      :Call.buildHealthUpdate(healthSeq);
+    else (no)
+    endif
+    if (planPreviewSyncTime elapsed?) then (yes)
+      :clientPlanSnapshotSend()\n→ Call.clientPlanSnapshotReceived\nto teammates;
+    else (no)
+    endif
+  repeat while (Players connected?) is (yes)
+  -> no;
+fork again
+  |Client|
+  repeat
+    :playerSyncTime (66ms):;
+    :Call.clientSnapshot\n(snapshotID, unitID, dead,\nx/y, pointerX/Y, rotation,\nvelocity, mining, shooting,\nchatting, building, plans, viewRect);
+    :pingTime (1s):;
+    :Call.ping(Time.millis())\n→ server responds pingResponse;
+    :planSyncTime (0.5s):;
+    :Call.clientPlanSnapshot\n(groupId, plans);
+  repeat while (Connected to server?) is (yes)
+  -> no;
+end fork
+
+|Server|
+:Receive clientSnapshot;
+if (snapshotID < lastReceivedClientSnapshot?) then (yes)
+  :Discard outdated snapshot;
+else (no)
+  :Validate / clamp float coordinates;
+  :Update player mouseX/Y,\ntyping, shooting, boosting,\nselectedBlock;
+  if (Builder — has build plans?) then (yes)
+    :admins.allowAction() — validate plans;
+    :Reject invalid → Call.removeQueueBlock;
+  else (no)
+  endif
+  if (Unit alive?) then (yes)
+    :unit.controlWeapons, unit.aim,\nunit.mineTile;
+    if (Strict mode — position deviation\n> correctDist?) then (yes)
+      :Call.setPosition(con, x, y);
+    else (no)
+    endif
+    :unit.readSyncManual(fbuffer)\nwith rotation + position;
+  else (no)
+  endif
+  :con.lastReceivedClientSnapshot = snapshotID;
+endif
+
+|Server|
+note right: Chat and Admin flows run concurrently during active session
+
+fork
+  :Receive chat message from client;
+  if (Not connected long enough\nor not confirmed?) then (yes)
+    :Drop message;
+  else (no)
+    if (Chat rate > chatSpamLimit?) then (yes)
+      :Kick + blacklistDos;
+    else (no)
+      if (Message starts with /?) then (yes)
+        :clientCommands.handleMessage(msg, player);
+        if (Invalid command?) then (yes)
+          :invalidHandler → player.sendMessage(error);
+        else (no)
+        endif
+      else (no)
+        :admins.filterMessage(player, message);
+        if (Not filtered?) then (yes)
+          :Call.sendMessage\n(chatFormatter.format(player, msg));
+        else (no)
+          :Drop filtered message;
+        endif
+      endif
+    endif
+  endif
+fork again
+  :Receive adminRequest;
+  if (Player is admin?) then (yes)
+    if (Target is null or admin?) then (yes)
+      :Warn and return;
+    else (no)
+      :Events.fire(AdminRequestEvent);
+      switch (Admin action?)
+      case (wave)
+        :logic.skipWave();
+      case (ban)
+        :admins.banPlayerID\n+ banPlayerIP;
+        :other.kick(KickReason.banned);
+      case (kick)
+        :other.kick(KickReason.kick);
+      case (trace)
+        :Build TraceInfo;
+        :Call.traceInfo(con, other, info);
+      case (switchTeam)
+        :other.team(team);
+      endswitch
+    endif
+  else (no)
+    :Log ACCESS DENIED;
+  endif
+fork again
+  :Player sends /votekick [target] [reason];
+  if (Votekick disabled / <3 players\n/ vote in progress / no args?) then (yes)
+    :Reject with reason message;
+  else (no)
+    :Find target by name or #id;
+    if (Self-kick / admin target\n/ local player / different team?) then (yes)
+      :Reject with reason message;
+    else (no)
+      if (Cooldown active (5 min)?) then (yes)
+        :Reject — too soon;
+      else (no)
+        :Create VoteSession(target)\n— schedule timer (30s);
+        :session.vote(initiator, +1)\n— announce vote to all;
+        repeat
+          if (Player sends /vote y|n?) then (yes)
+            :currentlyKicking.vote(player, ±1);
+          else (no)
+            if (Admin sends /vote c?) then (yes)
+              :Cancel VoteSession;
+            else (no)
+            endif
+          endif
+          :VoteSession.checkPass()\nvotes >= votesRequired?;
+        repeat while (30s not elapsed\nand not passed?) is (yes)
+        -> timeout/result;
+        if (Votes passed?) then (yes)
+          :Call.sendMessage ban notice;
+          :player.kick(KickReason.vote,\nkickDuration * 1000);
+        else (no)
+          :Announce vote failure;
+          :currentlyKicking = null;
+        endif
+      endif
+    endif
+  endif
+end fork
+
+|Server|
+:ArcNetProvider fires Disconnect event;
+:onDisconnect(player, reason);
+if (hasConnected?) then (yes)
+  :Events.fire(PlayerLeave);
+  :Call.sendMessage '[player] disconnected';
+  :Call.playerDisconnect(id);
+else (no)
+endif
+if (Unit spawned by core and alive?) then (yes)
+  :Call.unitDespawn(unit);
+else (no)
+endif
+:player.remove();
+:con.hasDisconnected = true;
+
+|Client|
+:Receive Disconnect event;
+:logic.reset();
+if (Was kicked?) then (yes)
+  :Show kick dialog with reason;
+else (no)
+  :Show connection error UI;
+endif
+
+stop
+
+@enduml

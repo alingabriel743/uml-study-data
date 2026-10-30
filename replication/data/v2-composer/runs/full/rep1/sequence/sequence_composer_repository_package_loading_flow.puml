@@ -1,0 +1,217 @@
+@startuml sequence_composer_repository_package_loading_flow
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipant underline
+skinparam sequenceBoxBackgroundColor #E9ECEF
+skinparam sequenceBoxBorderColor #6C757D
+skinparam sequenceLifeLineBorderColor #495057
+skinparam sequenceGroupBorderColor #6C757D
+skinparam sequenceGroupBackgroundColor #F1F3F5
+skinparam noteBorderColor #CED4DA
+skinparam noteBackgroundColor #FFF3CD
+
+title Composer Repository Package Loading Flow
+
+actor Caller as caller
+participant "ComposerRepository" as repo
+participant "Cache" as cache
+participant "HttpDownloader" as http
+participant "EventDispatcher" as events
+participant "StabilityFilter" as stability
+participant "MetadataMinifier" as minifier
+participant "ArrayLoader" as loader
+participant "Loop" as loop
+participant "ArrayRepository" as arrayrepo
+
+caller -> repo : loadPackages(packageNameMap, acceptableStabilities, stabilityFlags, alreadyLoaded)
+activate repo
+
+repo -> repo : hasProviders()\n→ loadRootServerFile()
+activate repo
+
+note over repo : loadRootServerFile() is lazy;\nguarded by $rootData != null
+
+repo -> cache : read('packages.json')
+activate cache
+cache --> repo : cachedData / null
+deactivate cache
+
+alt Cache hit and still fresh
+    note over repo : Use $data from cache directly
+else Cache hit with last-modified header
+    repo -> http : GET packages.json\n[If-Modified-Since: <lastModified>]
+    activate http
+    http --> repo : 304 Not Modified / 200 OK
+    deactivate http
+else No cache entry
+    repo -> events : dispatch(PRE_FILE_DOWNLOAD, PreFileDownloadEvent)
+    activate events
+    events --> repo
+    deactivate events
+
+    repo -> http : GET getPackagesJsonUrl()
+    activate http
+    http --> repo : Response (body + headers)
+    deactivate http
+
+    loop Up to 3 retries on checksum mismatch
+        repo -> repo : verify sha256(body)\nvs expected hash
+        note right : Throws RepositorySecurityException\nafter 3 mismatches (MITM protection)
+    end
+
+    repo -> events : dispatch(POST_FILE_DOWNLOAD, PostFileDownloadEvent)
+    activate events
+    events --> repo
+    deactivate events
+
+    repo -> cache : write('packages.json', json, lastModified)
+    activate cache
+    cache --> repo
+    deactivate cache
+end
+
+repo -> repo : set lazyProvidersUrl (V2 metadata-url)\nset providersUrl (V1)\nset hasProviders, availablePackages\nset availablePackagePatterns
+deactivate repo
+
+alt V1 Protocol — hasProviders = true
+    note over repo : Synchronous provider-file fetch per package
+
+    repo -> repo : whatProvides(name, stabilities, flags)
+    activate repo
+
+    repo -> repo : look up sha256 hash\nin providerListing
+
+    repo -> cache : sha256(cacheKey) == hash?\n→ read provider file
+    activate cache
+    cache --> repo : cachedProviderData / null
+    deactivate cache
+
+    alt Provider not cached
+        repo -> repo : fetchFile(providerUrl, cacheKey, hash)
+        note right : Same fetch-verify-cache\nsequence as packages.json
+    end
+
+    repo -> stability : isPackageAcceptable(stabilities, flags, names, stability)
+    activate stability
+    stability --> repo : bool
+    deactivate stability
+
+    repo -> loader : load(versionData)
+    activate loader
+    loader --> repo : PackageInterface
+    deactivate loader
+
+    repo -> repo : pkg->setRepository(this)\n[AliasPackage: also aliasOf->setRepository(this)]
+    deactivate repo
+
+else V2 Protocol — lazyProvidersUrl set
+    note over repo : Async loading via React Promises
+
+    repo -> repo : loadAsyncPackages(packageNameMap, stabilities, flags)
+    activate repo
+
+    note over repo : Add ~dev variant per\npackage if dev stability OK
+
+    loop For each package name
+        repo -> repo : startCachedAsyncDownload(name, realName)\n→ PromiseInterface
+        activate repo
+
+        repo -> cache : read(provider-{name}.json)\n→ lastModified
+        activate cache
+        cache --> repo : lastModified / null
+        deactivate cache
+
+        repo -> repo : asyncFetchFile(url, cacheKey, lastModified)
+        activate repo
+
+        alt URL already fresh (freshMetadataUrls[url] = true)
+            repo --> repo : resolve(true) — skip download
+        else URL previously 404'd
+            repo --> repo : resolve(['packages'=>[]]) — skip download
+        else Proceed with async HTTP request
+            repo -> events : dispatch(PRE_FILE_DOWNLOAD)
+            activate events
+            events --> repo
+            deactivate events
+
+            repo -> http : async GET url\n[If-Modified-Since: lastModified?]
+            activate http
+            http --> repo : Response (200 / 304 / 404)
+            deactivate http
+
+            alt HTTP 304 Not Modified
+                repo -> repo : freshMetadataUrls[url] = true\nresolve(true) — use cached data
+            else HTTP 404 Not Found
+                repo -> repo : packagesNotFoundCache[url] = true\nresolve(['packages'=>[]])
+            else HTTP 200 OK
+                repo -> events : dispatch(POST_FILE_DOWNLOAD)
+                activate events
+                events --> repo
+                deactivate events
+
+                repo -> cache : write(cacheKey, json)
+                activate cache
+                cache --> repo
+                deactivate cache
+            end
+        end
+        deactivate repo
+
+        note over repo : Promise.then() chain
+
+        repo -> minifier : expand(versions)\n[only if minified — 'composer/2.0' format]
+        activate minifier
+        minifier --> repo : expandedVersionData
+        deactivate minifier
+
+        repo -> stability : isVersionAcceptable(constraint, name,\n version, stabilities, flags)
+        activate stability
+        stability --> repo : bool
+        deactivate stability
+
+        repo -> loader : load(versionData)
+        activate loader
+        loader --> repo : PackageInterface
+        deactivate loader
+
+        repo -> repo : pkg->setRepository(this)\n[AliasPackage: also aliasOf->setRepository(this)]
+        deactivate repo
+    end
+
+    repo -> loop : wait(promises)\n[blocks until all async downloads complete]
+    activate loop
+    loop --> repo : all resolved
+    deactivate loop
+
+    deactivate repo
+
+else Fallback — no providers, no lazyProvidersUrl
+    note over repo : In-memory only repository
+
+    repo -> arrayrepo : parent::loadPackages(packageNameMap,\n acceptableStabilities, stabilityFlags, alreadyLoaded)
+    activate arrayrepo
+    note over arrayrepo : Iterates in-memory package array;\nchecks StabilityFilter + Constraint;\nhandles AliasPackage wrapping
+    arrayrepo --> repo : ['namesFound'=>[...], 'packages'=>[...]]
+    deactivate arrayrepo
+end
+
+repo --> caller : ['namesFound' => [...], 'packages' => [...PackageInterface]]
+deactivate repo
+
+@enduml

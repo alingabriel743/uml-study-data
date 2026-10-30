@@ -1,0 +1,129 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #212529
+    EndColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+
+title Lyra — Video World Generation Pipeline
+
+|Client|
+start
+:Submit generation request\n(prompt / condition video,\ncheckpoint_dir, inference_type);
+
+|Pipeline Orchestrator|
+:Instantiate World Generation Pipeline\n(DiffusionText2WorldGenerationPipeline\nor DiffusionVideo2WorldGenerationPipeline\nor ARBaseGenerationPipeline);
+
+:_load_model(checkpoint_name);
+
+if (Text encoder required?) then (yes)
+  :_load_text_encoder_model();
+endif
+
+if (Prompt upsampler enabled?) then (yes)
+  :_load_prompt_upsampler_model();
+endif
+
+if (Guardrail models required?) then (yes)
+  :Load guardrail models;
+endif
+
+|Conditioning Module|
+if (Inference type?) then (Text2World)
+  :Tokenize & encode text prompt\n(T5 / text encoder);
+  if (Prompt upsampler enabled?) then (yes)
+    :Run prompt upsampler\non raw prompt;
+    :Produce enhanced\ntext embedding;
+  else (no)
+    :Use raw prompt embedding;
+  endif
+  :Get negative prompt embedding\nfor classifier-free guidance;
+else (Video2World)
+  :Load input video / image\nfrom image_or_video_path;
+  :Encode frames with VAE tokenizer\nto latent condition;
+  :prepare_latent_condition()\n— optional noise augmentation;
+  :Get negative prompt embedding\nfor classifier-free guidance;
+endif
+
+|Pipeline Orchestrator|
+if (Offload network to CPU?) then (yes)
+  :_run_model_with_offload()\n— move model to GPU before call\n  move model back to CPU after;
+else (no)
+  :_run_model()\n— model stays on GPU;
+endif
+
+|Generation Engine|
+if (Model type?) then (Diffusion)
+  :generate_samples_from_batch()\n(DiffusionModel / DiffusionT2WModel\n/ DiffusionV2WModel\n/ ExtendDiffusionModel);
+  fork
+    :Build conditioned state\nGeneralConditioner._forward();
+  fork again
+    :Build unconditioned state\nGeneralConditioner.get_condition_uncondition();
+  end fork
+  :generate_cfg_samples()\n— classifier-free guidance loop;
+  repeat
+    :Sample noise level σ\nfrom sigma schedule;
+    :denoise(xt, σ, condition)\n→ DenoisePrediction;
+    :GeneralDIT.forward()\n— transformer blocks\n  with cross-attention;
+  repeat while (More denoising steps?) is (yes)
+  ->no;
+  :Produce clean latent x0;
+else (Autoregressive)
+  :generate_video_from_tokens()\n(ARBaseGenerationPipeline);
+  :Prepare visual token context;
+  repeat
+    :Transformer.forward()\n— causal self-attention\n  + cross-attention to context;
+    :Sample next video token\n(logit clipping applied);
+  repeat while (Token budget exhausted?) is (no)
+  ->yes;
+  :Collect generated token sequence;
+endif
+
+|Tokenizer / Decoder|
+:Decode latent / tokens to\npixel-space video frames\n(BaseVAE / VideoTokenizerInterface);
+:Convert tensor frames\nto output video (mp4);
+
+|Pipeline Orchestrator|
+if (Guardrail check passes?) then (no)
+  :Block unsafe output;
+  :_offload_guardrail_models();
+  |Client|
+  :Receive rejection / safety notice;
+  stop
+else (yes)
+  :_offload_guardrail_models();
+  :Persist output video to disk;
+endif
+
+|Client|
+:Receive generated world video;
+stop
+
+@enduml

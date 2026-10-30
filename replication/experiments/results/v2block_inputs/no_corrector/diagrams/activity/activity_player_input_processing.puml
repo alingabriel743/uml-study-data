@@ -1,0 +1,244 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #212529
+    EndColor #212529
+    BarColor #495057
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+
+title Player Input Processing
+
+|Player / UI|
+start
+
+:update() called each frame;
+:super.update() [InputHandler]\n— sync playerPlanTree, handle respawn,\n  building auto-pause;
+
+if (locked()?\n(cutscene / logicCutscene)) then (yes)
+  :Skip all player input\nthis frame;
+  stop
+else (no)
+endif
+
+:Handle camera pan\n(Binding.pan, boost, mouseMove, moveX/Y);
+
+if (commandMode key pressed?) then (yes)
+  :Toggle commandMode;
+  if (commandMode active?) then (yes)
+    :Handle control groups:\n  selectAllUnits (G)\n  selectAllUnitFactories (H)\n  selectAllUnitTransport;
+  endif
+endif
+
+if (Binding.control + Binding.select?) then (yes)
+  :Call.unitControl(player, unit)\nOR Call.buildingControlSelect();
+endif
+
+if (player alive AND !locked?) then (yes)
+  :updateMovement(unit);
+  note right: movement keys:\nmoveX (A/D), moveY (S/W),\nboost (shiftLeft)
+endif
+
+if (state.isMenu()\nOR scene has dialog?) then (yes)
+  :Return early — no world input;
+  stop
+else (no)
+endif
+
+if (player dead OR locked?) then (yes)
+  :pollInputNoPlayer()\n(camera/UI only);
+  stop
+else (no)
+endif
+
+|Input Handler|
+:pollInputPlayer();
+:Get cursor tile at mouse position → tileX, tileY;
+
+if (selectPlans not empty?) then (yes)
+  :Shift all pending plans\nto follow cursor;
+endif
+
+if (Binding.clearBuilding tapped?) then (yes)
+  :player.unit().clearBuilding()\nclear selectPlans;
+endif
+
+if (Binding.schematicSelect (F)\nOR rebuildSelect (B) released?) then (yes)
+  if (schematicSelect released?) then (yes)
+    :schematics.create()\n→ useSchematic();
+  else (rebuildSelect released)
+    :rebuildArea();
+  endif
+endif
+
+if (selectPlans not empty AND\nschematicFlipX/Y tapped?) then (yes)
+  :flipPlans() — mirror schematic;
+endif
+
+if (Binding.pauseBuilding (E) tapped?) then (yes)
+  :Toggle isBuilding flag;
+endif
+
+if (mode == placing AND cursor moved?) then (yes)
+  |Build System|
+  :updateLine(selectX, selectY)\n→ Placement.iterateLine()\n→ fill linePlans[] with BuildPlan objects;
+  |Input Handler|
+endif
+
+:Await input event this frame;
+
+if (Binding.deselect (RMB) tapped?) then (yes)
+  :block = null\nmode = none\nOR clear selectPlans;
+endif
+
+if (Binding.rotate (scroll) axis?) then (yes)
+  :rotation = (rotation + delta) mod 4;
+  if (currently placing?) then (yes)
+    |Build System|
+    :updateLine() — refresh line preview;
+    |Input Handler|
+  endif
+endif
+
+if (Binding.breakBlock (RMB) tapped?) then (yes)
+  :mode = breaking\nRecord selectX, selectY;
+endif
+
+if (Binding.commandQueue (middle) pressed?) then (yes)
+  :commandTap(x, y, queue=true);
+  |Server|
+  :Resolve commandTap targets\n(buildWorld / selectedEnemyUnit);
+  note right
+    @Remote commandUnits:
+    validate admin,
+    ai.command(moveCommand),
+    calculateFormation()
+  end note
+  :Call.commandUnits(player, unitIds[],\nbuildTarget, unitTarget, posTarget,\nqueue, finalBatch);
+  if (commandBuildings > 0?) then (yes)
+    :Call.commandBuilding(player,\nbuildingPositions[], target);
+    :build.onCommand(target)\nFire BuildingCommandEvent;
+  endif
+  :Fire Fx.attackCommand\nOR Fx.moveCommand;
+  |Input Handler|
+endif
+
+'---------- Binding.select TAPPED ----------
+if (Binding.select (LMB) TAPPED?) then (yes)
+
+  if (Binding.breakBlock held?) then (yes)
+    :mode = none;
+
+  elseif (selectPlans not empty?) then (yes)
+    :flushPlans(selectPlans)\n— commit schematic placement;
+    |Build System|
+    :FOR each plan:\n  validPlace(x, y, block, rotation)\n  AND no conflicting plan in playerPlanTree?;
+    if (placement valid?) then (yes)
+      :plan.copy()\nblock.onNewPlan(copy)\nplayer.unit().addBuild(copy)\nplayerPlanTree.insert(copy);
+    else (invalid)
+      :Skip plan (occupied / out of range);
+    endif
+    |Input Handler|
+
+  elseif (isPlacing()?) then (yes)
+    :selectX = cursorX\nmode = placing\nupdateLine();
+
+  elseif (queued plan at cursor\n(not in breaking mode)?) then (yes)
+    :Grab plan → splan\n(drag-reposition mode);
+
+  elseif (queued plan at cursor\n(in breaking mode)?) then (yes)
+    :deleting = true;
+
+  elseif (commandMode active?) then (yes)
+    :commandRect = true\n(begin unit-select rectangle);
+
+  else (no special mode)
+    :checkConfigTap()\n→ tileTapped(build)\n→ tryTapPlayer()\n→ tryBeginMine();
+    :player.shooting = shouldShoot;
+  endif
+
+endif
+
+'---------- Binding.select RELEASED ----------
+if (Binding.select (LMB) RELEASED?) then (yes)
+
+  if (mode == placing AND block != null?) then (yes)
+    |Build System|
+    :flushPlans(linePlans)\nOR flushPlansReverse(linePlans);
+    :FOR each plan:\n  validPlace(plan.x, plan.y, plan.block, plan.rotation)?;
+    if (valid?) then (yes)
+      :addBuild(plan)\nplayerPlanTree.insert(plan);
+    else (invalid)
+      :Discard plan;
+    endif
+    |Input Handler|
+    :mode = none;
+
+  elseif (mode == breaking?) then (yes)
+    :removeSelection(selectX, selectY, cursorX, cursorY);
+    :mode = none;
+  endif
+
+  :tryDropItems(build, x, y);
+  if (droppingItem AND player has items\nAND !canTapPlayer AND !paused?) then (yes)
+
+    if (build accepts stack AND\nallowDeposit() AND canDepositItem()?) then (yes)
+      |Server|
+      note right
+        @Remote transferInventory:
+        validate range,
+        check deposit cooldown,
+        admin check
+      end note
+      :Call.transferInventory(player, build);
+      :Call.transferItemTo(unit, item, accepted, build);
+      |Input Handler|
+
+    else (drop to ground)
+      |Server|
+      :Call.dropItem(angle)\nFx.dropItem effect\nunit.clearItem();
+      |Input Handler|
+    endif
+
+  endif
+
+  if (splan repositioned\nAND overlaps existing plan?) then (yes)
+    :Remove old plan at original position;
+    if (ctrl held?) then (yes)
+      :Show planConfig dialog;
+    endif
+  endif
+
+endif
+
+|Player / UI|
+:Frame complete — await next tick;
+
+stop
+
+@enduml

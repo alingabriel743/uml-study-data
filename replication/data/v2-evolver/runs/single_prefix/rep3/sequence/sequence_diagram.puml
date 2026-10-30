@@ -1,0 +1,218 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequence {
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ActorBackgroundColor #F8F9FA
+    ActorBorderColor #495057
+}
+skinparam noteBackgroundColor #FFF9C4
+skinparam noteBorderColor #F0C040
+
+title EvoMap Proxy — Startup, Sync & Request Handling Flow
+
+actor "Operator / CLI" as CLI
+
+participant "main()\n[index.js]" as Main
+participant "EvoMapProxy" as Proxy
+participant "LifecycleManager" as Lifecycle
+participant "SyncEngine" as Sync
+participant "InboundSync" as Inbound
+participant "OutboundSync" as Outbound
+participant "MailboxStore" as Store
+participant "ProxyHttpServer" as HttpServer
+participant "TaskMonitor" as Monitor
+participant "WebUiServer" as WebUI
+participant "Hub API" as Hub
+
+== Proxy Startup ==
+
+CLI -> Main: node index.js
+activate Main
+
+Main -> Main: acquireLock()
+note right: prevents concurrent instances
+
+Main -> Proxy: new EvoMapProxy(config)
+activate Proxy
+
+Main -> Proxy: start()
+
+Proxy -> Lifecycle: hello()
+activate Lifecycle
+Lifecycle -> Hub: POST /hello (fingerprint, nodeId, secret)
+activate Hub
+Hub --> Lifecycle: 200 OK (token, nodeConfig)
+deactivate Hub
+Lifecycle --> Proxy: authToken
+deactivate Lifecycle
+
+Proxy -> Monitor: new TaskMonitor()
+activate Monitor
+Monitor --> Proxy: monitor instance
+deactivate Monitor
+
+Proxy -> HttpServer: new ProxyHttpServer(routes)
+activate HttpServer
+HttpServer --> Proxy: server instance
+
+Proxy -> HttpServer: start()
+HttpServer -> HttpServer: randomBytes() — generate requestSecret
+HttpServer --> Proxy: listening on port
+deactivate HttpServer
+
+Proxy -> Lifecycle: startHeartbeatLoop(intervalMs)
+activate Lifecycle
+note right: schedules periodic heartbeats
+
+Lifecycle -> Hub: POST /heartbeat (events, pendingCount)
+activate Hub
+Hub --> Lifecycle: 200 OK
+deactivate Hub
+deactivate Lifecycle
+
+Proxy -> Sync: start()
+activate Sync
+Sync -> Sync: _scheduleInbound(delayMs)
+Sync -> Sync: _scheduleOutbound(delayMs)
+Sync --> Proxy: sync running
+deactivate Sync
+
+Proxy -> WebUI: start()
+activate WebUI
+WebUI --> Proxy: web UI listening
+deactivate WebUI
+
+Proxy --> Main: proxy started
+deactivate Proxy
+
+== Inbound Sync Cycle ==
+
+Sync -> Inbound: pull()
+activate Sync
+activate Inbound
+Inbound -> Hub: GET /mailbox/pull (headers, cursor)
+activate Hub
+Hub --> Inbound: batch of messages
+deactivate Hub
+Inbound -> Store: writeInboundBatch(messages)
+activate Store
+Store -> Store: _rebuildIndex()
+Store --> Inbound: persisted
+deactivate Store
+Inbound -> Inbound: ackDelivered(messageIds)
+Inbound -> Hub: POST /mailbox/ack (messageIds)
+Inbound --> Sync: inbound done
+deactivate Inbound
+
+Sync -> Sync: _scheduleInbound(nextDelayMs)
+deactivate Sync
+
+== Outbound Sync Cycle ==
+
+Sync -> Outbound: flush()
+activate Sync
+activate Outbound
+Outbound -> Store: countPending()
+activate Store
+Store --> Outbound: pendingCount
+deactivate Store
+
+alt pendingCount > 0
+    Outbound -> Store: getPendingMessages()
+    activate Store
+    Store --> Outbound: messages[]
+    deactivate Store
+    Outbound -> Hub: POST /mailbox/push (messages)
+    activate Hub
+    Hub --> Outbound: 200 OK (results)
+    deactivate Hub
+    Outbound -> Store: updateStatusBatch(results)
+    activate Store
+    Store -> Store: _persistState()
+    Store --> Outbound: updated
+    deactivate Store
+end
+
+Outbound --> Sync: outbound done
+deactivate Outbound
+Sync -> Sync: _scheduleOutbound(nextDelayMs)
+deactivate Sync
+
+== Incoming HTTP Request (DM Send) ==
+
+actor "Agent Client" as Agent
+
+Agent -> HttpServer: POST /dm/send (body)
+activate HttpServer
+HttpServer -> HttpServer: _matchRoute("POST", "/dm/send")
+HttpServer -> HttpServer: _handleRequest(req, res)
+
+HttpServer -> "DmHandler" as DmH: send(body)
+activate DmH
+DmH -> Store: store.send(message, metadata)
+activate Store
+Store -> Store: _persistState()
+Store --> DmH: messageId
+deactivate Store
+DmH -> Sync: notifyNewOutbound()
+activate Sync
+Sync -> Sync: clearTimeout(_outTimer)
+Sync -> Sync: _scheduleOutbound(0)
+Sync --> DmH: scheduled
+deactivate Sync
+DmH --> HttpServer: { messageId, timestamp }
+deactivate DmH
+
+HttpServer --> Agent: 200 { messageId }
+deactivate HttpServer
+
+== Authentication Error Handling ==
+
+Sync -> Sync: _handleAuthError("outbound")
+activate Sync
+Sync -> Lifecycle: reAuthenticate()
+activate Lifecycle
+Lifecycle -> Lifecycle: hello()
+Lifecycle -> Hub: POST /hello (refreshed secret)
+activate Hub
+Hub --> Lifecycle: new token
+deactivate Hub
+Lifecycle -> Lifecycle: _emitManualResetNeeded() [if max retries]
+Lifecycle --> Sync: re-auth complete
+deactivate Lifecycle
+Sync -> Sync: resume _scheduleOutbound
+deactivate Sync
+
+== Proxy Shutdown ==
+
+CLI -> Main: SIGTERM / SIGINT
+activate Main
+Main -> Main: shutdown()
+Main -> Proxy: stop()
+activate Proxy
+Proxy -> Sync: stop()
+Proxy -> HttpServer: stop()
+activate HttpServer
+HttpServer -> HttpServer: server.close()
+HttpServer --> Proxy: closed
+deactivate HttpServer
+Proxy -> WebUI: stop()
+activate WebUI
+WebUI -> WebUI: server.close()
+WebUI --> Proxy: closed
+deactivate WebUI
+Proxy -> Lifecycle: stopHeartbeatLoop()
+Proxy --> Main: stopped
+deactivate Proxy
+Main -> Main: releaseLock()
+deactivate Main
+
+@enduml

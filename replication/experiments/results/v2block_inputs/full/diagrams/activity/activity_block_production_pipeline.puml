@@ -1,0 +1,140 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activityBackgroundColor #F8F9FA
+skinparam activityBorderColor #495057
+skinparam activityArrowColor #495057
+skinparam activityFontColor #212529
+skinparam activityDiamondBackgroundColor #E9ECEF
+skinparam activityDiamondBorderColor #6C757D
+skinparam swimlaneBackgroundColor #E9ECEF
+skinparam swimlaneBorderColor #6C757D
+skinparam swimlaneTitleFontColor #212529
+skinparam swimlaneTitleFontSize 13
+
+title Block Production Pipeline
+
+'══════════════════════════════════════════════════════════
+'  LANE 1 — GAME ENGINE / TICK TRIGGER
+'══════════════════════════════════════════════════════════
+|Game Engine|
+start
+:Fire game tick;
+fork
+
+'══════════════════════════════════════════════════════════
+'  LANE 2 — HEAT CONDUCTOR
+'══════════════════════════════════════════════════════════
+|HeatConductor|
+:HeatConductorBuild.updateTile();
+if (lastHeatUpdate == state.updateId?) then (yes — already updated)
+    :Skip tick\n(guard prevents double-update);
+else (no — first update)
+    :Set lastHeatUpdate = state.updateId;
+    :calculateHeat(sideHeat, cameFrom)\n– Read heat from adjacent HeatBlock neighbors\n– Accumulate into sideHeat[4]\n– cameFrom IntSet prevents cycle double-counting;
+    :heat = calculated neighbor heat value;
+    if (splitHeat enabled?) then (yes)
+        :heatFrac = (heat / visualMaxHeat) / 3f;
+    else (no)
+        :heatFrac = heat / visualMaxHeat (max 15f);
+    endif
+    :Expose heat() and warmup()\nto downstream HeatCrafter consumers;
+endif
+
+'══════════════════════════════════════════════════════════
+'  LANE 3 — BEAM DRILL
+'══════════════════════════════════════════════════════════
+|Game Engine|
+fork again
+
+|BeamDrill|
+:BeamDrillBuild.updateTile();
+:onProximityUpdate / updateFacing()\n– Scan tiles in beam direction\n– Range: up to 5 tiles;
+:facing[] = drillable ore tiles found\nfacingAmount = count of valid ore tiles\nlastItem = ore type (determined by floor);
+:updateLasers()\n– Sync beam animation positions;
+if (Optional boost consumer\n(e.g. ConsumeCoolant) satisfied?) then (yes)
+    :boostWarmup increases;
+    :drillSpeed ×= optionalBoostIntensity (2.5×);
+else (no)
+    :boostWarmup decreases;
+endif
+if (facingAmount > 0\nAND no blockedItem conflict?) then (yes)
+    :warmup increases toward 1.0;
+    :time += drillSpeed\n(base drillTime = 200 ticks, scaled by\ntier and drillMultipliers per item type);
+    if (time ≥ getDrillTime(lastItem)?) then (yes)
+        :Add lastItem to building inventory\n→ Offload to adjacent containers;
+        :Reset time = 0;
+    else (no)
+        :Continue accumulating drill time;
+    endif
+else (no — no valid ore or blocked)
+    :warmup decreases;
+endif
+
+'══════════════════════════════════════════════════════════
+'  LANE 4 — GENERIC / ATTRIBUTE CRAFTER
+'══════════════════════════════════════════════════════════
+|Game Engine|
+fork again
+
+|Consume Validation|
+:Building.efficiency() iterates\nall Consume instances;
+repeat
+    if (consumer.ignore()?) then (yes)
+        :Skip this consumer;
+    elseif (consumer.optional?) then (optional)
+        :ConsumeCoolant (optional boost):\nCheck fluid temp ≤ maxTemp (0.5f)\nAND flammability ≤ maxFlammability (0.1f)\nReturn boost efficiency or 0f;
+    else (required)
+        :ConsumeCoolant.efficiency():\nReturn 1f if valid coolant fluid present\nelse 0f → blocks crafting;
+        :ConsumeItemDynamic.efficiency():\nCall items.get(build) → ItemStack[]\nCheck build.items has enough of each item\nReturn fraction or 1f;
+    endif
+repeat while (More consumers?) is (yes)
+-> (no);
+
+|GenericCrafter / AttributeCrafter|
+:GenericCrafterBuild.updateTile();
+if (shouldConsume() returns true?\n[All required consumers satisfied]) then (yes)
+    :warmup increases toward warmupTarget()\nat warmupSpeed = 0.019f;
+    if (Is AttributeCrafter?) then (yes)
+        :Recalculate attrsum =\nsumAttribute(attribute, tile.x, tile.y)\n[cached, refreshed on onProximityUpdate];
+        :efficiencyMultiplier =\nbaseEfficiency\n+ min(maxBoost, boostScale × attrsum)\n+ attribute.env();
+        :progress increment =\nefficiencyMultiplier / craftTime;
+        note right
+          scaleLiquidConsumption=true
+          also scales liquid use by
+          efficiencyScale()
+        end note
+    else (no — base GenericCrafter)
+        :progress increment =\nefficiency / craftTime (80 ticks);
+    endif
+    :Add increment to progress (0..1)\nAccumulate in totalProgress;
+    if (progress ≥ 1.0?) then (yes — craft cycle complete)
+        fork
+            :Trigger all consumers:\nConsume.trigger(build)\n→ items deducted via\nConsumeItemDynamic.trigger()\n→ liquids consumed;
+        fork again
+            :Spawn craftEffect\nat block tile position;
+        end fork
+        fork
+            :Output items:\noutputItem / outputItems\n→ building inventory;
+        fork again
+            :Output liquids:\noutputLiquid / outputLiquids\n→ liquid buffer;
+        end fork
+        :Reset progress to 0;
+    else (no — still in progress)
+        :Continue accumulating progress;
+    endif
+else (no — consumers not satisfied)
+    :warmup decays toward 0\n(no progress advance this tick);
+endif
+
+:dumpOutputs() — every tick:\n– Dump excess output liquids on liquidOutputDirections\n– If dumpExtraLiquid=true, dump non-output liquids too;
+
+|Game Engine|
+end fork
+:Tick complete;
+stop
+
+@enduml

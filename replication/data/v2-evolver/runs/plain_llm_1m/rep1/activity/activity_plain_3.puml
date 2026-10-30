@@ -1,0 +1,123 @@
+@startuml evolver_atp_lifecycle
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam swimlane {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+title ATP (Agent Task Protocol) — Task Lifecycle
+
+|Consumer (Buyer)|
+start
+
+if (AutoBuy triggered by evolution signals?) then (yes)
+    :Check Daily Budget Ledger\n(ledger.spent vs dailyCap\nwith cold-start halving);
+    if (Budget exhausted?) then (yes)
+        :Skip — daily cap reached;
+        stop
+    endif
+    :Compute Question Hash\n(_questionHash: caps+question);
+    if (Recently ordered same hash?) then (yes)
+        :Skip — duplicate within TTL;
+        stop
+    endif
+    :Compose Question from Signals\n(questionComposer.compose\nwith template + capabilities);
+else (manual CLI)
+    :Parse CLI Buy Args\n(evolver atp buy <caps>\n--budget --routing --question);
+endif
+
+:Register with Hub if needed\n(sendHelloToHub → node_id\n+ node_secret);
+
+:Place Order on Hub\n(POST /a2a/atp/order\ncapabilities + budget\n+ routing + question);
+
+:Record Spend in Ledger\n(dedup entry + spent amount);
+
+|Hub|
+:Validate Order\n(policy checks, balance);
+:Route to Matching Merchants\n(directory search by capability\n+ tier + routing mode);
+:Assign Task with Bounty;
+:Return Order ID;
+
+|Merchant (Seller)|
+:List My Available Tasks\n(hubClient.listMyTasks);
+
+:Score and Select Best Task\n(selectBestTask:\ncapability match + bounty\n+ difficulty estimate);
+
+if (Eligible task found?) then (yes)
+    :Check Spawn Cooldown\n(_recentlySpawned in ledger\nSPAWN_COOLDOWN_MS);
+    :Clip Question to Max Length\n(_clipQuestion MAX_ANSWER_PROMPT_CHARS);
+    :Build Spawn Task Prompt\n(task title + clipped question\n+ capabilities + answer path);
+    :Record Spawn in Ledger\n(task_id → timestamp);
+    :Spawn AI Agent Session\n(renderSessionsSpawnCall\nwith task + answer file);
+
+    :AI Agent Processes Task\n(reads question + codebase\ncontext, generates answer);
+    :Write Answer to File\n(atp_answer_<safe_taskId>.md);
+
+    :Execute completeAtpTask;
+
+    fork
+        :Build Gene from Answer\n(capabilities + signals\n+ strategy steps from answer);
+    fork again
+        :Build Capsule from Answer\n(confidence=0.9, blast radius\nfrom answer stats);
+    end fork
+
+    :Ensure Node Secret Present\n(_ensureNodeSecret\n→ sendHelloToHub if missing);
+
+    :Sign Bundle with HMAC-SHA256\n([gene.asset_id + capsule.asset_id]\nsorted + joined + signed);
+
+    :Publish Bundle to Hub\n(POST /a2a/publish\nwith nonce + timestamp);
+
+    :Complete Task on Hub\n(POST /a2a/task/complete\nwith result_asset_id);
+
+    :Remove Task from Spawn Ledger\n(atpTaskPickup.forget);
+
+else (no task)
+    :No eligible task — return null;
+    stop
+endif
+
+|Hub|
+:Verify Delivery Proof\n(validate HMAC + asset exists);
+:Record Proof Entry;
+:Notify Consumer of Delivery;
+
+|Consumer (Buyer)|
+:Receive Delivery Notification\n(inbound message from hub);
+
+if (Verify mode = auto?) then (yes)
+    :Auto-confirm Delivery\n(confirmDelivery);
+elseif (Verify mode = ai_judge?) then (ai judge)
+    :Request AI Judge Review\n(requestAiJudge);
+    :AI assesses result quality;
+    :Auto-confirm if passed;
+else (bilateral)
+    :Consumer Reviews Result;
+    if (Satisfied with delivery?) then (yes)
+        :Confirm Delivery;
+    else (no)
+        :Dispute Order\n(disputeOrder with reason);
+    endif
+endif
+
+:Settle Order\n(settleOrder → release payment\nto merchant on Hub);
+
+:Ingest Received Assets via A2A\n(a2a.lowerConfidence factor=0.6\n+ validate + isAllowedA2AAsset);
+
+:Append to External Candidates\n(external_candidates.jsonl);
+
+:Update Memory Graph\n(recordExternalCandidate);
+
+stop
+
+@enduml

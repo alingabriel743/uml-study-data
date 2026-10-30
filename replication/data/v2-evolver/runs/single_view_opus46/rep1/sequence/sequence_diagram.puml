@@ -1,0 +1,283 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ArrowColor #495057
+    LifeLineBorderColor #ADB5BD
+    GroupBackgroundColor #E9ECEF
+    GroupBorderColor #6C757D
+    DividerBackgroundColor #DEE2E6
+}
+skinparam note {
+    BackgroundColor #FFF3CD
+    BorderColor #856404
+}
+
+title EvoMapProxy — Startup, Sync & Request Handling Sequence
+
+actor "Client" as client
+participant "EvoMapProxy" as proxy
+participant "MailboxStore" as store
+participant "LifecycleManager" as lifecycle
+participant "ProxyHttpServer" as httpServer
+participant "SyncEngine" as syncEngine
+participant "InboundSync" as inbound
+participant "OutboundSync" as outbound
+participant "SkillUpdater" as skillUpdater
+participant "TaskMonitor" as taskMonitor
+participant "SessionHandler" as sessionHandler
+participant "A2A Hub" as hub
+
+== Proxy Startup ==
+
+client -> proxy: start()
+activate proxy
+
+proxy -> store: new MailboxStore(dataDir)
+activate store
+store --> proxy: store instance
+deactivate store
+
+proxy -> lifecycle: new LifecycleManager(hubUrl, store)
+proxy -> taskMonitor: new TaskMonitor(store)
+proxy -> skillUpdater: new SkillUpdater(store, skillPath)
+proxy -> sessionHandler: new SessionHandler(store)
+
+proxy -> syncEngine: new SyncEngine(store, hubUrl, getHeaders)
+activate syncEngine
+syncEngine -> outbound: new OutboundSync(store, hubUrl, getHeaders)
+syncEngine -> inbound: new InboundSync(store, hubUrl, getHeaders)
+deactivate syncEngine
+
+proxy -> proxy: buildRoutes(store, proxyHandlers, taskMonitor, extensions)
+
+proxy -> httpServer: new ProxyHttpServer(routes, port)
+proxy -> httpServer: start()
+activate httpServer
+httpServer -> httpServer: http.createServer()
+httpServer -> httpServer: tryListen(port)
+httpServer -> httpServer: writeSettings(url, pid, token)
+httpServer --> proxy: { port, url, token }
+deactivate httpServer
+
+proxy -> lifecycle: hello()
+activate lifecycle
+lifecycle -> lifecycle: _buildHeaders()
+lifecycle -> hub: POST /a2a/hello\n{sender_id, protocol, env_fingerprint}
+activate hub
+hub --> lifecycle: { node_secret, status: "ok" }
+deactivate hub
+lifecycle -> store: setState("node_secret", secret)
+lifecycle -> store: setState("node_id", nodeId)
+lifecycle --> proxy: { ok: true, nodeId }
+deactivate lifecycle
+
+proxy -> lifecycle: startHeartbeatLoop()
+activate lifecycle
+lifecycle -[#Gray]> lifecycle: schedule tick(interval)
+deactivate lifecycle
+
+proxy -> syncEngine: start()
+activate syncEngine
+syncEngine -> syncEngine: _scheduleOutbound(500ms)
+syncEngine -> syncEngine: _scheduleInbound(1000ms)
+deactivate syncEngine
+
+proxy --> client: { url, port, nodeId }
+deactivate proxy
+
+== Heartbeat Loop (periodic) ==
+
+lifecycle -[#666666]> lifecycle: tick()
+activate lifecycle
+lifecycle -> lifecycle: _buildHeaders()
+lifecycle -> hub: POST /a2a/heartbeat\n{node_id, env_fingerprint, meta}
+activate hub
+hub --> lifecycle: { ok, events[] }
+deactivate hub
+lifecycle -> store: setState("last_heartbeat_at", timestamp)
+
+opt Hub returns events
+    lifecycle -> store: writeInboundBatch(events)
+end
+
+alt heartbeat 403/401
+    lifecycle -> lifecycle: reAuthenticate()
+    activate lifecycle #DDD
+    lifecycle -> lifecycle: hello({ rotateSecret: true })
+    lifecycle -> hub: POST /a2a/hello\n{rotate_secret: true}
+    activate hub
+    hub --> lifecycle: { new node_secret }
+    deactivate hub
+    lifecycle -> store: setState("node_secret", newSecret)
+    lifecycle -> lifecycle: heartbeat({ _skipReauth: true })
+    lifecycle -> hub: POST /a2a/heartbeat (verify)
+    activate hub
+    hub --> lifecycle: { ok: true }
+    deactivate hub
+    deactivate lifecycle
+end
+
+deactivate lifecycle
+
+== Inbound Sync Cycle ==
+
+syncEngine -[#666666]> syncEngine: _scheduleInbound timer fires
+activate syncEngine
+
+syncEngine -> inbound: pull(channel, limit)
+activate inbound
+inbound -> store: getCursor(cursorKey)
+inbound -> store: getState("node_id")
+inbound -> hub: POST /a2a/mailbox/inbound\n{sender_id, cursor, limit}
+activate hub
+hub --> inbound: { messages[], next_cursor }
+deactivate hub
+
+opt messages received
+    inbound -> store: writeInboundBatch(messages)
+    inbound -> store: setCursor(cursorKey, next_cursor)
+end
+
+inbound --> syncEngine: { received: count }
+deactivate inbound
+
+syncEngine -> inbound: ackDelivered(channel)
+activate inbound
+inbound -> store: list({ status: "delivered" })
+inbound -> hub: POST /a2a/mailbox/ack\n{sender_id, message_ids}
+activate hub
+hub --> inbound: ok
+deactivate hub
+inbound --> syncEngine: { acked: count }
+deactivate inbound
+
+opt received > 0
+    syncEngine -> skillUpdater: pollAndApply()
+    activate skillUpdater
+    skillUpdater -> store: poll()
+    skillUpdater -> skillUpdater: processSkillUpdate(message)
+    skillUpdater -> store: ack(messageId)
+    deactivate skillUpdater
+end
+
+syncEngine -> syncEngine: _scheduleInbound(nextDelay)
+deactivate syncEngine
+
+== Outbound Sync Cycle ==
+
+syncEngine -[#666666]> syncEngine: _scheduleOutbound timer fires
+activate syncEngine
+
+syncEngine -> outbound: flush(channel)
+activate outbound
+outbound -> store: pollOutbound({ channel, limit: 50 })
+store --> outbound: pending messages[]
+
+outbound -> store: getState("node_id")
+outbound -> hub: POST /a2a/mailbox/outbound\n{sender_id, messages[]}
+activate hub
+hub --> outbound: { results[] }
+deactivate hub
+
+loop for each result
+    alt status == "accepted"
+        outbound -> store: updateStatusBatch([{id, status: "synced"}])
+    else status == "failed" && retries < MAX
+        outbound -> store: incrementRetry(id, error)
+    end
+end
+
+opt hub returned response payloads
+    outbound -> store: writeInboundBatch(responseMessages)
+end
+
+outbound -> store: setState("last_sync_at", timestamp)
+outbound --> syncEngine: { sent, synced, responses }
+deactivate outbound
+
+syncEngine -> syncEngine: _scheduleOutbound(nextDelay)
+deactivate syncEngine
+
+== HTTP Request Handling ==
+
+client -> httpServer: HTTP request (e.g., POST /mailbox/send)
+activate httpServer
+
+httpServer -> httpServer: verify Bearer token\n(timingSafeEqual)
+
+httpServer -> httpServer: _matchRoute(method, pathname)
+
+httpServer -> httpServer: parseBody(req)
+
+httpServer -> httpServer: invoke route handler(ctx)
+activate httpServer #DDD
+
+alt POST /session/create
+    httpServer -> sessionHandler: createSession(body)
+    activate sessionHandler
+    sessionHandler -> store: send(sessionMessage)
+    sessionHandler --> httpServer: result
+    deactivate sessionHandler
+else POST /task/claim
+    httpServer -> taskMonitor: recordClaim(taskId)
+    activate taskMonitor
+    taskMonitor -> store: setState(metrics)
+    taskMonitor --> httpServer: result
+    deactivate taskMonitor
+else POST /mailbox/send
+    httpServer -> store: send(message)
+    store --> httpServer: ok
+end
+
+deactivate httpServer
+
+httpServer -> syncEngine: notifyNewOutbound()
+activate syncEngine
+syncEngine -> syncEngine: clearTimeout + _scheduleOutbound(100ms)
+deactivate syncEngine
+
+httpServer --> client: JSON response
+deactivate httpServer
+
+== Proxy Shutdown ==
+
+client -> proxy: stop()
+activate proxy
+proxy -> syncEngine: stop()
+activate syncEngine
+syncEngine -> syncEngine: clearTimeout(outTimer)
+syncEngine -> syncEngine: clearTimeout(inTimer)
+deactivate syncEngine
+
+proxy -> lifecycle: stopHeartbeatLoop()
+activate lifecycle
+lifecycle -> lifecycle: clearTimeout(heartbeatTimer)
+deactivate lifecycle
+
+proxy -> httpServer: stop()
+activate httpServer
+httpServer -> httpServer: server.close()
+httpServer -> httpServer: clearSettings()
+deactivate httpServer
+
+proxy -> store: close()
+proxy --> client: stopped
+deactivate proxy
+
+@enduml

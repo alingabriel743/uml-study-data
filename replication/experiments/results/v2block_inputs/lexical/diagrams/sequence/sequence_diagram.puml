@@ -1,0 +1,205 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #DEE2E6
+    DividerBackgroundColor #E9ECEF
+    DividerBorderColor #6C757D
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #F1F3F5
+    BoxBackgroundColor #F8F9FA
+    BoxBorderColor #6C757D
+}
+
+title NetServer – Player Lifecycle & Game Loop (Mindustry)
+
+actor       "Client"         as client
+participant "Net\n(Transport)" as net
+participant "NetServer"       as srv
+participant "Administration"  as admin
+participant "State / World"   as world
+
+== Server Startup ==
+
+[-> srv : openServer()
+activate srv
+srv -> net : host(port)
+net --> srv : listening
+deactivate srv
+
+== Player Connection ==
+
+client -> net : connect(host, port)
+activate net
+net -> srv : connectConfirm(player)
+activate srv
+
+srv -> admin : isIDBanned(player.uuid)
+activate admin
+admin --> srv : false
+deactivate admin
+
+srv -> srv : assignTeam(player, players)
+activate srv #BBDDFF
+  srv -> world : state.teams.getActive()
+  activate world
+  world --> srv : activeTeamData
+  deactivate world
+  srv --> srv : team
+deactivate srv
+
+srv -> srv : sendWorldData(player)
+activate srv #BBDDFF
+  srv -> world : map.tiles, state.entities
+  activate world
+  world --> srv : world bytes
+  deactivate world
+  srv -> net : serverPacketReliable(player, "world", data)
+  net --> client : WorldPacket
+deactivate srv
+deactivate srv
+deactivate net
+
+== Game Loop (update tick) ==
+
+loop every game tick
+    client -> net : clientSnapshot(snapshotID, unitID, x, y, rotation, ...)
+    net -> srv : clientSnapshot(player, snapshotID, unitID, x, y, ...)
+    activate srv
+
+    srv -> world : update player position / state
+    activate world
+    world --> srv : ok
+    deactivate world
+
+    srv -> srv : writeEntitySnapshot(player)
+    activate srv #BBDDFF
+      srv -> world : state.units, state.teams
+      activate world
+      world --> srv : entity bytes
+      deactivate world
+      srv -> net : serverBinaryPacketUnreliable(player, "esnap", bytes)
+      net --> client : EntitySnapshotPacket
+    deactivate srv
+
+    opt building health changed
+        srv -> srv : buildHealthUpdate(build)
+        activate srv #BBDDFF
+          srv -> net : serverPacketReliable(player, "bh", healthData)
+          net --> client : BuildingHealthPacket
+        deactivate srv
+    end
+
+    opt block sync timer (every 6 s)
+        srv -> srv : writeBlockSnapshots()
+        activate srv #BBDDFF
+          srv -> world : tile / building state
+          activate world
+          world --> srv : block bytes
+          deactivate world
+          srv -> net : serverBinaryPacketReliable(player, "bsnap", bytes)
+          net --> client : BlockSnapshotPacket
+        deactivate srv
+    end
+
+    opt sync timer
+        srv -> srv : sync()
+        activate srv #BBDDFF
+          srv -> net : serverPacketReliable(players, "sync", stateData)
+          net --> client : SyncPacket
+        deactivate srv
+    end
+
+    deactivate srv
+end
+
+== Build Plan Exchange ==
+
+client -> net : clientPlanSnapshot(groupId, plans)
+net -> srv : clientPlanSnapshot(player, groupId, plans)
+activate srv
+srv -> srv : clientPlanSnapshotReceived(player, groupId, plans)
+activate srv #BBDDFF
+  srv -> world : apply / store build plans
+  activate world
+  world --> srv : ok
+  deactivate world
+deactivate srv
+srv -> net : clientPlanSnapshotSend(player, groupId, plansOut)
+net --> client : BuildPlanAckPacket
+deactivate srv
+
+== Block Snapshot Request ==
+
+client -> net : requestBlockSnapshot(pos)
+net -> srv : requestBlockSnapshot(player, pos)
+activate srv
+srv -> world : tile data at pos
+activate world
+world --> srv : blockBytes
+deactivate world
+srv -> net : serverBinaryPacketReliable(player, "bsnap", blockBytes)
+net --> client : BlockSnapshotPacket
+deactivate srv
+
+== Admin Request ==
+
+client -> net : adminRequest(target, action, params)
+net -> srv : adminRequest(player, other, action, params)
+activate srv
+
+srv -> admin : isAdmin(player)
+activate admin
+admin --> srv : true
+deactivate admin
+
+alt action == kick
+    srv -> srv : onDisconnect(other, "kicked")
+    srv -> net : serverPacketReliable(other, "kick", reason)
+    net --> client : KickPacket
+else action == ban
+    srv -> admin : banPlayer(other)
+    activate admin
+    admin --> srv : ok
+    deactivate admin
+    srv -> net : serverPacketReliable(other, "kick", "banned")
+    net --> client : KickPacket
+end
+
+deactivate srv
+
+== Player Disconnect ==
+
+client -x net : (connection lost / kick)
+net -> srv : onDisconnect(player, reason)
+activate srv
+srv -> world : remove player from state
+activate world
+world --> srv : ok
+deactivate world
+srv -> net : serverPacketReliable(others, "disconnect", playerInfo)
+net --> client : (broadcast disconnect)
+deactivate srv
+
+@enduml

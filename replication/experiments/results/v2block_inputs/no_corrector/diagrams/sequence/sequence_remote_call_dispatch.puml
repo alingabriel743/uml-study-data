@@ -1,0 +1,168 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipant underline
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #495057
+    LifeLineBackgroundColor #E9ECEF
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #E9ECEF44
+    DividerBackgroundColor #DEE2E6
+    DividerBorderColor #6C757D
+}
+skinparam noteBackgroundColor #FFF9C4
+skinparam noteBorderColor #F0AD4E
+
+title Remote Procedure Call Dispatch
+
+participant "AppCode" as app
+participant "Call\n«generated»" as call
+participant "XxxCallPacket\n«generated Packet»" as pkt
+participant "Net" as net
+participant "ArcNetProvider\n«client side»" as arcClient
+
+== Client Side: RPC Invocation ==
+
+app -> call : <methodName>(params)
+activate call
+
+note over call
+  Generated static method
+  from @Remote annotation
+end note
+
+alt local invocation enabled (local != none && (isServer || isClient || !net.active()))
+    call -> app : TargetClass.<methodName>(params)\n[local direct call, no network]
+end
+
+call -> pkt : new XxxCallPacket()
+activate pkt
+call -> pkt : packet.<field> = param\n[for each non-player parameter]
+
+alt send to all (net.server())
+    call -> net : send(packet, reliable=!unreliable)
+    activate net
+    note over net
+      iterates all connections,
+      calls con.send(packet, reliable)
+    end note
+    net -> arcClient : sendClient(packet, reliable)\nor con.send(packet, reliable)
+    deactivate net
+else send to one player (playerConnection variant)
+    call -> net : playerConnection.send(packet, reliable)
+    activate net
+    net -> arcClient : con.send(packet, reliable)
+    deactivate net
+end
+
+deactivate call
+
+activate arcClient
+arcClient -> pkt : packet.write(WRITE: Writes)
+activate pkt
+note over pkt
+  primitives: WRITE.<type>(val)
+  entities: TypeIO.writeEntity(WRITE, val)
+  (player field skipped on client for Loc.both)
+end note
+pkt --> arcClient : serialized bytes
+deactivate pkt
+deactivate arcClient
+
+== Network Boundary (TCP / UDP) ==
+
+...bytes transmitted over wire...
+
+== Server Side: Packet Reception & Dispatch ==
+
+participant "ArcNetProvider\n«server side»" as arcServer
+participant "Packet\n«base class»" as packetBase
+participant "NetConnection" as con
+participant "TargetClass\n«@Remote method»" as target
+
+arcServer -> arcServer : receive raw bytes\nidentify packet class by registered ID
+activate arcServer
+
+arcServer -> pkt : read(read: Reads, length: int)
+activate pkt
+note over pkt
+  DATA = READ.b(length)
+  stores raw bytes in buffer
+  (no deserialization yet)
+end note
+pkt --> arcServer : raw bytes buffered
+deactivate pkt
+
+arcServer -> pkt : handled()
+activate pkt
+note over pkt
+  BAIS.setBytes(DATA)
+  Reads READ = new Reads(BAIS)
+  deserializes each field in order
+  matching write() sequence
+  (primitives inline, entities via TypeIO.readEntity)
+end note
+pkt --> arcServer : fields populated
+deactivate pkt
+
+alt server-side handler
+    arcServer -> pkt : handleServer(con: NetConnection)
+    activate pkt
+    note over pkt
+      Guard: con.player == null || con.kicked → return
+    end note
+    pkt -> con : con.player (validate & assign player)
+    activate con
+    con --> pkt : player validated
+    deactivate con
+    pkt -> target : TargetClass.<methodName>(player, ...fields)
+    activate target
+    target --> pkt : [void]
+    deactivate target
+
+    opt forward=true && where.isServer
+        pkt -> call : Call.<name>__forward(exceptCon, player, ...fields)
+        activate call
+        note over call
+          private __forward method:
+          net.sendExcept(exceptConnection, packet, reliable)
+          broadcasts to all other clients
+        end note
+        call --> pkt : forwarded
+        deactivate call
+    end
+
+    deactivate pkt
+
+else client-side handler
+    arcServer -> pkt : handleClient()
+    activate pkt
+    pkt -> target : TargetClass.<methodName>(Vars.player, ...fields)
+    activate target
+    target --> pkt : [void]
+    deactivate target
+    deactivate pkt
+end
+
+deactivate arcServer
+
+note over packetBase
+  Packet base provides:
+  abstract write(Writes)
+  abstract read(Reads, int)
+  abstract handled()
+  handleServer(NetConnection)
+  handleClient()
+end note
+
+@enduml

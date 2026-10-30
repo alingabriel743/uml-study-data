@@ -1,0 +1,167 @@
+{
+  "scope": "show_command_workflow",
+  "title": "Show / List Command Workflow",
+  "diagram_type": "activity",
+  "key_participants": ["ShowCommand", "RepositoryManager", "InstalledRepository", "RepositorySet", "DefaultPolicy", "VersionSelector", "IOInterface", "CompletePackageInterface", "PackageInterface"],
+
+  "entry_point": "ShowCommand::execute(InputInterface $input, OutputInterface $output): int",
+
+  "activity_flow": [
+    "START: User runs `composer show [package] [version] [options]`",
+
+    "INIT: new VersionParser(); if --tree then initStyles(output)",
+    "INIT: tryComposer() → $composer (nullable); getIO() → $io",
+
+    "VALIDATE OPTIONS [guard block]:",
+    "  [--installed warned as deprecated]",
+    "  [--outdated → force --latest=true]",
+    "  [--direct + (--all|--available|--platform) → error, return 1]",
+    "  [--tree + (--all|--available) → error, return 1]",
+    "  [multiple of --major-only/--minor-only/--patch-only → error, return 1]",
+    "  [--tree + --latest → error, return 1]",
+    "  [--tree + --path → error, return 1]",
+    "  [format not in [text,json] → error, return 1]",
+
+    "BUILD PLATFORM REPO: new PlatformRepository([], $platformOverrides)",
+
+    "FORK: BUILD REPOSITORY SET based on flags:",
+    "  BRANCH --self (no --installed/--locked): InstalledRepository([RootPackageRepository(clone rootPkg)])",
+    "  BRANCH --platform: InstalledRepository([platformRepo])",
+    "  BRANCH --available (with composer): CompositeRepository(RepositoryManager::getRepositories()) + installedRepo adds localRepo",
+    "  BRANCH --available (no composer): RepositoryFactory::defaultReposWithDefaultManager(io)",
+    "  BRANCH --all (with composer): CompositeRepository([FilterRepository(installedRepo)] + RepositoryManager::getRepositories()); locker check → lockedRepo",
+    "  BRANCH --all (no composer): CompositeRepository([installedRepo] + defaultRepos)",
+    "  BRANCH --locked: Locker::getLockedRepository(!no-dev) → InstalledRepository([lockedRepo])",
+    "  BRANCH default/installed: InstalledRepository([RootRepo, localRepo]); if --no-dev filter via RepositoryUtils::filterRequiredPackages()",
+
+    "DISPATCH CommandEvent (PluginEvents::COMMAND, 'show') via EventDispatcher",
+    "[if --latest && no composer → disable --latest]",
+
+    "FORK: SINGLE PACKAGE vs LIST MODE:",
+
+    "=== SINGLE PACKAGE MODE (package arg set with no wildcard) ===",
+    "  LOOKUP: getPackage(installedRepo, repos, name, version):",
+    "    new RepositorySet('dev'); allowInstalledRepositories(); addRepository(repos)",
+    "    isPlatformPackage → createPoolWithAllPackages() else createPoolForPackage(name)",
+    "    pool.whatProvides(name, constraint) → match package",
+    "    if null === version && installedRepo.hasPackage() → matchedPackage",
+    "    else DefaultPolicy::selectPreferredPackages(pool, literals) → preferred",
+    "    return [CompletePackageInterface|null, versions[]]",
+    "  [if --direct && package not in getRootRequires() → InvalidArgumentException]",
+    "  [if package not found → throw InvalidArgumentException with hints]",
+
+    "  FORK on --tree:",
+    "    YES: generatePackageTree(package, installedRepo, remoteRepos):",
+    "           package.getRequires() → foreach req: addTree(name, link, installedRepo, remoteRepos, visited)",
+    "           addTree(): getPackage() recursively, build children array, detect circular deps",
+    "         if json: JsonFile::encode(['installed' => [arrayTree]])",
+    "         else: displayPackageTree([arrayTree]) → recursive displayTree() with ASCII ├└│── + color cycling",
+    "    NO: continue",
+
+    "  [if --path: io.write(package.getName() + installationManager.getInstallPath(package))]",
+
+    "  [if --latest: findLatestPackage(package, composer, platformRepo, flags)]:",
+    "    getRepositorySet(composer) → lazy-init RepositorySet with CompositeRepository(allRepos)",
+    "    new VersionSelector(repositorySet, platformRepo)",
+    "    determine targetVersion from --major-only/--minor-only/--patch-only",
+    "    versionSelector.findBestCandidate(name, targetVersion, stability, platformReqFilter)",
+
+    "  FORK output format:",
+    "    json: printPackageInfoAsJson(package, versions, installedRepo, latestPackage):",
+    "            build JSON struct; appendVersions(); appendLicenses(); appendAutoload(); appendLinks()",
+    "            io.write(JsonFile::encode(json))",
+    "    text: printPackageInfo(package, versions, installedRepo, latestPackage):",
+    "            printMeta() → name, description, keywords, printVersions(), released, latest, type, printLicenses(), homepage, source, dist, path, names, support, autoload",
+    "            printLinks(TYPE_REQUIRE); printLinks(TYPE_DEV_REQUIRE); suggests; printLinks(TYPE_PROVIDE/CONFLICT/REPLACE)",
+
+    "=== LIST MODE (no single package arg) ===",
+
+    "  [if --tree: collect rootRequires, sort packages, forEach root package → generatePackageTree(); displayPackageTree() or JSON]",
+
+    "  ITERATE RepositoryUtils::flattenRepositories(repos):",
+    "    classify repo → type: platform | locked | available | installed",
+    "    if ComposerRepository: collect getPackageNames(filter) as strings",
+    "    else: getPackages() → filter by AliasPackage, packageFilterRegex, packageListFilter (--direct)",
+    "    platformRepo.getDisabledPackages() also collected",
+
+    "  FOREACH type in [platform, locked, available, installed]:",
+    "    ksort packages[type]",
+    "    [if --latest && showVersion: findLatestPackage() for each object package → latestPackages[]]",
+    "    [if --sort-by-age: usort by getReleaseDate()]",
+    "    BUILD viewData[type][] per package:",
+    "      name, direct-dependency (in rootRequires), homepage, source (PackageInfo::getViewSourceUrl)",
+    "      version (if writeVersion), release-age/release-date (if writeReleaseDate)",
+    "      latest + latest-status: getUpdateStatus() → up-to-date|semver-safe-update|update-possible",
+    "      description (if CompletePackageInterface), path (if --path)",
+    "      warning + abandoned flag (if latestPackage.isAbandoned())",
+    "    [if --strict && hasOutdatedPackages: exitCode=1, break]",
+
+    "  RENDER OUTPUT:",
+    "    json: io.write(JsonFile::encode(viewData))",
+    "    text:",
+    "      [if --latest: print color legend to stderr]",
+    "      compute column widths: nameLength, versionLength, latestLength, releaseDateLength",
+    "      check terminal width fits: versionFits, latestFits, releaseDateFits, descriptionFits",
+    "      [if --latest && !--direct: split into directDeps / transitiveDeps, print separately]",
+    "      printPackages(io, packages, indent, writeVersion, writeLatest, writeDescription, widths):",
+    "        foreach pkg: pad name, write version, write latest (styled), write release-age, write description (truncated to terminal width, mb_strimwidth), write path, write warning",
+
+    "RETURN exitCode (0 or 1)"
+  ],
+
+  "key_methods": {
+    "execute": "Main entrypoint — validates options, builds repos, dispatches event, routes to single-package or list mode",
+    "getPackage": "Resolves a package by name/version using RepositorySet + pool.whatProvides() + DefaultPolicy",
+    "generatePackageTree": "Builds recursive array tree from package.getRequires() via addTree()",
+    "addTree": "Recursively resolves children, detects circular deps via $packagesInTree visited list",
+    "displayPackageTree": "ASCII tree rendering with ├──└── characters and 5-color cycle",
+    "displayTree": "Recursive display helper, aborts circular deps with warning label",
+    "findLatestPackage": "Uses VersionSelector.findBestCandidate() with stability/semver constraints",
+    "getRepositorySet": "Lazy-init RepositorySet combining all remote repos (cached in $this->repositorySet)",
+    "printPackageInfo": "Full single-package text output: meta + links",
+    "printPackageInfoAsJson": "Full single-package JSON output",
+    "printPackages": "Column-aligned list output with terminal-width-aware description truncation",
+    "getRootRequires": "Returns merged require+require-dev package names from root package",
+    "getUpdateStatus": "Returns up-to-date|semver-safe-update|update-possible based on semver satisfies()"
+  },
+
+  "key_relationships": [
+    "ShowCommand extends BaseCommand (uses CompletionTrait)",
+    "ShowCommand depends_on RepositoryManager (via composer.getRepositoryManager())",
+    "ShowCommand depends_on RepositorySet + DefaultPolicy (for package resolution)",
+    "ShowCommand depends_on VersionSelector + RepositorySet (for findLatestPackage)",
+    "ShowCommand uses InstalledRepository (wraps multiple repo types)",
+    "ShowCommand uses PlatformRepository (PHP/ext packages)",
+    "ShowCommand uses CompositeRepository (aggregates multiple repos)",
+    "ShowCommand uses FilterRepository (wrap with canonical/only/exclude filters)",
+    "ShowCommand reads CompletePackageInterface (description, keywords, license, autoload, suggests, support)",
+    "RepositoryManager holds InstalledRepositoryInterface localRepository + list<RepositoryInterface>",
+    "RepositoryManager.getLocalRepository() returns InstalledRepositoryInterface",
+    "RepositoryManager.getRepositories() returns remote repos list"
+  ],
+
+  "branching_conditions": [
+    "--self → show root package info only",
+    "--platform → only platform (php, ext-*) packages",
+    "--available → packages from remote repos",
+    "--all → all (installed + available combined)",
+    "--locked → from composer.lock only",
+    "default → installed packages only",
+    "--tree → dependency tree rendering (incompatible with --all, --available, --latest, --path)",
+    "--latest / --outdated → fetch latest version per package via VersionSelector",
+    "--direct → filter to root-directly-required packages only",
+    "--no-dev → filter via RepositoryUtils::filterRequiredPackages()",
+    "--sort-by-age → sort by getReleaseDate() ascending",
+    "--strict → return exit code 1 if outdated packages found",
+    "format=json → JSON output; format=text → aligned table output",
+    "single package arg (no wildcard) → single package detail view",
+    "package arg with wildcard → regex filter on list mode"
+  ],
+
+  "important_notes": "ShowCommand is the 'composer show'/'composer info' command. Three distinct output paths: (1) single package detail, (2) dependency tree, (3) package list table. Output columns adapt to terminal width using getTerminalWidth(). Abandoned packages trigger warnings. The lazy $repositorySet cache avoids re-creating the full repo pool per package in --latest list mode.",
+
+  "source_files_analyzed": [
+    "src/src/Composer/Command/ShowCommand.php",
+    "src/src/Composer/Repository/RepositoryManager.php"
+  ]
+}

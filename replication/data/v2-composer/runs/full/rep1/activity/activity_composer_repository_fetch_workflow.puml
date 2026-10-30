@@ -1,0 +1,306 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleBackgroundColor #E9ECEF
+}
+skinparam note {
+    BackgroundColor #E3F2FD
+    BorderColor #1565C0
+}
+
+title Composer Repository Fetch Workflow\n(ComposerRepository — Packagist metadata fetch, stability filter, async package load)
+
+|ComposerRepository|
+start
+:loadPackages(packageNameMap,\nacceptableStabilities, stabilityFlags, alreadyLoaded);
+
+:Call hasProviders()\n→ triggers loadRootServerFile();
+
+|#D4EDDA|ComposerRepository — loadRootServerFile|
+
+if (rootData already cached?) then (yes)
+    :Return cached rootData;
+else (no)
+    if (OpenSSL extension loaded?) then (no)
+        :Throw RuntimeException\n(HTTPS not available);
+        stop
+    else (yes)
+    endif
+
+    |Cache|
+    :Read cache("packages.json");
+
+    |ComposerRepository — loadRootServerFile|
+    if (Cache hit?) then (yes)
+        if (rootMaxAge set AND\ncache age <= maxAge?) then (yes)
+            :Use cachedData directly\n(TTL cache hit);
+        else (no)
+            if (last-modified header\nin cached data?) then (yes)
+                :fetchFileIfLastModified\n(url, key, lastModified);
+                |HttpDownloader|
+                :HTTP GET with\nIf-Modified-Since header;
+                |ComposerRepository — loadRootServerFile|
+                if (HTTP 304 Not Modified?) then (yes)
+                    :Use cachedData;
+                else (no)
+                    :Use fresh response data;
+                endif
+            else (no)
+                :fetchFile(packagesJsonUrl,\n"packages.json", null,\nstoreLastModifiedTime=true);
+            endif
+        endif
+    else (no)
+        :fetchFile(packagesJsonUrl,\n"packages.json", null,\nstoreLastModifiedTime=true);
+    endif
+endif
+
+|#FFF8E1|ComposerRepository — fetchFile|
+
+|EventDispatcher|
+:Dispatch PreFileDownloadEvent;
+
+|HttpDownloader|
+:HTTP GET(filename, options);
+
+|ComposerRepository — fetchFile|
+:Receive HTTP response;
+
+repeat
+    if (sha256 provided AND\nhash mismatch?) then (yes)
+        if (Retries remaining\n(max 3)?) then (yes)
+            :Sleep 100ms;
+        else (no)
+            :Throw RepositorySecurityException;
+            stop
+        endif
+    endif
+repeat while (Hash valid OR no sha256?) is (no)
+->yes;
+
+if (TransportException 404?) then (yes)
+    :Re-throw 404 exception;
+    stop
+else (no)
+    if (Other exception AND\nstale cache exists?) then (yes)
+        :Use degraded (stale) cache;
+        :Set degradedMode = true;
+        note right: IO warning logged
+    else (no)
+    endif
+endif
+
+:Decode JSON response;
+if (storeLastModifiedTime AND\nlast-modified header?) then (yes)
+    :Embed last-modified\nin response data;
+else (no)
+endif
+
+|Cache|
+:Write response to cache\n(if not readOnly);
+
+|EventDispatcher|
+:Dispatch PostFileDownloadEvent;
+
+|ComposerRepository — fetchFile|
+:Return parsed data;
+
+|ComposerRepository — loadRootServerFile|
+:Parse root data:\nextract notify-batch, search, mirrors;
+
+if (metadata-url present?\n(V2 protocol)) then (yes)
+    :Set lazyProvidersUrl = metadata-url;
+    :Clear providersUrl;
+    :hasProviders = false;
+    if (available-packages list?) then (yes)
+        :Build availablePackages map;
+        :hasAvailablePackageList = true;
+    endif
+    if (available-package-patterns?) then (yes)
+        :Compile regex patterns;
+    endif
+    if (security-advisories?) then (yes)
+        :Store securityAdvisoryConfig;
+    endif
+else (no)
+    if (providers-lazy-url?) then (yes)
+        :Set lazyProvidersUrl;
+        :hasProviders = true;
+    endif
+    if (providers-url?) then (yes)
+        :Set providersUrl;
+        :hasProviders = true;
+    endif
+endif
+
+if (allowSslDowngrade?) then (yes)
+    :Downgrade HTTPS → HTTP\nin all URLs;
+endif
+
+:Cache and return rootData;
+
+|ComposerRepository|
+if (hasProviders OR\nhasPartialPackages()?) then (yes — V1 path)
+    note right: Synchronous provider fetch\n(V1 static or lazy provider)
+    :For each name in packageNameMap;
+    if (No providers AND\npartial package missing?) then (yes)
+        :Skip this package name;
+    else (no)
+        :whatProvides(name,\nstabilities, stabilityFlags, alreadyLoaded);
+
+        |#E8F5E9|ComposerRepository — whatProvides|
+        if (Partial package\nexists for name?) then (yes)
+            :Use partialPackagesByName data;
+        else (no)
+            if (providerListing null?) then (yes)
+                :loadRootServerFile()\n+ loadProviderListings();
+            endif
+            :Determine URL and cacheKey\n(lazyProvidersUrl or providersUrl);
+            if (Cache valid?\n(sha256 or last-modified)) then (yes)
+                :Use cached packages;
+            else (no)
+                :fetchFile(url, cacheKey,\nhash, lastModifiedCheck);
+                if (HTTP 404 or 499\nfor lazy provider?) then (yes)
+                    :Treat as empty packages [];
+                endif
+            endif
+        endif
+
+        :For each version in packages;
+        if (Wrong name OR\nalready loaded?) then (yes)
+            :Skip version;
+        else (no)
+            :VersionParser.normalize(version);
+            if (isVersionAcceptable\n(stability + constraint)?) then (yes)
+                :StabilityFilter.isPackageAcceptable();
+                :Add to versionsToLoad;
+            else (no)
+                :Skip version;
+            endif
+        endif
+
+        :createPackages(versionsToLoad, packagesSource);
+        :For each loaded package:\nsetRepository(this);
+        if (AliasPackage?) then (yes)
+            :Also setRepository\non aliasOf package;
+        endif
+        :Return result map;
+        |ComposerRepository|
+        :Filter candidates by constraint;
+        :Include AliasPackage aliases\nof matched packages;
+        :Merge into packages array;
+    endif
+else (no — V2 async path)
+    if (lazyProvidersUrl set AND\npackageNameMap not empty?) then (yes)
+        note right: V2 protocol — ReactPHP async\nHTTP with loop->wait()
+        if (hasAvailablePackageList?) then (yes)
+            :Filter packageNameMap to\nonly known packages;
+        endif
+        :loadAsyncPackages(packageNameMap,\nstabilities, stabilityFlags, alreadyLoaded);
+
+        |#F3E5F5|ComposerRepository — loadAsyncPackages|
+        :loadRootServerFile() (ensure initialized);
+        :For each name in packageNames;
+        if (dev stability acceptable?) then (yes)
+            :Queue "name~dev" variant;
+        endif
+        if (ONLY dev stability requested?) then (yes)
+            :Remove non-dev entry;
+        endif
+        if (Platform package or __root__?) then (yes)
+            :Skip;
+        else (no)
+            :startCachedAsyncDownload\n(name, realName) → Promise;
+
+            |#EDE7F6|ComposerRepository — asyncFetchFile|
+            if (In packagesNotFoundCache?) then (yes)
+                :Resolve with empty immediately;
+            else if (In freshMetadataUrls?) then (yes)
+                :Resolve with true\n(304 simulation);
+            else (no)
+                :Build URL from\nlazyProvidersUrl template\n(%package% replaced);
+                |Cache|
+                :Read last-modified timestamp;
+                |HttpDownloader|
+                :Async HTTP GET(url, options);
+                |ComposerRepository — asyncFetchFile|
+                if (HTTP 304?) then (yes)
+                    :Resolve with true;
+                else if (HTTP 200?) then (yes)
+                    |Cache|
+                    :Cache response;
+                    |ComposerRepository — asyncFetchFile|
+                    :Resolve with data;
+                else if (HTTP 404?) then (yes)
+                    |Cache|
+                    :Cache as not-found;
+                    |ComposerRepository — asyncFetchFile|
+                    :Resolve with empty;
+                endif
+            endif
+
+            |ComposerRepository — loadAsyncPackages|
+            if (Response == true\n(304 / fresh)?) then (yes)
+                :Use cached contents;
+            else (no)
+                :Use fresh response data;
+            endif
+            :Register .then() callback\non promise;
+        endif
+
+        fork
+            :Async download promise 1;
+        fork again
+            :Async download promise 2;
+        fork again
+            :... (remaining promises);
+        end fork
+        :loop->wait(promises)\n— block until ALL complete;
+
+        :For each resolved promise callback;
+        if (Response has\npackages[realName]?) then (yes)
+            if (Minified format\n(composer/2.0)?) then (yes)
+                :MetadataMinifier::expand(versions);
+            endif
+            :For each version:\nnormalize version_normalized;
+            if (Already loaded?) then (yes)
+                :Skip;
+            else (no)
+                if (isVersionAcceptable\n(constraint + stability)?) then (yes)
+                    :Add to versionsToLoad;
+                else (no)
+                    :Skip version;
+                endif
+            endif
+            :createPackages(versionsToLoad, packagesSource);
+            :For each package:\nsetRepository(this);
+            if (AliasPackage?) then (yes)
+                :Register aliasOf\nin result map too;
+            endif
+        endif
+        :Return {namesFound, packages};
+
+        |ComposerRepository|
+        :Merge async result packages\ninto main packages array;
+    endif
+endif
+
+|ComposerRepository|
+:Return {namesFound: array_keys, packages};
+stop
+
+@enduml

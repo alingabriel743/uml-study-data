@@ -1,0 +1,159 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #212529
+    EndColor #212529
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleBackgroundColor #DEE2E6
+}
+skinparam note {
+    BackgroundColor #FFF3CD
+    BorderColor #FFC107
+}
+
+title Evolver Agent — Main Lifecycle and Sync Workflow
+
+|Main Process|
+start
+:Parse environment config\n(flags, intervals, env vars);
+:readJsonSafe: Load existing state;
+
+if (Pending run detected?) then (yes)
+    :rejectPendingRun\nRename state file with timestamp;
+endif
+
+:acquireLock\nWrite PID to lock file;
+
+if (Lock acquired?) then (no)
+    :Log error and exit;
+    stop
+endif
+
+|EvoMapProxy|
+:EvoMapProxy.constructor\nBuild hub URL and agent config;
+:EvoMapProxy.start\nInitialise proxy subsystems;
+fork
+    |LifecycleManager|
+    :LifecycleManager.hello\nBuild env fingerprint\nPOST /hello to hub;
+    if (Auth successful?) then (no)
+        :AuthError thrown\nLog authentication failure;
+        stop
+    endif
+    :LifecycleManager.startHeartbeatLoop\nSchedule periodic heartbeats;
+fork again
+    |ProxyHttpServer|
+    :ProxyHttpServer.start\nBind HTTP server on configured port\nRegister A2A + proxy routes;
+fork again
+    |WebUiServer|
+    :WebUiServer.start\nBind Web UI HTTP server\nBuild web UI routes;
+fork again
+    |TaskMonitor|
+    :TaskMonitor.subscribe\nSend subscribe message to hub\nBegin tracking task metrics;
+end fork
+
+|SyncEngine|
+:SyncEngine.start\nRecord start timestamp;
+fork
+    :SyncEngine._scheduleInbound\nSet inbound poll timer;
+fork again
+    :SyncEngine._scheduleOutbound\nSet outbound flush timer;
+end fork
+
+|Main Process|
+repeat
+
+    |SyncEngine|
+    :Inbound poll tick;
+
+    |InboundSync|
+    :InboundSync.pull\nFetch messages from hub via HTTP;
+    if (AuthError on pull?) then (yes)
+        :SyncEngine._handleAuthError\nEmit onAuthError callback;
+        :LifecycleManager.reAuthenticate\nRetry hello / reset secret;
+    else (no)
+        :Store inbound batch\nMailboxStore._rebuildIndex;
+    endif
+
+    |SkillUpdater|
+    :SkillUpdater.pollAndApply\nPoll mailbox for skill-update messages;
+    if (Skill update message found?) then (yes)
+        :SkillUpdater.processSkillUpdate\nWrite skill.md to disk\nLog skill version;
+    endif
+
+    |DmHandler|
+    :DmHandler.poll\nList direct messages from MailboxStore;
+    if (Direct messages pending?) then (yes)
+        :DmHandler.list\nRetrieve pending DM envelopes;
+        :Process each DM payload;
+        :DmHandler.ack\nAcknowledge processed message IDs;
+    endif
+
+    |SessionHandler|
+    :SessionHandler — check for session events;
+    if (Session invite received?) then (yes)
+        :SessionHandler.joinSession\nValidate session ID and role;
+        :SessionHandler.sendMessage\nPost message into session channel;
+    endif
+    if (Subtask delegation requested?) then (yes)
+        :SessionHandler.delegateSubtask\nValidate role, set deadline\nSend delegation envelope;
+    endif
+    if (Result submission ready?) then (yes)
+        :SessionHandler.submitResult\nSlice summary, attach score\nSend result envelope;
+    endif
+
+    |OutboundSync|
+    :OutboundSync.flush\nCollect pending outbound messages\nHTTP POST batch to hub;
+    if (Flush successful?) then (yes)
+        :MailboxStore.updateStatusBatch\nMark messages as delivered;
+    else (no)
+        :Log error, retain messages\nSchedule retry;
+    endif
+
+    |SyncEngine|
+    :SyncEngine.notifyNewOutbound\nReschedule outbound timer if needed;
+
+    |LifecycleManager|
+    :LifecycleManager.heartbeat\nBuild heartbeat payload\nPOST /heartbeat to hub;
+
+    |TaskMonitor|
+    :TaskMonitor.recordClaim / recordComplete / recordFailed\nUpdate in-memory metrics;
+
+    |Main Process|
+    :writeCycleProgressAtomic\nWrite progress JSON atomically;
+    if (autoDistill triggered?) then (yes)
+        :completeDistillation\nRun distillation pipeline;
+    endif
+    :sleepMs(cycleIntervalMs)\nWait for next cycle;
+
+repeat while (Shutdown signal received?) is (no)
+-> yes;
+
+|EvoMapProxy|
+:EvoMapProxy.stop\nStop heartbeat loop\nClose proxy HTTP server;
+
+|WebUiServer|
+:WebUiServer.stop\nClose Web UI HTTP server;
+
+|TaskMonitor|
+:TaskMonitor.unsubscribe\nSend unsubscribe message to hub;
+
+|Main Process|
+:shutdown\nstopEventStream\nreleaseLock — delete PID file;
+
+stop
+
+@enduml

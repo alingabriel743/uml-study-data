@@ -1,0 +1,299 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 11
+skinparam backgroundColor #FEFEFE
+skinparam activityBackgroundColor #F8F9FA
+skinparam activityBorderColor #495057
+skinparam activityArrowColor #495057
+skinparam activityFontColor #212529
+skinparam activityDiamondBackgroundColor #FFF3CD
+skinparam activityDiamondBorderColor #856404
+skinparam swimlaneBackgroundColor #E9ECEF
+skinparam swimlaneBorderColor #6C757D
+skinparam swimlaneTitleFontColor #212529
+
+title Plugin Loading Workflow — PluginManager (Composer)
+
+|PluginManager|
+start
+:loadInstalledPlugins();
+
+if (arePluginsDisabled('local')?) then (no)
+  :getLocalInstalledRepository();
+
+  |PackageSorter|
+  :repo.getPackages() — retrieve all packages;
+  :Assign priority weights:\n  composer/installers → −10000\n  plugin-modifies-install-path → −10000;
+  :PackageSorter::sortPackages(packages, weights)\n  [topological — high-priority first];
+
+  |PluginManager|
+  :RepositoryUtils::filterRequiredPackages\n  (packages, rootPackage);
+
+  repeat
+    :Next sorted package;
+    if (instanceof CompletePackage\nAND type in [composer-plugin,\ncomposer-installer]?) then (yes)
+      if (NOT in requiredPackages\nAND NOT isPluginAllowed?) then (yes)
+        :io.writeError warning — skip;
+      else (no — required or allowed)
+        :registerPackage(pkg, failOnMissing=false, isGlobal=false);
+      endif
+    else (no)
+      :skip — wrong type or not CompletePackage;
+    endif
+  repeat while (more local packages?) is (yes)
+else (yes — local disabled)
+endif
+
+if (globalComposer != null\nAND NOT arePluginsDisabled('global')?) then (yes)
+  note right: loadRepository(globalRepo, isGlobal=true)\nNo filterRequiredPackages step
+
+  |PackageSorter|
+  :PackageSorter::sortPackages(globalPackages, weights);
+
+  |PluginManager|
+  repeat
+    :Next sorted global package;
+    if (instanceof CompletePackage\nAND type in plugin types?) then (yes)
+      :registerPackage(pkg, failOnMissing=false, isGlobal=true);
+    else (no)
+      :skip package;
+    endif
+  repeat while (more global packages?) is (yes)
+else (no)
+endif
+
+note right
+  **registerPackage(pkg, failOnMissingClasses, isGlobalPlugin)**
+  [invoked per qualifying package from the loops above]
+end note
+
+if (arePluginsDisabled()?) then (yes)
+  :io.writeError("plugins disabled") — return;
+  stop
+else (no)
+endif
+
+if (type == 'composer-plugin'?) then (yes)
+  if (composer-plugin-api missing\nfrom require list?) then (yes)
+    :throw RuntimeException\n  "composer-plugin-api not required";
+    stop
+  else (no)
+  endif
+  if (API version incompatible\nwith PLUGIN_API_VERSION 2.9.0?) then (yes)
+    :io.writeError(API mismatch warning) — return;
+    stop
+  else (no)
+  endif
+  if (symfony/flex < 1.9.8\ndetected in requirements?) then (yes)
+    :io.writeError("symfony/flex conflict") — return;
+    stop
+  else (no)
+  endif
+endif
+
+:isPluginAllowed(name, isGlobal, optional=false, prompt=true);
+if (plugin NOT allowed?) then (yes)
+  :io.writeError(debug "not allowed") — return;
+  stop
+else (no)
+endif
+
+if (already in registeredPlugins[]?) then (yes)
+  :return — idempotent guard;
+  stop
+else (no)
+endif
+
+:Read extra['class'] list from package metadata;
+if (class list empty?) then (yes)
+  :throw RuntimeException\n  "plugin class missing from extra";
+  stop
+else (no)
+endif
+
+:collectDependencies() → parseAutoloads()\n  → createLoader() → classLoader.register();
+:Load files autoload entries\n  [skip laminas bridge hack];
+
+repeat
+  :Process next class from list;
+  if (class name already exists in PHP?) then (yes)
+    :eval() rename existing class\n  to _composer_tmp{staticCounter};
+  else (no)
+  endif
+  if (type == 'composer-installer'?) then (yes)
+    if (implements InstallerInterface?) then (no)
+      :throw RuntimeException\n  "must implement InstallerInterface";
+      stop
+    else (yes)
+      :new $class(io, composer);
+      |InstallationManager|
+      :addInstaller(installer);
+      |PluginManager|
+      :registeredPlugins[name][] = installer;
+    endif
+  else (no — composer-plugin)
+    if (class_exists in PHP?) then (yes)
+      if (implements PluginInterface?) then (no)
+        :throw RuntimeException\n  "must implement PluginInterface";
+        stop
+      else (yes)
+        :new $class();
+        :addPlugin(plugin, isGlobal, package);
+        :registeredPlugins[name][] = plugin;
+      endif
+    else (no — class missing)
+      if (failOnMissingClasses?) then (yes)
+        :throw UnexpectedValueException\n  "class not found";
+        stop
+      else (no)
+        :skip missing class silently;
+      endif
+    endif
+  endif
+repeat while (more classes in list?) is (yes)
+
+note right
+  **addPlugin(plugin, isGlobalPlugin, sourcePackage)**
+  [called from registerPackage for each PluginInterface instance]
+end note
+
+if (arePluginsDisabled()?) then (yes)
+  :return immediately;
+  stop
+else (no)
+endif
+
+if (sourcePackage == null?) then (yes)
+  :trigger E_USER_DEPRECATED warning;
+else (no)
+endif
+
+:isPluginAllowed(sourcePackage.name, isGlobal, optional=false);
+if (plugin NOT allowed?) then (yes)
+  :io.writeError(debug "not allowed in addPlugin") — return;
+  stop
+else (no)
+endif
+
+:io.writeError("Loading plugin: {name}") [DEBUG];
+:plugins[] = plugin — add to active plugin list;
+
+|Plugin / Installer|
+:plugin.activate(composer, io);
+
+|PluginManager|
+if (plugin implements\nEventSubscriberInterface?) then (yes)
+  :eventDispatcher.addSubscriber(plugin);
+else (no)
+endif
+
+note right
+  **isPluginAllowed(package, isGlobal, optional, prompt)**
+  [shared helper — called from loadRepository, registerPackage, addPlugin]
+end note
+
+:Select rules:\n  allowPluginRules (local) or allowGlobalPluginRules (global);
+
+if (rules == null?\n[legacy lock file, pre-2.2]) then (yes)
+  if (interactive mode?) then (yes)
+    :rules = [] — empty, will prompt for each;
+  else (no — non-interactive)
+    :throw RuntimeException\n  "lock file without allow-plugins config";
+    stop
+  endif
+else (no)
+endif
+
+if (rules === true?) then (yes)
+  :return true — all plugins allowed;
+else if (rules === false?) then (yes)
+  :return false — all plugins blocked;
+else (map)
+  if (package name matches\na glob pattern in rules?) then (yes)
+    :return allow/block per matched pattern;
+  else (no match)
+    if (pkg == 'composer/package-versions-deprecated'?) then (yes)
+      :return false — always blocked (deprecated);
+    else (no)
+      if (interactive mode AND prompt=true?) then (yes)
+        |User (IO)|
+        :Prompt: "Allow plugin {name}? [y,n,d,?]";
+        if (answer == 'y'?) then (yes)
+          :Persist allow=true to\n  composer.json allow-plugins;
+          :return true;
+        elseif (answer == 'n'?) then (yes)
+          :Persist allow=false to\n  composer.json allow-plugins;
+          :return false;
+        elseif (answer == 'd' or\n>5 attempts?) then (yes)
+          :Discard — return false;
+        endif
+        |PluginManager|
+      else (no — non-interactive or no prompt)
+        if (optional == true?) then (yes)
+          :return false — silently skip;
+        else (no)
+          :throw PluginBlockedException\n  "plugin not in allow-plugins";
+          stop
+        endif
+      endif
+    endif
+  endif
+endif
+
+|PluginManager|
+
+note right
+  **DEACTIVATION PATH — deactivateInstalledPlugins()**
+  [called on uninstall or Composer shutdown]
+end note
+
+if (Local repo available\nAND local not disabled?) then (yes)
+  :deactivateRepository(localRepo, isGlobal=false);
+else (no)
+endif
+
+if (globalComposer != null\nAND global not disabled?) then (yes)
+  :deactivateRepository(globalRepo, isGlobal=true);
+else (no)
+endif
+
+|PackageSorter|
+:PackageSorter::sortPackages(packages)\n  [REVERSED — deactivate in reverse load order];
+
+|PluginManager|
+repeat
+  :Next package (reversed sort order);
+  if (type in [composer-plugin,\ncomposer-installer]?) then (yes)
+    if (name in registeredPlugins[]?) then (yes)
+      repeat
+        :Next registered plugin/installer\n  for this package;
+        if (implements InstallerInterface?) then (yes)
+          |InstallationManager|
+          :installationManager.removeInstaller(plugin);
+          |PluginManager|
+        else (no — PluginInterface)
+          :removePlugin(plugin);
+          |Plugin / Installer|
+          if (plugin found in plugins[] (strict)?) then (yes)
+            :io.writeError("Unloading plugin: {name}") [DEBUG];
+            :unset plugins[index];
+            :plugin.deactivate(composer, io);
+            :eventDispatcher.removeListener(plugin);
+          else (no — not found)
+            :return — nothing to remove;
+          endif
+          |PluginManager|
+        endif
+      repeat while (more plugins for package?) is (yes)
+      :unset registeredPlugins[name];
+    else (no — not registered)
+    endif
+  else (no — not a plugin type)
+  endif
+repeat while (more packages?) is (yes)
+
+stop
+
+@enduml

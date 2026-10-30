@@ -1,0 +1,263 @@
+@startuml
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequenceParticipant underline
+skinparam sequence {
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    NoteBackgroundColor #FFF3CD
+    NoteBorderColor #FFC107
+    GroupBorderColor #6C757D
+    GroupBackgroundColor #DEE2E6
+    GroupFontColor #212529
+    DividerBackgroundColor #CED4DA
+    DividerFontColor #212529
+    BoxBackgroundColor #F1F3F5
+    BoxBorderColor #ADB5BD
+}
+
+title Annotation Processor Code Generation Pipeline
+
+participant "Java\nCompiler" as compiler
+participant "BaseProcessor" as base
+participant "EntityProcess" as entity
+participant "AssetsProcess" as assets
+participant "StructProcess" as struct
+participant "RemoteProcess" as remote
+participant "LoadRegion\nProcessor" as loadregion
+participant "TypeIOResolver" as resolver
+participant "EntityIO" as entityio
+participant "CallGenerator" as callgen
+participant "JavaPoet\n(TypeSpec/JavaFile)" as javapoet
+participant "Filer\n(javax.tools)" as filer
+
+== Initialization ==
+
+compiler -> base: init(ProcessingEnvironment)
+activate base
+base -> base: store typeu, elementu,\nfiler, messager, trees
+base -> base: set rootDirectory\nfrom CLASS_OUTPUT path
+deactivate base
+
+== EntityProcess — Round 1: Component Interfaces ==
+
+compiler -> entity: process(RoundEnvironment) [round=1]
+activate entity
+entity -> resolver: resolve(this)
+activate resolver
+resolver --> entity: ClassSerializer
+deactivate resolver
+entity -> base: types(BaseComponent.class)\n→ baseComponents
+entity -> base: types(Component.class)\n→ allComponents
+entity -> entity: collect varInitializers,\nmethodBlocks, componentNames,\nimports per component
+
+loop for each Component
+    entity -> javapoet: interfaceBuilder(interfaceName(comp))
+    activate javapoet
+    javapoet --> entity: TypeSpec.Builder inter
+    deactivate javapoet
+    entity -> entity: getDependencies(comp)\nadd superinterfaces\nadd abstract getters/setters
+    entity -> base: write(inter)
+    activate base
+    base -> javapoet: JavaFile.builder(packageName, inter.build())
+    base -> filer: writeTo(filer)
+    note right of filer: Emits IBlock, IUnit, etc.\nin mindustry.gen
+    filer --> base: ok
+    deactivate base
+    opt component.base() == true
+        entity -> javapoet: classBuilder(baseName(comp))
+        activate javapoet
+        javapoet --> entity: TypeSpec.Builder baseClass
+        deactivate javapoet
+        entity -> entity: baseClasses.add(baseClass)
+    end
+end
+deactivate entity
+
+== EntityProcess — Round 2: Entity Classes, Groups & EntityMapping ==
+
+compiler -> entity: process(RoundEnvironment) [round=2]
+activate entity
+
+loop for each GroupDef
+    entity -> javapoet: interfaceBuilder('IndexableEntity__' + name)
+    entity -> base: write(accessor)
+    base -> filer: writeTo(filer)
+    note right of filer: Group accessor interface
+end
+
+loop for each EntityDef
+    entity -> entity: allComponents(type) →\ninterfaces → getDependencies()\n(recursive)
+    entity -> javapoet: classBuilder(entityName)
+    activate javapoet
+    javapoet --> entity: TypeSpec.Builder entityBuilder
+    deactivate javapoet
+    entity -> entity: merge component fields & methods\n(priority / @Replace resolution)
+    opt entity has @EntityIO
+        entity -> entityio: new EntityIO(name, builder,\nallFieldSpecs, serializer,\nrevisionsDir)
+        activate entityio
+        entity -> entityio: io.write(mbuilder, isWrite, allFields)
+        entity -> entityio: io.writeSync(mbuilder, isWrite, allFields)
+        entity -> entityio: io.writeSyncManual(mbuilder,\nisWrite, syncedFields)
+        entity -> entityio: io.writeInterpolate(mbuilder, syncedFields)
+        entityio --> entity: read / write / sync /\ninterpolate MethodSpecs
+        deactivate entityio
+    end
+end
+
+entity -> javapoet: build Groups class\n(init / clear / resize / update / queueFree)
+entity -> base: write(groupsBuilder)
+base -> filer: writeTo(filer)
+note right of filer: Emits Groups class\nin mindustry.gen
+
+entity -> entity: load classids.properties\nassign classID per EntityDefinition
+entity -> javapoet: build EntityMapping class\n(idMap[], nameMap, classId())
+entity -> base: write(entityMappingBuilder)
+base -> filer: writeTo(filer)
+note right of filer: Emits EntityMapping class\nin mindustry.gen
+deactivate entity
+
+== EntityProcess — Round 3: Finalize & Emit Entity Classes ==
+
+compiler -> entity: process(RoundEnvironment) [round=3]
+activate entity
+loop for each EntityDefinition
+    entity -> entity: set superclass\naddSuperinterface per component\ngenerate getter/setter overrides
+    entity -> base: write(def.builder, imports)
+    activate base
+    base -> base: sort members deterministically
+    base -> javapoet: JavaFile.builder(packageName,\ndef.builder.build())
+    base -> filer: createSourceFile() → writeTo(filer)
+    note right of filer: Emits concrete entity classes\n(Bullet, Unit, …) in mindustry.gen
+    filer --> base: ok
+    deactivate base
+end
+entity -> base: write all baseClass builders
+activate base
+base -> filer: writeTo(filer)
+note right of filer: Emits Block, Unit\nbase classes
+deactivate base
+deactivate entity
+
+== AssetsProcess — Asset Registration ==
+
+compiler -> assets: process(RoundEnvironment)
+activate assets
+
+assets -> assets: processSounds('Sounds',\ncore/assets/sounds,\narc.audio.Sound, genid=true)
+activate assets
+assets -> assets: walk asset directory\nbuild static Sound fields\n+ load statements\nbuild getSoundId() / getSound() + maps
+assets -> javapoet: JavaFile.builder(packageName, Sounds.build())
+assets -> filer: writeTo(filer)
+note right of filer: Emits Sounds class
+deactivate assets
+
+assets -> assets: processSounds('Musics',\ncore/assets/music,\narc.audio.Music, genid=false)
+activate assets
+assets -> assets: walk asset directory\nbuild static Music fields + load statements
+assets -> javapoet: JavaFile.builder(packageName, Musics.build())
+assets -> filer: writeTo(filer)
+note right of filer: Emits Musics class
+deactivate assets
+
+assets -> assets: processUI(StyleDefaults elements)
+activate assets
+assets -> assets: read icons.properties + config.json\nbuild Iconc char constants + codeToName maps
+assets -> assets: walk sprites/ui PNG files\nbuild Tex Drawable fields + atlas.drawable() loads
+assets -> assets: iterate StyleDefaults elements\nloadStyles() / addStyle statements
+assets -> javapoet: JavaFile.builder(...) [Iconc, Icon, Tex]
+assets -> filer: writeTo(filer)
+note right of filer: Emits Iconc, Icon, Tex classes
+deactivate assets
+
+deactivate assets
+
+== StructProcess — Struct Packing ==
+
+compiler -> struct: process(RoundEnvironment)
+activate struct
+struct -> base: types(Struct.class) → elements
+
+loop for each @Struct class
+    struct -> struct: compute structSize (sum bit-widths)\npick structType (byte/short/int/long)
+    struct -> javapoet: classBuilder(structClass)
+    activate javapoet
+    javapoet --> struct: TypeSpec.Builder classBuilder
+    deactivate javapoet
+    struct -> struct: build get(fields…) constructor\n(bit-packing expression)
+    loop for each field
+        struct -> struct: build getter (bit-shift / mask)\nbuild setter (clear + set bits)\nadd bitMask<Field> constant
+    end
+    struct -> javapoet: JavaFile.builder(packageName,\nclassBuilder.build())
+    struct -> filer: writeTo(filer)
+    note right of filer: Emits packed struct class\n(e.g. DrawLayer) in mindustry.gen
+end
+deactivate struct
+
+== RemoteProcess — RPC Scaffolding ==
+
+compiler -> remote: process(RoundEnvironment)
+activate remote
+remote -> resolver: resolve(this)
+activate resolver
+resolver --> remote: ClassSerializer
+deactivate resolver
+remote -> base: methods(Remote.class) → elements
+remote -> remote: sort by toString\nassign lastMethodID\ncreate MethodEntry per @Remote method
+
+remote -> callgen: generate(serializer, methods)
+activate callgen
+callgen -> javapoet: classBuilder('Call')
+activate javapoet
+javapoet --> callgen: TypeSpec.Builder callBuilder
+deactivate javapoet
+
+loop for each MethodEntry
+    callgen -> javapoet: classBuilder(packetClassName)\nextends Packet
+    activate javapoet
+    javapoet --> callgen: TypeSpec.Builder packet
+    deactivate javapoet
+    callgen -> callgen: makeWriter(packet, ent, serializer)\n→ write() serialization method
+    callgen -> callgen: makeReader(packet, ent, serializer)\n→ read() deserialization method
+    opt ent.where.isClient
+        callgen -> callgen: addMethod(writeHandleMethod(ent, false))
+    end
+    opt ent.where.isServer
+        callgen -> callgen: addMethod(writeHandleMethod(ent, true))
+    end
+    callgen -> callgen: registerPackets()
+end
+
+callgen -> javapoet: JavaFile.builder(packageName, callBuilder.build())
+callgen -> filer: writeTo(filer)
+note right of filer: Emits Call class with packet\nsubclasses per @Remote method\nin mindustry.gen
+deactivate callgen
+deactivate remote
+
+== LoadRegionProcessor — Content Region Loading ==
+
+compiler -> loadregion: process(RoundEnvironment)
+activate loadregion
+loadregion -> base: fields(Load.class)\n→ annotated Svar fields
+loadregion -> loadregion: group by enclosing type\n→ ObjectMap<Stype, Seq<Svar>> fieldMap
+loadregion -> loadregion: build loadRegions(MappableContent)\nmethod body
+
+loop for each enclosing type
+    loadregion -> loadregion: if(content instanceof Type) block\natlas.find() assignment per field\nhandle array fields (multi-dim loops)\nfallback regions via parse()
+end
+
+loadregion -> base: write(regionClass)
+activate base
+base -> javapoet: JavaFile.builder(packageName,\nContentRegions.build())
+base -> filer: createSourceFile('ContentRegions')\n→ writeTo(filer)
+note right of filer: Emits ContentRegions class\nwith loadRegions(MappableContent)\nin mindustry.gen
+filer --> base: ok
+deactivate base
+deactivate loadregion
+
+@enduml

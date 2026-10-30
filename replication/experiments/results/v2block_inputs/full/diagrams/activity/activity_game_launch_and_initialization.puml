@@ -1,0 +1,169 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleBackgroundColor #E9ECEF
+    TitleFontColor #212529
+}
+
+title Game Launch and Initialization
+
+|AndroidLauncher|
+start
+:AndroidLauncher.onCreate(savedInstanceState);
+:Register CrashHandler as default\nuncaught exception handler;
+:super.onCreate(savedInstanceState);
+
+if (isTablet?) then (yes)
+    :Scl.setAddition(0.5f)\n[adjust UI scale for tablet];
+else (no)
+endif
+
+:initialize(ClientLauncher, AndroidApplicationConfiguration\n[useImmersiveMode, GL30]);
+
+|ClientLauncher|
+:ClientLauncher.init() called by framework;
+:setup() begins;
+
+:Read MINDUSTRY_DATA_DIR system property;
+if (MINDUSTRY_DATA_DIR set?) then (yes)
+    :Core.settings.setDataDirectory(customPath);
+else (no)
+endif
+
+:checkLaunch()\n[write launchIDFile crash-detection marker];
+if (launchIDFile already exists?) then (yes)
+    :Set failedToLaunch = true\n[prior run crashed];
+else (no)
+    :Set failedToLaunch = false;
+endif
+
+:loadLogger()\n[configure Log with color tags + buffer];
+:new LoadRenderer()\n[create loading screen renderer];
+:Events.fire(ClientCreateEvent);
+:loadFileLogger()\n[open last_log.txt writer, chain handler];
+
+:Query platform capabilities:\n- maxTextureSize = Gl.getInt(GL_MAX_TEXTURE_SIZE)\n- Log GL version, VRAM, Java version, RAM;
+
+:IntelGpuCheck.init(vendorString)\n[disable GL3 on Intel if memory issues];
+
+:Time.setDeltaProvider\n[deltaTime * 60, clamped to maxDeltaClient];
+
+|AssetManager|
+:UI.loadColors()\nbatch = new SpriteBatch()\nassets = new AssetManager();
+
+:Register asset loaders:\n- Texture.class → MapPreviewLoader\n- Sound.class → async SoundLoader\n- Music.class → async MusicLoader;
+
+:assets.load('sprites/error.png', Texture.class)\n[error fallback texture];
+:atlas = TextureAtlas.blankAtlas();
+
+|ClientLauncher|
+:Vars.net = new Net(platform.getNet())\nMapPreviewLoader.setupLoaders()\ntree = new FileTree();
+
+:mods = new Mods()\nschematics = new Schematics()\nFonts.loadSystemCursors();
+
+|AssetManager|
+:assets.load(new Vars())\n[queues Vars.loadAsync];
+
+|Vars|
+fork
+    :loadSettings():\n- settings.setJson, setAppName\n- load keybindings; Binding.init()\n- set UI scale\n- load locale bundle (external or internal);
+    if (steam / Version.isSteam?) then (yes)
+        :Set saves dir to local saves/;
+    else (no)
+    endif
+    if (locale == 'router'?) then (yes)
+        :Replace all bundle strings\nwith router icon;
+    else (no)
+    endif
+fork again
+    :Vars.init():\n- Groups.init()\n- Version.init(), CacheLayer.init()\n- Set dataDirectory + subdirectories\n  (screenshots, maps, saves, mods, schematics...);
+    :Create core singletons:\nContentLoader, Waves, EntityCollisions,\nWorld, Universe, BeControl, AsyncCore,\nMapEditor, Maps, WaveSpawner,\nBlockIndexer, Pathfinder, FogControl,\nBaseRegistry, GlobalVars, GameState;
+    :Set mobile/iOS/Android flags\nbecontrol.init()\nmodDirectory.mkdirs();
+    :Register ContentInitEvent listener\n[create emptyTile];
+    :mods.load()\nmaps.load();
+end fork
+
+|AssetManager|
+:Fonts.loadDefaultFont();
+
+if (maxTextureSize >= 4096?) then (yes)
+    :Load 'sprites/sprites.aatls'\n[full resolution atlas];
+else (no)
+    :Load 'sprites/fallback/sprites.aatls'\n[reduced resolution atlas];
+endif
+:atlas = loaded TextureAtlas;
+
+:assets.loadRun('maps')\n[maps.loadPreviews()];
+:Musics.load()\nSounds.load();
+
+:assets.loadRun('contentcreate'):\n1. content.createBaseContent()\n2. content.loadColors()\n3. mods.loadScripts()\n4. content.createModContent();
+
+:assets.load(mods);
+:assets.loadRun('mergeUI')\n[Fonts.mergeFontAtlas(atlas)];
+
+|ClientLauncher|
+:Register core modules (auto-loaded via assets):\nadd Logic, Control, Renderer, UI,\nNetServer, NetClient;
+
+|AssetManager|
+:assets.load(schematics)\nassets.loadRun('contentinit'):\n- content.init(); content.load()\nassets.loadRun('baseparts'):\n- bases.load();
+
+note right
+  **Asset Loading Loop (per-frame update())**
+  Runs until all assets are fully loaded.
+end note
+
+repeat
+    :loader.draw()\n[render loading screen at 20 FPS];
+    :assets.update(1000/20)\n[process pending asset batch];
+repeat while (assets fully loaded?) is (no)
+-> yes;
+
+|ClientLauncher|
+:loader.dispose(); loader = null;
+:SoundPriority.init();
+:for each module: module.init()\n[Logic, Control, Renderer, UI, NetServer, NetClient];
+:mods.eachClass(Mod::init)\n[initialize all mod classes];
+:finished = true;
+:Events.fire(ClientLoadEvent)\n[notify subsystems of completed load];
+:Log total load time\nclientLoaded = true;
+:app.post x4 → super.resize(width, height);
+:finishLaunch():\n- settings.put lastBuild/lastBuildString\n- launchIDFile.delete()\n[crash detection marker cleared];
+
+|AndroidLauncher|
+:checkFiles(getIntent())\n[handle file URI intents: .msav save or map];
+:Set external data directory\nfrom getExternalFilesDir();
+:Delete cache folder if exists;
+
+if (files_moved marker exists?) then (yes)
+    :Skip migration\n[files already moved];
+else (no)
+    :Copy local storage → external storage\nWrite files_moved marker;
+endif
+
+stop
+
+@enduml

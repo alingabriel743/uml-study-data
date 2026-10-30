@@ -1,0 +1,169 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequence {
+    ArrowColor #495057
+    LifeLineBorderColor #495057
+    LifeLineBackgroundColor #F8F9FA
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    NoteBackgroundColor #FFF9C4
+    NoteBorderColor #ADB5BD
+}
+
+title Package Alias Resolution Flow
+
+participant "Installer" as installer
+participant "RepositorySet" as repoSet
+participant "PoolBuilder" as poolBuilder
+participant "ArrayRepository" as arrayRepo
+participant "AliasPackage" as aliasPackage
+participant "CompleteAliasPackage" as completeAlias
+participant "BasePackage" as basePkg
+participant "VersionParser" as versionParser
+participant "Link" as link
+participant "Pool" as pool
+
+== Initiate Pool Creation ==
+
+installer -> repoSet : createPool(request, io)
+activate repoSet
+
+repoSet -> poolBuilder : buildPool(repositories, request)
+activate poolBuilder
+
+== Load Packages from Repository ==
+
+poolBuilder -> arrayRepo : loadPackages(packageNameMap,\n  acceptableStabilities, stabilityFlags, alreadyLoaded)
+activate arrayRepo
+
+arrayRepo -> arrayRepo : getPackages()
+note right: Returns stored BasePackage\nand AliasPackage list
+
+group Pass 1 — Match packages by name/stability
+    arrayRepo -> arrayRepo : check each package against packageNameMap
+    opt AliasPackage matched
+        arrayRepo -> arrayRepo : getAliasOf() → also add base package to result set
+    end
+end
+
+group Pass 2 — Collect orphaned alias wrappers
+    arrayRepo -> arrayRepo : add AliasPackages whose aliasOf\n  is in results (even if alias didn't match)
+end
+
+arrayRepo --> poolBuilder : [packages, namesFound]
+deactivate arrayRepo
+
+== Store Packages and Build Alias Map ==
+
+loop for each loaded package
+    poolBuilder -> poolBuilder : loadPackage(request, repositories,\n  package, propagateUpdate)
+
+    poolBuilder -> poolBuilder : packages[indexCounter++] = package
+
+    alt package instanceof AliasPackage
+        poolBuilder -> poolBuilder : aliasMap[spl_object_hash(aliasOf)][index]\n  = aliasPackage
+    end
+
+    opt rootAliases[name][version] exists\n  AND propagateUpdate = true
+        poolBuilder -> aliasPackage : getAliasOf()
+        activate aliasPackage
+        aliasPackage --> poolBuilder : basePackage (unwrapped)
+        deactivate aliasPackage
+
+        alt basePackage instanceof CompletePackage
+            poolBuilder -> completeAlias : new CompleteAliasPackage(\n  basePackage, alias_normalized, alias)
+            activate completeAlias
+        else
+            poolBuilder -> aliasPackage : new AliasPackage(\n  basePackage, alias_normalized, alias)
+            activate aliasPackage
+        end
+
+        == AliasPackage Construction ==
+
+        aliasPackage -> basePkg : __construct(aliasOf.getName())
+        activate basePkg
+        basePkg --> aliasPackage : initialized
+        deactivate basePkg
+
+        aliasPackage -> versionParser : parseStability(version)
+        activate versionParser
+        versionParser --> aliasPackage : stability, isDev flag
+        deactivate versionParser
+
+        loop foreach Link::$TYPES as linkType
+            aliasPackage -> aliasPackage : links = aliasOf.get{LinkType}()
+
+            aliasPackage -> aliasPackage : replaceSelfVersionDependencies(links, linkType)
+
+            group Self-Version Substitution
+                opt prettyVersion == DEFAULT_BRANCH_ALIAS
+                    aliasPackage -> aliasPackage : use aliasOf.getPrettyVersion()\n  as substitute version
+                end
+
+                alt linkType in [conflict, provide, replace]
+                    aliasPackage -> link : new Link(source, target,\n  Constraint('=', aliasVersion), linkType, prettyVersion)
+                    activate link
+                    link --> aliasPackage : newLink
+                    deactivate link
+                    aliasPackage -> aliasPackage : append newLink\n  (keep original link too)
+                else linkType in [require, dev-require]
+                    aliasPackage -> link : new Link(source, target,\n  Constraint('=', aliasVersion), linkType, prettyVersion)
+                    activate link
+                    link --> aliasPackage : replacementLink
+                    deactivate link
+                    aliasPackage -> aliasPackage : replace link in-place;\n  set hasSelfVersionRequires = true
+                end
+            end
+        end
+
+        alt was CompleteAliasPackage
+            completeAlias --> poolBuilder : rootAliasWrapper
+            deactivate completeAlias
+        else was AliasPackage
+            aliasPackage --> poolBuilder : rootAliasWrapper
+            deactivate aliasPackage
+        end
+
+        poolBuilder -> poolBuilder : setRootPackageAlias(true)
+        poolBuilder -> poolBuilder : packages[newIndex] = rootAliasWrapper;\n  register in aliasMap
+    end
+end
+
+== Finalize Pool ==
+
+poolBuilder --> repoSet : pool data (packages + aliasMap)
+deactivate poolBuilder
+
+repoSet -> pool : new Pool(packages)
+activate pool
+pool --> repoSet : pool instance
+deactivate pool
+
+repoSet --> installer : Pool (base packages + alias wrappers)
+deactivate repoSet
+
+note over installer, pool
+  AliasPackages present a different version while delegating
+  all non-version data to aliasOf (getType, getAutoload, etc.).
+  Nested AliasPackages are always unwrapped via getAliasOf()
+  before a new alias wrapper is created.
+end note
+
+@enduml

@@ -1,0 +1,266 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 11
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam swimlane {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleBackgroundColor #DEE2E6
+}
+skinparam note {
+    BackgroundColor #FFFBE6
+    BorderColor #C9A227
+    FontColor #212529
+}
+
+title Unit AI Decision Making\n<size:10>AIController update cycle — FlyingAI · GroundAI · BuilderAI · MinerAI · CargoAI</size>
+
+|AIController|
+start
+:updateUnit() — called each game tick;
+
+if (useFallback() && fallback != null?) then (yes)
+  :Delegate to fallback.updateUnit()\n<i>BuilderAI: PrebuildAI or FlyingAI/GroundAI</i>;
+  kill
+else (no)
+endif
+
+:updateVisuals()\n<i>wobble animation · lookAt prefRotation (flying units)</i>;
+
+|Weapon Targeting|
+if (unit has weapons?) then (yes)
+  :updateTargeting() → updateWeapons();
+  if (retarget timer expired?\n<i>40 ticks: no target | 90 ticks: has target</i>) then (yes)
+    :findMainTarget(x, y, range, air, ground)\nUpdate unit.target;
+  endif
+  if (target invalid or gone?) then (yes)
+    :target = null; reset noTargetTime;
+  else (no)
+    :noTargetTime += delta;
+  endif
+  repeat
+    :Process weapon mount\n<i>(controllable & aiControllable)</i>;
+    if (singleTarget weapon?) then (yes)
+      :mount.target = unit.target;
+    else (no)
+      :findTarget(mountX, mountY, wrange, air, ground);
+    endif
+    if (target in range && shouldShoot()?) then (yes)
+      :mount.shoot = true; mount.rotate = true;
+      if (!shouldFire()?) then (yes)
+        :override — mount.shoot = false;
+      endif
+    else (no)
+      if (autoDropBombs && not shooting?) then (yes)
+        :findClosestTarget(ground)\nas bomb-drop fallback;
+      endif
+      if (noTargetTime >= 300s?) then (yes)
+        :rotate weapon back to base angle;
+      endif
+      :mount.shoot = false;
+    endif
+  repeat while (more weapon mounts?) is (yes)
+else (no)
+endif
+
+|AIController|
+:updateMovement()\n<i>polymorphic dispatch to AI subclass</i>;
+
+fork
+  |#CCE5FF|FlyingAI|
+  :unloadPayloads()\n<i>drop payload near building target</i>;
+  if (target != null && hasWeapons?) then (yes)
+    if (circleTarget mode?) then (yes)
+      :circleAttack(circleTargetRadius);
+    else (no)
+      :moveTo(target, range x 0.8)\nlookAt(target);
+    endif
+  else (no)
+    if (waves && defaultTeam?) then (yes)
+      :moveTo(closestSpawner, dropZoneRadius + 130);
+    endif
+  endif
+  note right
+    Target priority:
+    1. Core (flag-based)
+    2. Random targets (waveAI)
+    3. type.targetFlags list
+    4. Core (closest fallback)
+  end note
+
+fork again
+  |#FFF3CD|GroundAI|
+  :Compute stuckThreshold\nmax(1, stuckRange x 2 / unit.speed);
+  if (closestEnemyCore within range/1.3?) then (yes)
+    :Set target = core\nAll ground-mount targets point to core;
+  else (no)
+    if (waves && defaultTeam?) then (yes)
+      if (within spawner drop zone OR no spawner?) then (yes)
+        :Suppress movement;
+      else (no)
+        :pathfind(fieldCore, stopAtTarget=true,\navoidance = stuckTime >= threshold);
+      endif
+    else (no)
+      if (no core && no spawner?) then (yes)
+        :Suppress movement;
+      else (no)
+        :pathfind(fieldCore, stopAtTarget=true);
+      endif
+    endif
+  endif
+  if (canBoost && elevation > 0 && !onSolid?) then (yes)
+    :Descend via approachDelta;
+  endif
+  :faceTarget()\n<i>face target or velocity direction</i>;
+  if (within stuckRange of last position?) then (yes)
+    :stuckTime++\nPropagate stuck state to nearby GroundAI units;
+  endif
+
+fork again
+  |#F8D7DA|BuilderAI|
+  note right
+    useFallback() = true if:
+    prebuildAi flag OR
+    (waves && waveTeam && !rtsAi)
+    Delegates to FlyingAI or GroundAI
+  end note
+  if (target != null && shouldShoot()?) then (yes)
+    :lookAt(target);
+  else (no)
+    if (!flying?) then (yes)
+      :lookAt(prefRotation);
+    endif
+  endif
+  :unit.updateBuilding = true\nValidate assistFollowing & following refs;
+  if (assistFollowing actively building?) then (yes)
+    :following = assistFollowing\nCopy follower's buildPlan;
+  endif
+  if (no buildPlan OR alwaysFlee && !holdPosition?) then (yes)
+    if (timer expired OR alwaysFlee, AND enemy in fleeRange?) then (yes)
+      :clearBuilding()\nmoveTo(core, retreatDst);
+    endif
+  else (no)
+    if (buildPlan valid?) then (yes)
+      if (!holdPosition?) then (yes)
+        :moveTo(plan.tile, buildRange);
+      else (no)
+        if (out of range && !infiniteResources?) then (yes)
+          :Discard buildPlan;
+        endif
+      endif
+    else (no)
+      :Discard invalid buildPlan;
+    endif
+    if (no buildPlan && assistFollowing && !hold?) then (yes)
+      :moveTo(assistFollowing);
+    else (no)
+      if (!onlyAssist && plans exist && timer?) then (yes)
+        :Pick next valid BlockPlan\nfrom team.data().plans;
+      else (no)
+        :Scan nearby units\nFind active builder to follow;
+      endif
+    endif
+  endif
+  if (!flying?) then (yes)
+    :updateBoosting;
+  endif
+
+fork again
+  |#E2D9F3|MinerAI|
+  if (!canMine OR no core present?) then (yes)
+    :RETURN — idle this tick;
+  else (no)
+    if (mineTile invalid?) then (yes)
+      :Clear mineTile reference;
+    endif
+    if (mining = true — gather mode?) then (yes)
+      if (every 4s — pick targetItem?) then (yes)
+        :Select targetItem\n<i>CommandAI stance filter OR type.mineItems\nPrefer item most needed by core</i>;
+      endif
+      if (core full of targetItem?) then (yes)
+        :clearItem(); end this cycle;
+      elseif (inventory full OR unit does not accept item?) then
+        :Set mining = false\n<i>Switch to deposit mode</i>;
+      else (no)
+        if (every 1s — find ore tile?) then (yes)
+          :Find closest ore tile\n<i>Floor tiles first, then walls</i>;
+        endif
+        if (ore found?) then (yes)
+          :moveTo(ore, mineRange / 2);
+          if (within mineRange && validMine?) then (yes)
+            :unit.mineTile = ore\n<i>Begin active mining</i>;
+          endif
+        endif
+      endif
+    else (no)
+      :Deposit mode — clear mineTile;
+      if (stack.amount == 0?) then (yes)
+        :Set mining = true — back to gather mode;
+      elseif (within core range?) then
+        :transferItemTo(core)\nclearItem(); mining = true;
+      else (no)
+        :circle(core, range / 1.8)\n<i>Approach core to deposit</i>;
+      endif
+    endif
+    note right
+      stanceChanged(): if
+      mineAuto or item stance
+      lost → stop mining,
+      clear targetItem
+    end note
+  endif
+
+fork again
+  |#D1ECF1|CargoAI|
+  if (!BuildingTether OR no tethered building?) then (yes)
+    :RETURN — idle this tick;
+  else (no)
+    if (!unit.hasItem() — pickup mode?) then (yes)
+      :moveTo(tetheredBuild, moveRange=6, smoothing=20);
+      if (build has items && within transferRange=20?) then (yes)
+        :Scan unitCargoUnloadPoints\nOrder by most-available item descending\nFind non-stale unloadTarget;
+        if (unloadTarget found?) then (yes)
+          :Call.takeItems(build, itemTarget,\nmin(capacity, available), unit);
+        endif
+      endif
+    else (no)
+      if (no unloadTarget?) then (yes)
+        :retarget → findDropTarget(item, offset, null);
+        if (still no target found?) then (yes)
+          :unit.clearItem();
+        endif
+      else (no)
+        if (target reconfigured OR isPayload?) then (yes)
+          :Nullify target; RETURN;
+        else (no)
+          :moveTo(unloadTarget, moveRange, smoothing);
+          if (within transferRange && dropSpacing timer 1.5s elapsed?) then (yes)
+            if (acceptStack capacity > 0?) then (yes)
+              :Call.transferItemTo(unloadTarget);
+            endif
+            if (cargo empty OR noDestTimer >= 120s?) then (yes)
+              :findDropTarget(item, targetIndex+1, current);
+              if (no new target found?) then (yes)
+                :unit.clearItem();
+              endif
+            endif
+          endif
+        endif
+      endif
+    endif
+  endif
+end fork
+
+|AIController|
+stop
+
+@enduml

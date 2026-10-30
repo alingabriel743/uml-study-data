@@ -1,0 +1,187 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequence {
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ArrowColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #E9ECEF
+    ActorBackgroundColor #F8F9FA
+    ActorBorderColor #495057
+}
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #F9A825
+}
+
+title Dependency Resolution Flow
+
+participant "Installer" as installer
+participant "RepositoryManager" as repoMgr
+participant "RepositorySet" as repoSet
+participant "Request" as request
+participant "PoolBuilder" as poolBuilder
+participant "ComposerRepository" as composerRepo
+participant "Pool" as pool
+participant "Solver" as solver
+participant "RuleSetGenerator" as ruleGen
+participant "Decisions" as decisions
+participant "LockTransaction" as lockTx
+participant "Locker" as locker
+participant "InstallationManager" as installMgr
+
+== Initialization ==
+
+[-> installer: run()
+activate installer
+installer -> installer: gc_disable()
+installer -> repoMgr: getLocalRepository()
+activate repoMgr
+repoMgr --> installer: localRepo
+deactivate repoMgr
+
+== doUpdate: Build Repository Set ==
+
+installer -> installer: doUpdate(localRepo, doInstall)
+activate installer #DDE3FF
+
+installer -> installer: createPlatformRepo(forUpdate=true)
+note right: Reads PHP version,\nextensions from environment
+installer --> installer: platformRepo
+
+installer -> installer: createPolicy(forUpdate=true, lockedRepo)
+installer --> installer: policy : DefaultPolicy
+
+installer -> installer: createRepositorySet(forUpdate=true, platformRepo, aliases)
+activate repoSet
+installer -> repoSet: addRepository(RootPackageRepository(fixedRootPackage))
+installer -> repoSet: addRepository(platformRepo)
+installer -> repoMgr: getRepositories()
+activate repoMgr
+repoMgr --> installer: remoteRepositories[]
+deactivate repoMgr
+installer -> repoSet: addRepository(repo) [for each remote repo]
+installer -> repoSet: addRepository(lockedRepository) [if locked]
+
+== doUpdate: Build Request ==
+
+installer -> installer: createRequest(fixedRootPackage, platformRepo, lockedRepository)
+activate request
+installer -> request: new Request(lockedRepository)
+installer -> request: fixPackage(rootPackage)
+note right: fixedRootPackage has\nrequires/devRequires cleared
+installer -> request: fixPackage(platformPackage) [for each platform package]
+
+installer -> installer: requirePackagesForUpdate(request, lockedRepository, withDevReqs=true)
+installer -> request: requireName(packageName, constraint)\n[root requires + devRequires]
+
+alt partial update requested
+    installer -> request: setUpdateAllowList(updateAllowList, transitiveMode)
+end
+deactivate request
+
+== doUpdate: Build Pool (Lazy Load) ==
+
+installer -> repoSet: createPool(request, io, eventDispatcher, poolOptimizer)
+activate repoSet #DDE3FF
+repoSet -> poolBuilder: new PoolBuilder(stabilities, flags, aliases)
+activate poolBuilder
+repoSet -> poolBuilder: buildPool(repositories, request)
+poolBuilder -> composerRepo: loadPackages(packageNameMap)
+activate composerRepo
+note right: HTTP calls to\nPackagist / private registry
+composerRepo --> poolBuilder: packages[]
+deactivate composerRepo
+poolBuilder --> repoSet: pool : Pool
+deactivate poolBuilder
+repoSet --> installer: pool
+deactivate repoSet
+
+== doUpdate: SAT Solve (Main) ==
+
+installer -> solver: new Solver(policy, pool, io)
+activate solver
+installer -> solver: solve(request, platformRequirementFilter)
+solver -> solver: setupFixedMap(request)
+solver -> ruleGen: new RuleSetGenerator(policy, pool)
+activate ruleGen
+solver -> ruleGen: getRulesFor(request, platformRequirementFilter)
+ruleGen --> solver: ruleSet : RuleSet
+deactivate ruleGen
+solver -> solver: checkForRootRequireProblems(request, filter)
+solver -> decisions: new Decisions(pool)
+activate decisions
+solver -> solver: insert RuleWatchNode(rule) for each rule
+solver -> solver: makeAssertionRuleDecisions()
+solver -> solver: runSat() [DPLL: propagate / analyze / backtrack]
+
+alt unresolvable dependencies
+    solver -> solver: throw SolverProblemsException\n[exit code: ERROR_DEPENDENCY_RESOLUTION_FAILED=2]
+end
+
+solver -> lockTx: new LockTransaction(pool, presentMap, fixedPackagesMap, decisions)
+activate lockTx
+deactivate decisions
+solver --> installer: lockTransaction
+deactivate solver
+
+== doUpdate: Extract Dev Packages (Second Solve) ==
+
+installer -> installer: extractDevPackages(lockTransaction, platformRepo, aliases, policy)
+activate installer #FFE0B2
+note right: Second SAT solve to\nseparate dev from non-dev packages
+installer -> installer: createRepositorySet(true, platformRepo, aliases) → repoSet2
+installer -> installer: createRequest(fixedRootPackage, platformRepo) → request2
+installer -> installer: requirePackagesForUpdate(request2, lockedRepository, withDevReqs=false)
+installer -> repoSet: createPoolWithAllPackages() → pool2
+installer -> solver: new Solver(policy, pool2, io)
+activate solver
+installer -> solver: solve(request2) → nonDevLockTransaction
+solver --> installer: nonDevLockTransaction
+deactivate solver
+installer -> lockTx: setNonDevPackages(nonDevLockTransaction)
+deactivate installer
+
+== Persist Lock File ==
+
+installer -> lockTx: getOperations()
+lockTx --> installer: operations[]
+installer -> locker: setLockData(lockTransaction)
+activate locker
+note right: Writes composer.lock\nwith resolved package versions
+locker --> installer: lock written
+deactivate locker
+deactivate lockTx
+
+== doInstall: Execute Operations ==
+
+installer -> installer: doInstall(localRepo, alreadySolved=true)
+activate installer #D5F5E3
+installer -> locker: getLockedRepository(devMode)
+activate locker
+locker --> installer: lockArrayRepository
+deactivate locker
+installer -> installer: createPool(request, ...) → pool
+note right: Lightweight re-solve to verify\nplatform compatibility only
+installer -> solver: solve(request, platformRequirementFilter)
+activate solver
+solver --> installer: lockTransaction (verified)
+deactivate solver
+installer -> installMgr: execute(operations from lockTransaction)
+activate installMgr
+note right: Install / update / remove\npackages on disk
+installMgr --> installer: done
+deactivate installMgr
+deactivate installer
+
+deactivate installer
+deactivate installer
+
+[<-- installer: installation complete
+
+@enduml

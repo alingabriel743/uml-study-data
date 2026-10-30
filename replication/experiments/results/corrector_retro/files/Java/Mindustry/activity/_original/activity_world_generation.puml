@@ -1,0 +1,195 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+}
+skinparam swimlane {
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleBackgroundColor #E9ECEF
+}
+skinparam note {
+    BackgroundColor #FFF9C4
+    BorderColor #B8A000
+    FontColor #212529
+}
+
+title World & Map Generation
+
+' ═══════════════════════════════════════════════════
+'  PATH 1 — loadMap (file-based map with filter passes)
+' ═══════════════════════════════════════════════════
+
+|World|
+start
+if (Generation pathway?) then (loadMap — file-based)
+
+  |World|
+  if (customMapLoaders.containsKey(map)?) then (yes)
+    :customMapLoaders.get(map).run();
+    stop
+  endif
+  :Create FilterContext(map);
+
+  |IO Layer|
+  :SaveIO.load(map.file, filterContext);
+  note right
+    Reads serialised map file;
+    tiles are written into the world
+    via the FilterContext callbacks
+  end note
+
+  |Filter Pipeline|
+  :FilterContext.end() triggered by SaveIO;
+  :applyFilters() — iterate Seq<GenerateFilter>;
+
+  repeat
+    :filter.randomize() [assign random seed];
+    :input.begin(width, height, tileProvider);
+    if (filter.isBuffered()?) then (yes — spatial transform)
+      :Read all tiles into long[] buffer;
+      :filter.apply(tiles, input);
+      :Write updated buffer back to tiles;
+    else (no — per-tile transform)
+      repeat
+        :input.set(tile);
+        :filter.apply(input) — per-tile override;
+        :tile.setFloor / setBlock / setOverlay;
+      repeat while (more tiles?) is (yes)
+    endif
+  repeat while (more filters?) is (yes)
+
+  |World|
+  :super.end() → endMapLoad();
+  note right
+    **endMapLoad() sequence:**
+    1. Events.fire(WorldLoadEndEvent)
+    2. Remove LegacyBlocks per tile
+    3. tile.build.updateProximity() for all tiles
+    4. addDarkness(tiles) — flood-fill erosion
+    5. Groups.resize(world bounds)
+    6. generating = false
+    7. Events.fire(WorldLoadEvent)
+  end note
+  :state.map = map;
+
+  if (headless mode?) then (no — client)
+    :Validate map rules\n(cores / pvp / attack);
+    if (violations found?) then (yes)
+      :invalidMap = true;
+      :Core.app.post()\n→ state.set(State.menu);
+    endif
+  else (yes — server / headless)
+    :Check active teams have cores;
+    if (no team cores found?) then (yes)
+      #pink:throw MapException;
+      kill
+    endif
+  endif
+
+' ═══════════════════════════════════════════════════
+'  PATH 2 — loadSector (procedural map generation)
+' ═══════════════════════════════════════════════════
+
+else (loadSector — procedural)
+
+  |World|
+  :setSectorRules(sector, params.saveInfo);
+  :state.map = new Map(sector name / tags);
+  :state.rules.sector = sector;
+  :planet.generator.addWeather(sector, rules);
+  :Iterate tiles — collect resources\n(items / liquids / walls) into content set;
+  :sector.planet.applyRules(rules);
+  :sector.info.resources = content.toSeq();
+
+  if (params.saveInfo?) then (yes)
+    :sector.saveInfo();
+  endif
+
+  :size = sector.getSize();
+
+  ' ── loadGenerator() wrapper begins ──
+  :beginMapLoad();
+  note right
+    generating = true
+    Events.fire(WorldLoadBeginEvent)
+  end note
+  :resize(width, height);
+  note right
+    clearBuildings() — remove all builds
+    new Tiles(width, height) if size changed
+  end note
+
+  |Generator|
+  if (sector.preset != null?) then (yes — preset overrides planet)
+    :preset.generator.generate(tiles, params);
+    :preset.rules.get(state.rules);
+  else (no — use planet generator)
+    if (planet.generator != null?) then (yes)
+      :planet.generator.generate\n(tiles, sector, params);
+    else (no — misconfigured)
+      #pink:throw RuntimeException\n"No generator defined for planet";
+      kill
+    endif
+  endif
+  :state.rules.sector = sector;
+
+  |World|
+  :endMapLoad();
+  note right
+    **endMapLoad() sequence:**
+    1. Events.fire(WorldLoadEndEvent)
+    2. Remove LegacyBlocks per tile
+    3. tile.build.updateProximity() for all tiles
+    4. addDarkness(tiles) — flood-fill erosion
+    5. Groups.resize(world bounds)
+    6. generating = false
+    7. Events.fire(WorldLoadEvent)
+  end note
+
+  ' ── Post-generation sector finalisation ──
+  if (saveInfo && rules.waves?) then (yes)
+    :sector.info.waves = state.rules.waves;
+  endif
+
+  if (preset == null && planet.generator != null?) then (yes)
+    |Generator|
+    :planet.generator.postGenerate(tiles);
+    note right: Runs after endMapLoad —\nfinal biome / entity placement
+    |World|
+  endif
+
+  :setSectorRules(sector, saveInfo) — re-apply;
+  note right: Rules reset to ensure\nconsistency after generation
+
+  if (defaultTeam.core() != null?) then (yes)
+    :sector.info.spawnPosition = core.pos();
+  endif
+
+endif
+
+stop
+
+' ─── Supplementary: addDarkness detail ──────────────
+note as N1
+  **addDarkness(Tiles tiles) — flood-fill erosion**
+  1. Initialise byte[] dark array
+  2. Mark tiles adjacent to empty space with darkRadius
+  3. Repeat darkRadius times:
+     - For each tile: check d4 neighbours
+     - If neighbour value < current, reduce value
+     - arraycopy writeBuffer → dark
+  4. Write final darkness bytes to tile.data
+  5. Mark fully-surrounded tiles as darkRadius+1 (fully dark)
+end note
+
+@enduml

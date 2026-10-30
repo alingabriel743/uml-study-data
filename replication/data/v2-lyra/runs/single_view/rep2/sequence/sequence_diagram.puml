@@ -1,0 +1,194 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+    NoteBackgroundColor #FFF3CD
+    NoteBorderColor #FFC107
+}
+
+title Lyra — Video World Generation Inference Sequence
+
+actor "Client / Script" as Client
+
+box "Inference Layer" #E8F4FD
+    participant "DiffusionText2World\nGenerationPipeline" as Pipeline
+end box
+
+box "Model Layer" #EDF7ED
+    participant "DiffusionT2WModel" as T2WModel
+    participant "GeneralConditioner" as Conditioner
+    participant "AbstractEmbModel" as EmbModel
+end box
+
+box "Network Layer" #FDF3E8
+    participant "GeneralDIT" as DIT
+end box
+
+box "Tokenizer / VAE" #F5EDF7
+    participant "VideoTokenizer\nInterface" as VAE
+    participant "BasePretrainedImageVAE" as ImageVAE
+end box
+
+box "Training Callbacks" #FDEAEA
+    participant "Callback" as CB
+    participant "AbstractCheckpointer" as Checkpointer
+end box
+
+== Initialization ==
+
+Client -> Pipeline : __init__(checkpoint_dir, checkpoint_name,\n  inference_type, enable_prompt_upsampler)
+activate Pipeline
+
+Pipeline -> Pipeline : _load_text_encoder_model()
+note right : Loads T5 / text encoder\nfor prompt embedding
+
+Pipeline -> Pipeline : _load_model(checkpoint_name)
+activate Pipeline
+Pipeline -> T2WModel : __init__(config)
+activate T2WModel
+T2WModel -> T2WModel : build_model() : ModuleDict
+note right : Builds DIT network,\nconditioner & VAE components
+T2WModel -> Conditioner : __init__(**emb_models)
+activate Conditioner
+Conditioner --> T2WModel : conditioner ready
+deactivate Conditioner
+T2WModel -> T2WModel : set_up_tokenizer(tokenizer_dir)
+T2WModel --> Pipeline : model instance
+deactivate T2WModel
+deactivate Pipeline
+
+== Prompt Encoding ==
+
+Client -> Pipeline : generate(prompt, num_steps=35, guidance=7.0)
+activate Pipeline
+
+Pipeline -> Pipeline : encode_prompt(prompt)
+note right : Text → T5 embedding
+Pipeline --> Pipeline : prompt_embedding : Tensor
+
+== Condition Preparation ==
+
+Pipeline -> T2WModel : generate_samples_from_batch(\n  data_batch, guidance, seed, num_steps)
+activate T2WModel
+
+T2WModel -> T2WModel : _get_conditions(data_batch)
+activate T2WModel
+
+T2WModel -> Conditioner : get_condition_uncondition(data_batch)
+activate Conditioner
+
+Conditioner -> Conditioner : _forward(batch)
+activate Conditioner
+
+loop for each embedding model
+    Conditioner -> EmbModel : random_dropout_input(\n    in_tensor, dropout_rate, key)
+    activate EmbModel
+    EmbModel --> Conditioner : conditioned_tensor : Tensor
+    deactivate EmbModel
+end
+
+deactivate Conditioner
+Conditioner --> T2WModel : (condition, uncondition) : Tuple[CosmosCondition, CosmosCondition]
+deactivate Conditioner
+deactivate T2WModel
+
+== Video Latent Encoding ==
+
+T2WModel -> VAE : encode(raw_video_frames)
+activate VAE
+VAE -> ImageVAE : register_mean_std(vae_dir)
+activate ImageVAE
+ImageVAE --> VAE : mean/std registered
+deactivate ImageVAE
+VAE --> T2WModel : latent_state : Tensor [B, C, T, H, W]
+deactivate VAE
+
+== Diffusion Denoising Loop ==
+
+T2WModel -> T2WModel : generate_cfg_samples(\n  batch_size, condition, uncondition, guidance)
+activate T2WModel
+
+loop num_steps denoising iterations
+    T2WModel -> DIT : forward(x, timesteps, crossattn_emb,\n    crossattn_mask, fps, image_size,\n    padding_mask, scalar_feature)
+    activate DIT
+
+    DIT -> DIT : forward_before_blocks(x, timesteps, crossattn_emb, ...)
+    note right : Patchify input, apply\nposition embeddings & time embedding
+    DIT -> DIT : prepare_embedded_sequence(\n    x_B_C_T_H_W, fps, padding_mask)
+    DIT --> DIT : embedded_sequence : Tensor
+
+    alt regular forward
+        DIT -> DIT : forward_blocks_regular(\n    x, affline_emb_B_D, crossattn_emb, ...)
+    else memory-saving forward
+        DIT -> DIT : forward_blocks_memory_save(\n    x, affline_emb_B_D, crossattn_emb, ...)
+    end
+
+    DIT -> DIT : decoder_head(x_B_T_H_W_D, emb_B_D,\n    crossattn_emb, origin_shape)
+    DIT --> T2WModel : denoised_x : Tensor
+    deactivate DIT
+end
+
+deactivate T2WModel
+deactivate T2WModel
+
+== VAE Decoding ==
+
+T2WModel -> VAE : decode(denoised_latent)
+activate VAE
+VAE -> ImageVAE : reset_dtype()
+ImageVAE --> VAE : dtype reset
+VAE --> T2WModel : video_frames : np.ndarray [T, H, W, C]
+deactivate VAE
+
+T2WModel --> Pipeline : generated_video : Tensor
+deactivate T2WModel
+
+Pipeline -> Pipeline : _run_model_with_offload(\n    prompt_embedding, negative_prompt_embedding)
+note right : Offload guardrail models\nto free GPU memory
+
+Pipeline --> Client : video_output : np.ndarray
+deactivate Pipeline
+
+== Training Step (alternate flow) ==
+
+note over Client, Checkpointer
+  **Training Flow** (not shown in detail above)
+end note
+
+Client -> T2WModel : training_step(data_batch, iteration)
+activate T2WModel
+T2WModel -> CB : on_before_optimizer_step(\n    model_ddp, optimizer, scheduler,\n    grad_scaler, iteration)
+activate CB
+CB --> T2WModel : (void)
+deactivate CB
+
+T2WModel -> T2WModel : compute_loss_with_epsilon_and_sigma(\n    data_batch, x0_from_data_batch,\n    x0, condition, epsilon, sigma)
+T2WModel --> T2WModel : loss : Tensor
+
+T2WModel -> CB : on_training_step_end(\n    model, data_batch, output_batch,\n    loss, iteration)
+activate CB
+CB --> T2WModel : (void)
+deactivate CB
+
+T2WModel -> Checkpointer : finalize()
+activate Checkpointer
+Checkpointer -> Checkpointer : _write_latest_checkpoint_file(checkpoint_file)
+Checkpointer --> T2WModel : checkpoint saved
+deactivate Checkpointer
+
+T2WModel --> Client : (output_batch, loss)
+deactivate T2WModel
+
+@enduml

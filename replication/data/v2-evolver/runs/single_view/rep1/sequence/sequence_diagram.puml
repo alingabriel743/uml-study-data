@@ -1,0 +1,193 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequence {
+    ArrowColor #495057
+    ActorBorderColor #495057
+    LifeLineBorderColor #6C757D
+    LifeLineBackgroundColor #F8F9FA
+    ParticipantBorderColor #495057
+    ParticipantBackgroundColor #F8F9FA
+    ParticipantFontColor #212529
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+}
+
+title Evolver Proxy — Runtime Interaction Sequence
+
+actor "External Client" as client
+participant "EvoMapProxy" as proxy
+participant "LifecycleManager" as lifecycle
+participant "ProxyHttpServer" as httpServer
+participant "WebUiServer" as webui
+participant "SyncEngine" as sync
+participant "InboundSync" as inbound
+participant "OutboundSync" as outbound
+participant "MailboxStore" as mailbox
+participant "DmHandler" as dm
+participant "SessionHandler" as session
+participant "TaskMonitor" as taskmon
+participant "SkillUpdater" as skillUpdater
+
+== Proxy Startup ==
+
+[-> proxy: start()
+activate proxy
+
+proxy -> lifecycle: hello()
+activate lifecycle
+lifecycle -> lifecycle: _buildHeaders()
+lifecycle -> lifecycle: _getEnvFingerprint()
+lifecycle --> proxy: authToken / headers
+deactivate lifecycle
+
+proxy -> taskmon: new TaskMonitor()
+activate taskmon
+taskmon --> proxy: taskMonitor instance
+deactivate taskmon
+
+proxy -> httpServer: new ProxyHttpServer(routes)
+activate httpServer
+httpServer -> httpServer: buildRoutes(store, proxyHandlers, taskMonitor, extensions)
+httpServer --> proxy: httpServer instance
+deactivate httpServer
+
+proxy -> webui: new WebUiServer()
+activate webui
+webui -> webui: buildWebUiRoutes()
+webui -> webui: start()
+webui --> proxy: webui instance
+deactivate webui
+
+proxy -> httpServer: start()
+activate httpServer
+httpServer --> proxy: listening on port
+deactivate httpServer
+
+proxy -> lifecycle: startHeartbeatLoop(intervalMs)
+activate lifecycle
+lifecycle --> proxy: heartbeat loop started
+deactivate lifecycle
+
+proxy -> sync: start()
+activate sync
+sync -> sync: _scheduleInbound(delayMs)
+sync -> sync: _scheduleOutbound(delayMs)
+sync --> proxy: sync engine started
+deactivate sync
+
+== Heartbeat Loop ==
+
+loop every intervalMs
+    lifecycle -> lifecycle: heartbeat()
+    activate lifecycle
+    lifecycle -> lifecycle: this.hello()
+    lifecycle -> lifecycle: countPending()
+    lifecycle --> lifecycle: heartbeat payload sent
+    deactivate lifecycle
+end
+
+== Inbound Sync Pull ==
+
+sync -> inbound: pull()
+activate inbound
+inbound -> inbound: getHeaders()
+inbound -> inbound: fetch(hubEndpoint)
+activate inbound
+inbound --> inbound: response
+deactivate inbound
+inbound -> mailbox: writeInboundBatch(messages)
+activate mailbox
+mailbox -> mailbox: _rebuildIndex()
+mailbox --> inbound: batch written
+deactivate mailbox
+inbound -> inbound: ackDelivered()
+inbound --> sync: inbound pull complete
+deactivate inbound
+
+== HTTP Request: Send Direct Message ==
+
+client -> httpServer: POST /dm/send {to, body}
+activate httpServer
+httpServer -> httpServer: _handleRequest(req, res)
+httpServer -> httpServer: _matchRoute("POST", "/dm/send")
+httpServer -> dm: send(to, body)
+activate dm
+dm -> mailbox: store.send(message)
+activate mailbox
+mailbox -> mailbox: _persistState()
+mailbox --> dm: message stored
+deactivate mailbox
+dm --> httpServer: {messageId, timestamp}
+deactivate dm
+httpServer --> client: 200 OK {messageId}
+deactivate httpServer
+
+sync -> sync: notifyNewOutbound()
+activate sync
+sync -> outbound: flush()
+activate outbound
+outbound -> outbound: store.updateStatusBatch()
+outbound -> mailbox: writeInboundBatch(ackMessages)
+activate mailbox
+mailbox --> outbound: ack stored
+deactivate mailbox
+outbound --> sync: flush complete
+deactivate outbound
+deactivate sync
+
+== HTTP Request: Create Session ==
+
+client -> httpServer: POST /session/create {inviteNodeIds}
+activate httpServer
+httpServer -> httpServer: _handleRequest(req, res)
+httpServer -> session: createSession(inviteNodeIds)
+activate session
+session -> session: inviteNodeIds.slice(max)
+session -> mailbox: store.send(sessionInvite)
+activate mailbox
+mailbox --> session: invite stored
+deactivate mailbox
+session --> httpServer: {sessionId, participants}
+deactivate session
+httpServer --> client: 200 OK {sessionId}
+deactivate httpServer
+
+== Skill Update via Mailbox ==
+
+inbound -> skillUpdater: pollAndApply()
+activate skillUpdater
+skillUpdater -> mailbox: store.poll()
+activate mailbox
+mailbox --> skillUpdater: pendingSkillMessages
+deactivate mailbox
+skillUpdater -> skillUpdater: processSkillUpdate(message)
+activate skillUpdater
+skillUpdater -> skillUpdater: fs.writeFileSync(skill.md)
+deactivate skillUpdater
+skillUpdater -> mailbox: store.ack(messageIds)
+activate mailbox
+mailbox --> skillUpdater: ack confirmed
+deactivate mailbox
+skillUpdater --> inbound: skills applied
+deactivate skillUpdater
+
+== Task Monitoring ==
+
+client -> httpServer: GET /tasks/metrics
+activate httpServer
+httpServer -> taskmon: getMetrics()
+activate taskmon
+taskmon -> taskmon: recordClaim(taskId)
+taskmon --> httpServer: {metrics}
+deactivate taskmon
+httpServer --> client: 200 OK {metrics}
+deactivate httpServer
+
+[<- proxy: running
+
+@enduml

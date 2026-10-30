@@ -1,0 +1,152 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #FFF3CD
+    DiamondBorderColor #856404
+}
+skinparam swimlane {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+    TitleFontColor #212529
+    TitleFontSize 13
+}
+skinparam note {
+    BackgroundColor #D1ECF1
+    BorderColor #0C5460
+    FontColor #0C5460
+}
+skinparam ArrowColor #495057
+
+title Kafka Connect Component Discovery
+
+|KafkaConnectDiscoveryService|
+start
+:discoverKafkaConnectComponents();
+note right
+  Returns Map<ComponentType, List<Class<?>>>
+  ComponentTypes: TRANSFORMATION, CONVERTER,
+  HEADER_CONVERTER, PREDICATE
+end note
+
+:indexKafkaConnectJars();
+
+|ClassLoader / SPI|
+:Iterate COMPONENT_INTERFACES.values()
+(one interfaceName per ComponentType);
+
+repeat
+  :Build serviceFile =
+  "META-INF/services/" + interfaceName;
+  :ClassLoader.getResources(serviceFile)
+  → Enumeration<URL>;
+  :Filter: keep only URLs starting with "jar:file:";
+  :extractJarPath(urlString)
+  → strip "jar:" prefix, extract path before "!";
+
+  |KafkaConnectDiscoveryService|
+  if (JAR name already in indices?) then (yes)
+    :Skip — deduplicate by JAR filename;
+  else (no)
+    :indexJarFile(jarPath);
+
+    |Jandex Indexer|
+    :tryLoadPrebuiltIndex(jarPath);
+    :Build URL:
+    "jar:file:<absPath>!/META-INF/jandex.idx";
+
+    if (jandex.idx accessible?) then (yes)
+      :IndexReader.read()
+      → prebuilt Index;
+      note right: Preferred — faster\nthan runtime scan
+    else (no)
+      :createIndexFromJarClasses(jarPath);
+      :new Indexer();
+      :open JarFile(jarPath);
+
+      repeat
+        if (entry ends with ".class"?) then (yes)
+          :jarFile.getInputStream(entry)
+          → indexer.index(classStream);
+          if (index error?) then (yes)
+            :log debug, skip entry;
+          else (no)
+          endif
+        else (no)
+          :skip non-class entry;
+        endif
+      repeat while (more JarEntries?) is (yes)
+      ->no;
+
+      :indexer.complete() → Index;
+      note right: Falls back to\nOptional.empty()\non any Exception
+    endif
+
+    |KafkaConnectDiscoveryService|
+    :indices.put(jarName, index);
+  endif
+
+  |ClassLoader / SPI|
+  note right: IOException from getResources()\n→ log warn, continue to next interface
+repeat while (more COMPONENT_INTERFACES?) is (yes)
+->no;
+
+|KafkaConnectDiscoveryService|
+:Return Map<String, Index> jarIndices;
+
+if (jarIndices.isEmpty()?) then (yes)
+  #FFCCCC:log warn "No Kafka Connect JARs found";
+  :return empty Map.of();
+  stop
+else (no)
+endif
+
+:Iterate COMPONENT_INTERFACES.entrySet()
+(ComponentType → interfaceName pairs);
+
+repeat
+  :discoverComponentType(jarIndices, interfaceName);
+  :DotName.createSimple(interfaceName);
+
+  |Jandex Indexer|
+  repeat
+    :index.getAllKnownImplementors(interfaceDotName)
+    → Collection<ClassInfo>;
+    :Filter: classInfo.name()
+    startsWith "org.apache.kafka.";
+    :Filter: !Modifier.isAbstract(classInfo.flags());
+
+    if (Class.forName(classInfo.name()) succeeds?) then (yes)
+      :Add Class<?> to discovered list;
+    else (no)
+      #FFCCCC:log warn ClassNotFoundException, skip class;
+    endif
+  repeat while (more JAR indices?) is (yes)
+  ->no;
+
+  :Collect unmodifiable List<Class<?>>;
+
+  |KafkaConnectDiscoveryService|
+  :log "Discovered N <ComponentType> component(s)";
+repeat while (more ComponentTypes?) is (yes)
+->no;
+
+:Build EnumMap<ComponentType, List<Class<?>>>
+from all discovered components;
+
+:return discovery result map;
+note right
+  Map keys guaranteed for all 4 types:
+  TRANSFORMATION, CONVERTER,
+  HEADER_CONVERTER, PREDICATE
+end note
+stop
+
+@enduml

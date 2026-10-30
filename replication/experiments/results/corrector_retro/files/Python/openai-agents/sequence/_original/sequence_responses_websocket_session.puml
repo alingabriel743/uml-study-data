@@ -1,0 +1,211 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipantBackgroundColor #F8F9FA
+skinparam sequenceParticipantBorderColor #495057
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceGroupBorderColor #6C757D
+skinparam sequenceGroupBackgroundColor #E9ECEF
+skinparam noteBorderColor #6C757D
+skinparam noteBackgroundColor #FFF9C4
+skinparam sequenceBoxBorderColor #ADB5BD
+skinparam sequenceBoxBackgroundColor #F1F3F5
+
+title Responses WebSocket Session
+
+actor Caller as caller
+
+participant "responses_websocket_session\n(async context manager)" as ctx_mgr
+participant "MultiProvider" as multi
+participant "OpenAIProvider" as openai_prov
+participant "ResponsesWebSocketSession" as ws_session
+participant "Runner" as runner
+participant "OpenAIResponsesWSModel" as ws_model
+participant "WebSocketConnection" as ws_conn
+participant "OpenAI Responses\nAPI (WebSocket)" as openai_ws
+
+== Context Initialisation ==
+
+caller -> ctx_mgr : async with responses_websocket_session(\n  api_key, base_url, websocket_base_url, \n  openai_prefix_mode, unknown_prefix_mode)
+activate ctx_mgr
+
+ctx_mgr -> multi : MultiProvider(\n  openai_use_responses=True,\n  openai_use_responses_websocket=True,\n  openai_prefix_mode, unknown_prefix_mode)
+activate multi
+multi --> ctx_mgr : model_provider
+deactivate multi
+
+ctx_mgr -> multi : .openai_provider
+activate multi
+multi --> ctx_mgr : provider (OpenAIProvider)
+deactivate multi
+
+ctx_mgr -> ws_session : ResponsesWebSocketSession(\n  provider=provider,\n  run_config=RunConfig(model_provider=MultiProvider))
+activate ws_session
+
+ws_session -> ws_session : __post_init__() →\n_validate_provider_alignment()\n[checks MultiProvider.openai_provider\nis same provider instance]
+
+note right of ws_session
+  Frozen dataclass: provider + RunConfig(MultiProvider)
+  Alignment validation ensures the shared OpenAIProvider
+  is exactly the one inside the MultiProvider.
+end note
+
+ctx_mgr --> caller : yield session
+deactivate ctx_mgr
+
+== Agent Turn: session.run() ==
+
+caller -> ws_session : session.run(starting_agent, input, **kwargs)
+activate ws_session
+
+ws_session -> ws_session : _prepare_runner_kwargs('run', kwargs)\n→ validates alignment, raises if run_config\nalready in kwargs, injects run_config
+
+ws_session -> runner : Runner.run(starting_agent, input,\n  run_config=RunConfig(MultiProvider), ...)
+activate runner
+
+runner -> ws_model : get_response(system_instructions, input,\n  model_settings, tools, output_schema,\n  handoffs, previous_response_id, conversation_id)
+activate ws_model
+
+ws_model -> ws_model : _fetch_response(..., stream=False)
+activate ws_model
+
+ws_model -> ws_model : _build_response_create_kwargs(\n  system_instructions, input, model_settings,\n  tools, output_schema, stream=True)\n→ create_kwargs dict
+note right of ws_model
+  Inherits _build_response_create_kwargs from
+  OpenAIResponsesModel. Uses ItemHelpers and
+  Converter for tools, tool_choice, output schema.
+end note
+
+== WebSocket Request Setup ==
+
+ws_model -> ws_model : _iter_websocket_response_events(create_kwargs)\n[async generator]
+activate ws_model
+
+ws_model -> ws_model : _get_websocket_request_timeouts()\n→ _WebSocketRequestTimeouts(lock, connect, send, recv)
+ws_model -> ws_model : _get_ws_request_lock()\n→ asyncio.Lock (per event loop)
+ws_model -> ws_model : _await_websocket_with_timeout(\n  request_lock.acquire(), timeout.lock,\n  phase='request lock wait')
+
+note right of ws_model
+  Per-loop lock serialises concurrent requests
+  over the shared WebSocket connection.
+end note
+
+ws_model -> ws_model : _prepare_websocket_request(create_kwargs)\n→ (frame={type:'response.create', stream:True,\n   model, input, tools, instructions},\n   ws_url, handshake_headers)
+ws_model -> openai_prov : _refresh_openai_client_api_key_if_supported(client)
+activate openai_prov
+openai_prov --> ws_model : refreshed client
+deactivate openai_prov
+
+== WebSocket Connection ==
+
+ws_model -> ws_model : _await_websocket_with_timeout(\n  _ensure_websocket_connection(ws_url, headers),\n  timeout.connect, phase='connect')
+ws_model -> ws_conn : _is_websocket_connection_reusable()\n[OPEN + same URL/headers identity + same event loop?]
+activate ws_conn
+
+alt Cached connection is reusable
+    ws_conn --> ws_model : existing connection (reused)
+else New connection required
+    ws_conn -> openai_ws : WebSocket upgrade (ws_url, handshake_headers)
+    activate openai_ws
+    openai_ws --> ws_conn : 101 Switching Protocols
+    deactivate openai_ws
+    ws_conn --> ws_model : new WebSocketConnection
+end
+deactivate ws_conn
+
+== Frame Send & Event Stream ==
+
+ws_model -> ws_model : _await_websocket_with_timeout(\n  connection.send(json.dumps(frame)),\n  timeout.send, phase='send')
+ws_model -> openai_ws : send {type:"response.create", stream:true, ...}
+activate openai_ws
+
+loop Receive events until terminal
+    ws_model -> ws_model : _await_websocket_with_timeout(\n  connection.recv(), timeout.recv, phase='receive')
+    openai_ws --> ws_model : raw frame (bytes/str)
+    deactivate openai_ws
+    ws_model -> ws_model : json.loads(frame) → payload dict
+    ws_model -> ws_model : _construct_response_stream_event_from_payload(payload)\n→ ResponseStreamEvent
+
+    alt error or response.error event
+        ws_model -> ws_model : raise ResponsesWebSocketError
+    else terminal event (response.completed / response.failed / response.incomplete)
+        ws_model -> ws_model : yield event → stop loop
+    else streaming event (response.created, output_item.added/done, text.delta, ...)
+        ws_model --> ws_model : yield ResponseStreamEvent to _fetch_response
+        activate openai_ws
+    end
+end
+
+note right of ws_model
+  Terminal event types:
+  • response.completed
+  • response.failed
+  • response.incomplete
+  Lock released in finally block.
+end note
+
+ws_model -> ws_model : [finally] release request_lock
+
+== Response Assembly ==
+
+ws_model -> ws_model : [non-stream path] consume all events;\n  capture ResponseCompletedEvent.response\n  → final_response
+ws_model -> ws_model : if final_response is None → raise RuntimeError
+
+deactivate ws_model 'inner _iter_websocket_response_events
+
+ws_model --> ws_model : return Response
+deactivate ws_model ' _fetch_response
+
+ws_model --> runner : ModelResponse(\n  output=response.output,\n  usage=Usage(input_tokens, output_tokens),\n  response_id=response.id,\n  request_id=None)
+note right of ws_model
+  No x-request-id header on WS upgrade;
+  ModelResponse.request_id is always None.
+end note
+deactivate ws_model
+
+runner --> ws_session : RunResult
+deactivate runner
+ws_session --> caller : RunResult
+deactivate ws_session
+
+== Context Exit & Cleanup ==
+
+caller -> ctx_mgr : __aexit__ (exit async with block)
+activate ctx_mgr
+
+ctx_mgr -> ws_session : session.aclose()
+activate ws_session
+ws_session -> multi : _validate_provider_alignment().aclose()
+activate multi
+multi -> ws_model : OpenAIResponsesWSModel.close()\n[increments _ws_client_close_generation,\n force-aborts if lock held, drops WS connection]
+activate ws_model
+ws_model --> multi : closed
+deactivate ws_model
+multi --> ws_session : done
+deactivate multi
+ws_session --> ctx_mgr : closed
+deactivate ws_session
+deactivate ctx_mgr
+
+note over caller, openai_ws
+  Important: Caller must drain all streamed iterators before exiting the context.
+  Exiting while a WS request is in-flight forces the shared connection to be aborted.
+  Do NOT pass run_config to session.run() or session.run_streamed() — session injects it.
+end note
+
+@enduml

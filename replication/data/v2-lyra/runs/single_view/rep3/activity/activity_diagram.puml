@@ -1,0 +1,114 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam activity {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+    DiamondBackgroundColor #E9ECEF
+    DiamondBorderColor #6C757D
+    StartColor #495057
+    EndColor #212529
+}
+
+title Lyra — Video World Generation Pipeline
+
+|User|
+start
+:Provide text prompt\n(and optional condition video/image);
+
+|Pipeline (DiffusionText2WorldGenerationPipeline\n/ DiffusionVideo2WorldGenerationPipeline\n/ ARBaseGenerationPipeline)|
+:Initialize pipeline\n(inference_type, checkpoint_dir, checkpoint_name);
+
+fork
+  :_load_model(checkpoint_name)
+  Load diffusion / AR network weights;
+fork again
+  :_load_text_encoder_model()
+  Load T5 / CLIP text encoder;
+end fork
+
+if (enable_prompt_upsampler?) then (yes)
+  :_load_prompt_upsampler_model()
+  Load prompt upsampler LLM;
+  :Upsample short prompt\nto detailed description;
+else (no)
+endif
+
+:Encode text prompt\nvia text encoder\n→ prompt_embedding;
+
+if (offload_network?) then (yes)
+  :offload guardrail models\nto CPU to free GPU VRAM;
+else (no)
+endif
+
+|Conditioner (GeneralConditioner)|
+:Compute conditioning embeddings\n_forward(data_batch)
+→ CosmosCondition / VideoExtendCondition;
+
+:get_condition_uncondition(data_batch)
+Build positive + negative conditioning tensors;
+
+|Pipeline (DiffusionText2WorldGenerationPipeline\n/ DiffusionVideo2WorldGenerationPipeline\n/ ARBaseGenerationPipeline)|
+if (Inference type?) then (text-to-world / T2W)
+  :Proceed with text embedding\nas sole conditioning signal;
+else (video-to-world / V2W)
+  :Load condition video or image\nfrom image_or_video_path;
+  :Encode condition frames\nvia BaseVAE → condition_latent;
+  :prepare_latent_condition()\nAugment latent with noise σ;
+  :add_condition_video_indicator_and_video_input_mask()
+  Mask conditioning frames in latent;
+endif
+
+if (offload_network?) then (yes)
+  :_run_model_with_offload()\nStream model layers through GPU;
+else (no)
+  :_run_model()\nFull in-GPU forward pass;
+endif
+
+|DiffusionModel (GeneralDIT backbone)|
+:generate_cfg_samples()\nInitialise noisy latent x_T\nfrom Gaussian noise;
+
+repeat
+  :denoise(xt, sigma, condition)\nCompute denoised prediction x0\nvia GeneralDIT forward pass;
+  :Apply classifier-free guidance (CFG)\nxt = xt + guidance × (cond − uncond);
+  :Advance ODE solver step\n(2nd-order Adams–Bashforth / Euler);
+repeat while (sigma > sigma_min?) is (yes)
+-> (no) denoising complete;
+
+:generate_samples_from_batch()\nReturn final clean latent x0;
+
+|Tokenizer (BaseVAE / VideoTokenizerInterface)|
+:Decode latent x0\n→ raw video tensor (B, C, T, H, W);
+
+|Guardrail / Post-processing|
+:Run safety / quality guardrail check\non decoded video frames;
+
+if (Guardrail passed?) then (yes)
+  :Save video to output path\nvia ImageioVideoHandler.dump_to_path()\n(mp4, configurable fps / quality);
+else (no)
+  :Block output\nLog guardrail violation;
+  stop
+endif
+
+|User|
+:Receive generated video output;
+
+stop
+
+@enduml

@@ -1,0 +1,212 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+
+skinparam sequenceArrowThickness 2
+skinparam sequenceParticipant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequenceActorBorderColor #495057
+skinparam sequenceActorBackgroundColor #E9ECEF
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceGroupBorderColor #6C757D
+skinparam sequenceGroupBodyBackgroundColor #F8F9FA
+skinparam noteBorderColor #495057
+skinparam noteBackgroundColor #FFF3CD
+
+title Cosmos Predict1 — Video2World Generation Pipeline\n(Text-Conditioned Autoregressive World Generation)
+
+actor "User / Script" as User
+
+participant "InferenceScript\n(video2world.py)" as Script
+participant "ARVideo2World\nGenerationPipeline" as V2WPipeline
+participant "ARBaseGeneration\nPipeline" as BasePipeline
+participant "TextGuardrail\nRunner" as TextGuardrail
+participant "CosmosT5\nTextEncoder" as T5Encoder
+participant "AutoRegressive\nModel" as ARModel
+participant "VideoTokenizer" as Tokenizer
+participant "LatentDiffusion\nDecoderModel" as DiffDecoder
+participant "VideoGuardrail\nRunner" as VideoGuardrail
+
+== Initialization ==
+
+User -> Script: parse_args()
+activate Script
+
+Script -> V2WPipeline: __init__(checkpoint_dir, checkpoint_name,\ninference_type="video2world", ...)
+activate V2WPipeline
+
+V2WPipeline -> BasePipeline: super().__init__(...)
+activate BasePipeline
+
+BasePipeline -> BasePipeline: _load_model()
+note right: Creates AutoRegressiveModel\nwith parallel config
+
+BasePipeline -> ARModel: __init__(config, model_parallel)
+activate ARModel
+ARModel --> BasePipeline: model instance
+deactivate ARModel
+
+BasePipeline -> BasePipeline: _load_network()
+note right: Loads AR model weights\nfrom checkpoint
+
+BasePipeline -> BasePipeline: _load_tokenizer()
+note right: Loads video tokenizer\n(DV8x16x16-720p)
+
+BasePipeline -> BasePipeline: _load_text_guardrail()
+BasePipeline -> TextGuardrail: create_text_guardrail_runner(checkpoint_dir)
+activate TextGuardrail
+TextGuardrail --> BasePipeline: text_guardrail
+deactivate TextGuardrail
+
+BasePipeline -> BasePipeline: _load_video_guardrail()
+BasePipeline -> VideoGuardrail: create_video_guardrail_runner(checkpoint_dir)
+activate VideoGuardrail
+VideoGuardrail --> BasePipeline: video_guardrail
+deactivate VideoGuardrail
+
+BasePipeline --> V2WPipeline: base initialized
+deactivate BasePipeline
+
+V2WPipeline -> V2WPipeline: _load_diffusion_decoder()
+V2WPipeline -> DiffDecoder: load_model_by_config(config_job_name, ...)\n+ load_network_model() + load_tokenizer_model()
+activate DiffDecoder
+DiffDecoder --> V2WPipeline: diffusion_decoder_model
+deactivate DiffDecoder
+
+V2WPipeline -> V2WPipeline: _load_text_encoder_model()
+V2WPipeline -> T5Encoder: CosmosT5TextEncoder(cache_dir)
+activate T5Encoder
+T5Encoder --> V2WPipeline: text_encoder
+deactivate T5Encoder
+
+V2WPipeline --> Script: pipeline ready
+deactivate V2WPipeline
+
+== Load Input Video ==
+
+Script -> Script: load_vision_input(input_type, path, data_resolution, num_input_frames)
+note right: Reads video/image from disk\ninto torch.Tensor
+
+== Video2World Generation Loop ==
+
+loop for each input_filename in input_videos
+
+    Script -> V2WPipeline: generate(inp_prompt, inp_vid,\nnum_input_frames, seed, sampling_config)
+    activate V2WPipeline
+
+    == Step 1: Text Prompt Safety Check ==
+
+    V2WPipeline -> V2WPipeline: _run_guardrail_on_prompt_with_offload(inp_prompt)
+    V2WPipeline -> TextGuardrail: run_text_guardrail(prompt, text_guardrail)
+    activate TextGuardrail
+    TextGuardrail --> V2WPipeline: is_safe: bool
+    deactivate TextGuardrail
+
+    alt prompt not safe
+        V2WPipeline --> Script: return None
+        Script -> Script: log "Input text prompt is not safe"
+    else prompt is safe
+
+        == Step 2: Text Embedding ==
+
+        V2WPipeline -> V2WPipeline: _run_text_embedding_on_prompt_with_offload([inp_prompt])
+        V2WPipeline -> T5Encoder: encode_prompts([prompt])
+        activate T5Encoder
+        T5Encoder --> V2WPipeline: prompt_embedding, prompt_mask\n(T5 token embeddings)
+        deactivate T5Encoder
+
+        == Step 3: Autoregressive Token Generation ==
+
+        V2WPipeline -> V2WPipeline: _run_model_with_offload(prompt_embedding, prompt_mask,\ninp_vid, num_input_frames, seed, sampling_config)
+        activate V2WPipeline #LightBlue
+
+        V2WPipeline -> V2WPipeline: _run_model(...)
+        note right: Prepares data_batch with\ncontext embeddings + video;\ndetermines context length
+
+        V2WPipeline -> V2WPipeline: generate_partial_tokens_from_data_batch(\ndata_batch, num_tokens_to_generate,\nsampling_config, tokenizer_config, ...)
+
+        V2WPipeline -> Tokenizer: tokenize(data_batch)
+        activate Tokenizer
+        Tokenizer --> V2WPipeline: data_tokens, token_boundaries
+        deactivate Tokenizer
+
+        loop for each sample in batch
+
+            V2WPipeline -> V2WPipeline: generate_video_from_tokens(\nprompt_tokens, latent_shape,\nmax_gen_len, sampling_config, context, ...)
+
+            V2WPipeline -> ARModel: generate(prompt_tokens, temperature, top_p,\necho, seed, context, context_mask,\nmax_gen_len, compile_sampling, stop_tokens)
+            activate ARModel
+            note right: Autoregressive sampling\nwith cross-attention\nover text embeddings
+            ARModel --> V2WPipeline: generation_tokens [B, T*H*W]
+            deactivate ARModel
+
+            V2WPipeline -> V2WPipeline: reshape tokens\nB(T H W) -> B T H W\n(rearrange + offset)
+
+            V2WPipeline -> Tokenizer: video_tokenizer.decode(indices_tensor)
+            activate Tokenizer
+            Tokenizer --> V2WPipeline: video_decoded [B, C, T, H, W]
+            deactivate Tokenizer
+
+        end
+
+        V2WPipeline --> V2WPipeline: out_videos, indices_tensors, prompt_embedding
+        deactivate V2WPipeline #LightBlue
+
+        == Step 4: Diffusion Decoder Enhancement ==
+
+        V2WPipeline -> V2WPipeline: _run_diffusion_decoder_with_offload(\nout_videos, indices_tensor, [prompt_embedding])
+
+        V2WPipeline -> DiffDecoder: diffusion_decoder_process_tokens(\nmodel, indices_tensor, dd_sampling_config,\noriginal_video, t5_emb_batch)
+        activate DiffDecoder
+        note right: Enhances discrete token\nquality via latent\ndiffusion decoding
+        DiffDecoder --> V2WPipeline: enhanced_videos (higher quality)
+        deactivate DiffDecoder
+
+        V2WPipeline -> V2WPipeline: prepare_video_batch_for_saving(out_videos)
+        note right: Normalize to uint8\nformat for saving
+
+        == Step 5: Video Safety Check ==
+
+        V2WPipeline -> V2WPipeline: _run_guardrail_on_video_with_offload(output_video)
+        V2WPipeline -> VideoGuardrail: run_video_guardrail(video, video_guardrail)
+        activate VideoGuardrail
+        VideoGuardrail --> V2WPipeline: safe_video | None
+        deactivate VideoGuardrail
+
+        alt video not safe
+            V2WPipeline --> Script: return None
+            Script -> Script: log "Generated video is not safe"
+        else video is safe
+            V2WPipeline --> Script: output_video: np.ndarray\n(T, H, W, C)
+        end
+
+        == Save Output ==
+
+        Script -> Script: imageio.mimsave(out_vid_path, out_vid, fps=25)
+        Script -> Script: log "Saved video to {path}"
+
+    end
+
+end
+
+deactivate V2WPipeline
+deactivate Script
+
+@enduml

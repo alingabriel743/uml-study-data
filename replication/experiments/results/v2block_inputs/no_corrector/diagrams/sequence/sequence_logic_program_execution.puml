@@ -1,0 +1,170 @@
+@startuml
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipant underline
+skinparam participant {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    FontColor #212529
+}
+skinparam sequence {
+    GroupBackgroundColor #E9ECEF
+    GroupBorderColor #6C757D
+    GroupFontColor #212529
+    LifeLineBorderColor #495057
+    LifeLineBackgroundColor #DEE2E6
+    ArrowColor #495057
+    BoxBackgroundColor #E9ECEF
+    BoxBorderColor #6C757D
+}
+skinparam noteBorderColor #ADB5BD
+skinparam noteBackgroundColor #FFF3CD
+
+title Logic Block Program Execution
+
+participant "LogicBuild\n(Building)" as LB
+participant "LAssembler" as LA
+participant "LParser" as LP
+participant "LogicIO" as LIO
+participant "LStatement" as LST
+participant "GlobalVars" as GV
+participant "LExecutor" as LE
+participant "LInstruction" as LI
+participant "LVar" as LV
+participant "Building/Unit/World" as EXT
+participant "Call\n(Remote)" as CALL
+
+== Assembly Phase ==
+
+LB -> LA : assemble(code: String, privileged: boolean)
+activate LA
+
+LA -> LP : new LParser(text, privileged).parse()
+activate LP
+
+loop for each line of code
+    LP -> LP : statement() — tokenize line, checkRead()
+    LP -> LIO : read(tokens[], tok)
+    activate LIO
+    LIO --> LP : LStatement (or InvalidStatement)
+    deactivate LIO
+end
+
+LP -> LP : resolve jump labels\n(build forward-reference table)
+LP --> LA : Seq<LStatement>
+deactivate LP
+
+loop for each LStatement
+    LA -> LST : build(asm: LAssembler) → LInstruction
+    activate LST
+
+    loop for each operand symbol
+        LST -> LA : var(symbol)
+        activate LA
+        LA -> GV : get(symbol, privileged)\n(check built-in constants first)
+        activate GV
+        GV --> LA : LVar (or null)
+        deactivate GV
+        alt symbol not found in GlobalVars
+            LA -> LA : putConst() — string/numeric literal\nor putVar() — new user variable
+        end
+        LA --> LST : LVar (resolved operand)
+        deactivate LA
+    end
+
+    LST --> LA : LInstruction
+    deactivate LST
+end
+
+note right of LA
+  vars: OrderedMap<String,LVar>
+  instructions: LInstruction[]
+  Special built-ins bound:
+  @counter, @unit, @this, @ipt
+end note
+
+LA --> LB : assembled LAssembler\n(instructions[], vars map)
+deactivate LA
+
+== Load Phase ==
+
+LB -> LE : load(builder: LAssembler)
+activate LE
+LE -> LA : extract vars[] (non-constant),\ninstructions[],\nbind @counter / @unit / @this / @ipt
+activate LA
+LA --> LE : vars[], instructions[], special LVars
+deactivate LA
+deactivate LE
+
+== Tick Execution Phase (per game tick) ==
+
+note over LB, LE
+  runOnce() is called **ipt** times per tick
+  (ipt = instructions-per-tick, default from LogicBlock)
+end note
+
+loop each game tick
+    LB -> LE : runOnce()
+    activate LE
+
+    LE -> LE : check counter bounds\n(if counter ≥ instructions.length → reset to 0)
+
+    loop ipt times (or until yield=true)
+        LE -> LI : instructions[counter++].run(exec)
+        activate LI
+
+        LI -> LV : num() / obj() / bool()\n(read operand values)
+        activate LV
+        LV --> LI : value
+        deactivate LV
+
+        LI -> LV : setnum() / setobj() / set(LVar)\n(write results)
+        activate LV
+        LV --> LI : —
+        deactivate LV
+
+        alt I/O or sensing instruction
+            LI -> LE : access graphicsBuffer /\ntextBuffer / links[] / team / build
+        end
+
+        alt Building / Unit / World control
+            LI -> EXT : b.control() / unit.controller() /\nworld.tile() — side-effect call
+            activate EXT
+            EXT --> LI : result (or void)
+            deactivate EXT
+        end
+
+        alt Network sync (SyncI)
+            LI -> CALL : syncVariable(build, variable.id, value)\n@ 20 Hz
+            activate CALL
+            CALL --> LI : —
+            deactivate CALL
+        end
+
+        alt Content lookup (LookupI)
+            LI -> GV : lookupContent(ContentType, id)
+            activate GV
+            GV --> LI : Content object
+            deactivate GV
+        end
+
+        deactivate LI
+
+        alt WaitI / StopI
+            LE -> LE : yield = true\ncounter-- (re-run same instruction next tick)
+        else JumpI (conditional branch)
+            LE -> LE : counter.numval = target address
+        else EndI
+            LE -> LE : counter.numval = instructions.length\n(force program end)
+        end
+    end
+
+    LE --> LB : —
+    deactivate LE
+end
+
+@enduml

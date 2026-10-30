@@ -1,0 +1,228 @@
+@startuml
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam defaultFontName "Segoe UI"
+skinparam defaultFontSize 12
+skinparam backgroundColor #FEFEFE
+skinparam class {
+    BackgroundColor #F8F9FA
+    BorderColor #495057
+    ArrowColor #495057
+    FontColor #212529
+}
+skinparam package {
+    BackgroundColor #E9ECEF
+    BorderColor #6C757D
+}
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipantBorderColor #495057
+skinparam sequenceParticipantBackgroundColor #F8F9FA
+skinparam sequenceLifeLineBorderColor #6C757D
+skinparam sequenceGroupBorderColor #6C757D
+skinparam sequenceGroupBackgroundColor #E9ECEF
+skinparam sequenceBoxBorderColor #ADB5BD
+skinparam noteBorderColor #6C757D
+skinparam noteBackgroundColor #FFF3CD
+
+title AI Base Building
+
+participant "Logic\n(game loop)" as Logic
+participant "BaseBuilderAI" as BBAI
+participant "TeamData" as TD
+participant "WaveSpawner\n(Vars.spawner)" as Spawner
+participant "Pathfinder\n(Vars.pathfinder)" as PF
+participant "BaseRegistry\n(Vars.bases)" as BR
+participant "BasePart" as BP
+participant "Schematics" as Schem
+participant "Build\n(validator)" as Build
+participant "BuilderAI\n(unit AI)" as BAI
+participant "BlockIndexer\n(Vars.indexer)" as BI
+
+== Game Loop Tick ==
+
+Logic -> Logic : update()
+note right: rules.buildAi == true\n&& !state.rules.pvp
+
+Logic -> TD : data.buildAi (get/create BaseBuilderAI)
+activate TD
+TD --> Logic : buildAi instance
+deactivate TD
+
+Logic -> BBAI : update()
+activate BBAI
+
+== Core Item Fill ==
+
+BBAI -> TD : cores (get CoreBuild list)
+activate TD
+TD --> BBAI : Seq<CoreBuild>
+deactivate TD
+
+loop for each Item in core items
+    BBAI -> BBAI : core.items.set(item,\ncore.getMaximumAccepted(item))
+end
+
+== Core Unit Spawn (conditional) ==
+
+opt rules.aiCoreSpawn && timer(timerSpawn, 60*6f) && hasCore()
+    BBAI -> TD : cores.size, team.data().units
+    activate TD
+    TD --> BBAI : coreCount, unitCount
+    deactivate TD
+    BBAI -> BBAI : block.unitType.create(team)
+    note right: spawns CoreUnit\nif coreUnits < cores.size * 2
+    BBAI -> BBAI : unit.add()
+end
+
+== Path Recalculation (every 3 minutes) ==
+
+opt !calculating && timer(timerRefreshPath, 3*Time.toMinutes)
+    BBAI -> BBAI : calculating = true\ncalcPath.clear()
+
+    BBAI -> Spawner : eachGroundSpawn(x, y)
+    activate Spawner
+    Spawner --> BBAI : calcTile (start tile)
+    deactivate Spawner
+
+    BBAI -> PF : getField(team, costGround, fieldCore)
+    activate PF
+    PF --> BBAI : Flowfield (completeWeights[])
+    deactivate PF
+
+    loop pathStep = 50 iterations per tick
+        BBAI -> BBAI : walk d4 neighbors via completeWeights
+        BBAI -> BBAI : add tile pos + d8 neighbors\nto calcPath (IntSet)
+        alt calcTile.build is enemy CoreBuild
+            BBAI -> BBAI : path = calcPath\ncalculating = false\nfoundPath = true
+        end
+    end
+end
+
+== Block Placement Attempt ==
+
+opt (foundPath || !calculating) && plans.isEmpty()\n&& timer(timerStep, lerp(12f, 2f, buildAiTier))
+
+    loop up to 6 placement attempts
+        BBAI -> TD : cores.random() or spawner.getSpawns().random()
+        activate TD
+        TD --> BBAI : origin tile
+        deactivate TD
+
+        BBAI -> BBAI : randomPosition()\napply random offset (range=150 tiles)
+        BBAI -> BBAI : world.tiles.getc(wx, wy) → tile
+
+        BBAI -> Spawner : getSpawns().contains(t → t.within(tile, 40 tiles))
+        activate Spawner
+        Spawner --> BBAI : nearSpawn (boolean)
+        deactivate Spawner
+
+        alt nearSpawn == true
+            BBAI -> BBAI : skip tile (too close to spawn)
+        else tile valid
+            alt tile.drop() != null
+                BBAI -> BR : forResource(tile.drop())
+                activate BR
+                BR --> BBAI : Seq<BasePart> (resource-matched parts)
+                deactivate BR
+            else Mathf.chance(0.01f)
+                BBAI -> BR : parts (no-resource parts)
+                activate BR
+                BR --> BBAI : Seq<BasePart>
+                deactivate BR
+            end
+
+            BBAI -> BR : parts.random()
+            activate BR
+            BR --> BBAI : BasePart part
+            deactivate BR
+
+            BBAI -> BBAI : tryPlace(part, tile.x, tile.y)
+        end
+    end
+end
+
+deactivate BBAI
+
+== tryPlace — Schematic Validation ==
+
+activate BBAI
+BBAI -> Schem : rotate(part.schematic, rotation)
+activate Schem
+Schem --> BBAI : rotated Schematic result
+deactivate Schem
+
+loop for each Stile in rotated schematic
+    BBAI -> Build : validPlace(block, team, realX, realY, rotation)
+    activate Build
+    Build --> BBAI : valid (boolean)
+    deactivate Build
+    alt !valid
+        BBAI --> BBAI : abort tryPlace
+    end
+end
+
+loop for each solid Stile
+    BBAI -> BBAI : wtile.getLinkedTilesAs(block, tmpTiles)\n.contains(t → path.contains(t.pos()))
+    alt tile on AI path
+        BBAI --> BBAI : abort (would block path)
+    end
+end
+
+opt part.required instanceof Item
+    loop for each Drill tile in schematic
+        BBAI -> BBAI : tile.block.iterateTaken(x, y, ...)\ncount correct / incorrect resource matches
+    end
+    alt anyDrills && (incorrect != 0 || correct == 0)
+        BBAI --> BBAI : abort (wrong resource under drills)
+    end
+end
+
+note over BBAI: All checks passed — placement valid
+
+loop for each Stile in schematic
+    BBAI -> TD : plans.add(new BlockPlan(cx+tile.x, cy+tile.y,\nrotation, block, config))
+    activate TD
+    TD --> BBAI : plan queued
+    deactivate TD
+end
+deactivate BBAI
+
+== Builder Unit Executes Plans ==
+
+BAI -> TD : team.data().plans.first()
+activate TD
+TD --> BAI : BlockPlan
+deactivate TD
+
+BAI -> BAI : new BuildPlan(x, y, rotation, block, config)
+BAI -> BAI : unit.addBuild(plan)
+
+BAI -> Build : validPlace(block, team, x, y, rotation)
+activate Build
+Build --> BAI : valid
+deactivate Build
+
+BAI -> BAI : moveTo(req.tile(), buildRange=1500, 20f)
+BAI -> BAI : unit builds block → placed in world
+note right: TileChangeEvent fired
+
+== Block Index Update (reactive) ==
+
+BAI -> BI : [TileChangeEvent] addIndex(tile)
+activate BI
+BI -> BI : process(tile)
+BI -> TD : buildingTree.insert(build)\n[QuadTree<Building>]
+activate TD
+TD --> BI : inserted
+deactivate TD
+
+opt block.attacks && build instanceof Ranged
+    BI -> TD : turretTree.insert(build)\n[TurretQuadtree]
+    activate TD
+    TD --> BI : inserted
+    deactivate TD
+end
+deactivate BI
+
+@enduml
